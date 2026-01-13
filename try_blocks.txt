@@ -1,0 +1,88 @@
+# reward_calculator.py
+
+class AdaptiveRewardWeighting:
+    def __init__(self, base_penalty=-10.0, alpha=0.5, 
+                 base_c=10.0, beta=0.3, 
+                 max_episodes=20000, warmup_episodes=200,
+                 enable_adaptive=True):
+        self.base_penalty = base_penalty
+        self.alpha = alpha
+        self.base_c = base_c
+        self.beta = beta
+        self.max_episodes = max_episodes
+        self.warmup_episodes = warmup_episodes
+        self.enable = enable_adaptive
+
+        # 动态参数
+        self.current_penalty = base_penalty
+        self.current_c = base_c
+        self.success_rate = 0.0
+        self.history_success = []
+        self.critic_loss_window = []
+
+    def update_success_rate(self, success_flag: bool, window_size=100):
+        """统计最近100回合成功率"""
+        self.history_success.append(float(success_flag))
+        if len(self.history_success) > window_size:
+            self.history_success.pop(0)
+        self.success_rate = sum(self.history_success) / len(self.history_success)
+
+    def update_critic_loss(self, loss_value, window_size=50):
+        """监控 Critic loss 波动"""
+        self.critic_loss_window.append(loss_value)
+        if len(self.critic_loss_window) > window_size:
+            self.critic_loss_window.pop(0)
+
+    def adjust_weights(self, episode_idx):
+        """动态调整奖励权重"""
+        if not self.enable or episode_idx < self.warmup_episodes:
+            return  # 预热阶段不调整
+
+        # ① 动态碰撞惩罚
+        ratio = min(1.0, episode_idx / self.max_episodes)
+        self.current_penalty = self.base_penalty * (1.0 + self.alpha * ratio)
+
+        # ② 动态距离奖励权重 c
+        self.current_c = self.base_c * (1.0 + self.beta * (1.0 - self.success_rate))
+
+        # ③ Critic loss 平滑修正
+        if len(self.critic_loss_window) > 10:
+            std = np.std(self.critic_loss_window)
+            if std > 0.5:
+                self.current_c *= 0.8  # 平滑奖励
+
+    def apply_to_rewards(self, reward_terms: dict) -> dict:
+        """
+        将动态权重应用到奖励项字典中
+        例如 reward_terms = {'collision': -10, 'distance': +2.5, ...}
+        """
+        if 'collision' in reward_terms:
+            reward_terms['collision'] *= abs(self.current_penalty / self.base_penalty)
+        if 'distance' in reward_terms:
+            reward_terms['distance'] *= (self.current_c / self.base_c)
+        return reward_terms
+        集成说明
+
+        在训练循环中：
+        
+        # 每回合结束后更新成功率
+        adaptive_reward.update_success_rate(success_flag)
+        
+        # 每步训练时更新 critic loss 状态
+        adaptive_reward.update_critic_loss(critic_loss)
+        
+        # 每回合开始时调整奖励参数
+        adaptive_reward.adjust_weights(episode_idx)
+        
+        
+        在计算总奖励时：
+        
+        reward_terms = vectorized_reward_calculator(obs, actions, info)
+        reward_terms = adaptive_reward.apply_to_rewards(reward_terms)
+        total_reward = sum(reward_terms.values())
+        
+        
+        在日志中记录：
+        
+        logger.info(f"[ARW] Episode {ep} | penalty={adaptive_reward.current_penalty:.2f} "
+                    f"c={adaptive_reward.current_c:.2f} | SR={adaptive_reward.success_rate:.2f}")
