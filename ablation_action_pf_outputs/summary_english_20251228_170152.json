@@ -1,0 +1,32 @@
+{
+  "timestamp": "20251228_170152",
+  "experiments": [
+    {
+      "label": "apf_traditional",
+      "name": "APF Traditional",
+      "log_dir": "logs/apf_traditional_20251227_201909",
+      "episodes": 500,
+      "final_reward": 5096002.481446266,
+      "avg_reward": 5106916.680267143,
+      "team_success_rate": 0.0
+    },
+    {
+      "label": "action_apf_fusion",
+      "name": "Action+APF Fusion",
+      "log_dir": "logs/action_apf_fusion_20251227_063729",
+      "episodes": 500,
+      "final_reward": 3992517.5847322345,
+      "avg_reward": 3332391.224868637,
+      "team_success_rate": 0.006
+    },
+    {
+      "label": "action_only",
+      "name": "Action Only",
+      "log_dir": "logs/action_only_20251227_133708",
+      "episodes": 500,
+      "final_reward": 32996.82877922058,
+      "avg_reward": -367470.1517861779,
+      "team_success_rate": 0.0
+    }
+  ]
+}

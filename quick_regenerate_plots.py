@@ -42,40 +42,83 @@ def load_experiment_data(log_dir):
     """加载实验数据"""
     log_path = Path(log_dir)
     
-    # 🔧 修复：数据可能在子目录中（格式：parent_dir/timestamp_dir/results.json）
-    # 查找results.json文件
+    # 🔧 修复：优先查找episode_rewards.json（包含完整指标），如果没有再查找results.json
+    episode_rewards_file = None
+    loss_history_file = None
     results_file = None
     
     # 先尝试直接路径
-    if (log_path / "results.json").exists():
+    if (log_path / "episode_rewards.json").exists():
+        episode_rewards_file = log_path / "episode_rewards.json"
+    elif (log_path / "results.json").exists():
         results_file = log_path / "results.json"
     else:
-        # 查找子目录中的results.json
+        # 查找子目录中的文件
         subdirs = [d for d in log_path.iterdir() if d.is_dir()]
         for subdir in subdirs:
-            if (subdir / "results.json").exists():
+            if (subdir / "episode_rewards.json").exists():
+                episode_rewards_file = subdir / "episode_rewards.json"
+                break
+            elif (subdir / "results.json").exists() and results_file is None:
                 results_file = subdir / "results.json"
+    
+    # 查找loss_history.json
+    if episode_rewards_file:
+        # episode_rewards.json在同一目录下
+        loss_history_file = episode_rewards_file.parent / "loss_history.json"
+    elif results_file:
+        # results.json在同一目录下
+        loss_history_file = results_file.parent / "loss_history.json"
+    else:
+        # 查找子目录中的loss_history.json
+        subdirs = [d for d in log_path.iterdir() if d.is_dir()]
+        for subdir in subdirs:
+            if (subdir / "loss_history.json").exists():
+                loss_history_file = subdir / "loss_history.json"
                 break
     
-    if not results_file:
-        print(f"警告：找不到 results.json 在 {log_dir}")
-        return {}
-    
-    print(f"    读取: {results_file}")
-    with open(results_file, 'r') as f:
-        data = json.load(f)
-    
     metrics = {
-        "episode_rewards": data.get("episode_rewards", []),
-        "loss_history": data.get("loss_history", []),
-        "success_flags": data.get("success_flags", []),
-        "collision_counts": data.get("collision_counts", []),
-        "min_distances_to_obstacle": data.get("min_distances_to_obstacle", []),
-        "agent_success_flags": data.get("agent_success_flags", []),
-        "team_success_flags": data.get("team_success_flags", []),
-        "agent_success_rates": data.get("agent_success_rates", []),
-        "team_success_rate": data.get("team_success_rate", 0.0)
+        "episode_rewards": [],
+        "loss_history": [],
+        "success_flags": [],
+        "collision_counts": [],
+        "min_distances_to_obstacle": [],
+        "agent_success_flags": [],
+        "team_success_flags": [],
+        "agent_success_rates": [],
+        "team_success_rate": 0.0
     }
+    
+    # 优先从episode_rewards.json加载（包含完整指标）
+    if episode_rewards_file:
+        print(f"    读取: {episode_rewards_file}")
+        with open(episode_rewards_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        metrics["episode_rewards"] = data.get("episode_rewards", [])
+        metrics["success_flags"] = data.get("success_flags", [])
+        metrics["collision_counts"] = data.get("collision_counts", [])
+        metrics["min_distances_to_obstacle"] = data.get("min_distances_to_obstacle", [])
+        metrics["agent_success_flags"] = data.get("agent_success_flags", [])
+        metrics["team_success_flags"] = data.get("team_success_flags", [])
+        metrics["agent_success_rates"] = data.get("agent_success_rates", [])
+        metrics["team_success_rate"] = data.get("team_success_rate", 0.0)
+    elif results_file:
+        # 从results.json加载（可能只有rewards字段）
+        print(f"    读取: {results_file}")
+        with open(results_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # 🔧 修复：results.json中可能使用"rewards"字段而不是"episode_rewards"
+        metrics["episode_rewards"] = data.get("episode_rewards", data.get("rewards", []))
+        # results.json通常不包含其他指标，所以保持默认值
+    else:
+        print(f"    警告：找不到 episode_rewards.json 或 results.json 在 {log_dir}")
+        return metrics
+    
+    # 加载损失数据
+    if loss_history_file and loss_history_file.exists():
+        print(f"    读取: {loss_history_file}")
+        with open(loss_history_file, 'r', encoding='utf-8') as f:
+            metrics["loss_history"] = json.load(f)
     
     return metrics
 

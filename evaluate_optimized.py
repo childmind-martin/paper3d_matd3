@@ -18,6 +18,9 @@ import math
 
 # 设置环境变量抑制多智能体环境警告
 os.environ['SUPPRESS_MA_PROMPT'] = '1'
+# 🔧 抑制 TensorFlow/XLA 警告（如 cuFFT 注册警告）
+# TF_CPP_MIN_LOG_LEVEL: 0=全部日志, 1=INFO及以上, 2=WARNING及以上, 3=ERROR及以上
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')  # 抑制警告，保留错误信息
 
 # 可视化依赖（非交互后端）
 import matplotlib
@@ -96,6 +99,20 @@ class ModelEvaluator:
             try_apply_scenario_params(self.scenario, self.world, self.args, tqdm_file=None)
         except Exception:
             pass
+        
+        # 🚨 关键修复：确保碰撞检测参数被正确设置到场景对象
+        # 即使try_apply_scenario_params没有处理这些参数，也要手动设置
+        try:
+            if hasattr(self.args, 'collision_distance_threshold') and self.args.collision_distance_threshold is not None:
+                if hasattr(self.scenario, 'collision_distance_threshold'):
+                    self.scenario.collision_distance_threshold = float(self.args.collision_distance_threshold)
+                    print(f"✅ 已设置碰撞距离阈值: {self.scenario.collision_distance_threshold}")
+            if hasattr(self.args, 'collision_penalty_value') and self.args.collision_penalty_value is not None:
+                if hasattr(self.scenario, 'collision_penalty_value'):
+                    self.scenario.collision_penalty_value = float(self.args.collision_penalty_value)
+                    print(f"✅ 已设置碰撞惩罚值: {self.scenario.collision_penalty_value}")
+        except Exception as e:
+            print(f"⚠️  设置碰撞检测参数失败: {e}")
         
         # 创建环境
         self.env = MultiAgentEnv(
@@ -228,12 +245,31 @@ class ModelEvaluator:
             use_pf: 是否使用势场特征（作为单独输入，如果启用）
         
         Returns:
-            actions: (n_agents, action_dim) 或 (batch_size, n_agents, action_dim)
+            actions: (n_agents, action_dim) 或 (batch_size, n_agents, action_dim) - TensorFlow tensor
+        """
+        # 🔧 性能优化：使用tf.function装饰器加速（与训练代码一致）
+        return self._select_actions_eval_tf(processed_obs, use_fr, use_pf)
+    
+    @tf.function(reduce_retracing=True)
+    def _select_actions_eval_tf(self, processed_obs, use_fr, use_pf):
+        """
+        评估时的动作选择（TensorFlow图模式，性能优化）
+        
+        Args:
+            processed_obs: TensorFlow tensor (n_agents, obs_dim) 或 (batch_size, n_agents, obs_dim)
+            use_fr: bool 是否使用填充率特征
+            use_pf: bool 是否使用势场特征
+        
+        Returns:
+            actions: TensorFlow tensor (n_agents, action_dim) 或 (batch_size, n_agents, action_dim)
         """
         # 🔧 修复：Actor网络期望的输入结构
         # 如果 use_pf_feature=True，Actor期望3个输入：[obs, fr_input, pf_input]
         # 如果 use_fr_feature=True 但 use_pf_feature=False，Actor期望2个输入：[obs, fr_input]
         # 如果两者都False，Actor期望1个输入：[obs]
+        
+        # 确保是tensor
+        processed_obs = tf.convert_to_tensor(processed_obs, dtype=tf.float32)
         
         # 确保有批次维度
         if len(processed_obs.shape) == 2:  # (n_agents, obs_dim)
@@ -242,28 +278,31 @@ class ModelEvaluator:
         else:
             squeeze_output = False
         
-        batch_size = processed_obs.shape[0]
+        batch_size = tf.shape(processed_obs)[0]
         actions_list = []
         
         # 🔧 获取PF特征维度（从训练配置或网络结构推断）
-        pf_feature_dim = getattr(self.maddpg, 'pf_feature_dim', 3)
+        pf_feature_dim = 3  # 固定为3（PF力是3维向量）
         
         # 🔧 关键修复：计算真实的FR值（action_force_ratio），而不是使用零向量
         # 训练时FR值会随时间变化（schedule），评估时应该使用固定的FR值
-        action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
-        fr_value = float(action_force_ratio)
+        # 🔧 性能优化：在tf.function外部缓存FR值，避免每次调用时获取
+        if not hasattr(self, '_cached_fr_value'):
+            action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
+            self._cached_fr_value = float(action_force_ratio)
+        fr_value = tf.cast(self._cached_fr_value, tf.float32)
         
+        # 🔧 性能优化：批量处理所有智能体（与训练代码一致）
         for i in range(self.n_agents):
             # 提取当前智能体的观测（基础观测，不包含PF特征）
-            agent_obs = processed_obs[:, i, :self.obs_shapes[i]]  # (batch_size, obs_dim)
+            obs_dim = self.obs_shapes[i] if i < len(self.obs_shapes) else processed_obs.shape[2]
+            agent_obs = processed_obs[:, i, :obs_dim]  # (batch_size, obs_dim)
             
             # 构建输入：obs + fr_input（如果启用）+ pf_input（如果启用）
             actor_inputs = [agent_obs]
             if use_fr:
                 # 🔧 关键修复：使用真实的FR值，而不是零向量
-                fr_input = tf.constant([[fr_value]], dtype=tf.float32)  # (1, 1)
-                if batch_size > 1:
-                    fr_input = tf.tile(fr_input, [batch_size, 1])  # (batch_size, 1)
+                fr_input = tf.fill([batch_size, 1], fr_value)  # (batch_size, 1)
                 actor_inputs.append(fr_input)
             if use_pf:
                 # 🔧 关键修复：计算真实的PF特征（从势场力中提取）
@@ -271,7 +310,7 @@ class ModelEvaluator:
                 # 为了简化，我们先使用零向量，但应该从实际的势场力计算中提取
                 # TODO: 从实际的势场力计算中提取PF特征
                 # 临时方案：使用零向量（与训练时PF特征的计算方式一致）
-                pf_placeholder = tf.zeros((batch_size, pf_feature_dim), dtype=tf.float32)
+                pf_placeholder = tf.zeros([batch_size, pf_feature_dim], dtype=tf.float32)
                 actor_inputs.append(pf_placeholder)
             
             # 调用actor
@@ -289,7 +328,8 @@ class ModelEvaluator:
         if squeeze_output:
             actions = actions[0]  # (n_agents, action_dim)
         
-        return actions.numpy()
+        # 🔧 性能优化：返回tensor而不是numpy，延迟转换到env.step时
+        return actions
         
     def load_model(self):
         """加载训练好的模型"""
@@ -353,8 +393,7 @@ class ModelEvaluator:
         training_use_fr = None
         training_use_pf = None
         training_pf_feature_dim = None
-        training_action_force_ratio = None
-        best_episode_force_ratio = None  # 🔧 新增：读取最佳回合的FR值
+        best_episode_force_ratio = None  # 🔧 关键：只读取最佳回合的FR值，不进行任何回退
         best_episode_num = None  # 🔧 新增：保存最佳回合编号
         training_action_range_x = None
         training_action_range_y = None
@@ -362,6 +401,11 @@ class ModelEvaluator:
         training_episode_length = None  # 🚨 新增：读取训练时的episode_length
         training_actor_hidden = None  # 🚨 新增：读取训练时的actor_hidden
         training_critic_hidden = None  # 🚨 新增：读取训练时的critic_hidden
+        training_gravity = None  # 🔧 新增：读取训练时的gravity
+        training_damping = None  # 🔧 新增：读取训练时的damping
+        training_agent_max_speed = None  # 🔧 新增：读取训练时的agent_max_speed
+        training_agent_accel = None  # 🔧 新增：读取训练时的agent_accel
+        training_control_accel_gain = None  # 🔧 新增：读取训练时的control_accel_gain
         for log_dir in potential_log_dirs:
             # 查找results.json（可能在子目录中）
             results_files = []
@@ -376,6 +420,14 @@ class ModelEvaluator:
                     with open(results_file, 'r', encoding='utf-8') as f:
                         results = json.load(f)
                     
+                    # 🔧 关键修复：优先从顶层读取最佳回合的FR值（无论是否有args，都应该先检查顶层）
+                    # best_episode_force_ratio 保存在 results.json 的顶层，与 best_episode 同级
+                    if 'best_episode_force_ratio' in results:
+                        best_episode_force_ratio = float(results['best_episode_force_ratio'])
+                        if 'best_episode' in results:
+                            best_episode_num = int(results['best_episode']) + 1
+                        print(f"✅ 从训练配置读取最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
+                    
                     # 读取训练时的特征标志
                     if 'args' in results and isinstance(results['args'], dict):
                         # 从args字典中读取
@@ -386,14 +438,6 @@ class ModelEvaluator:
                         # 🔧 关键修复：读取训练时的pf_feature_dim
                         if 'pf_feature_dim' in results['args']:
                             training_pf_feature_dim = int(results['args']['pf_feature_dim'])
-                        # 🔧 关键修复：优先读取最佳回合的FR值，如果没有则读取训练时的action_force_ratio
-                        if 'best_episode_force_ratio' in results:
-                            best_episode_force_ratio = float(results['best_episode_force_ratio'])
-                            if 'best_episode' in results:
-                                best_episode_num = int(results['best_episode']) + 1
-                            print(f"✅ 从训练配置读取最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
-                        elif 'action_force_ratio' in results['args']:
-                            training_action_force_ratio = float(results['args']['action_force_ratio'])
                         # 🔧 关键修复：读取训练时的动作范围参数
                         if 'action_range_x' in results['args']:
                             training_action_range_x = float(results['args']['action_range_x'])
@@ -409,6 +453,22 @@ class ModelEvaluator:
                             training_actor_hidden = str(results['args']['actor_hidden'])
                         if 'critic_hidden' in results['args']:
                             training_critic_hidden = str(results['args']['critic_hidden'])
+                        # 🔧 新增：读取训练时的物理参数（如果值为None，保持None以便后续报错）
+                        if 'gravity' in results['args']:
+                            val = results['args']['gravity']
+                            training_gravity = float(val) if val is not None else None
+                        if 'damping' in results['args']:
+                            val = results['args']['damping']
+                            training_damping = float(val) if val is not None else None
+                        if 'agent_max_speed' in results['args']:
+                            val = results['args']['agent_max_speed']
+                            training_agent_max_speed = float(val) if val is not None else None
+                        if 'agent_accel' in results['args']:
+                            val = results['args']['agent_accel']
+                            training_agent_accel = float(val) if val is not None else None
+                        if 'control_accel_gain' in results['args']:
+                            val = results['args']['control_accel_gain']
+                            training_control_accel_gain = float(val) if val is not None else None
                     else:
                         # 从顶层读取（向后兼容）
                         if 'use_fr_feature' in results:
@@ -417,14 +477,6 @@ class ModelEvaluator:
                             training_use_pf = bool(results['use_pf_feature'])
                         if 'pf_feature_dim' in results:
                             training_pf_feature_dim = int(results['pf_feature_dim'])
-                        # 🔧 关键修复：优先读取最佳回合的FR值（向后兼容）
-                        if 'best_episode_force_ratio' in results:
-                            best_episode_force_ratio = float(results['best_episode_force_ratio'])
-                            if 'best_episode' in results:
-                                best_episode_num = int(results['best_episode']) + 1
-                            print(f"✅ 从训练配置读取最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
-                        elif 'action_force_ratio' in results:
-                            training_action_force_ratio = float(results['action_force_ratio'])
                         # 🔧 关键修复：从顶层读取动作范围参数（向后兼容）
                         if 'action_range_x' in results:
                             training_action_range_x = float(results['action_range_x'])
@@ -437,13 +489,27 @@ class ModelEvaluator:
                             training_actor_hidden = str(results['actor_hidden'])
                         if 'critic_hidden' in results:
                             training_critic_hidden = str(results['critic_hidden'])
+                        # 🔧 新增：从顶层读取物理参数（向后兼容，如果值为None，保持None以便后续报错）
+                        if 'gravity' in results:
+                            val = results['gravity']
+                            training_gravity = float(val) if val is not None else None
+                        if 'damping' in results:
+                            val = results['damping']
+                            training_damping = float(val) if val is not None else None
+                        if 'agent_max_speed' in results:
+                            val = results['agent_max_speed']
+                            training_agent_max_speed = float(val) if val is not None else None
+                        if 'agent_accel' in results:
+                            val = results['agent_accel']
+                            training_agent_accel = float(val) if val is not None else None
+                        if 'control_accel_gain' in results:
+                            val = results['control_accel_gain']
+                            training_control_accel_gain = float(val) if val is not None else None
                     
                     if training_use_fr is not None and training_use_pf is not None:
                         print(f"✅ 从训练配置读取特征标志: use_fr_feature={training_use_fr}, use_pf_feature={training_use_pf}")
                         if training_pf_feature_dim is not None:
                             print(f"✅ 从训练配置读取PF特征维度: {training_pf_feature_dim}")
-                        if training_action_force_ratio is not None:
-                            print(f"✅ 从训练配置读取ACTION_FORCE_RATIO: {training_action_force_ratio}")
                         # 🔧 关键修复：打印动作范围参数
                         if training_action_range_x is not None or training_action_range_y is not None or training_action_range_z is not None:
                             print(f"✅ 从训练配置读取动作范围: X={training_action_range_x}, Y={training_action_range_y}, Z={training_action_range_z}")
@@ -458,52 +524,131 @@ class ModelEvaluator:
         use_fr_feature = training_use_fr if training_use_fr is not None else int(os.getenv('USE_FR_FEATURE', getattr(self.args, 'use_fr_feature', 1))) > 0
         use_pf_feature = training_use_pf if training_use_pf is not None else int(os.getenv('USE_PF_FEATURE', getattr(self.args, 'use_pf_feature', 1))) > 0
         
-        # 🔧 关键修复：优先使用最佳回合的FR值，如果没有则使用训练时的action_force_ratio
-        # 最佳回合的FR值反映了模型在该回合训练时的实际FR值，更准确
+        # 🔧 关键修复：只使用最佳回合的FR值，不进行任何回退
+        # 测试时应该使用对应训练留下的最佳回合的FR值，而不是使用默认值（即使能运行也毫无意义）
         if best_episode_force_ratio is not None:
-            # 使用最佳回合的FR值（最准确）
+            # 使用最佳回合的FR值
             eval_action_force_ratio = best_episode_force_ratio
             ep_str = f"回合 {best_episode_num}" if best_episode_num is not None else "最佳回合"
             print(f"✅ 使用最佳回合的ACTION_FORCE_RATIO: {eval_action_force_ratio} ({ep_str})")
-        elif training_action_force_ratio is not None:
-            # 回退到训练时的FR值
-            eval_action_force_ratio = training_action_force_ratio
-            print(f"✅ 使用训练时的ACTION_FORCE_RATIO: {eval_action_force_ratio}（未找到最佳回合FR值，使用训练配置）")
         else:
-            # 使用环境变量或args中的值
-            eval_action_force_ratio = float(os.getenv('ACTION_FORCE_RATIO', getattr(self.args, 'action_force_ratio', 0.3)))
-            print(f"ℹ️  未找到训练配置中的ACTION_FORCE_RATIO，使用当前配置: {eval_action_force_ratio}")
+            # 🚨 关键修复：如果找不到最佳回合的FR值，报错并退出
+            # 因为测试应该使用对应训练留下的最佳回合的FR值，使用默认值即使能运行也毫无意义
+            error_msg = (
+                "❌ 错误：无法找到训练配置中的最佳回合FR值 (best_episode_force_ratio)\n"
+                "   测试时必须使用对应训练留下的最佳回合的FR值，而不是使用默认值\n"
+                "   请检查训练配置文件 (results.json) 是否包含 best_episode_force_ratio 字段\n"
+                "   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
+            )
+            print(error_msg)
+            raise ValueError("无法找到最佳回合的FR值，评估无法继续。请确保训练配置文件包含 best_episode_force_ratio 字段。")
         
         # 更新args中的action_force_ratio，确保后续使用
         self.args.action_force_ratio = eval_action_force_ratio
         
-        # 🔧 关键修复：优先使用训练时的动作范围参数（确保与训练时完全一致）
-        # 如果找到训练配置中的动作范围，则覆盖args中的值
-        if training_action_range_x is not None:
+        # 🔧 关键修复：必须使用训练时的动作范围参数实际值，不允许使用默认值
+        # 如果找不到训练配置中的参数，报错并退出
+        missing_action_ranges = []
+        
+        if training_action_range_x is None:
+            missing_action_ranges.append("action_range_x")
+        else:
             self.args.action_range_x = training_action_range_x
             print(f"✅ 使用训练时的ACTION_RANGE_X: {training_action_range_x}")
-        if training_action_range_y is not None:
+        
+        if training_action_range_y is None:
+            missing_action_ranges.append("action_range_y")
+        else:
             self.args.action_range_y = training_action_range_y
             print(f"✅ 使用训练时的ACTION_RANGE_Y: {training_action_range_y}")
-        if training_action_range_z is not None:
+        
+        if training_action_range_z is None:
+            missing_action_ranges.append("action_range_z")
+        else:
             self.args.action_range_z = training_action_range_z
             print(f"✅ 使用训练时的ACTION_RANGE_Z: {training_action_range_z}")
         
-        # 🚨 新增：优先使用训练时的episode_length（确保与训练时完全一致）
-        if training_episode_length is not None:
+        # 🚨 如果缺少任何必需的动作范围参数，报错并退出
+        if missing_action_ranges:
+            error_msg = (
+                f"❌ 错误：无法找到训练配置中的以下动作范围参数: {', '.join(missing_action_ranges)}\n"
+                f"   测试时必须使用训练时实际使用的参数值，而不是使用默认值\n"
+                f"   请检查训练配置文件 (results.json) 是否包含这些参数\n"
+                f"   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
+            )
+            print(error_msg)
+            raise ValueError(f"无法找到训练配置中的动作范围参数: {', '.join(missing_action_ranges)}，评估无法继续。")
+        
+        # 🔧 关键修复：优先使用命令行参数，如果未指定则使用训练配置中的值
+        # 这样支持消融实验使用不同的episode_length（如4000步）进行评估
+        # 保存命令行参数的值（在覆盖之前）
+        cmd_episode_length = getattr(self.args, 'episode_length', None)
+        
+        # 检查命令行参数是否明确指定（不是默认值2200）
+        if cmd_episode_length is not None and cmd_episode_length != 2200:
+            # 命令行参数明确指定了episode_length（不是默认值2200），使用命令行参数
+            print(f"✅ 使用命令行指定的EPISODE_LENGTH: {cmd_episode_length} (覆盖训练配置中的 {training_episode_length if training_episode_length is not None else 'N/A'})")
+            # 保持使用命令行参数，不覆盖
+        elif training_episode_length is not None:
+            # 使用训练配置中的episode_length
             self.args.episode_length = training_episode_length
             print(f"✅ 使用训练时的EPISODE_LENGTH: {training_episode_length}")
         else:
-            # 如果未找到训练配置，使用环境变量或args中的值
-            env_episode_length = os.getenv('EPISODE_LENGTH', None)
-            if env_episode_length is not None:
-                try:
-                    self.args.episode_length = int(env_episode_length)
-                    print(f"ℹ️  使用环境变量EPISODE_LENGTH: {self.args.episode_length}")
-                except ValueError:
-                    print(f"⚠️  环境变量EPISODE_LENGTH无效: {env_episode_length}，使用默认值: {self.args.episode_length}")
-            else:
-                print(f"ℹ️  未找到训练配置中的EPISODE_LENGTH，使用当前配置: {self.args.episode_length}")
+            # 既没有命令行参数，也没有训练配置，使用默认值
+            error_msg = (
+                "❌ 错误：无法找到训练配置中的episode_length参数\n"
+                "   测试时必须使用训练时实际使用的episode_length值，而不是使用默认值\n"
+                "   请检查训练配置文件 (results.json) 是否包含 episode_length 字段\n"
+                "   或者通过 --episode-length 参数明确指定\n"
+                "   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
+            )
+            print(error_msg)
+            raise ValueError("无法找到训练配置中的episode_length，评估无法继续。请确保训练配置文件包含 episode_length 字段，或通过 --episode-length 参数指定。")
+        
+        # 🔧 关键修复：必须使用训练时的物理参数实际值，不允许使用默认值
+        # 如果找不到训练配置中的参数，报错并退出（因为使用默认值会导致评估不准确）
+        missing_params = []
+        
+        if training_gravity is None:
+            missing_params.append("gravity")
+        else:
+            self.args.gravity = training_gravity
+            print(f"✅ 使用训练时的GRAVITY: {training_gravity}")
+        
+        if training_damping is None:
+            missing_params.append("damping")
+        else:
+            self.args.damping = training_damping
+            print(f"✅ 使用训练时的DAMPING: {training_damping}")
+        
+        if training_agent_max_speed is None:
+            missing_params.append("agent_max_speed")
+        else:
+            self.args.agent_max_speed = training_agent_max_speed
+            print(f"✅ 使用训练时的AGENT_MAX_SPEED: {training_agent_max_speed}")
+        
+        if training_agent_accel is None:
+            missing_params.append("agent_accel")
+        else:
+            self.args.agent_accel = training_agent_accel
+            print(f"✅ 使用训练时的AGENT_ACCEL: {training_agent_accel}")
+        
+        if training_control_accel_gain is None:
+            missing_params.append("control_accel_gain")
+        else:
+            self.args.control_accel_gain = training_control_accel_gain
+            print(f"✅ 使用训练时的CONTROL_ACCEL_GAIN: {training_control_accel_gain}")
+        
+        # 🚨 如果缺少任何必需的物理参数，报错并退出
+        if missing_params:
+            error_msg = (
+                f"❌ 错误：无法找到训练配置中的以下物理参数: {', '.join(missing_params)}\n"
+                f"   测试时必须使用训练时实际使用的参数值，而不是使用默认值\n"
+                f"   请检查训练配置文件 (results.json) 是否包含这些参数\n"
+                f"   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
+            )
+            print(error_msg)
+            raise ValueError(f"无法找到训练配置中的物理参数: {', '.join(missing_params)}，评估无法继续。")
         
         if training_use_fr is not None or training_use_pf is not None:
             print(f"✅ 使用特征标志: use_fr_feature={use_fr_feature}, use_pf_feature={use_pf_feature}")
@@ -567,12 +712,58 @@ class ModelEvaluator:
             delta_radius=getattr(self.args, 'delta_radius', 5.0),
         )
         
+        # 🔧 新增：创建环境对象以支持Oracle模式
+        # 注意：评估时使用SingleEnvWrapper，需要获取实际的env对象
+        eval_env = MultiAgentEnv(
+            self.world,
+            self.scenario.reset_world,
+            self.scenario.reward,
+            self.scenario.observation,
+            info_callback=None,
+            shared_viewer=False
+        )
+        # 将scenario引用挂到world（与训练路径保持一致）
+        try:
+            self.world.scenario = self.scenario
+            eval_env.scenario = self.scenario
+        except Exception:
+            pass
+        
+        # 🔧 新增：设置terrain_sensing_mode（评估时使用，不影响Actor/Critic输入）
+        terrain_sensing_mode = getattr(self.args, 'terrain_sensing_mode', 'local')
+        maddpg_args.terrain_sensing_mode = terrain_sensing_mode
+        print(f"[地形感知模式] {terrain_sensing_mode}")
+        if terrain_sensing_mode.startswith('oracle'):
+            print(f"  ⚠️  Oracle模式：仅用于APF地形力计算，Actor/Critic输入保持不变（使用观测）")
+        
         # 初始化MADDPG或MATD3（根据算法选择）
+        # 🔧 修复：移除env参数，因为训练脚本中已经移除了env参数支持
+        # Oracle模式通过其他方式实现（在_calculate_terrain_forces_sphere_tf中直接访问scenario）
         algorithm = getattr(self.args, 'algorithm', 'matd3').lower()
         if algorithm == 'matd3':
             self.maddpg = OptimizedMATD3(self.n_agents, self.obs_shapes, self.action_dims, maddpg_args)
         else:
             self.maddpg = OptimizedMADDPG(self.n_agents, self.obs_shapes, self.action_dims, maddpg_args)
+        
+        # 🔧 新增：为Oracle模式设置scenario引用（如果需要）
+        # 注意：Oracle模式在评估时通过evaluate_optimized.py中的scenario对象访问
+        # 训练脚本中的_calculate_terrain_forces_sphere_tf会通过其他方式获取scenario（如果需要）
+        terrain_sensing_mode = getattr(self.args, 'terrain_sensing_mode', 'local')
+        if terrain_sensing_mode.startswith('oracle'):
+            # 将scenario引用存储到maddpg对象中，以便在APF计算时使用
+            try:
+                self.maddpg.scenario_ref = self.scenario
+                self.maddpg.world_ref = self.world
+                print(f"  ✅ Oracle模式：已设置scenario引用，scenario类型: {type(self.scenario).__name__}")
+                # 验证scenario是否有get_terrain_height方法
+                if hasattr(self.scenario, 'get_terrain_height'):
+                    print(f"  ✅ Oracle模式：scenario具有get_terrain_height方法")
+                else:
+                    print(f"  ⚠️  Oracle模式：scenario缺少get_terrain_height方法，Oracle模式可能无法正常工作")
+            except Exception as e:
+                print(f"  ❌ Oracle模式：设置scenario引用失败: {e}")
+                import traceback
+                traceback.print_exc()
         
         # 加载模型权重（带有效性检查与回退策略）
         def _is_valid_weights_dir(dir_path: str, n_agents: int) -> bool:
@@ -663,12 +854,17 @@ class ModelEvaluator:
             pf_feature_dim = getattr(maddpg_args, 'pf_feature_dim', 3)
             
             for i in range(self.n_agents):
-                # 🔧 构建 actor：PF特征已经包含在obs中，不需要单独输入
+                # 🔧 构建 actor：根据训练配置构建正确的输入结构
+                # 如果 use_pf_feature=True，Actor期望3个输入：[obs, fr_input, pf_input]
+                # 如果 use_fr_feature=True 但 use_pf_feature=False，Actor期望2个输入：[obs, fr_input]
+                # 如果两者都False，Actor期望1个输入：[obs]
                 dummy_obs = tf.zeros((1, self.obs_shapes[i]), dtype=tf.float32)
                 actor_inputs = [dummy_obs]
                 if use_fr:
                     actor_inputs.append(tf.zeros((1, 1), dtype=tf.float32))
-                # 注意：PF特征已经包含在dummy_obs中（如果启用），不需要单独输入
+                if use_pf:
+                    # 🔧 关键修复：如果训练时启用了PF特征，Actor需要PF特征作为单独输入
+                    actor_inputs.append(tf.zeros((1, pf_feature_dim), dtype=tf.float32))
                 
                 if len(actor_inputs) == 1:
                     _ = self.maddpg.agents[i]['actor'](actor_inputs[0], training=False)
@@ -895,14 +1091,46 @@ class ModelEvaluator:
         """评估单个回合，仿照1.0版本的逻辑"""
         print(f"\n🚀 开始评估回合 {episode_idx + 1}")
         
+        # 🔧 关键修复：在reset前记录固定位置信息，确保所有评估模式使用相同的起点
+        if hasattr(self.scenario, 'use_fixed_positions') and self.scenario.use_fixed_positions:
+            if hasattr(self.scenario, 'fixed_positions') and self.scenario.fixed_positions:
+                agents_pos = self.scenario.fixed_positions.get('agents', [])
+                goal_pos = self.scenario.fixed_positions.get('goal', None)
+                if episode_idx == 0:  # 只在第一个回合打印
+                    print(f"🔧 固定位置验证: 使用固定位置，{len(agents_pos)}个智能体")
+                    if len(agents_pos) > 0:
+                        print(f"   智能体0起点: [{agents_pos[0][0]:.2f}, {agents_pos[0][1]:.2f}, {agents_pos[0][2]:.2f}]")
+                    if goal_pos:
+                        print(f"   目标位置: [{goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f}]")
+            else:
+                if episode_idx == 0:
+                    print(f"⚠️  警告: use_fixed_positions=True但fixed_positions为None，可能未正确加载位置文件")
+        
         # 环境重置
         reset_result = self.env.reset()
         if isinstance(reset_result, tuple):
             obs_n, _ = reset_result
         else:
             obs_n = reset_result
+        
+        # 🔧 关键修复：在reset后验证实际起点位置，确保所有评估模式使用相同的起点
+        if episode_idx == 0:  # 只在第一个回合打印
+            actual_start_positions = []
+            for i, agent in enumerate(self.world.agents):
+                actual_start_positions.append(agent.state.p_pos.copy())
+                if i < 3:  # 只打印前3个智能体
+                    print(f"   实际智能体{i}起点: [{agent.state.p_pos[0]:.2f}, {agent.state.p_pos[1]:.2f}, {agent.state.p_pos[2]:.2f}]")
             
         episode_reward = 0
+        try:
+            light_mode = os.getenv("EVAL_LIGHT_MODE", "0").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            light_mode = False
+        # 🔧 修复：默认记录轨迹和动作历史（用于生成交互图）
+        # 评估时默认需要记录轨迹，因为交互图生成需要轨迹数据
+        # 可以通过EVAL_LIGHT_MODE=1禁用（如果不需要可视化）
+        record_trajectory = not light_mode  # 默认记录轨迹（用于可视化）
+        record_actions = not light_mode  # 默认记录动作历史（用于可视化）
         episode_trajectory = []
         episode_actions_history = []  # 🔧 新增：记录动作历史（用于生成动作时序图）
         step_count = 0
@@ -910,9 +1138,25 @@ class ModelEvaluator:
         # 处理观察数据
         processed_obs = self.maddpg.obs_processor.batch_process_observations(obs_n)
         
-        # 🔧 修复：如果启用PF特征，追加势场力占位符到初始观测
-        use_pf = getattr(self.args, 'use_pf_feature', False)
-        if use_pf and len(processed_obs.shape) == 2:
+        # 🔧 关键修复：如果启用PF特征，计算真实的PF力而不是使用零向量占位符
+        # 🔧 修复：使用训练配置的特征标志，确保与训练时一致
+        use_pf = getattr(self.maddpg.args, 'use_pf_feature', False) if hasattr(self, 'maddpg') and hasattr(self.maddpg, 'args') else getattr(self.args, 'use_pf_feature', False)
+        use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
+        action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
+        
+        if use_pf and use_tf_potential_field and action_force_ratio > 0.0 and len(processed_obs.shape) == 2:
+            # 🔧 关键修复：计算真实的PF力（与训练时一致）- 批量化以提升速度
+            n_agents_eval = processed_obs.shape[0]
+            dummy_actions_tf = tf.zeros((n_agents_eval, 7), dtype=tf.float32)  # (n_agents, action_dim)
+            base_obs_tf = tf.convert_to_tensor(processed_obs, dtype=tf.float32)  # (n_agents, obs_dim)
+            _, pf_forces_tf = self.maddpg._apply_potential_field_correction(
+                dummy_actions_tf, base_obs_tf, action_force_ratio
+            )
+            pf_forces = pf_forces_tf.numpy()
+            # 将PF力追加到观测中
+            processed_obs = np.concatenate([processed_obs, pf_forces], axis=1)
+        elif use_pf and len(processed_obs.shape) == 2:
+            # 如果启用PF特征但不满足计算条件，使用零向量占位符
             n_agents_eval = processed_obs.shape[0]
             pf_placeholder = np.zeros((n_agents_eval, 3), dtype=np.float32)
             processed_obs = np.concatenate([processed_obs, pf_placeholder], axis=1)
@@ -926,27 +1170,118 @@ class ModelEvaluator:
             episode_length = 2200
             print(f"⚠️  警告: episode_length无效，使用默认值: {episode_length}")
         
-        print(f"📊 评估配置: episode_length={episode_length}, disable_early_termination={getattr(self.args, 'disable_early_termination', False)}")
+        # 🔧 新增：打印关键评估参数，便于调试
+        action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
+        use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
+        use_fr_feature = getattr(self.args, 'use_fr_feature', False)
+        use_pf_feature = getattr(self.args, 'use_pf_feature', False)
+        action_range_x = getattr(self.args, 'action_range_x', None)
+        action_range_y = getattr(self.args, 'action_range_y', None)
+        action_range_z = getattr(self.args, 'action_range_z', None)
         
-        for step in range(int(episode_length)):
-            # 🔧 修复：如果启用PF特征，追加势场力到观测（使用零向量作为占位符）
+        print(f"📊 评估配置:")
+        print(f"   - episode_length={episode_length}")
+        print(f"   - disable_early_termination={getattr(self.args, 'disable_early_termination', False)}")
+        print(f"   - ACTION_FORCE_RATIO={action_force_ratio} {'⚠️ 为0，势场修正将不生效！' if action_force_ratio == 0.0 else ''}")
+        print(f"   - USE_TF_POTENTIAL_FIELD={use_tf_potential_field}")
+        print(f"   - use_fr_feature={use_fr_feature}")
+        print(f"   - use_pf_feature={use_pf_feature}")
+        print(f"   - action_range: X={action_range_x}, Y={action_range_y}, Z={action_range_z}")
+        if use_tf_potential_field and action_force_ratio > 0.0:
+            print(f"   ✅ 势场修正将生效 (FR={action_force_ratio})")
+        else:
+            print(f"   ⚠️  势场修正将不生效 (use_tf_potential_field={use_tf_potential_field}, FR={action_force_ratio})")
+        
+        # 🔧 新增：添加进度条显示评估进度
+        # 🔧 修复：确保进度条正确显示，设置合适的更新频率
+        try:
+            tqdm_to_stdout = os.getenv("TQDM_TO_STDOUT", "1").lower() in ("1", "true", "yes", "on")
+            tqdm_file = sys.stdout if tqdm_to_stdout else sys.stderr
+        except Exception:
+            tqdm_file = sys.stdout
+        try:
+            tqdm_disable = os.getenv("TQDM_DISABLE", "0").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tqdm_disable = False
+        try:
+            debug_action_steps = int(os.getenv("EVAL_DEBUG_ACTION_STEPS", "3"))
+        except Exception:
+            debug_action_steps = 3
+        # 🚨 关键修复：设置position参数，避免多个进度条重叠显示
+        # 问题：多个回合的进度条同时显示时，如果没有设置position，会导致显示混乱
+        # 解决方案：每个回合使用position=0（单行显示），或者使用leave=False（完成后清除）
+        # 注意：如果使用position，需要确保所有进度条使用相同的position，否则会显示多行
+        # 这里使用leave=False，让进度条完成后自动清除，避免累积
+        pbar = tqdm(range(int(episode_length)), desc=f"回合 {episode_idx + 1}", unit="步",
+                   ncols=120, leave=False, mininterval=0.1, miniters=1,
+                   file=tqdm_file, dynamic_ncols=False, ascii=False, disable=tqdm_disable,
+                   position=0)  # 🔧 修复：设置position=0，确保所有进度条在同一行显示
+        
+        for step in pbar:
+            # 🔧 关键修复：如果启用PF特征，计算真实的PF力而不是使用零向量占位符
+            # 与训练时保持一致：先计算PF力，然后作为特征传递给Actor
             use_pf = getattr(self.args, 'use_pf_feature', False)
-            if use_pf:
-                # 为每个智能体的观测追加3维零向量（势场力占位符）
-                # 训练时：观测=78维基础+3维势场力=81维
-                # 评估时：我们追加零向量来匹配维度，虽然不准确但至少能加载模型
+            use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
+            action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
+            
+            # 🔧 性能优化：大幅减少进度条更新频率（每200步更新一次，与训练脚本一致）
+            # 训练脚本通常不使用步级进度条，评估时也减少更新频率以提升性能
+            if step % 200 == 0 or step < 5:
+                pbar.set_postfix({
+                    '奖励': f'{episode_reward:.1f}',
+                    '步数': f'{step + 1}/{episode_length}'
+                })
+                # 🔧 性能优化：移除pbar.refresh()，让tqdm自动管理刷新频率
+            
+            if use_pf and use_tf_potential_field and action_force_ratio > 0.0:
+                # 🔧 关键修复：计算真实的PF力（与训练时一致）
+                # 使用dummy_actions来计算PF力，就像训练时那样
+                if len(processed_obs.shape) == 2:  # (n_agents, obs_dim)
+                    n_agents_eval = processed_obs.shape[0]
+                    # 获取基础观测维度（去除PF特征后的维度）
+                    base_obs_dim = processed_obs.shape[1]
+                    if base_obs_dim > 78:  # 如果已经包含PF特征，先去除
+                        base_obs_dim = 78
+                    
+                    # 提取基础观测（去除可能存在的PF特征）
+                    base_obs = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
+                    
+                    # 🔧 性能优化：批量计算PF力，直接使用批量势场修正
+                    base_obs_tf = tf.convert_to_tensor(base_obs, dtype=tf.float32)  # (n_agents, obs_dim)
+                    dummy_actions_tf = tf.zeros((n_agents_eval, 7), dtype=tf.float32)  # (n_agents, action_dim)
+                    _, pf_forces_tf = self.maddpg._apply_potential_field_correction(
+                        dummy_actions_tf, base_obs_tf, action_force_ratio
+                    )
+                    pf_forces = pf_forces_tf.numpy()  # 一次性转换
+                    
+                    # 将PF力追加到观测中
+                    processed_obs = np.concatenate([base_obs, pf_forces], axis=1)
+                else:
+                    # 如果形状不对，使用零向量作为后备
+                    n_agents_eval = processed_obs.shape[0] if len(processed_obs.shape) >= 2 else 1
+                    pf_placeholder = np.zeros((n_agents_eval, 3), dtype=np.float32)
+                    processed_obs = np.concatenate([processed_obs, pf_placeholder], axis=1)
+            elif use_pf:
+                # 如果启用PF特征但不满足计算条件，使用零向量占位符
                 if len(processed_obs.shape) == 2:  # (n_agents, obs_dim)
                     n_agents_eval = processed_obs.shape[0]
                     pf_placeholder = np.zeros((n_agents_eval, 3), dtype=np.float32)
                     processed_obs = np.concatenate([processed_obs, pf_placeholder], axis=1)
             
             # 选择动作（评估时不加噪声）
-            use_fr = getattr(self.args, 'use_fr_feature', False)
-            use_pf = getattr(self.args, 'use_pf_feature', False)
-            raw_actions = self.select_actions_eval(processed_obs, use_fr=use_fr, use_pf=use_pf)
+            # 🔧 关键修复：使用训练配置的特征标志，而不是命令行参数
+            # 确保与训练时的网络输入结构完全一致
+            use_fr = getattr(self.maddpg.args, 'use_fr_feature', False)
+            use_pf = getattr(self.maddpg.args, 'use_pf_feature', False)
+            raw_actions_tf = self.select_actions_eval(processed_obs, use_fr=use_fr, use_pf=use_pf)
+            # 🔧 性能优化：延迟numpy转换，尽量在tensor空间内操作
+            raw_actions = raw_actions_tf.numpy() if isinstance(raw_actions_tf, tf.Tensor) else raw_actions_tf
             
             # 🔧 新增：记录Actor原始输出（用于生成动作时序图）
-            episode_actions_history.append(raw_actions.copy())
+            # 🔧 性能优化：只在需要时记录，避免不必要的copy操作
+            if record_actions:
+                # 🔧 性能优化：使用列表推导式，避免循环中的多次copy
+                episode_actions_history.append([action.copy() for action in raw_actions])
             
             # 🔧 关键修复：应用势场修正（与训练时一致）
             # 势场修正生效条件：USE_TF_POTENTIAL_FIELD=1 AND ACTION_FORCE_RATIO > 0.0
@@ -954,47 +1289,64 @@ class ModelEvaluator:
             action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
             
             if use_tf_potential_field and action_force_ratio > 0.0:
-                # 应用势场修正
-                # 将numpy数组转换为TensorFlow tensor
-                raw_actions_tf = tf.constant(raw_actions, dtype=tf.float32)  # (n_agents, action_dim)
-                processed_obs_tf = tf.constant(processed_obs, dtype=tf.float32)  # (n_agents, obs_dim)
+                # 🔧 性能优化：批量应用势场修正，尽量在tensor空间内操作
+                # 🔧 关键优化：如果raw_actions已经是tensor，避免重复转换
+                if isinstance(raw_actions_tf, tf.Tensor):
+                    raw_actions_tf_for_correction = raw_actions_tf
+                else:
+                    raw_actions_tf_for_correction = tf.convert_to_tensor(raw_actions, dtype=tf.float32)  # (n_agents, action_dim)
                 
-                # 对每个智能体应用势场修正
-                corrected_actions_list = []
-                for i in range(self.n_agents):
-                    agent_action = raw_actions_tf[i:i+1, :]  # (1, action_dim)
-                    agent_obs = processed_obs_tf[i:i+1, :]  # (1, obs_dim)
+                # 🔧 性能优化：如果processed_obs已经包含PF特征，直接使用；否则需要提取基础观测
+                # 注意：processed_obs此时是numpy数组（从obs_processor返回），需要转换为tensor
+                base_obs_dim = processed_obs.shape[1]
+                if base_obs_dim > 78:  # 如果已经包含PF特征，去除PF特征部分
+                    base_obs_dim = 78
+                base_obs_for_correction = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
+                processed_obs_tf = tf.convert_to_tensor(base_obs_for_correction, dtype=tf.float32)  # (n_agents, obs_dim)
                     
-                    # 调用势场修正函数（仅修正前3维）
-                    corrected_head, _ = self.maddpg._apply_potential_field_correction(
-                        agent_action, agent_obs, action_force_ratio
+                # 🔧 性能优化：使用训练代码的@tf.function装饰的势场修正函数
+                corrected_head_tf, _ = self.maddpg._apply_potential_field_correction(
+                    raw_actions_tf_for_correction, processed_obs_tf, action_force_ratio
                     )
                     
-                    # 前3维使用修正后的，后4维保持原始值
-                    if agent_action.shape[1] > 3:
-                        corrected_action = tf.concat([corrected_head, agent_action[:, 3:]], axis=1)
-                    else:
-                        corrected_action = corrected_head
-                    
-                    corrected_actions_list.append(corrected_action[0])  # 移除批次维度
+                # 获取action_dim（从tensor形状推断）
+                action_dim = tf.shape(raw_actions_tf_for_correction)[1]
+                if action_dim > 3:
+                    corrected_actions_tf = tf.concat([corrected_head_tf, raw_actions_tf_for_correction[:, 3:]], axis=1)
+                else:
+                    corrected_actions_tf = corrected_head_tf
                 
-                # 堆叠为 (n_agents, action_dim)
-                actions = tf.stack(corrected_actions_list, axis=0).numpy()
+                # 🔧 性能优化：延迟numpy转换，只在env.step需要时转换
+                actions = corrected_actions_tf.numpy()  # env.step需要numpy数组
             else:
                 # 不使用势场修正，直接使用原始动作
-                actions = raw_actions
+                # 🔧 性能优化：如果raw_actions_tf是tensor，转换为numpy；否则直接使用
+                if isinstance(raw_actions_tf, tf.Tensor):
+                    actions = raw_actions_tf.numpy()
+                else:
+                    actions = raw_actions
             
-            # 记录轨迹（仿照1.0版本）
-            try:
-                positions = []
-                for agent in self.env.agents:
-                    if hasattr(agent.state, 'p_pos'):
-                        positions.append(agent.state.p_pos.copy())
-                    else:
-                        positions.append([0, 0, 0])  # 默认位置
-                episode_trajectory.append(positions)
-            except Exception as e:
-                print(f"轨迹记录警告: {e}")
+            # 🔧 性能优化：记录轨迹（只在需要可视化时记录）
+            # 注意：环境中的agent._trajectory记录无法禁用（在environment.py的step方法中），但这里的额外记录可以禁用
+            if record_trajectory:
+                try:
+                    # 🔧 性能优化：使用列表推导式，一次性完成所有操作
+                    positions = [agent.state.p_pos.copy() if hasattr(agent.state, 'p_pos') else [0, 0, 0] 
+                                for agent in self.env.agents]
+                    episode_trajectory.append(positions)
+                except Exception as e:
+                    # 🔧 性能优化：只在非quiet模式下输出警告
+                    if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
+                        tqdm.write(f"轨迹记录警告: {e}", file=tqdm_file)
+                
+            # 🔧 新增：在前几步打印动作值，便于调试（使用tqdm.write避免干扰进度条）
+            if step < debug_action_steps:
+                tqdm.write(f"   Step {step}: 动作值 (前3个智能体):", file=tqdm_file)
+                for i in range(min(3, len(actions))):
+                    tqdm.write(
+                        f"      Agent {i}: {actions[i][:3]} (原始动作: {raw_actions[i][:3] if 'raw_actions' in locals() else 'N/A'})",
+                        file=tqdm_file
+                    )
                 
             # 执行动作
             step_result = self.env.step(actions)
@@ -1016,18 +1368,218 @@ class ModelEvaluator:
             
             # 检查结束条件（支持禁用提前终止）
             if all(done_n) and (not getattr(self.args, 'disable_early_termination', False)):
-                print(f"📍 回合在第 {step + 1}/{episode_length} 步自然结束（所有智能体done）")
+                # 🔧 性能优化：只在进度条启用时更新
+                if not tqdm_disable:
+                    pbar.set_postfix({
+                        '奖励': f'{episode_reward:.1f}',
+                        '状态': '提前结束',
+                        '步数': f'{step + 1}/{episode_length}'
+                    })
+                    pbar.close()
+                if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
+                    tqdm.write(f"📍 回合在第 {step + 1}/{episode_length} 步自然结束（所有智能体done）", file=tqdm_file)
                 break
                 
+        # 🔧 修复：在循环结束后更新最终状态
+        # 🔧 性能优化：只在进度条启用时更新
+        if not tqdm_disable:
+            pbar.set_postfix({
+                '奖励': f'{episode_reward:.1f}',
+                '步数': f'{step_count}/{episode_length}',
+                '状态': '完成'
+            })
+            pbar.close()
+        
         # 计算回合统计
         episode_duration = time.time() - start_time
         avg_step_time = episode_duration / step_count if step_count > 0 else 0
+        
+        # 🔧 新增：收集碰撞次数和最小净空距离（与训练脚本一致）
+        # 🚨 关键修复：确保使用与训练时相同的统计方式
+        # 训练时使用 agent.current_episode_collision_count 和 agent.debug_info['total_penetration_count']
+        # 两者应该同步更新，但优先使用 debug_info['total_penetration_count']（与训练脚本一致）
+        episode_collision_counts = []
+        episode_min_distances = []
+        try:
+            if hasattr(self.env, 'world') and hasattr(self.env.world, 'agents'):
+                for agent in self.env.world.agents:
+                    # 🚨 关键修复：确保debug_info已初始化
+                    if not hasattr(agent, 'debug_info'):
+                        agent.debug_info = {}
+                    if not isinstance(agent.debug_info, dict):
+                        agent.debug_info = {}
+                    
+                    # 🚨 关键修复：优先从debug_info读取，如果没有则从current_episode_collision_count读取
+                    # 确保与训练脚本的统计方式完全一致
+                    penetration_count = 0
+                    if 'total_penetration_count' in agent.debug_info:
+                        penetration_count = agent.debug_info.get('total_penetration_count', 0)
+                    elif hasattr(agent, 'current_episode_collision_count'):
+                        # 回退：如果debug_info中没有，使用current_episode_collision_count
+                        penetration_count = agent.current_episode_collision_count
+                    
+                    try:
+                        penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
+                    except (ValueError, TypeError, OverflowError):
+                        penetration_count = 0
+                    
+                    episode_collision_counts.append(penetration_count)
+                    
+                    # 收集min_distance_to_obstacle
+                    min_dist = None
+                    if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                        min_dist = agent.debug_info.get('d_min_current', None)
+                        if min_dist is not None:
+                            try:
+                                if isinstance(min_dist, np.ndarray):
+                                    if min_dist.size > 0:
+                                        min_dist = float(min_dist[-1] if min_dist.ndim > 0 else min_dist.item())
+                                    else:
+                                        min_dist = None
+                                else:
+                                    min_dist = float(min_dist)
+                            except (ValueError, TypeError, AttributeError):
+                                min_dist = None
+                    
+                    # 如果debug_info中没有，尝试从last_min_distance获取
+                    if min_dist is None and hasattr(agent, 'last_min_distance') and agent.last_min_distance is not None:
+                        try:
+                            last_min_dist = agent.last_min_distance
+                            if isinstance(last_min_dist, np.ndarray):
+                                if last_min_dist.size > 0:
+                                    min_dist = float(last_min_dist[-1] if last_min_dist.ndim > 0 else last_min_dist.item())
+                                else:
+                                    min_dist = None
+                            else:
+                                min_dist = float(last_min_dist)
+                        except (ValueError, TypeError, AttributeError):
+                            min_dist = None
+                    
+                    if min_dist is not None and np.isfinite(min_dist):
+                        episode_min_distances.append(min_dist)
+        except Exception as e:
+            if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
+                print(f"⚠️  收集碰撞统计信息时出错: {e}")
+        
+        # 🔧 新增：计算成功标志（与训练脚本一致）
+        # 定义：Reach_i := ∃t ≤ T_max, ||p_t^i - g^i|| ≤ r_goal
+        #       Safe_i := ∀t ≤ T_max, no-collision for agent i
+        #       Succ_i := Reach_i ∧ Safe_i
+        #       Succ_team := Λ_{i=1}^{M} Succ_i
+        agent_success_flags = []
+        team_success_flag = 1
+        try:
+            thr_success = float(getattr(self.args, 'success_distance_threshold', 4.0))
+            if hasattr(self.env, 'world') and hasattr(self.env.world, 'agents'):
+                scn = getattr(self.env, 'scenario', None)
+                goal_pos = None
+                if scn is not None:
+                    goal_pos = getattr(scn, 'goal_pos', None)
+                    if goal_pos is None and hasattr(scn, 'get_goal_pos'):
+                        try:
+                            goal_pos = scn.get_goal_pos()
+                        except Exception:
+                            goal_pos = None
+                
+                for agent_idx, agent in enumerate(self.env.world.agents):
+                    # 检查是否到达目标（Reach_i）
+                    pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
+                    if pos is None or len(pos) < 3:
+                        agent_success_flags.append(0)
+                        team_success_flag = 0
+                        continue
+                    
+                    # 获取智能体的目标位置
+                    ag_goal = None
+                    if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and getattr(agent.goal_a.state, 'p_pos', None) is not None:
+                        ag_goal = agent.goal_a.state.p_pos
+                    if ag_goal is None:
+                        ag_goal = goal_pos
+                    
+                    if ag_goal is None:
+                        agent_success_flags.append(0)
+                        team_success_flag = 0
+                        continue
+                    
+                    # 计算到目标的距离
+                    dx = pos[0] - ag_goal[0]
+                    dy = pos[1] - ag_goal[1]
+                    dz = pos[2] - ag_goal[2]
+                    dist_goal_3d = (dx*dx + dy*dy + dz*dz) ** 0.5
+                    reach_i = (dist_goal_3d <= (1.2 * thr_success))
+                    
+                    # 检查是否无碰撞（Safe_i）
+                    safe_i = (episode_collision_counts[agent_idx] == 0) if agent_idx < len(episode_collision_counts) else False
+                    
+                    # 单智能体成功 = 到达目标 AND 无碰撞
+                    succ_i = 1 if (reach_i and safe_i) else 0
+                    agent_success_flags.append(succ_i)
+                    
+                    if succ_i == 0:
+                        team_success_flag = 0
+        except Exception as e:
+            if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
+                print(f"⚠️  计算成功标志时出错: {e}")
+            agent_success_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
+            team_success_flag = 0
+        
+        # 计算汇总统计
+        total_collisions = sum(episode_collision_counts) if episode_collision_counts else 0
+        try:
+            total_collisions = int(total_collisions) if np.isfinite(total_collisions) else 0
+        except (ValueError, TypeError, OverflowError):
+            total_collisions = 0
+        
+        # 计算最小净空距离的统计（与训练脚本格式一致）
+        min_distance_stat = None
+        if episode_min_distances:
+            try:
+                min_distance_stat = {
+                    'mean': float(np.mean(episode_min_distances)),
+                    'min': float(np.min(episode_min_distances))
+                }
+            except Exception:
+                min_distance_stat = None
+        
+        episode_success = (team_success_flag == 1)
+        success_flag = 1 if episode_success else 0
+        
+        # 🔧 新增：计算到达时间/步数（如果成功）
+        arrival_step = step_count if success_flag == 1 else None
+        arrival_time = episode_duration if success_flag == 1 else None
+        
+        # 🔧 新增：计算穿透深度统计（从min_distance中的负值提取）
+        penetration_depths = []
+        penetration_count_episodes = 0
+        if episode_min_distances:
+            for min_dist in episode_min_distances:
+                if min_dist is not None and np.isfinite(min_dist):
+                    if min_dist < 0:  # 负值表示穿透
+                        penetration_depths.append(abs(min_dist))
+                        penetration_count_episodes += 1
+        
+        penetration_stat = None
+        if penetration_depths:
+            penetration_stat = {
+                'count': penetration_count_episodes,
+                'max_depth': float(np.max(penetration_depths)),
+                'mean_depth': float(np.mean(penetration_depths)),
+                'min_depth': float(np.min(penetration_depths))
+            }
         
         print(f"✅ 回合 {episode_idx + 1} 完成:")
         print(f"   - 奖励: {episode_reward:.2f}")
         print(f"   - 步数: {step_count}/{episode_length} (完成度: {step_count/episode_length*100:.1f}%)")
         print(f"   - 用时: {episode_duration:.2f}秒")
         print(f"   - 平均步时: {avg_step_time:.4f}秒/步")
+        print(f"   - 碰撞次数: {total_collisions} (智能体: {episode_collision_counts})")
+        print(f"   - 成功率: 团队={success_flag}, 智能体={agent_success_flags}")
+        if arrival_step is not None:
+            print(f"   - 到达步数: {arrival_step}")
+        if min_distance_stat is not None:
+            print(f"   - 最小净空距离: 均值={min_distance_stat['mean']:.2f}, 最小值={min_distance_stat['min']:.2f}")
+        if penetration_stat is not None:
+            print(f"   - 穿透统计: 次数={penetration_stat['count']}, 最大深度={penetration_stat['max_depth']:.2f}, 平均深度={penetration_stat['mean_depth']:.2f}")
         if step_count < episode_length:
             print(f"   ⚠️  注意: 回合提前结束（可能由于done=True或提前终止）")
         
@@ -1037,11 +1589,28 @@ class ModelEvaluator:
             'steps': step_count,
             'trajectory': episode_trajectory,
             'actions_history': episode_actions_history,  # 🔧 新增：返回动作历史
-            'duration': episode_duration
+            'duration': episode_duration,
+            # 🔧 新增：返回碰撞和成功指标（与训练脚本一致）
+            'collision_count': total_collisions,
+            'agent_collision_counts': episode_collision_counts,
+            'min_distance': min_distance_stat,
+            'success': success_flag,
+            'agent_success_flags': agent_success_flags,
+            'team_success': team_success_flag,
+            # 🔧 新增：到达时间/步数
+            'arrival_step': arrival_step,
+            'arrival_time': arrival_time,
+            # 🔧 新增：穿透深度统计
+            'penetration_stat': penetration_stat
         }
         
-    def generate_visualization(self, episode_data):
-        """生成可视化结果，仿照1.0版本"""
+    def generate_visualization(self, episode_data, is_best=False):
+        """生成可视化结果，仿照1.0版本
+        
+        Args:
+            episode_data: 回合数据
+            is_best: 是否为最佳回合（用于文件名标识）
+        """
         if not self.visualizer or not episode_data['trajectory']:
             return
             
@@ -1061,10 +1630,17 @@ class ModelEvaluator:
         try:
             # 生成轨迹图像（同时传入场景提取的目标信息，避免空字典提示）
             terrain_level = episode_data.get('terrain_complexity_level', 'unknown')
-            image_path = os.path.join(
-                self.args.save_viz_path, 
-                f"trajectory_ep{episode_data['episode']}_level{terrain_level}_r{episode_data['reward']:.0f}.png"
-            )
+            # 🔧 修改：如果是最佳回合，使用best前缀（与训练脚本一致）
+            if is_best:
+                image_path = os.path.join(
+                    self.args.save_viz_path, 
+                    f"best_trajectory_ep{episode_data['episode']+1}_r{episode_data['reward']:.0f}.png"
+                )
+            else:
+                image_path = os.path.join(
+                    self.args.save_viz_path, 
+                    f"trajectory_ep{episode_data['episode']}_level{terrain_level}_r{episode_data['reward']:.0f}.png"
+                )
             goal_positions_img = None
             try:
                 goal_positions_img = self._get_goal_positions_from_scenario()
@@ -1098,6 +1674,22 @@ class ModelEvaluator:
                     traceback.print_exc()
                     actor_outputs_history = None
             
+            # 🔧 关键修复：传递env_instance参数，确保能正确绘制地形和目标位置
+            # 如果没有env_instance，visualizer无法获取正确的地形数据，导致图片为空
+            # 🚨 关键修复：确保goal_positions不为None，如果获取失败则使用场景中的目标位置
+            if goal_positions_img is None:
+                try:
+                    goal_positions_img = self._get_goal_positions_from_scenario()
+                    if goal_positions_img and goal_positions_img.get('goal_pos') is None:
+                        # 如果仍然没有目标位置，尝试从world.landmarks获取
+                        if hasattr(self.world, 'landmarks') and len(self.world.landmarks) > 0:
+                            landmark = self.world.landmarks[0]
+                            if hasattr(landmark, 'state') and hasattr(landmark.state, 'p_pos'):
+                                goal_positions_img = {'goal_pos': landmark.state.p_pos.tolist(), 'agent_goals': []}
+                                print(f"✅ 从world.landmarks获取目标位置: {goal_positions_img['goal_pos']}")
+                except Exception as e:
+                    print(f"⚠️  获取目标位置失败: {e}")
+            
             self.visualizer.generate_trajectory_image(
                     trajectories=episode_data['trajectory'],
                     scenario=self.scenario,
@@ -1106,6 +1698,7 @@ class ModelEvaluator:
                     reward=episode_data['reward'],
                     episode_type='evaluation',
                     goal_positions=goal_positions_img,
+                    env_instance=self.env,  # 🔧 关键修复：传递环境实例，用于获取地形和目标数据
                     actor_outputs_history=actor_outputs_history  # 🔧 传入动作历史（如果存在）
             )
 
@@ -1121,34 +1714,52 @@ class ModelEvaluator:
             else:
                 print(f"⏭️ 跳过overlay图片生成（已禁用）")
             
-            # 先生成HTML（若启用），避免GIF长时阻塞
-            enable_html = getattr(self.args, 'enable_html', True) and not getattr(self.args, 'disable_html', False)
+            # 🔧 修改：只生成最佳回合的交互式HTML（与训练脚本一致）
+            # 通过环境变量SAVE_INTERACTIVE_TRAJ控制，且只在最佳回合时生成
+            enable_interactive_traj = os.getenv('SAVE_INTERACTIVE_TRAJ', '0').lower() in ('1','true','yes','on')
+            enable_html = enable_interactive_traj and is_best
             if enable_html:
+                # 🔧 修改：使用best前缀（与训练脚本一致）
                 html_path = os.path.join(
                     self.args.save_viz_path,
-                    f"trajectory_ep{episode_data['episode']}_level{terrain_level}_interactive.html"
+                    f"best_trajectory_ep{episode_data['episode']+1}_interactive.html"
                 )
+                # 🚨 关键修复：确保交互式HTML中显示目标点
                 goal_positions_html = None
                 try:
-                    if hasattr(self.env, 'get_goal_positions'):
-                        goal_positions_html = self.env.get_goal_positions(0)
-                    if not isinstance(goal_positions_html, dict):
-                        goal_positions_html = self._get_goal_positions_from_scenario()
-                except Exception:
+                    # 优先使用之前获取的目标位置
+                    if goal_positions_img is not None:
+                        goal_positions_html = goal_positions_img
+                    else:
+                        # 尝试从环境获取
+                        if hasattr(self.env, 'get_goal_positions'):
+                            goal_positions_html = self.env.get_goal_positions(0)
+                        if not isinstance(goal_positions_html, dict) or goal_positions_html.get('goal_pos') is None:
+                            goal_positions_html = self._get_goal_positions_from_scenario()
+                        # 如果仍然没有，尝试从world.landmarks获取
+                        if (not goal_positions_html or goal_positions_html.get('goal_pos') is None) and hasattr(self.world, 'landmarks') and len(self.world.landmarks) > 0:
+                            landmark = self.world.landmarks[0]
+                            if hasattr(landmark, 'state') and hasattr(landmark.state, 'p_pos'):
+                                goal_positions_html = {'goal_pos': landmark.state.p_pos.tolist(), 'agent_goals': []}
+                                print(f"✅ 交互式HTML: 从world.landmarks获取目标位置: {goal_positions_html['goal_pos']}")
+                except Exception as e:
+                    print(f"⚠️  获取交互式HTML目标位置失败: {e}")
                     goal_positions_html = None
+                
                 self.visualizer.generate_trajectory_interactive(
                     trajectories=episode_data['trajectory'],
                     save_path=html_path,
                     title=f"Evaluation Episode {episode_data['episode']} (reward={episode_data['reward']:.1f})",
                     goal_positions=goal_positions_html,
-                    scenario=self.scenario
+                    scenario=self.scenario,
+                    env_instance=self.env  # 🔧 关键修复：传递环境实例，确保能获取目标位置
                 )
 
-            # 生成GIF动画（可禁用或限制帧数以避免长时间阻塞/刷屏）
-            if len(episode_data['trajectory']) > 10 and not getattr(self.args, 'disable_gif', False):
+            # 🔧 修改：只生成最佳回合的GIF（与训练脚本一致）
+            if is_best and len(episode_data['trajectory']) > 10 and not getattr(self.args, 'disable_gif', False):
                 gif_path = os.path.join(
                     self.args.save_viz_path,
-                    f"trajectory_ep{episode_data['episode']}_level{terrain_level}_animation.gif"
+                    f"best_trajectory_ep{episode_data['episode']+1}_animation.gif"
                 )
                 self.visualizer.generate_trajectory_gif(
                     trajectories=episode_data['trajectory'],
@@ -1183,15 +1794,58 @@ class ModelEvaluator:
         all_rewards = []
         all_episodes_data = []
         
+        # 🔧 新增：跟踪最佳回合（与训练脚本逻辑一致）
+        best_reward = -np.inf
+        best_episode = 0
+        best_episode_data = None
+        best_trajectory = None
+        best_actor_outputs_history = None
+        
+        # 🔧 新增：检查是否保存最佳回合可视化（与训练脚本一致）
+        enable_best_traj = os.getenv('SAVE_BEST_TRAJ', '1').lower() in ('1','true','yes','on')
+        enable_interactive = os.getenv('SAVE_INTERACTIVE_TRAJ', '0').lower() in ('1','true','yes','on')
+        
         print(f"\n📊 开始评估 {self.args.eval_episodes} 个回合")
         print(f"🏔️ 地形模式: {'随机地形' if self.args.random_terrain else '固定地形'}")
         if self.args.terrain_complexity_level is not None:
             print(f"🏔️ 地形复杂度等级: {self.args.terrain_complexity_level}")
         else:
             print(f"🏔️ 地形复杂度等级: 随机选择 (1-4)")
+        print(f"📸 保存最佳回合可视化: {'是' if enable_best_traj else '否'}")
+        print(f"📊 保存交互式HTML: {'是' if enable_interactive else '否'}")
+        
+        # 🔧 关键修复：从环境变量读取地形种子序列，确保所有评估模式使用相同的地图顺序
+        terrain_seed_sequence = None
+        terrain_seed_str = os.getenv('TERRAIN_SEED_SEQUENCE', '')
+        if terrain_seed_str:
+            try:
+                terrain_seed_sequence = [int(s.strip()) for s in terrain_seed_str.split(',') if s.strip()]
+                print(f"🔧 使用预定义地形种子序列（共{len(terrain_seed_sequence)}个）: {terrain_seed_sequence[:5]}... (前5个)")
+            except Exception as e:
+                print(f"⚠️  解析地形种子序列失败: {e}，将使用随机地形")
+                terrain_seed_sequence = None
         
         for episode in range(self.args.eval_episodes):
             print(f"\n🚀 开始评估回合 {episode + 1}/{self.args.eval_episodes}")
+            
+            # 🔧 关键修复：如果提供了地形种子序列，使用序列中的种子重新生成地形
+            if terrain_seed_sequence and episode < len(terrain_seed_sequence):
+                terrain_seed = terrain_seed_sequence[episode]
+                print(f"🔧 使用预定义地形种子: {terrain_seed} (回合 {episode + 1})")
+                # 重新生成地形（使用指定的种子）
+                if hasattr(self.scenario, 'regenerate_terrain'):
+                    self.scenario.regenerate_terrain(new_seed=terrain_seed)
+                    # 重新创建world（因为地形已变化）
+                    self.world = self.scenario.make_world()
+                    # 重新创建环境（因为world已变化）
+                    self.env = MultiAgentEnv(
+                        self.world,
+                        reset_callback=self.scenario.reset_world,
+                        reward_callback=self.scenario.reward,
+                        observation_callback=self.scenario.observation,
+                        done_callback=self.scenario.is_done,
+                        info_callback=None
+                    )
             
             # 为每个回合随机选择地形复杂度等级（如果未指定）
             if self.args.terrain_complexity_level is None:
@@ -1223,17 +1877,17 @@ class ModelEvaluator:
                 all_rewards.append(episode_data['reward'])
                 all_episodes_data.append(episode_data)
                 
-                # 生成可视化（包括HTML交互式轨迹图）
-                if not self.args.disable_visualization:
-                    print(f"🎨 正在为回合 {episode + 1} 生成可视化结果...")
-                    try:
-                        self.generate_visualization(episode_data)
-                    except Exception as viz_e:
-                        print(f"⚠️  回合 {episode + 1} 可视化生成失败: {viz_e}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    print(f"⏭️ 跳过回合 {episode + 1} 的可视化生成")
+                # 🔧 修改：跟踪最佳回合（与训练脚本逻辑一致）
+                if episode_data['reward'] > best_reward:
+                    best_reward = episode_data['reward']
+                    best_episode = episode
+                    best_episode_data = episode_data.copy()
+                    best_trajectory = episode_data.get('trajectory', [])
+                    best_actor_outputs_history = episode_data.get('actions_history', None)
+                    print(f"✅ 更新最佳回合: Episode {episode + 1}, Reward = {best_reward:.2f}")
+                
+                # 🔧 修改：不再为每个回合生成可视化，只在最后生成最佳回合的可视化
+                # 与训练脚本保持一致，避免生成大量文件
             except Exception as ep_e:
                 print(f"❌ 回合 {episode + 1} 评估失败: {ep_e}")
                 import traceback
@@ -1307,21 +1961,85 @@ class ModelEvaluator:
                     'reward': float(ep['reward']),
                     'steps': ep['steps'],
                     'terrain_complexity_level': ep.get('terrain_complexity_level', 'unknown'),
-                    'duration': ep['duration']
+                    'duration': ep['duration'],
+                    # 🔧 新增：保存轨迹数据（用于生成对比交互图）
+                    'trajectory': ep.get('trajectory', []),  # 保存轨迹数据
+                    # 🔧 新增：保存碰撞和成功指标（与训练脚本一致）
+                    'collision_count': ep.get('collision_count', 0),
+                    'agent_collision_counts': ep.get('agent_collision_counts', []),
+                    'min_distance': ep.get('min_distance', None),
+                    'success': ep.get('success', 0),
+                    'agent_success_flags': ep.get('agent_success_flags', []),
+                    'team_success': ep.get('team_success', 0),
+                    # 🔧 新增：到达时间/步数
+                    'arrival_step': ep.get('arrival_step', None),
+                    'arrival_time': ep.get('arrival_time', None),
+                    # 🔧 新增：穿透深度统计
+                    'penetration_stat': ep.get('penetration_stat', None)
                 } for ep in all_episodes_data
             ],
             'evaluation_time': time.strftime('%Y-%m-%d %H:%M:%S')
         }
         
         results_path = os.path.join(self.args.save_viz_path, 'evaluation_results.json')
+        
+        # 🔧 修复：将numpy数组转换为列表，确保JSON可序列化
+        def convert_to_json_serializable(obj):
+            """递归地将numpy数组和其他不可序列化对象转换为JSON可序列化的格式"""
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj) if isinstance(obj, np.floating) else int(obj)
+            elif isinstance(obj, dict):
+                return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_json_serializable(item) for item in obj]
+            elif obj is None:
+                return None
+            elif isinstance(obj, (bool, int, float, str)):
+                return obj
+            else:
+                # 对于其他类型，尝试转换为字符串
+                try:
+                    return str(obj)
+                except Exception:
+                    return None
+        
+        # 转换结果数据
+        results_serializable = convert_to_json_serializable(results)
+        
         with open(results_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(results_serializable, f, indent=2, ensure_ascii=False)
             
         print(f"✅ 评估结果已保存: {results_path}")
+        
+        # 🔧 新增：生成最佳回合的可视化（与训练脚本逻辑一致）
+        if enable_best_traj and best_episode_data is not None and not self.args.disable_visualization:
+            print(f"\n🎨 正在生成最佳回合可视化 (Episode {best_episode + 1}, Reward = {best_reward:.2f})...")
+            try:
+                # 准备最佳回合数据
+                best_episode_data_for_viz = best_episode_data.copy()
+                best_episode_data_for_viz['trajectory'] = best_trajectory
+                if best_actor_outputs_history is not None:
+                    best_episode_data_for_viz['actions_history'] = best_actor_outputs_history
+                
+                # 生成可视化（只生成最佳回合）
+                self.generate_visualization(best_episode_data_for_viz, is_best=True)
+                print(f"✅ 最佳回合可视化已生成")
+            except Exception as viz_e:
+                print(f"⚠️  最佳回合可视化生成失败: {viz_e}")
+                import traceback
+                traceback.print_exc()
+        elif not enable_best_traj:
+            print(f"⏭️  跳过最佳回合可视化生成（SAVE_BEST_TRAJ=0）")
+        elif self.args.disable_visualization:
+            print(f"⏭️  跳过最佳回合可视化生成（--disable-visualization）")
         
         # 显示生成的文件信息
         print(f"\n📁 生成的文件:")
         print(f"  📊 评估统计: {results_path}")
+        if enable_best_traj and best_episode_data is not None:
+            print(f"  🏆 最佳回合: Episode {best_episode + 1}, Reward = {best_reward:.2f}")
         
         # 列出生成的图片和HTML文件
         if os.path.exists(self.args.save_viz_path):
@@ -1637,6 +2355,11 @@ HTML交互式轨迹图功能:
     parser.add_argument("--use-tf-potential-field", type=lambda x: (str(x).lower() in ('1','true','yes','on')), default=True,
                        help="是否使用TensorFlow版本的势场修正 (1=TF版本, 0=原版)")
     
+    # 🔧 新增：地形感知模式参数（仅用于评估时APF地形力计算）
+    parser.add_argument("--terrain-sensing-mode", type=str, default="local",
+                        choices=["local", "oracle_same_probes", "oracle_dense"],
+                        help="地形感知模式: local=使用观测中的地形信息, oracle_same_probes=Oracle真值(相同probe布局), oracle_dense=Oracle真值(密集探测)")
+    
     # 🔧 新增：FR和PF特征标志
     parser.add_argument("--use-fr-feature", type=lambda x: (str(x).lower() in ('1','true','yes','on')), default=True,
                        help="Enable FR feature (Force Ratio as separate input)")
@@ -1723,11 +2446,67 @@ HTML交互式轨迹图功能:
 def main():
     """主函数"""
     args = parse_args()
+    try:
+        disable_viz_env = os.getenv("EVAL_DISABLE_VISUALIZATION", "0").lower() in ("1", "true", "yes", "on")
+    except Exception:
+        disable_viz_env = False
+    try:
+        light_mode_env = os.getenv("EVAL_LIGHT_MODE", "0").lower() in ("1", "true", "yes", "on")
+    except Exception:
+        light_mode_env = False
+    if disable_viz_env or light_mode_env:
+        args.disable_visualization = True
+        args.disable_gif = True
+        setattr(args, 'disable_html', True)
     # 在任何 TensorFlow 操作之前优先配置GPU，避免已初始化后再设内存增长
     try:
         configure_gpu()
     except Exception:
         pass
+    
+    # 🔧 新增：启用XLA加速（如果环境变量XLA_GLOBAL=1）
+    # 与训练脚本保持一致，使用XLA Global模式加速评估
+    # 注意：必须在TensorFlow图构建之前启用XLA
+    xla_global = os.getenv('XLA_GLOBAL', '1').lower() in ('1', 'true', 'yes', 'on')  # 默认启用
+    if xla_global:
+        try:
+            # 🔧 关键修复：在启用XLA前设置稳定的XLA配置，避免CUDA错误
+            # 与训练脚本保持一致，使用稳定的XLA配置
+            existing_xla_flags = os.environ.get('XLA_FLAGS', '')
+            # 移除所有可能导致问题的flag
+            flags_to_remove = [
+                '--xla_gpu_enable_triton_gemm=false',
+                '--xla_gpu_enable_triton_gemm=true',
+                '--xla_gpu_force_compilation_parallelism=1',
+                '--xla_gpu_force_compilation_parallelism=0',
+            ]
+            cleaned_flags = existing_xla_flags
+            for flag in flags_to_remove:
+                cleaned_flags = cleaned_flags.replace(flag, '')
+            cleaned_flags = ' '.join(cleaned_flags.split())  # 清理多余空格
+            
+            # 设置稳定的XLA配置
+            stable_xla_flags = [
+                '--xla_gpu_autotune_level=1',  # 降低autotune级别，减少kernel搜索空间
+                '--xla_gpu_deterministic_ops=true',  # 强制确定性操作
+            ]
+            
+            # 合并配置
+            if cleaned_flags:
+                stable_xla_flags_str = cleaned_flags + ' ' + ' '.join(stable_xla_flags)
+            else:
+                stable_xla_flags_str = ' '.join(stable_xla_flags)
+            os.environ['XLA_FLAGS'] = stable_xla_flags_str
+            
+            # 启用XLA Global JIT编译（与训练脚本一致）
+            tf.config.optimizer.set_jit(True)
+            print("✅ XLA加速已启用（Global JIT模式）")
+            print("   💡 提示：XLA首次编译可能需要一些时间，后续运行会更快")
+        except Exception as e:
+            print(f"⚠️  XLA加速启用失败: {e}")
+            print("   💡 提示：如果遇到问题，可以设置XLA_GLOBAL=0禁用XLA")
+    else:
+        print("ℹ️  XLA加速未启用（设置XLA_GLOBAL=1以启用）")
 
     # 设置随机种子以确保每次评估都有不同的随机性
     import time

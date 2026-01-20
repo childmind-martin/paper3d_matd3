@@ -45,11 +45,21 @@ echo "MADDPG 优化版训练启动器 (已修复)"
 echo "======================================"
 
 # 设置默认参数
-EPISODES=${1:-1400}    
+EPISODES=${1:-500}    
 BATCH_SIZE=${2:-1024}  # 🚀 提升批次大小到4096，充分利用GPU并行能力
-EXP_NAME=${3:-"双头q改进测试、固定FR随机地图、无重力、无早停、无预热、固定地图、4环境_exp"}
+EXP_NAME=${3:-"双头q改进测试、变FR、改动作添加噪声、随机地图、复杂4_exp"}
 USE_WEIGHTED_REWARD=${4:-1}  # 新增：是否使用分项加权求和奖励机制（1=启用，0=禁用）
 ALGORITHM=${5:-"matd3"}     # 新增：选择训练算法（maddpg或matd3）
+RESUME_MODEL=${6:-""}       # 🔧 新增：持续训练模型路径（可选，指定要恢复的模型目录）
+
+# 🔧 持续训练模型配置（优先级：命令行参数 > 环境变量 > 空）
+# 如果通过环境变量指定，优先使用环境变量
+if [ -z "$RESUME_MODEL" ] && [ -n "${RESUME_MODEL_ENV:-}" ]; then
+    RESUME_MODEL="${RESUME_MODEL_ENV}"
+fi
+if [ -z "$RESUME_MODEL" ] && [ -n "${CHECKPOINT_MODEL:-}" ]; then
+    RESUME_MODEL="${CHECKPOINT_MODEL}"
+fi
 
 # 生成时间戳，确保每次训练都有唯一的目录
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -80,6 +90,11 @@ echo "  - 带时间戳的实验名称: $EXP_NAME_WITH_TIMESTAMP"
 echo "  - 使用分项加权奖励: $USE_WEIGHTED_REWARD"
 echo "  - 训练算法: $ALGORITHM"
 echo "  - 随机种子: $SEED ($SEED_SOURCE)"
+if [ -n "$RESUME_MODEL" ]; then
+    echo "  - 🔧 持续训练: 从模型恢复 - $RESUME_MODEL"
+else
+    echo "  - 🔧 持续训练: 否（新训练）"
+fi
 echo ""
 
 echo ""
@@ -97,24 +112,24 @@ fi
 
 # === 学习率参数 ===
 # 🚨 修复训练波动：降低Critic学习率，提高稳定性
-export LEARNING_RATE_ACTOR=${LEARNING_RATE_ACTOR:-0.0005}   # 🔧 保持Actor学习率
+export LEARNING_RATE_ACTOR=${LEARNING_RATE_ACTOR:-0.0008}   # 🔧 保持Actor学习率
                                                               # 原因：0.0003是合理的Actor学习率
-export LEARNING_RATE_CRITIC=${LEARNING_RATE_CRITIC:-0.001}  # 🚨 关键修复：提高Critic学习率（0.0005→0.001）
+export LEARNING_RATE_CRITIC=${LEARNING_RATE_CRITIC:-0.002}  # 🚨 关键修复：提高Critic学习率（0.0005→0.001）
                                                                # 原因：之前学习率太小导致更新缓慢，Critic Loss过小（~0.01）
                                                                # 修复：提高到0.001，是Actor的2倍，加快Critic更新速度
                                                                # 预期：Q值估计更快收敛，Critic Loss提升到0.1-1.0范围
 
 # === 🔧 Loss函数参数（增强梯度信号）===
-export HUBER_DELTA=${HUBER_DELTA:-1.5}                 # 🔧 Huber Delta参数（从2.5降低到1.5）
+export HUBER_DELTA=${HUBER_DELTA:-2.0}                 # 🔧 Huber Delta参数（从2.5降低到2.0）
                                                         # 原因：reward_scale改为1/1000后，Q值范围~[-500,500]，TD误差~2-20
                                                         # 作用：delta=1.5使TD误差>1.5进入线性区，<1.5在平方区，让Loss对误差更敏感
                                                         # 效果：梯度增强，网络更新更快，Critic Loss从0.01-0.015提升到0.1-1.0
                                                         # 建议范围：1.0-2.0（根据Q值范围调整，通常为Q值范围的0.3-0.5%）
 
 # === 🔥 学习率衰减参数（保持学习能力）===
-export LR_DECAY_ENABLED=${LR_DECAY_ENABLED:-0}                          # 启用学习率衰减，但设置更高的最小学习率
+export LR_DECAY_ENABLED=${LR_DECAY_ENABLED:-1}                          # 启用学习率衰减，但设置更高的最小学习率
 export LR_DECAY_STEPS=${LR_DECAY_STEPS:-20000}                           # 🔧 衰减步数放宽到20000，减缓衰减速度
-export LR_DECAY_RATE=${LR_DECAY_RATE:-0.9998}                           # 🔧 衰减更慢（0.999→0.9995），每20000步衰减0.05%
+export LR_DECAY_RATE=${LR_DECAY_RATE:-0.9996}                           # 🔧 衰减更慢（0.999→0.9995），每20000步衰减0.05%
 export LR_STAIRCASE=${LR_STAIRCASE:-1}                                  # 是否使用阶梯式衰减（1=阶梯，0=平滑）
 export LR_MIN_ACTOR=${LR_MIN_ACTOR:-0.00030}                            # 🔧 提高Actor最小学习率（0.00008→0.00015），保持后期学习能力
 export LR_MIN_CRITIC=${LR_MIN_CRITIC:-0.00040}                          # 🔧 提高Critic最小学习率（0.00010→0.00020），保持后期学习能力
@@ -157,7 +172,7 @@ export USE_LITE_BUFFER=${USE_LITE_BUFFER:-1}      # 默认启用内存友好的s
 # export USE_TF_BUFFER=${USE_TF_BUFFER:-0}
 export PER_ENABLED=${PER_ENABLED:-1}              # 启用优先经验回放（对 Lite/ReplayBuffer 生效）
 export BUFFER_SIZE=${BUFFER_SIZE:-500000}   # 经验缓冲区大小（增加到50万）
-export UPDATE_RATE=${UPDATE_RATE:-25}       # 🔧 回滚到30：UPDATE_RATE不是主要问题，奖励尺度才是
+export UPDATE_RATE=${UPDATE_RATE:-40}       # 🔧 回滚到30：UPDATE_RATE不是主要问题，奖励尺度才是
 export ACTOR_UPDATE_DELAY=${ACTOR_UPDATE_DELAY:-2}  # 🚨 关键修复：提高Actor更新延迟（从1到2），减少训练频率，提高训练稳定性
                                                       # 问题：每步都更新Actor导致训练不稳定，Loss波动大
                                                       # 修复：每2步更新一次Actor，让Critic有更多时间稳定Q值估计
@@ -258,13 +273,13 @@ export NOISE_RESTART_INTERVAL=${NOISE_RESTART_INTERVAL:-20}    # 🔧 修复局�
 # === 分阶段探索策略参数 ===
 # 🔧 修复过拟合：提高随机动作概率，增强探索能力
 export RANDOM_ACTION_PROB=${RANDOM_ACTION_PROB:-0.12}         # 🔧 预热随机动作降低到12%，避免过度发散
-export RANDOM_ACTION_PROB_TRAINING=${RANDOM_ACTION_PROB_TRAINING:-0.05}  # 🔧 训练随机动作降低到5%，减少不必要探索
+export RANDOM_ACTION_PROB_TRAINING=${RANDOM_ACTION_PROB_TRAINING:-0.00}  # 🔧 训练随机动作降低到5%，减少不必要探索
 ## 清理：训练脚本未读取以下两项（已统一采用"预热阶段/训练阶段"）：
 # export EXPLORATION_PHASE_SWITCH=${EXPLORATION_PHASE_SWITCH:-"warmup"}
 # export EXPLORATION_SWITCH_THRESHOLD=${EXPLORATION_SWITCH_THRESHOLD:-10}
 
 # === 位置和地形控制参数 ===
-export DYNAMIC_FIRST_TIME=${DYNAMIC_FIRST_TIME:-0}    # 🔧 启用动态首次：第一回合生成固定位置，后续回合使用该固定位置
+export DYNAMIC_FIRST_TIME=${DYNAMIC_FIRST_TIME:-1}    # 🔧 启用动态首次：第一回合生成固定位置，后续回合使用该固定位置
                                                         # 配合 USE_FIXED_POSITIONS=1 使用，实现固定起点训练
 export WARMUP_RANDOM_INIT=${WARMUP_RANDOM_INIT:-0}    # 🔧 临时禁用，避免多进程竞态条件
 export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3} # 地形复杂度等级 (1-4) - 默认等级2
@@ -754,7 +769,7 @@ if [ -z "${ACTION_FORCE_RATIO_SCHEDULE_PCT:-}" ]; then
     #   - 中期（20-60%）：FR=0.80-0.50，逐渐降低，平衡势场和网络学习
     #   - 后期（60-100%）：FR=0.50-0.30，网络主导，势场仅提供安全修正
     # 这样既能保证初期有好的初始解，又能让网络在后期有足够的学习空间
-    export ACTION_FORCE_RATIO_SCHEDULE_PCT=""  # 🔧 修复：大幅提高初期PF比例，防止随机策略导致坠毁
+    export ACTION_FORCE_RATIO_SCHEDULE_PCT="0%:0.50,10%:0.40,20%:0.30,40%:0.20,60%:0.15,100%:0.10"  # 🔧 修复：大幅提高初期PF比例，防止随机策略导致坠毁
                                                                                                     # 问题诊断：30%的FR仍导致智能体过度依赖APF贴地飞行
                                                                                                     # 修复策略：初期30%→后期2%，让Actor尽早主导
                                                                                                     # 目标：让智能体学习自主避障，而不是依赖APF0%:0.50,10%:0.40,20%:0.30,40%:0.20,60%:0.15,100%:0.10
@@ -772,13 +787,13 @@ export SUCCESS_COUNT_MODE=${SUCCESS_COUNT_MODE:-any}                  # 并行�
 # FR条件化与Q安全参数
 export USE_FR_FEATURE=${USE_FR_FEATURE:-1}            # ✅ 启用FR特征（作为独立条件输入传递给网络）
 export USE_PF_FEATURE=${USE_PF_FEATURE:-1}            # ✅ 启用势场矢量特征（训练脚本会在保存经验时追加到obs）
-export Q_CLIP_VALUE=${Q_CLIP_VALUE:-500.0}          # 🚨 关键修复：降低Q裁剪值以匹配新的奖励缩放（1/2000）
+export Q_CLIP_VALUE=${Q_CLIP_VALUE:-300.0}          # 🚨 关键修复：降低Q裁剪值以匹配新的奖励缩放（1/2000）
                                                       # 原因：APF方法5M奖励→500，Action Only 45k→4.5，Q值在[-1000,1000]范围内
 export CRITIC_Q_REG=${CRITIC_Q_REG:-0.005}           # 🔧 进一步降低Q正则（0.01→0.005），稍微放开critic的学习能力
                                                       # 作用：降低正则化约束，允许critic网络有更强的学习能力
                                                       # 调整：降低50%，减少对Q值的正则化惩罚，让critic能够更好地学习Q值估计
                                                       # 建议范围：0.003-0.01（过小可能导致Q值不稳定，过大可能限制学习能力）
-export ACTION_REG_COEF=${ACTION_REG_COEF:-0.00010}    # 🔧 大幅降低动作正则（0.002→0.0005），让Actor敢于输出更大的加速度值
+export ACTION_REG_COEF=${ACTION_REG_COEF:-0.00014}    # 🔧 大幅降低动作正则（0.002→0.0005），让Actor敢于输出更大的加速度值
                                                                                                  # 问题：网络输出范围依然不大，无法直接给出较大的加速度效果
                                                                                                  # 修复：进一步降低正则化，允许Actor输出更大的动作幅值
                                                                                                  # 新值0.0005：降低75%，大幅减少对大幅动作的惩罚
@@ -795,6 +810,8 @@ export NEG_Z_REG_COEF=${NEG_Z_REG_COEF:-0.0}           # 🔧 默认关闭负向
 #    - 目标吸引力：使用sigmoid函数实现可微分段，实现NumPy版本的分段效果
 #    - 所有斥力都基于实际的环境信息，不再使用随机方向
 export USE_TF_POTENTIAL_FIELD=${USE_TF_POTENTIAL_FIELD:-1}           # 势场修正版本（统一使用TF版本）
+# 🔧 注意：TERRAIN_SENSING_MODE 仅用于评估，训练时强制使用local模式
+# Oracle模式仅在评估时通过 evaluate_optimized.py 传递，训练时不需要此参数
                                                                      # 
                                                                      # 1 = TF版本（默认，推荐）
                                                                      #   ✅ 训练-推理完全一致（梯度可回传）
@@ -841,9 +858,9 @@ export HOVER_REWARD_INTERVAL=${HOVER_REWARD_INTERVAL:-10}     # 🔧 增加悬�
 #       第一次重置使用动态采样起点/目标，并保存到 POSITIONS_FILE；
 #       后续回合与其他并行环境都会从该文件加载同一套固定起点/目标，不再变化。
 #   - USE_SCENARIO_SEED=1 + SCENARIO_SEED 固定 → 地形高度图可复现（但障碍物默认仍按随机数生成，每回合会变化）。
-export USE_FIXED_POSITIONS=${USE_FIXED_POSITIONS:-0}     # 启用固定起点/目标（配合 DYNAMIC_FIRST_TIME 和 POSITIONS_FILE）
+export USE_FIXED_POSITIONS=${USE_FIXED_POSITIONS:-1}     # 启用固定起点/目标（配合 DYNAMIC_FIRST_TIME 和 POSITIONS_FILE）
 export POSITIONS_FILE=${POSITIONS_FILE:-./saved_positions/5.json}  # 固定位置文件路径（dynamic_first_time 首回合会写入）
-export USE_SCENARIO_SEED=${USE_SCENARIO_SEED:-0}         # 是否使用固定随机种子来固定地图 (0=随机, 1=固定)
+export USE_SCENARIO_SEED=${USE_SCENARIO_SEED:-1}         # 是否使用固定随机种子来固定地图 (0=随机、但是要把后面RANDOM_TERRAIN设置为1, 1=固定)
 # 只有在 USE_SCENARIO_SEED=1 时才设置 SCENARIO_SEED 环境变量（用于可复现实验）
 # 否则不设置该变量，让代码使用时间戳生成真正的随机种子
 if [ "${USE_SCENARIO_SEED}" = "1" ] || [ "${USE_SCENARIO_SEED,,}" = "true" ] || [ "${USE_SCENARIO_SEED,,}" = "yes" ] || [ "${USE_SCENARIO_SEED,,}" = "on" ]; then
@@ -1083,6 +1100,8 @@ ARGS=(
     
     # 势场修正版本选择
     --use-tf-potential-field "$USE_TF_POTENTIAL_FIELD"                      # 是否使用TensorFlow版本的势场修正
+    # 🔧 注意：--terrain-sensing-mode 参数已移除，训练时强制使用local模式
+    # Oracle模式仅在评估时通过 evaluate_optimized.py 传递
     
     # 🔧 delta+base 模式参数（用于 TensorFlow 版本的势场参数调整）
     # 基准值参数
@@ -1156,6 +1175,41 @@ fi
 # 注意：SEED已在脚本开头初始化（第54-66行），这里直接使用
 # 随机种子会通过--seed参数传递给训练脚本，并保存到results.json中
 ARGS+=(--seed "$SEED")
+
+# 🔧 持续训练模型配置（如果指定了模型路径）
+if [ -n "$RESUME_MODEL" ]; then
+    # 检查模型路径是否存在
+    if [ ! -d "$RESUME_MODEL" ]; then
+        echo "⚠️  警告: 指定的模型路径不存在: $RESUME_MODEL"
+        echo "   将尝试自动查找检查点..."
+        # 尝试查找checkpoint目录
+        CHECKPOINT_DIR="${RESUME_MODEL}/checkpoint"
+        if [ -d "$CHECKPOINT_DIR" ]; then
+            echo "✅ 找到检查点目录: $CHECKPOINT_DIR"
+            ARGS+=(--checkpoint "$CHECKPOINT_DIR")
+        elif [ -d "${RESUME_MODEL}/final" ]; then
+            echo "✅ 找到final目录，使用final作为检查点: ${RESUME_MODEL}/final"
+            ARGS+=(--checkpoint "${RESUME_MODEL}/final")
+        else
+            echo "❌ 错误: 无法找到有效的检查点目录"
+            echo "   请确保模型路径包含 checkpoint/ 或 final/ 目录"
+            exit 1
+        fi
+    else
+        # 检查是否存在checkpoint目录
+        if [ -d "${RESUME_MODEL}/checkpoint" ]; then
+            echo "✅ 使用检查点目录: ${RESUME_MODEL}/checkpoint"
+            ARGS+=(--checkpoint "${RESUME_MODEL}/checkpoint")
+        elif [ -d "${RESUME_MODEL}/final" ]; then
+            echo "✅ 使用final目录作为检查点: ${RESUME_MODEL}/final"
+            ARGS+=(--checkpoint "${RESUME_MODEL}/final")
+        else
+            # 直接使用指定的路径作为检查点
+            echo "✅ 使用指定路径作为检查点: $RESUME_MODEL"
+            ARGS+=(--checkpoint "$RESUME_MODEL")
+        fi
+    fi
+fi
 
 # ========= 奖励参数分组：根据 USE_WEIGHTED_REWARD 切换 =========
 if [ "$USE_WEIGHTED_REWARD" = "1" ] || [ "${USE_WEIGHTED_REWARD,,}" = "true" ]; then
@@ -1305,7 +1359,21 @@ echo "🎲 随机种子信息:"
 echo "  - 本次训练使用的随机种子: $SEED"
 echo "  - 种子已保存到: logs/$EXP_NAME_WITH_TIMESTAMP/*/results.json"
 # 🔧 关键修复：使用单引号包裹复现命令，防止shell误解析为可执行命令
-echo "  - 复现此实验请运行: SEED=$SEED ./run_optimized.sh $EPISODES $BATCH_SIZE '$EXP_NAME' $USE_WEIGHTED_REWARD $ALGORITHM"
+if [ -n "$RESUME_MODEL" ]; then
+    echo "  - 复现此实验请运行: SEED=$SEED ./run_optimized.sh $EPISODES $BATCH_SIZE '$EXP_NAME' $USE_WEIGHTED_REWARD $ALGORITHM '$RESUME_MODEL'"
+else
+    echo "  - 复现此实验请运行: SEED=$SEED ./run_optimized.sh $EPISODES $BATCH_SIZE '$EXP_NAME' $USE_WEIGHTED_REWARD $ALGORITHM"
+fi
+echo ""
+echo "🔧 持续训练使用示例:"
+echo "  # 方式1：从指定模型目录恢复训练（自动查找checkpoint或final目录）"
+echo "  ./run_optimized.sh 200 1024 '继续训练' 1 matd3 'models/my_experiment_20240101_120000'"
+echo ""
+echo "  # 方式2：通过环境变量指定模型路径"
+echo "  RESUME_MODEL_ENV='models/my_experiment_20240101_120000' ./run_optimized.sh 200 1024 '继续训练' 1 matd3"
+echo ""
+echo "  # 方式3：使用CHECKPOINT_MODEL环境变量"
+echo "  CHECKPOINT_MODEL='models/my_experiment_20240101_120000/checkpoint' ./run_optimized.sh 200 1024 '继续训练' 1 matd3"
 echo ""
 
 # === 🔧 自动测试评估（使用相同环境配置）===

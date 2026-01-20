@@ -11,6 +11,7 @@ build/
 # Virtual Environment
 .venv/
 venv/
+maddpg_venv/
 ENV/
 env/
 
@@ -28,6 +29,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
 
 # Model checkpoints and data (uncomment if you don't want to upload these)
 # *.pth
@@ -35,7 +37,14 @@ Thumbs.db
 # *.ckpt
 # data/
 # checkpoints/
+weights/
+evaluation_results/
+models/
+terrain_sensing_experiments/
+/apf_demo.gif
 
 # Temporary files
 *.tmp
 *.bak
+*.backup
+*backup*

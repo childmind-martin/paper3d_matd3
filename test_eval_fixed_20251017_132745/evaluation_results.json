@@ -1,0 +1,22 @@
+{
+  "model_path": "models/optimized_exp_20251016_215848/final",
+  "scenario": "paper3d_terrain_weighted",
+  "episodes": 1,
+  "avg_reward": -297756.1321422671,
+  "std_reward": 0.0,
+  "max_reward": -297756.1321422671,
+  "min_reward": -297756.1321422671,
+  "all_rewards": [
+    -297756.1321422671
+  ],
+  "episode_details": [
+    {
+      "episode": 0,
+      "reward": -297756.1321422671,
+      "steps": 2000,
+      "terrain_complexity_level": 3,
+      "duration": 12.04281497001648
+    }
+  ],
+  "evaluation_time": "2025-10-17 13:29:18"
+}

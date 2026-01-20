@@ -1,0 +1,49 @@
+{
+  "timestamp": "20260118_221538",
+  "experiments": [
+    {
+      "label": "apf_learnable",
+      "name": "APF Learnable",
+      "name_en": "apf_learnable",
+      "description": "APF action only, parameters learned via Actor network",
+      "log_dir": "logs/apf_learnable_20260118_174345/20260118_174353",
+      "final_reward": -658862.1665377617,
+      "avg_reward": -679701.6099210716,
+      "max_reward": -581461.3647897243
+    },
+    {
+      "label": "action_apf_fusion",
+      "name": "Action+APF Fusion",
+      "name_en": "action_apf_fusion",
+      "description": "Network action + learnable APF correction (default config)",
+      "log_dir": "logs/action_apf_fusion_20260118_185737/20260118_185742",
+      "final_reward": -45662.964758098125,
+      "avg_reward": -694200.0596372491,
+      "max_reward": -45662.964758098125
+    },
+    {
+      "label": "action_only",
+      "name": "Action Only",
+      "name_en": "action_only",
+      "description": "Network action only, no APF correction",
+      "log_dir": "logs/action_only_20260118_201337/20260118_201342",
+      "final_reward": 30724.940961122513,
+      "avg_reward": -118360.26848892987,
+      "max_reward": 34061.62558543682
+    },
+    {
+      "label": "apf_traditional",
+      "name": "APF Traditional",
+      "name_en": "apf_traditional",
+      "description": "APF action only, fixed parameters (base values, no learning)",
+      "log_dir": "logs/apf_traditional_20260118_212423/20260118_212428",
+      "final_reward": -691724.6664345264,
+      "avg_reward": -684484.3321112496,
+      "max_reward": -632653.3897624016
+    }
+  ],
+  "output_files": {
+    "reward_comparison": "reward_comparison_20260118_221538.png",
+    "loss_comparison": "loss_comparison_20260118_221538.png"
+  }
+}

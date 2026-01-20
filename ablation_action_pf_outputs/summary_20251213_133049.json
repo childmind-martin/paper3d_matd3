@@ -1,0 +1,36 @@
+{
+  "timestamp": "20251213_133049",
+  "experiments": [
+    {
+      "label": "apf_learnable",
+      "name": "可学习APF",
+      "description": "仅使用势场动作，势场参数通过Actor网络学习优化",
+      "log_dir": "logs/apf_learnable_20251212_221400/20251212_221405",
+      "final_reward": 141345.8643398881,
+      "avg_reward": 84061.28300705474,
+      "max_reward": 188048.83397901058
+    },
+    {
+      "label": "apf_traditional",
+      "name": "传统APF",
+      "description": "仅使用势场动作，势场参数固定（base值，不学习）",
+      "log_dir": "logs/apf_traditional_20251213_031501/20251213_031507",
+      "final_reward": 132077.0327552557,
+      "avg_reward": 104330.89530635523,
+      "max_reward": 227971.26406872272
+    },
+    {
+      "label": "action_apf_fusion",
+      "name": "两者融合",
+      "description": "网络动作+可学习势场修正（当前默认，使用完整训练配置）",
+      "log_dir": "logs/action_apf_fusion_20251213_082204/20251213_082209",
+      "final_reward": 97498.52018818259,
+      "avg_reward": -248412.33482593342,
+      "max_reward": 148823.36656713486
+    }
+  ],
+  "output_files": {
+    "reward_comparison": "reward_comparison_20251213_133049.png",
+    "loss_comparison": "loss_comparison_20251213_133049.png"
+  }
+}

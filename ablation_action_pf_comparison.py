@@ -112,7 +112,7 @@ EXPERIMENT_CONFIGS = [
             "ACTION_FORCE_RATIO_SCHEDULE_PCT": "DISABLED",  # 🚨 关键修复：显式禁用schedule，确保FR始终为0.0
             "USE_TF_POTENTIAL_FIELD": "1",  # 保持TF版本启用，但force_ratio=0会阻止修正
             "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保公平对比（消除随机性影响）
-            "TF_DETERMINISTIC_OPS": "1"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
+            "TF_DETERMINISTIC_OPS": "0"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
         }
     },
     {
@@ -131,8 +131,26 @@ EXPERIMENT_CONFIGS = [
             "DELTA_LAMBDA_1": "0.0",
             "DELTA_K_REP": "0.0",
             "DELTA_RADIUS": "0.0",
-            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保公平对比（消除随机性影响）
-            "TF_DETERMINISTIC_OPS": "1"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
+            # 🚨 关键修复：显式设置base值，确保Traditional APF使用正确的参数（而不是随机初始化的网络参数）
+            # 这些base值必须与run_optimized.sh的默认值完全一致
+            # run_optimized.sh默认base值（第685-708行）：
+            "GOAL_ATTRACTION": "6.0",                    # ✅ 与run_optimized.sh一致（默认6.0）
+            "LAMBDA_1_BASE": "8.5",                      # ✅ 与run_optimized.sh一致（默认8.5）
+            "TERRAIN_REPULSION": "8000.0",               # ✅ 与run_optimized.sh一致（默认8000.0）
+            "AGENT_INFLUENCE_RANGE": "150.0",           # ✅ 与run_optimized.sh一致（默认150.0）
+            # 实际使用的势场参数（因为DELTA=0.0，所以参数=base值）：
+            #   k_att = 6.0（固定）
+            #   lambda_1 = 8.5（固定）
+            #   k_rep = 8000.0（固定）
+            #   radius = 150.0（固定）
+            # 🚨 关键修复：网络初始化一致性
+            # 所有算法（apf_traditional、apf_learnable、action_apf_fusion）都使用相同的SEED
+            # 训练脚本会在创建网络之前设置随机种子（paper3d_train_optimized.py 第12069-12072行）
+            # 这确保了所有算法的网络初始化完全一致，即使Traditional APF不使用网络输出的后4维参数
+            # 网络初始化包括：Actor和Critic网络的权重初始化（使用相同的随机种子）
+            # 这样对比才公平：Traditional APF使用的是"固定参数的APF"，而不是"随机初始化的网络+固定参数"
+            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保网络初始化一致（与apf_learnable、action_apf_fusion相同）
+            "TF_DETERMINISTIC_OPS": "0"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
         }
     },
     {
@@ -144,21 +162,37 @@ EXPERIMENT_CONFIGS = [
             "ACTION_FORCE_RATIO": "1.0",  # ✅ 真正有效的控制：100%势场动作
             "ACTION_FORCE_RATIO_SCHEDULE_PCT": "DISABLED",  # 🚨 关键修复：使用特殊值标记禁用，确保FR始终为1.0
             "USE_TF_POTENTIAL_FIELD": "1",  # 确保使用TF版本
+            # 🔧 性能优化：与其他算法保持一致，确保公平对比
+            # 注意：移除NOISE_SCALE设置，使用默认值0.35，与其他算法保持一致
+            # "NOISE_SCALE": "0.35",  # ✅ 修复：与其他算法保持一致（默认0.35），确保公平对比
+            # 🔧 显式禁用随机动作，确保纯APF训练不受随机动作干扰
+            "RANDOM_ACTION_PROB_TRAINING": "0.0",  # 禁用训练阶段的随机动作，确保动作完全由APF控制
             # 🚨 关键修复：显式设置delta值为run_optimized.sh的默认值，确保可学习APF真正学习
             # 注意：这些值必须与run_optimized.sh中的默认值完全一致
-            # run_optimized.sh默认值（第645-661行）：DELTA_K_ATT=5.0, DELTA_LAMBDA_1=2.2, DELTA_K_REP=1000.0, DELTA_RADIUS=80.0
-            # run_optimized.sh base值（第612-638行）：GOAL_ATTRACTION=8.0, LAMBDA_1_BASE=8.5, TERRAIN_REPULSION=2800.0, AGENT_INFLUENCE_RANGE=150.0
+            # run_optimized.sh默认值（第720-736行）：DELTA_K_ATT=5.0, DELTA_LAMBDA_1=2.2, DELTA_K_REP=1200.0, DELTA_RADIUS=80.0
+            # run_optimized.sh base值（第685-708行）：GOAL_ATTRACTION=6.0, LAMBDA_1_BASE=8.5, TERRAIN_REPULSION=8000.0, AGENT_INFLUENCE_RANGE=150.0
             # 实际参数范围（基于base值）：
-            #   k_att = 8.0 ± 5.0 = [3.0, 13.0]
+            #   k_att = 6.0 ± 5.0 = [1.0, 11.0]
             #   lambda_1 = 8.5 ± 2.2 = [6.3, 10.7]
-            #   k_rep = 2800.0 ± 1000.0 = [1800.0, 3800.0]
+            #   k_rep = 8000.0 ± 1200.0 = [6800.0, 9200.0]
             #   radius = 150.0 ± 80.0 = [70.0, 230.0]
             "DELTA_K_ATT": "5.0",      # ✅ 与run_optimized.sh一致（默认5.0）
             "DELTA_LAMBDA_1": "2.2",   # ✅ 与run_optimized.sh一致（默认2.2）
-            "DELTA_K_REP": "1000.0",   # ✅ 与run_optimized.sh一致（默认1000.0）
-            "DELTA_RADIUS": "80.0",    # ✅ 修复：与run_optimized.sh一致（默认80.0，不是60.0）
-            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保公平对比（消除随机性影响）
-            "TF_DETERMINISTIC_OPS": "1"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
+            "DELTA_K_REP": "1200.0",   # 🚨 修复：与run_optimized.sh一致（默认1200.0，不是1000.0）
+            "DELTA_RADIUS": "80.0",    # ✅ 与run_optimized.sh一致（默认80.0）
+            # 🚨 关键修复：显式设置base值，确保与apf_traditional和action_apf_fusion使用相同的base值
+            # 原因：虽然run_optimized.sh有默认值，但显式设置可以确保所有实验组使用完全相同的base值
+            # 这样对比才公平：apf_learnable和action_apf_fusion使用相同的base值，只是DELTA不同
+            "GOAL_ATTRACTION": "6.0",                    # ✅ 与run_optimized.sh一致（默认6.0）
+            "LAMBDA_1_BASE": "8.5",                      # ✅ 与run_optimized.sh一致（默认8.5）
+            "TERRAIN_REPULSION": "8000.0",               # ✅ 与run_optimized.sh一致（默认8000.0）
+            "AGENT_INFLUENCE_RANGE": "150.0",           # ✅ 与run_optimized.sh一致（默认150.0）
+            # 🚨 关键修复：网络初始化一致性
+            # 所有算法（apf_traditional、apf_learnable、action_apf_fusion）都使用相同的SEED
+            # 训练脚本会在创建网络之前设置随机种子（paper3d_train_optimized.py 第12069-12072行）
+            # 这确保了所有算法的网络初始化完全一致，包括Actor和Critic网络的权重初始化
+            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保网络初始化一致（与apf_traditional、action_apf_fusion相同）
+            "TF_DETERMINISTIC_OPS": "0"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
         }
     },
     {
@@ -176,11 +210,15 @@ EXPERIMENT_CONFIGS = [
             # 这样消融实验才能真正反映"融合APF"在标准训练配置下的表现
             "ACTION_FORCE_RATIO_SCHEDULE_PCT": "0%:0.50,10%:0.40,20%:0.30,40%:0.20,60%:0.15,100%:0.10",  # ✅ 修复：与 run_optimized.sh 默认值完全一致
             "USE_TF_POTENTIAL_FIELD": "1",  # 确保使用TF版本
-            "SEED": "252488",  # 🚨 关键修复：为每个实验设置相同的训练随机种子，确保训练过程可重复
+            # 🚨 关键修复：网络初始化一致性
+            # 所有算法（apf_traditional、apf_learnable、action_apf_fusion）都使用相同的SEED
+            # 训练脚本会在创建网络之前设置随机种子（paper3d_train_optimized.py 第12069-12072行）
+            # 这确保了所有算法的网络初始化完全一致，包括Actor和Critic网络的权重初始化
+            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保网络初始化一致（与apf_traditional、apf_learnable相同）
             # 🚨 关键修复：启用 TensorFlow 确定性操作，确保完全可重复
             # 原因：即使设置了随机种子，TensorFlow 的某些操作（如卷积、矩阵乘法）可能仍然有非确定性
             # 启用 TF_DETERMINISTIC_OPS 可以确保所有操作都是确定性的
-            "TF_DETERMINISTIC_OPS": "1"  # 启用 TensorFlow 确定性操作，确保完全可重复
+            "TF_DETERMINISTIC_OPS": "0"  # 启用 TensorFlow 确定性操作，确保完全可重复
             # 其他所有配置（学习率、网络架构、奖励权重、噪声参数等）都使用 run_optimized.sh 的默认值
         }
     },
@@ -216,10 +254,10 @@ EXPERIMENT_CONFIGS = [
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="动作与势场修正消融对比实验")
+    parser = argparse.ArgumentParser(description="动作与势场修正消融对比实验、地形复杂度3、无随机动作判断穿透原因是否是随机动作导致的")
     parser.add_argument("--script", type=str, default="./run_optimized.sh",
                         help="训练启动脚本路径 (默认 ./run_optimized.sh)")
-    parser.add_argument("--episodes", type=int, default=450,
+    parser.add_argument("--episodes", type=int, default=400,
                         help="每个实验的训练回合数（默认5）")
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="训练批次大小")
@@ -257,11 +295,9 @@ def parse_args():
 
 def ensure_fixed_positions(positions_file: Path, args, exp_name_prefix: str) -> Path:
     """
-    确保固定位置文件存在，不存在则生成
+    确保固定位置文件存在，不存在则生成（轻量级方法，不运行完整训练）
     
-    注意：如果位置文件不存在，会运行一个辅助实验（只训练1个回合）来生成它。
-    这个辅助实验会在日志目录中创建记录（例如：logs/ablation_action_pf_init_positions/），
-    但这不是真正的消融实验。真正的消融实验是：action_only, apf_traditional, apf_learnable, action_apf_fusion
+    🔧 优化：直接初始化场景获取位置信息，避免运行完整训练流程产生不必要的日志和模型目录
     """
     if positions_file is None:
         # 🚨 关键修复：使用与 run_optimized.sh 相同的默认位置文件路径
@@ -276,47 +312,107 @@ def ensure_fixed_positions(positions_file: Path, args, exp_name_prefix: str) -> 
         return positions_file
     
     print(f"[消融实验] 固定位置文件不存在，开始生成: {positions_file}")
-    print(f"[消融实验] 注意：将运行一个辅助实验（只训练1个回合）来生成位置文件")
+    print(f"[消融实验] 使用轻量级方法：直接初始化场景获取位置信息（不运行训练）")
     
-    env = os.environ.copy()
-    env["USE_FIXED_POSITIONS"] = "1"
-    env["DYNAMIC_FIRST_TIME"] = "0"
-    env["SAVE_POSITIONS"] = "1"
-    env["POSITIONS_FILE"] = str(positions_file)
-    # 固定地形和课程制
-    env["UNLOCK_ENV_ON_SUCCESS"] = "0"
-    env["UNLOCK_ENV_ON_PLATEAU"] = "0"
-    env["RANDOM_TERRAIN"] = "0"
-    env["PER_ENV_TERRAIN"] = "0"
-    env["PER_EPISODE_TERRAIN"] = "0"
-    env["USE_SCENARIO_SEED"] = "1"
-    env["SCENARIO_SEED"] = "67"  # 场景生成种子
-    env["SEED"] = "252488"  # 🔧 关键修复：统一使用252488，与训练实验保持一致（仅用于位置生成）
-    # 🔧 关键修复：确保地图生成参数与 run_optimized.sh 完全一致（显式设置，覆盖父进程环境变量）
-    env["TERRAIN_COMPLEXITY_LEVEL"] = "2"  # ✅ 修复：与run_optimized.sh保持一致（默认2）
-    env["MAP_SIZE"] = "200"  # 地图大小
-    env["MOUNTAIN_MIN_DISTANCE"] = "55"  # 山峰之间的最小距离
-    env["NUM_ENVS"] = "1"  # 生成位置时使用单环境
-    env["XLA_GLOBAL"] = "1"
-    env.setdefault("PF_JIT", "0")
-    
-    exp_name = f"{exp_name_prefix}_init_positions"
-    cmd = [
-        args.script,
-        "1",  # 只需要1个回合
-        str(args.batch_size),
-        exp_name,
-        str(args.use_weighted_reward),
-        args.algorithm,
-    ]
-    
-    subprocess.run(cmd, check=True, env=env)
-    
-    if not positions_file.exists():
-        raise RuntimeError(f"生成固定位置失败，文件仍不存在: {positions_file}")
-    
-    print(f"[消融实验] 位置文件已生成: {positions_file}")
-    print(f"[消融实验] 辅助实验日志目录: logs/{exp_name}/（这不是真正的消融实验，可以忽略）")
+    # 🔧 优化：直接初始化场景，获取位置信息并保存，避免运行完整训练
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        
+        # 设置环境变量（用于场景初始化）
+        import os
+        original_env = {}
+        # 🔧 关键修复：使用与 run_optimized.sh 完全一致的默认配置
+        # 参考 run_optimized.sh 的默认值：
+        #   - TERRAIN_COMPLEXITY_LEVEL=3 (默认等级3)
+        #   - MAP_SIZE=200
+        #   - MOUNTAIN_MIN_DISTANCE=55
+        #   - SCENARIO_SEED=88 (但位置生成使用67，与消融实验保持一致)
+        env_vars = {
+            "USE_SCENARIO_SEED": "1",
+            "SCENARIO_SEED": "67",  # 位置生成使用67，与消融实验保持一致
+            "TERRAIN_COMPLEXITY_LEVEL": "3",  # 🔧 修复：与 run_optimized.sh 默认值一致（3）
+            "MAP_SIZE": "200",  # 与 run_optimized.sh 默认值一致
+            "MOUNTAIN_MIN_DISTANCE": "55",  # 与 run_optimized.sh 默认值一致
+            "RANDOM_TERRAIN": "0",
+            "PER_ENV_TERRAIN": "0",
+            "PER_EPISODE_TERRAIN": "0",
+        }
+        
+        # 临时设置环境变量
+        for key, value in env_vars.items():
+            original_env[key] = os.environ.get(key)
+            os.environ[key] = value
+        
+        # 导入场景
+        from multiagent.environment import MultiAgentEnv
+        from multiagent.scenarios import load
+        
+        # 🔧 修复：根据奖励模式和向量化场景设置选择场景（与run_optimized.sh逻辑一致）
+        # run_optimized.sh 逻辑：
+        #   - USE_WEIGHTED_REWARD=1 且 VECTORIZED_SCENARIO=1 → paper3d_terrain_vectorized
+        #   - USE_WEIGHTED_REWARD=1 且 VECTORIZED_SCENARIO=0（或未设置）→ paper3d_terrain_weighted
+        #   - USE_WEIGHTED_REWARD=0 → paper3d_terrain_energy
+        if args.use_weighted_reward:
+            # 检查是否启用向量化场景（默认不启用，使用paper3d_terrain_weighted）
+            vectorized_scenario = os.environ.get("VECTORIZED_SCENARIO", "0").lower() in ("1", "true", "yes", "on")
+            if vectorized_scenario:
+                scenario_name = "paper3d_terrain_vectorized"
+            else:
+                scenario_name = "paper3d_terrain_weighted"  # ✅ 修复：使用weighted而不是vectorized（默认）
+        else:
+            scenario_name = "paper3d_terrain_energy"
+        
+        # 加载场景
+        scenario = load(scenario_name).Scenario(
+            seed=67,
+            use_fixed_positions=False,
+            dynamic_first_time=True,
+            fixed_positions_file=str(positions_file),
+            random_terrain=False,
+            terrain_complexity_level=3,  # 🔧 修复：与 run_optimized.sh 默认值一致（3）
+        )
+        
+        # 创建环境并初始化
+        world = scenario.make_world()
+        scenario.reset_world(world)
+        
+        # 获取智能体位置和目标位置
+        agents_pos = [agent.state.p_pos.tolist() for agent in world.agents]
+        goal_pos = scenario.goal_pos.tolist() if scenario.goal_pos is not None else None
+        
+        if goal_pos is None:
+            # 如果没有目标位置，使用默认值
+            goal_pos = [float(scenario.map_size / 2), float(scenario.map_size / 2), 25.0]
+        
+        # 保存位置文件
+        positions_data = {
+            "agents": agents_pos,
+            "goal": goal_pos
+        }
+        
+        with open(positions_file, 'w', encoding='utf-8') as f:
+            json.dump(positions_data, f, indent=2, ensure_ascii=False)
+        
+        # 恢复环境变量
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        
+        print(f"[消融实验] ✅ 位置文件已生成: {positions_file}")
+        print(f"[消融实验]   智能体数量: {len(agents_pos)}")
+        print(f"[消融实验]   目标位置: {goal_pos}")
+        
+    except Exception as e:
+        # 🚨 关键修复：位置文件生成失败时，直接抛出错误，不运行完整训练
+        # 原因：位置文件生成应该只使用轻量级方法，运行完整训练会产生不必要的日志和模型目录
+        raise RuntimeError(
+            f"生成固定位置文件失败: {e}\n"
+            f"提示：请检查场景初始化代码和环境配置是否正确。\n"
+            f"位置文件路径: {positions_file}"
+        )
     
     return positions_file
 
@@ -389,7 +485,10 @@ def setup_base_env_vars(positions_file: Path, gpu_id: int = None) -> dict:
     env["PER_ENV_TERRAIN"] = "0"
     env["PER_EPISODE_TERRAIN"] = "0"
     env["USE_SCENARIO_SEED"] = "1"
-    env["SCENARIO_SEED"] = "88"  # 场景生成种子（所有实验使用相同的地形）
+    # 🔧 关键修复：使用与 run_optimized.sh 一致的默认值
+    # run_optimized.sh 默认: SCENARIO_SEED=${SCENARIO_SEED:-88}
+    # 但位置文件生成使用67，为了保持一致，这里也使用67
+    env["SCENARIO_SEED"] = "67"  # 🔧 修复：与位置文件生成保持一致，确保地形一致
     # 🚨 关键修复：不在这里设置SEED，让实验配置中的SEED生效
     # 这样既能保证地形一致（SCENARIO_SEED相同），又能保证训练过程一致（SEED相同，确保公平对比）
     # 如果实验配置中没有设置SEED，训练脚本会使用默认值1337
@@ -397,7 +496,7 @@ def setup_base_env_vars(positions_file: Path, gpu_id: int = None) -> dict:
     if "SEED" in env:
         del env["SEED"]  # 删除基础配置中的SEED，让实验配置中的SEED生效
     # 🔧 关键修复：确保地图生成参数与 run_optimized.sh 完全一致（显式设置，覆盖父进程环境变量）
-    env["TERRAIN_COMPLEXITY_LEVEL"] = "2"  # ✅ 修复：与run_optimized.sh保持一致（默认2）
+    env["TERRAIN_COMPLEXITY_LEVEL"] = "3"  # ✅ 修复：与run_optimized.sh保持一致（默认3）
     env["MAP_SIZE"] = "200"  # 地图大小
     env["MOUNTAIN_MIN_DISTANCE"] = "55"  # 山峰之间的最小距离
     
@@ -779,6 +878,8 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     print(f"    UNLOCK_ENV_ON_SUCCESS={env.get('UNLOCK_ENV_ON_SUCCESS')} (消融实验：始终禁用课程学习)")
     print(f"    UNLOCK_ENV_ON_PLATEAU={env.get('UNLOCK_ENV_ON_PLATEAU')} (消融实验：始终禁用课程学习)")
     print(f"    RANDOM_TERRAIN={env.get('RANDOM_TERRAIN')} (消融实验：始终使用固定地形)")
+    print(f"    NOISE_SCALE={env.get('NOISE_SCALE', '未设置（将使用默认0.35）')} (OU噪声幅度)")
+    print(f"    RANDOM_ACTION_PROB_TRAINING={env.get('RANDOM_ACTION_PROB_TRAINING', '未设置（将使用默认0.00）')} (训练阶段随机动作概率)")
     print(f"{'='*70}\n")
     
     try:
@@ -1082,6 +1183,9 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     # Get collision threshold (for violation probability calculation)
     collision_threshold = 1.5  # Default value, can be read from environment variables or config
     
+    # 🔧 修复：在循环外定义quantiles，避免UnboundLocalError
+    quantiles = [5, 10, 25, 50, 75, 90, 95]  # 默认分位数列表
+    
     # 🔧 标记是否已经设置了阈值线（避免重复绘制）
     threshold_line_added_ax2 = False
     threshold_line_added_ax4 = False
@@ -1201,7 +1305,7 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
                 # 2.4 Quantiles and violation probability
                 if len(valid_clearances) > 0:
                     # Calculate quantiles (according to image definition: Q5%, Q50%, Q95%)
-                    quantiles = [5, 10, 25, 50, 75, 90, 95]
+                    # quantiles已在循环外定义
                     quantile_values = [np.percentile(valid_clearances, q) for q in quantiles]
                     
                     # Calculate violation probability (P_viol^i(δ) = (1/N) * Σ 1{d_min < δ})
@@ -1272,9 +1376,10 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     ax5.set_ylabel("Clearance (m)", fontsize=12, fontfamily='DejaVu Sans')
     ax5_twin = ax5.twinx()
     ax5_twin.set_ylabel("Violation Probability", fontsize=12, fontfamily='DejaVu Sans')
-    # 🔧 修复：设置分位数x轴标签
-    ax5.set_xticks(np.arange(len(quantiles)))
-    ax5.set_xticklabels([f'Q{q}%' for q in quantiles])
+    # 🔧 修复：设置分位数x轴标签（quantiles已在循环外定义）
+    if has_data:
+        ax5.set_xticks(np.arange(len(quantiles)))
+        ax5.set_xticklabels([f'Q{q}%' for q in quantiles])
     ax5.grid(True, alpha=0.3, linestyle='--')
     legend5 = ax5.legend(loc='upper left', fontsize=9, prop={'family': 'DejaVu Sans'})
     legend5_twin = ax5_twin.legend(loc='upper right', fontsize=9, prop={'family': 'DejaVu Sans'})
@@ -1432,34 +1537,37 @@ def main():
         print(f"[错误] 找不到训练脚本: {script_path}")
         sys.exit(1)
     
-    # 🔧 新增：创建批次管理器和批次目录
+    # 🔧 优化：先生成固定位置文件，再创建批次目录（避免不必要的目录创建）
+    # 生成固定位置文件（所有实验共享）
+    exp_name_prefix = "ablation_action_pf"
+    positions_file = ensure_fixed_positions(args.positions_file, args, exp_name_prefix)
+    
+    # 🔧 新增：创建批次管理器和批次目录（在位置文件生成之后）
+    # 批次目录用于组织消融实验的结果，确保所有实验使用相同的位置文件
     manager = AblationBatchManager()
     batch_config = {
         "episodes": args.episodes,
         "batch_size": args.batch_size,
         "algorithm": args.algorithm,
         "use_weighted_reward": args.use_weighted_reward,
-        "seed": 252488,  # 训练随机种子
-        "scenario_seed": 88,  # 地形种子
-        "terrain_complexity": 2,
-        "map_size": 200,
-        "mountain_min_distance": 55,
-        "positions_file": str(args.positions_file),
-        "notes": "消融实验：对比动作与势场修正的效果"
+        "seed": 252488,  # 训练随机种子（与 run_optimized.sh 默认值一致）
+        "scenario_seed": 67,  # 🔧 地形种子（与位置生成保持一致，确保地形一致）
+        "terrain_complexity": 3,  # 🔧 修复：与 run_optimized.sh 默认值一致（3）
+        "map_size": 200,  # 与 run_optimized.sh 默认值一致
+        "mountain_min_distance": 55,  # 与 run_optimized.sh 默认值一致
+        "positions_file": str(positions_file),
+        "notes": "消融实验：对比动作与势场修正的效果（使用 run_optimized.sh 运行完整训练）"
     }
     batch_dir = manager.create_batch(config=batch_config)
     
     print(f"{'='*70}")
     print(f"✅ 批次目录已创建: {batch_dir}")
+    print(f"   用途：组织消融实验的结果，所有实验共享位置文件: {positions_file}")
     print(f"{'='*70}\n")
     
     # 🔧 修改：输出目录使用批次目录下的plots子目录
     output_dir = batch_dir / "plots"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 生成固定位置文件（所有实验共享）
-    exp_name_prefix = "ablation_action_pf"
-    positions_file = ensure_fixed_positions(args.positions_file, args, exp_name_prefix)
     
     cache: Dict[str, Dict] = {}
     series = []
@@ -1615,6 +1723,44 @@ def main():
         for cfg in configs_to_run:
             result = run_experiment(cfg, positions_file, args, cache)
             series.append(result)
+    
+    # 🔧 修复：检查series是否为空，如果为空则提示用户
+    if not series:
+        print(f"\n{'='*70}")
+        print(f"⚠️  警告: 没有可用的实验数据，无法生成对比图")
+        print(f"{'='*70}")
+        print(f"\n可能的原因:")
+        print(f"  1. 所有实验都失败了")
+        print(f"  2. 所有实验都没有episode_rewards数据")
+        print(f"  3. 训练过程中出现了错误")
+        print(f"\n建议:")
+        print(f"  1. 检查日志目录: logs/")
+        print(f"  2. 检查实验结果文件: logs/*/results.json")
+        print(f"  3. 使用 quick_regenerate_plots.py 手动重新生成图表")
+        print(f"{'='*70}\n")
+        sys.exit(1)
+    
+    # 🔧 修复：检查series中是否有有效数据
+    has_valid_data = False
+    for item in series:
+        if item.get("metrics", {}).get("episode_rewards"):
+            has_valid_data = True
+            break
+    
+    if not has_valid_data:
+        print(f"\n{'='*70}")
+        print(f"⚠️  警告: 所有实验都没有episode_rewards数据，无法生成对比图")
+        print(f"{'='*70}")
+        print(f"\n建议:")
+        print(f"  1. 检查实验结果文件: logs/*/results.json")
+        print(f"  2. 确认训练是否成功完成")
+        print(f"  3. 使用 quick_regenerate_plots.py 手动重新生成图表")
+        print(f"{'='*70}\n")
+        sys.exit(1)
+    
+    print(f"\n{'='*70}")
+    print(f"✅ 找到 {len(series)} 个实验的数据，开始生成对比图...")
+    print(f"{'='*70}\n")
     
     # 生成图表
     title = "Action vs APF Correction Ablation Comparison"

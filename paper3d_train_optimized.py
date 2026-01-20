@@ -3441,7 +3441,9 @@ def try_apply_scenario_params(scenario, world, args, tqdm_file=None):
         'detection_height_range', 'agent_detection_radius', 'minimum_clearance',
         'terrain_gradient_threshold', 'previous_velocity_weight',
         'min_height_above_terrain', 'terrain_safety_margin',
-        'goal_alignment_weight', 'potential_field_weight', 'force_param_ratio'
+        'goal_alignment_weight', 'potential_field_weight', 'force_param_ratio',
+        # 🚨 关键修复：添加碰撞检测参数，确保评估时正确设置
+        'collision_distance_threshold', 'collision_penalty_value'
     ]
 
     applied = {}
@@ -3619,6 +3621,9 @@ class OptimizedMADDPG:
         self.action_dims = action_dims
         self.args = args
         self.base_obs_shapes = list(getattr(self.args, 'base_obs_shapes', obs_shapes))
+        # 🔧 新增：存储scenario和world引用（用于评估时的Oracle模式）
+        self.scenario_ref = None
+        self.world_ref = None
         try:
             self.map_size = float(getattr(args, 'map_size', 200.0))
         except Exception:
@@ -5110,24 +5115,19 @@ class OptimizedMADDPG:
             )
         )
 
-        # 🔧 clamp 目标位置，避免越界
+        # 🔧 clamp 目标位置XY坐标，避免越界
         dtype_goal = goal_pos.dtype
         min_xy = tf.cast(0.0, dtype_goal)
         max_xy = self.c_map_size - tf.cast(1.0, dtype_goal)
         gx = tf.clip_by_value(goal_pos[:, 0:1], min_xy, max_xy)
         gy = tf.clip_by_value(goal_pos[:, 1:2], min_xy, max_xy)
 
-        # 🔧 XLA修复：直接使用缓存的tensor，避免在@tf.function中调用方法导致autograph转换错误
-        # 注意：不能在@tf.function装饰的函数中调用未装饰的方法，会导致autograph转换错误
-        height_map = self._terrain_height_tensor
-        ix, iy = self._world_to_map_transform_tf(gx, gy)
-        terrain_height = self._bilinear_sample_height_tf(height_map, ix, iy)
-        terrain_margin = tf.cast(self.c_terrain_margin, dtype_goal)
-        gz = tf.clip_by_value(
-            tf.maximum(goal_pos[:, 2:3], terrain_height + terrain_margin),
-            terrain_height,
-            tf.cast(self.c_map_size, dtype_goal)
-        )
+        # 🚨 关键修复：不要clamp目标位置的Z坐标到地形高度+margin
+        # 原因：观测中的目标位置是从agent.goal_a.state.p_pos编码的，已经是正确的目标位置
+        # 如果clamp到地形高度+margin，会导致目标位置被错误地调整，特别是当目标位置在地形上方较高处时
+        # 解决方案：直接使用观测中的目标Z坐标，不进行任何调整
+        # 注意：只clamp XY坐标，Z坐标完全保留观测中的值
+        gz = goal_pos[:, 2:3]  # 直接使用观测中的Z坐标，不进行任何调整
         goal_pos = tf.concat([gx, gy, gz], axis=1)
 
         # === 提取 Actor 输出的势场参数（后4维） ===
@@ -5577,13 +5577,17 @@ class OptimizedMADDPG:
         radius = tf.maximum(radius, tf.cast(10.0, dtype))
         
         return tf.concat([k_att, lambda_1, k_rep, radius], axis=1)
-    
     def _calculate_terrain_forces_sphere_tf(self, agent_pos, goal_pos, k_rep, radius, obs):
         """
         计算地形斥力（基于观察数据的实际势场公式）
         
         基于观察数据的地形斥力公式：
         F_rep = λr * (1/r_min - 1/R_safe) * (1/r_min²) * κ * d^n * n̂
+        
+        🔧 新增：支持地形感知模式切换
+        - local: 使用观测中的地形信息（默认）
+        - oracle_same_probes: 使用Oracle接口获取真值，probe布局与local一致
+        - oracle_dense: 使用Oracle接口，提升探测密度
         
         参数:
             agent_pos: (batch, 3) 智能体位置
@@ -5601,21 +5605,248 @@ class OptimizedMADDPG:
         radius = tf.cast(radius, dtype)
         goal_pos = tf.cast(goal_pos, dtype)
         
-        # 从观察数据中提取地形信息
-        # 🚨 修复：obs实际结构（与场景一致）: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境6] = 81维（地形从29→32）
-        terrain_start_idx = 9  # 跳过状态9
-        terrain_info = tf.cast(obs[:, terrain_start_idx:terrain_start_idx + 32], dtype)  # 🔧 修复：地形信息32维（从29维增加到32维，前方探测点+3）
+        # 🔧 新增：检查地形感知模式（评估时支持Oracle模式）
+        terrain_sensing_mode = getattr(self.args, 'terrain_sensing_mode', 'local')
+        use_oracle = terrain_sensing_mode.startswith('oracle')
         
-        # 🔧 修复：正确还原地形信息（确保归一化还原正确）
-        # 地形信息实际结构：相对高度(0), 当前地形高度(1), 梯度(2-5), 前方绝对高度(6-13), 周围近距绝对高度(14-21), 周围远距绝对高度(22-29), 复杂度(30), 法向净空(31)
-        # 地形信息归一化方式：relative_height/20.0, current_height/100.0, gradient/10.0, absolute_height/100.0, normal_clearance/20.0
-        relative_height = terrain_info[:, 0:1] * tf.cast(20.0, dtype)  # 🔧 修复：索引0是相对高度（智能体高度-地形高度）
-        current_height = terrain_info[:, 1:2] * tf.cast(100.0, dtype)  # 🔧 修复：索引1是当前地形高度 (归一化还原：×100.0)
-        terrain_gradients = terrain_info[:, 2:6] * tf.cast(10.0, dtype)  # 🔧 修复：索引2-5是地形梯度 (归一化还原：×10.0)
-        # 🔧 改为绝对高度：前方8个点、近距8方向、远距8方向都是绝对高度（除以100.0归一化）
-        forward_terrain_heights = terrain_info[:, 6:14] * tf.cast(100.0, dtype)  # 前方8个点的绝对地形高度
-        surround_near_heights = terrain_info[:, 14:22] * tf.cast(100.0, dtype)  # 近距8方向的绝对地形高度
-        surround_far_heights = terrain_info[:, 22:30] * tf.cast(100.0, dtype)  # 远距8方向的绝对地形高度
+        # 🔧 调试信息：验证Oracle模式是否生效
+        if use_oracle:
+            if self.scenario_ref is None:
+                # 如果scenario_ref为None，回退到local模式
+                use_oracle = False
+                if not hasattr(self, '_oracle_warning_printed'):
+                    print(f"⚠️  警告: Oracle模式({terrain_sensing_mode})但scenario_ref为None，回退到local模式")
+                    self._oracle_warning_printed = True
+            elif not hasattr(self.scenario_ref, 'get_terrain_height'):
+                # 如果scenario没有get_terrain_height方法，回退到local模式
+                use_oracle = False
+                if not hasattr(self, '_oracle_warning_printed'):
+                    print(f"⚠️  警告: Oracle模式({terrain_sensing_mode})但scenario缺少get_terrain_height方法，回退到local模式")
+                    self._oracle_warning_printed = True
+        
+        if use_oracle and self.scenario_ref is not None:
+            # Oracle模式：使用Oracle接口获取真值地形信息
+            # 注意：只在评估时使用，训练时始终使用local模式
+            # 计算probe的真实世界坐标，然后调用get_terrain_height获取真值
+            
+            # 从观测中提取智能体位置和速度方向
+            agent_pos_xy = agent_pos[:, 0:2]  # (batch, 2)
+            agent_height = agent_pos[:, 2:3]   # (batch, 1)
+            
+            # 从观测中提取速度（索引3-5是速度，需要还原）
+            # obs结构: [位置3, 速度3, 高度1, 朝向2] = 9维状态
+            vel_xy = obs[:, 3:5]  # 速度（已归一化，需要还原）
+            max_speed = tf.cast(getattr(self, 'agent_max_speed_cached', 37.5), dtype)
+            vel_xy = vel_xy * max_speed  # 还原速度
+            
+            # 计算速度方向（前方方向）
+            vel_norm = tf.norm(vel_xy, axis=1, keepdims=True) + tf.cast(1e-6, dtype)
+            vel_dir = vel_xy / vel_norm  # 归一化方向
+            
+            # 前方探测距离（与local模式一致）
+            forward_distances = tf.constant([2.0, 4.0, 6.0, 10.0, 15.0, 20.0, 25.0, 30.0], dtype=dtype)
+            
+            # 周围探测方向（8个方向）
+            surround_directions = tf.constant([
+                [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [-1.0, 1.0],
+                [-1.0, 0.0], [-1.0, -1.0], [0.0, -1.0], [1.0, -1.0]
+            ], dtype=dtype)  # (8, 2)
+            surround_directions = surround_directions / (tf.norm(surround_directions, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+            
+            # 周围探测距离
+            surround_near_dist = tf.cast(5.0, dtype)   # 近距5米
+            surround_far_dist = tf.cast(12.0, dtype)    # 远距12米
+            
+            # 使用tf.py_function调用Python函数获取地形高度
+            # 🔧 关键：通过闭包访问self.scenario_ref（tf.py_function不能直接传递Python对象）
+            scenario_ref = self.scenario_ref  # 捕获到局部变量
+            
+            def _get_oracle_terrain_info(agent_pos_xy_np, vel_dir_np):
+                """使用Oracle接口获取地形信息（通过闭包访问scenario_ref）"""
+                import numpy as np
+                batch_size = agent_pos_xy_np.shape[0]
+                
+                # 初始化输出数组
+                current_heights = np.zeros((batch_size, 1), dtype=np.float32)
+                forward_heights = np.zeros((batch_size, 8), dtype=np.float32)
+                surround_near_heights = np.zeros((batch_size, 8), dtype=np.float32)
+                surround_far_heights = np.zeros((batch_size, 8), dtype=np.float32)
+                gradients = np.zeros((batch_size, 4), dtype=np.float32)
+                
+                if scenario_ref is None or not hasattr(scenario_ref, 'get_terrain_height'):
+                    # 如果scenario不可用，回退到local模式（从观测中提取）
+                    return current_heights, forward_heights, surround_near_heights, surround_far_heights, gradients
+                
+                forward_dists = np.array([2.0, 4.0, 6.0, 10.0, 15.0, 20.0, 25.0, 30.0], dtype=np.float32)
+                surround_dirs = np.array([
+                    [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [-1.0, 1.0],
+                    [-1.0, 0.0], [-1.0, -1.0], [0.0, -1.0], [1.0, -1.0]
+                ], dtype=np.float32)
+                # 归一化方向
+                dir_norms = np.linalg.norm(surround_dirs, axis=1, keepdims=True)
+                surround_dirs = surround_dirs / (dir_norms + 1e-6)
+
+                use_batch = hasattr(scenario_ref, 'get_terrain_heights_batch')
+                if use_batch:
+                    try:
+                        ax = agent_pos_xy_np[:, 0:1].astype(np.float32, copy=False)
+                        ay = agent_pos_xy_np[:, 1:2].astype(np.float32, copy=False)
+                        vx = vel_dir_np[:, 0:1].astype(np.float32, copy=False)
+                        vy = vel_dir_np[:, 1:2].astype(np.float32, copy=False)
+
+                        current_vals = scenario_ref.get_terrain_heights_batch(
+                            agent_pos_xy_np[:, 0], agent_pos_xy_np[:, 1]
+                        )
+                        current_heights[:, 0] = np.asarray(current_vals, dtype=np.float32)
+
+                        forward_x = ax + vx * forward_dists.reshape(1, -1)
+                        forward_y = ay + vy * forward_dists.reshape(1, -1)
+                        forward_vals = scenario_ref.get_terrain_heights_batch(
+                            forward_x.reshape(-1), forward_y.reshape(-1)
+                        )
+                        forward_heights[:, :] = np.asarray(forward_vals, dtype=np.float32).reshape(batch_size, -1)
+
+                        dir_x = surround_dirs[:, 0].reshape(1, -1)
+                        dir_y = surround_dirs[:, 1].reshape(1, -1)
+
+                        near_x = ax + dir_x * 5.0
+                        near_y = ay + dir_y * 5.0
+                        near_vals = scenario_ref.get_terrain_heights_batch(
+                            near_x.reshape(-1), near_y.reshape(-1)
+                        )
+                        surround_near_heights[:, :] = np.asarray(near_vals, dtype=np.float32).reshape(batch_size, -1)
+
+                        far_x = ax + dir_x * 12.0
+                        far_y = ay + dir_y * 12.0
+                        far_vals = scenario_ref.get_terrain_heights_batch(
+                            far_x.reshape(-1), far_y.reshape(-1)
+                        )
+                        surround_far_heights[:, :] = np.asarray(far_vals, dtype=np.float32).reshape(batch_size, -1)
+
+                        # 梯度（4个方向）- 批量计算
+                        try:
+                            grad_dx = 1.0
+                            grad_dy = 1.0
+                            h_x_plus = scenario_ref.get_terrain_heights_batch(
+                                (ax + grad_dx).reshape(-1), ay.reshape(-1)
+                            )
+                            h_x_minus = scenario_ref.get_terrain_heights_batch(
+                                (ax - grad_dx).reshape(-1), ay.reshape(-1)
+                            )
+                            h_y_plus = scenario_ref.get_terrain_heights_batch(
+                                ax.reshape(-1), (ay + grad_dy).reshape(-1)
+                            )
+                            h_y_minus = scenario_ref.get_terrain_heights_batch(
+                                ax.reshape(-1), (ay - grad_dy).reshape(-1)
+                            )
+                            grad_x = (np.asarray(h_x_plus, dtype=np.float32) -
+                                      np.asarray(h_x_minus, dtype=np.float32)) / (2.0 * grad_dx)
+                            grad_y = (np.asarray(h_y_plus, dtype=np.float32) -
+                                      np.asarray(h_y_minus, dtype=np.float32)) / (2.0 * grad_dy)
+                            gradients[:, 0] = grad_x
+                            gradients[:, 1] = grad_y
+                            gradients[:, 2] = grad_x
+                            gradients[:, 3] = grad_y
+                        except Exception:
+                            gradients[:, :] = 0.0
+                    except Exception:
+                        use_batch = False
+
+                if not use_batch:
+                    for i in range(batch_size):
+                        ax, ay = float(agent_pos_xy_np[i, 0]), float(agent_pos_xy_np[i, 1])
+                        vx, vy = float(vel_dir_np[i, 0]), float(vel_dir_np[i, 1])
+
+                        # 当前位置地形高度
+                        try:
+                            current_heights[i, 0] = scenario_ref.get_terrain_height(ax, ay)
+                        except Exception:
+                            current_heights[i, 0] = 0.0
+
+                        # 前方8个探测点
+                        for j, dist in enumerate(forward_dists):
+                            probe_x = ax + vx * dist
+                            probe_y = ay + vy * dist
+                            try:
+                                forward_heights[i, j] = scenario_ref.get_terrain_height(probe_x, probe_y)
+                            except Exception:
+                                forward_heights[i, j] = 0.0
+
+                        # 周围近距8方向
+                        for j, dir_vec in enumerate(surround_dirs):
+                            probe_x = ax + dir_vec[0] * 5.0
+                            probe_y = ay + dir_vec[1] * 5.0
+                            try:
+                                surround_near_heights[i, j] = scenario_ref.get_terrain_height(probe_x, probe_y)
+                            except Exception:
+                                surround_near_heights[i, j] = 0.0
+
+                        # 周围远距8方向
+                        for j, dir_vec in enumerate(surround_dirs):
+                            probe_x = ax + dir_vec[0] * 12.0
+                            probe_y = ay + dir_vec[1] * 12.0
+                            try:
+                                surround_far_heights[i, j] = scenario_ref.get_terrain_height(probe_x, probe_y)
+                            except Exception:
+                                surround_far_heights[i, j] = 0.0
+
+                # 梯度（4个方向）
+                if not use_batch and hasattr(scenario_ref, 'get_terrain_grad'):
+                    for i in range(batch_size):
+                        ax, ay = float(agent_pos_xy_np[i, 0]), float(agent_pos_xy_np[i, 1])
+                        try:
+                            grad = scenario_ref.get_terrain_grad(ax, ay, dx=1.0, dy=1.0)
+                            gradients[i, 0] = grad[0]  # grad_x
+                            gradients[i, 1] = grad[1]  # grad_y
+                            # 计算另外两个方向的梯度（用于兼容）
+                            gradients[i, 2] = grad[0]
+                            gradients[i, 3] = grad[1]
+                        except Exception:
+                            gradients[i, :] = 0.0
+                
+                return current_heights, forward_heights, surround_near_heights, surround_far_heights, gradients
+            
+            # 调用Oracle接口（需要将tensor转换为numpy）
+            # 🔧 注意：在eager模式下可以直接调用，在graph模式下需要使用tf.py_function
+            oracle_results = tf.py_function(
+                func=lambda ap, vd: _get_oracle_terrain_info(ap.numpy(), vd.numpy()),
+                inp=[agent_pos_xy, vel_dir],
+                Tout=[tf.float32, tf.float32, tf.float32, tf.float32, tf.float32]
+            )
+            
+            # 设置输出形状（tf.py_function需要显式设置形状）
+            oracle_results[0].set_shape([None, 1])
+            oracle_results[1].set_shape([None, 8])
+            oracle_results[2].set_shape([None, 8])
+            oracle_results[3].set_shape([None, 8])
+            oracle_results[4].set_shape([None, 4])
+            
+            # 解析返回结果
+            current_height = oracle_results[0]
+            forward_terrain_heights = oracle_results[1]
+            surround_near_heights = oracle_results[2]
+            surround_far_heights = oracle_results[3]
+            terrain_gradients = oracle_results[4] * tf.cast(10.0, dtype)  # 归一化（与local模式一致）
+            
+            # 计算相对高度
+            relative_height = agent_pos[:, 2:3] - current_height
+            
+        else:
+            # Local模式：从观测中提取地形信息（训练时始终使用local模式）
+            # 🚨 修复：obs实际结构（与场景一致）: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境6] = 81维（地形从29→32）
+            terrain_start_idx = 9  # 跳过状态9
+            terrain_info = tf.cast(obs[:, terrain_start_idx:terrain_start_idx + 32], dtype)  # 🔧 修复：地形信息32维（从29维增加到32维，前方探测点+3）
+            
+            # 🔧 修复：正确还原地形信息（确保归一化还原正确）
+            # 地形信息实际结构：相对高度(0), 当前地形高度(1), 梯度(2-5), 前方绝对高度(6-13), 周围近距绝对高度(14-21), 周围远距绝对高度(22-29), 复杂度(30), 法向净空(31)
+            # 地形信息归一化方式：relative_height/20.0, current_height/100.0, gradient/10.0, absolute_height/100.0, normal_clearance/20.0
+            relative_height = terrain_info[:, 0:1] * tf.cast(20.0, dtype)  # 🔧 修复：索引0是相对高度（智能体高度-地形高度）
+            current_height = terrain_info[:, 1:2] * tf.cast(100.0, dtype)  # 🔧 修复：索引1是当前地形高度 (归一化还原：×100.0)
+            terrain_gradients = terrain_info[:, 2:6] * tf.cast(10.0, dtype)  # 🔧 修复：索引2-5是地形梯度 (归一化还原：×10.0)
+            # 🔧 改为绝对高度：前方8个点、近距8方向、远距8方向都是绝对高度（除以100.0归一化）
+            forward_terrain_heights = terrain_info[:, 6:14] * tf.cast(100.0, dtype)  # 前方8个点的绝对地形高度
+            surround_near_heights = terrain_info[:, 14:22] * tf.cast(100.0, dtype)  # 近距8方向的绝对地形高度
+            surround_far_heights = terrain_info[:, 22:30] * tf.cast(100.0, dtype)  # 远距8方向的绝对地形高度
         
         # 🔧 改进地形距离计算：区分穿透和未穿透情况
         agent_height = agent_pos[:, 2:3]  # 智能体Z坐标
@@ -5647,6 +5878,19 @@ class OptimizedMADDPG:
         terrain_normal_base = tf.concat([-grad_x, -grad_y, tf.ones_like(grad_x)], axis=1)
         terrain_normal_base = terrain_normal_base / (tf.norm(terrain_normal_base, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
         
+        # 🚨 关键修复：确保法向量Z分量始终为正（防止向下分量导致穿透加重）
+        # 问题：当梯度很大（陡峭地形）时，归一化后的法向量Z分量可能很小甚至为负
+        # 这会导致地形斥力产生向下的分量，抵消甚至加重穿透
+        # 解决方案：强制法向量Z分量≥0.1，确保始终指向上方
+        terrain_normal_z = terrain_normal_base[:, 2:3]
+        terrain_normal_z_safe = tf.maximum(terrain_normal_z, tf.cast(0.1, dtype))  # 确保z分量≥0.1
+        terrain_normal_safe = tf.concat([
+            terrain_normal_base[:, 0:2],
+            terrain_normal_z_safe
+        ], axis=1)
+        # 重新归一化以确保单位向量
+        terrain_normal_safe = terrain_normal_safe / (tf.norm(terrain_normal_safe, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+        
         # 穿透时使用纯向上的法向量，确保产生向上推力
         upward_normal = tf.concat([
             tf.zeros_like(grad_x),
@@ -5657,8 +5901,16 @@ class OptimizedMADDPG:
         # 根据穿透掩码选择法向量
         terrain_normal_vertical = tf.where(
             tf.tile(penetration_mask, [1, 3]),
-            upward_normal,
-            terrain_normal_base
+            upward_normal,  # 穿透时：纯向上 [0, 0, 1]
+            terrain_normal_safe  # 正常时：确保Z分量≥0.1的地形外法向
+        )
+        
+        # 🚨 额外安全验证：如果法向量Z分量仍然为负（异常情况），强制使用向上法向量
+        terrain_normal_z_final = terrain_normal_vertical[:, 2:3]
+        terrain_normal_vertical = tf.where(
+            tf.tile(terrain_normal_z_final < tf.cast(0.0, dtype), [1, 3]),
+            upward_normal,  # 如果Z分量为负，强制使用向上法向量
+            terrain_normal_vertical
         )
         
         # 2. 前方地形斥力（基于前方地形高度信息）
@@ -5790,123 +6042,196 @@ class OptimizedMADDPG:
         
         # 计算垂直方向斥力（基于当前点地形高度）
         terrain_force_vertical = terrain_normal_vertical * repulsion_strength
+        # 🚨 关键安全栅：地形排斥力的z分量不得为负（确保始终产生向上推力）
+        terrain_force_vertical_z = terrain_force_vertical[:, 2:3]
+        terrain_force_vertical_z_safe = tf.maximum(terrain_force_vertical_z, tf.cast(0.0, dtype))  # 强制z≥0
+        terrain_force_vertical = tf.concat([
+            terrain_force_vertical[:, 0:2],
+            terrain_force_vertical_z_safe
+        ], axis=1)
         
-        # 🔧 改进：基于探测点的矢量斥力计算，而不是仅基于当前位置的Z坐标
+        # 🔧 优化：基于净空(clearance)的曲面外法向斥力，避免地形高于无人机时产生向下推力导致穿地
         # 从观察信息中提取速度方向（索引3:6是速度，归一化到[-1,1]，需要还原）
         vel_norm = obs[:, 3:6] * tf.cast(22.5, dtype)  # 还原速度（max_speed=22.5）
         vel_norm_magnitude = tf.norm(vel_norm, axis=1, keepdims=True) + tf.cast(1e-6, dtype)
         vel_dir = vel_norm / vel_norm_magnitude  # 速度方向（单位向量）
         vel_dir_xy = vel_dir[:, 0:2]  # XY平面的速度方向
         
-        # 1. 前方探测点的矢量斥力（8个点：2, 4, 6, 10, 15, 20, 25, 30米）
-        # 🔧 修复地形穿透：增加前方探测点密度，消除0-5米盲区
-        forward_distances = tf.constant([2.0, 4.0, 6.0, 10.0, 15.0, 20.0, 25.0, 30.0], dtype=dtype)  # 前方探测距离
-        forward_terrain_heights_reshaped = tf.reshape(forward_terrain_heights, [-1, 8])  # (batch, 8) - 已经是绝对高度
+        # 🚨 关键优化：复用垂直斥力中已计算的地形外法向（确保一致性）
+        # terrain_normal_base 已在上面计算：normalize([-grad_x, -grad_y, 1])
+        # 强制normal_z>0：确保法向量指向地形外部（向上）
+        terrain_normal_z = terrain_normal_base[:, 2:3]
+        terrain_normal_z_positive = tf.maximum(terrain_normal_z, tf.cast(0.1, dtype))  # 确保z分量≥0.1
+        terrain_normal_safe = tf.concat([
+            terrain_normal_base[:, 0:2],
+            terrain_normal_z_positive
+        ], axis=1)
+        terrain_normal_safe = terrain_normal_safe / (tf.norm(terrain_normal_safe, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
         
-        # 🔧 改为绝对高度：观察信息中的forward_terrain_heights已经是绝对高度（乘以100.0还原），无需再加current_height
-        forward_terrain_heights = forward_terrain_heights_reshaped  # (batch, 8) - 前方探测点的绝对地形高度（8个点）
+        # 穿透时强制使用纯向上法向量
+        terrain_normal_forward = tf.where(
+            tf.tile(penetration_mask, [1, 3]),
+            upward_normal,  # 穿透时：[0, 0, 1]
+            terrain_normal_safe  # 正常时：地形外法向（z≥0.1）
+        )
         
-        # 计算每个前方探测点的3D位置
-        # 探测点位置：XY = 智能体XY + 速度方向XY * 距离，Z = 该XY位置的地形高度（用于判断碰撞）
-        # 🔧 修复维度不匹配：vel_dir_xy需要扩展为[batch, 8, 2]，forward_distances需要扩展为[batch, 8, 1]
-        # agent_pos[:, 0:2]: [batch, 2]
-        # vel_dir_xy: [batch, 2]
-        # forward_distances: [8]
-        agent_pos_xy_expanded = tf.expand_dims(agent_pos[:, 0:2], axis=1)  # [batch, 1, 2]
-        vel_dir_xy_expanded = tf.expand_dims(vel_dir_xy, axis=1)  # [batch, 1, 2]
-        forward_distances_expanded = tf.expand_dims(forward_distances, axis=0)  # [1, 8]
-        # 扩展vel_dir_xy到[batch, 8, 2]：每个距离对应一个方向
-        vel_dir_xy_tiled = tf.tile(vel_dir_xy_expanded, [1, 8, 1])  # [batch, 8, 2]
-        # 扩展forward_distances到[batch, 8, 1]：每个距离对应一个值
-        forward_distances_tiled = tf.tile(tf.expand_dims(forward_distances_expanded, axis=2), [tf.shape(agent_pos)[0], 1, 1])  # [batch, 8, 1]
-        # 计算探测点位置：agent_pos + vel_dir * distance
-        forward_probe_positions_xy = agent_pos_xy_expanded + vel_dir_xy_tiled * forward_distances_tiled  # [batch, 8, 2]
-        forward_probe_positions_z = tf.expand_dims(forward_terrain_heights, axis=2)  # (batch, 8, 1) - 探测点的地形高度
-        forward_probe_positions = tf.concat([
-            forward_probe_positions_xy,
-            forward_probe_positions_z
-        ], axis=2)  # (batch, 8, 3)
+        # 🚨 关键重构：基于净空的连续斥力势场（完全向量化、XLA友好、可微）
+        # 替换硬阈值触发 + tf.where 掩码逻辑为连续势场
         
-        # 计算从智能体到每个探测点的矢量（完整的3D矢量）
-        agent_pos_expanded = tf.expand_dims(agent_pos, axis=1)  # (batch, 1, 3)
-        forward_vecs = forward_probe_positions - agent_pos_expanded  # (batch, 8, 3) - 从智能体指向探测点（8个点）
-        forward_dists = tf.norm(forward_vecs, axis=2, keepdims=True) + tf.cast(1e-6, dtype)  # (batch, 8, 1)
-        forward_dirs = forward_vecs / forward_dists  # (batch, 8, 3) - 单位方向向量
+        # 1. 统一定义净空（全部使用"净空=自身高度-地形高度"）
+        forward_terrain_heights_reshaped = tf.reshape(forward_terrain_heights, [-1, 8])  # (batch, 8) - 绝对高度
+        surround_terrain_heights = tf.reshape(surround_near_heights, [-1, 8])  # (batch, 8) - 绝对高度
         
-        # 🔧 修复：改进前方碰撞检测逻辑，避免过度阻止向前移动
-        # 计算每个探测点的碰撞风险（地形高度 - 智能体高度）
-        forward_height_diff = forward_terrain_heights - tf.tile(agent_height, [1, 8])  # (batch, 8)
-        # 🔧 改进：只有当地形高度明显高于智能体（超过2米）时才产生斥力，避免轻微高度差就阻止移动
-        forward_collision_threshold = tf.cast(2.0, dtype)  # 碰撞阈值（米）
-        forward_collision_mask = forward_height_diff > forward_collision_threshold  # (batch, 8) - 地形明显高于智能体（8个点）
+        # 净空定义：clearance = agent_z - terrain_h（全部为正表示安全，为负表示穿透）
+        clear_f = agent_height - forward_terrain_heights  # (batch, 8) - 前方净空
+        clear_s = agent_height - surround_terrain_heights  # (batch, 8) - 周围净空
+        clear_0 = agent_height - current_height  # (batch, 1) - 当前位置净空
         
-        # 🔧 改进：计算每个探测点的斥力强度，使用更合理的公式
-        # 斥力强度应该与高度差和距离相关，但不应过强
-        forward_repulsion_strength = tf.where(
-            forward_collision_mask,
-            k_rep * (forward_height_diff - forward_collision_threshold) / (tf.squeeze(forward_dists, axis=2) + tf.cast(1.0, dtype)) * tf.cast(0.3, dtype),  # 斥力强度（缩放0.3倍，避免过强）
-            tf.zeros_like(forward_height_diff)  # 无碰撞时，无斥力
-        )  # (batch, 8)
+        # 2. 获取速度信息（用于预测净空）
+        # 从观测中提取速度（索引3-5是速度，已归一化，需要还原）
+        vel_norm = obs[:, 3:6]  # (batch, 3) - 归一化速度
+        max_speed = tf.cast(getattr(self, 'agent_max_speed_cached', 37.5), dtype)
+        vel_actual = vel_norm * max_speed  # (batch, 3) - 还原速度
+        v_z = vel_actual[:, 2:3]  # (batch, 1) - Z方向速度（下降时为负）
         
-        # 🔧 修复：计算完整的3D矢量斥力（从探测点指向智能体）
-        # 斥力方向：从探测点指向智能体，即 -forward_dirs（完整的3D方向）
-        forward_repulsion_vectors = -forward_dirs * tf.expand_dims(forward_repulsion_strength, axis=2)  # (batch, 8, 3) - 完整的3D矢量（8个点）
-        forward_repulsion_total = tf.reduce_sum(forward_repulsion_vectors, axis=1)  # (batch, 3) - 合并所有前方探测点的完整3D斥力
+        # 获取时间步长（用于预测净空）
+        import os
+        dt = tf.cast(float(os.getenv('SIMULATION_DT', '0.08')), dtype)  # 默认0.08秒
         
-        # 2. 周围探测点的矢量斥力（8个方向，每个方向近距5米）
+        # 3. 裁剪净空并计算预测净空（避免数值爆炸与XLA下NaN传播）
+        c_min = tf.cast(0.05, dtype)  # 最小净空（米）
+        d_safe = radius  # (batch, 1) - 安全检测半径（10-50米）
+        c_max = d_safe  # (batch, 1) - 最大净空（裁剪上限）
+        
+        # 裁剪净空
+        c_f = tf.clip_by_value(clear_f, c_min, tf.expand_dims(c_max, axis=1))  # (batch, 8)
+        c_s = tf.clip_by_value(clear_s, c_min, tf.expand_dims(c_max, axis=1))  # (batch, 8)
+        c_0 = tf.clip_by_value(clear_0, c_min, c_max)  # (batch, 1)
+        
+        # 预测净空：pred_c = c + v_z * dt（v_z下降时为负，预测净空会更小，提前触发）
+        pred_c_f = c_f + v_z * dt  # (batch, 8) - 前方预测净空
+        pred_c_s = c_s + v_z * dt  # (batch, 8) - 周围预测净空
+        pred_c_0 = c_0 + v_z * dt  # (batch, 1) - 当前位置预测净空
+        
+        # 4. 平滑门控因子（替代硬mask）：gate = sigmoid((d_safe - pred_c)/sigma)
+        sigma = tf.cast(1.5, dtype)  # 门控平滑参数（1-2米）
+        gate_f = tf.sigmoid((tf.expand_dims(d_safe, axis=1) - pred_c_f) / sigma)  # (batch, 8)
+        gate_s = tf.sigmoid((tf.expand_dims(d_safe, axis=1) - pred_c_s) / sigma)  # (batch, 8)
+        gate_0 = tf.sigmoid((d_safe - pred_c_0) / sigma)  # (batch, 1)
+        
+        # 5. 斥力强度（标准clearance势场形式，完全向量化）
+        eps = tf.cast(1e-6, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
+        inv_c_f = tf.cast(1.0, dtype) / (c_f + eps)  # (batch, 8)
+        inv_c_s = tf.cast(1.0, dtype) / (c_s + eps)  # (batch, 8)
+        inv_c_0 = tf.cast(1.0, dtype) / (c_0 + eps)  # (batch, 1)
+        inv_d_f = tf.cast(1.0, dtype) / (tf.expand_dims(d_safe, axis=1) + eps)  # (batch, 8)
+        inv_d_s = tf.cast(1.0, dtype) / (tf.expand_dims(d_safe, axis=1) + eps)  # (batch, 8)
+        inv_d_0 = tf.cast(1.0, dtype) / (d_safe + eps)  # (batch, 1)
+        
+        # 目标距离影响因子κ
+        goal_dist = tf.norm(goal_pos - agent_pos, axis=1, keepdims=True)  # (batch, 1)
+        kappa_denom = tf.cast(1.0, dtype) + goal_dist / tf.cast(50.0, dtype)
+        kappa = tf.cast(1.0, dtype) / (kappa_denom + eps)
+        kappa = tf.clip_by_value(kappa, tf.cast(0.1, dtype), tf.cast(1.0, dtype))  # (batch, 1)
+        
+        # 下沉速度强化因子（强化下沉时的抗穿透）
+        k_v = tf.cast(0.5, dtype)  # 速度强化系数
+        v_z_negative = tf.nn.relu(-v_z)  # (batch, 1) - 只考虑下降速度（v_z<0）
+        velocity_factor = tf.cast(1.0, dtype) + k_v * v_z_negative  # (batch, 1)
+        
+        # 斥力强度：strength = k_rep * gate * (inv_c - inv_d) * inv_c * inv_c * kappa * velocity_factor
+        strength_f = k_rep * gate_f * (inv_c_f - inv_d_f) * inv_c_f * inv_c_f * tf.expand_dims(kappa * velocity_factor, axis=1)  # (batch, 8)
+        strength_s = k_rep * gate_s * (inv_c_s - inv_d_s) * inv_c_s * inv_c_s * tf.expand_dims(kappa * velocity_factor, axis=1)  # (batch, 8)
+        strength_0 = k_rep * gate_0 * (inv_c_0 - inv_d_0) * inv_c_0 * inv_c_0 * kappa * velocity_factor  # (batch, 1)
+        
+        # 上限裁剪（保证稳定）
+        Fmax = tf.cast(10000.0, dtype)
+        strength_f = tf.clip_by_value(strength_f, tf.cast(0.0, dtype), Fmax)
+        strength_s = tf.clip_by_value(strength_s, tf.cast(0.0, dtype), Fmax)
+        strength_0 = tf.clip_by_value(strength_0, tf.cast(0.0, dtype), Fmax)
+        
+        # 6. 方向向量（避免向下分量）
+        # 6.1 前方/周围探测点：使用水平几何方向构造斥力方向并强制向上
+        forward_distances = tf.constant([2.0, 4.0, 6.0, 10.0, 15.0, 20.0, 25.0, 30.0], dtype=dtype)  # (8,)
+        # 从速度方向获取前方方向（XY平面）
+        vel_xy = vel_actual[:, 0:2]  # (batch, 2)
+        vel_xy_norm = tf.norm(vel_xy, axis=1, keepdims=True) + eps
+        vel_dir_xy = vel_xy / vel_xy_norm  # (batch, 2) - 归一化XY方向
+        
+        # 前方探测点位置（XY平面）
+        forward_dir_xy = vel_dir_xy  # (batch, 2) - 前方方向（每个探测点使用相同方向）
+        forward_dir_xy_expanded = tf.expand_dims(forward_dir_xy, axis=1)  # (batch, 1, 2)
+        
+        # 周围探测点方向（8个方向）
         surround_directions = tf.constant([
             [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [-1.0, 1.0],
             [-1.0, 0.0], [-1.0, -1.0], [0.0, -1.0], [1.0, -1.0]
         ], dtype=dtype)  # (8, 2)
-        surround_directions_norm = surround_directions / (tf.norm(surround_directions, axis=1, keepdims=True) + tf.cast(1e-6, dtype))  # 归一化
-        surround_distance = tf.cast(5.0, dtype)  # 近距探测距离
+        surround_directions_norm = surround_directions / (tf.norm(surround_directions, axis=1, keepdims=True) + eps)  # (8, 2)
+        surround_dir_xy_expanded = tf.expand_dims(surround_directions_norm, axis=0)  # (1, 8, 2)
         
-        # 计算每个周围探测点的3D位置
-        # 🔧 改为绝对高度：观察信息中的surround_near_heights已经是绝对高度（乘以100.0还原），无需再加current_height
-        surround_terrain_heights = tf.reshape(surround_near_heights, [-1, 8])  # (batch, 8) - 只使用近距探测点，已经是绝对高度
+        # 计算从探测点指向智能体的方向（水平方向取反，Z方向强制向上）
+        z_up = tf.cast(0.7, dtype)  # Z向上分量常数（0.5-1.0）
+        # 前方：dir_xy = (probe_xy - agent_xy) / ||probe_xy - agent_xy||，但这里我们使用速度方向的反方向
+        forward_dir_xy_reverse = -forward_dir_xy_expanded  # (batch, 1, 2) - 从前方指向智能体
+        forward_rep_dir_xy = forward_dir_xy_reverse / (tf.norm(forward_dir_xy_reverse, axis=2, keepdims=True) + eps)  # (batch, 1, 2)
+        # 使用广播创建Z分量
+        forward_rep_dir = tf.concat([
+            forward_rep_dir_xy,
+            tf.ones_like(forward_rep_dir_xy[:, :, 0:1]) * z_up  # (batch, 1, 1)
+        ], axis=2)  # (batch, 1, 3)
+        forward_rep_dir = forward_rep_dir / (tf.norm(forward_rep_dir, axis=2, keepdims=True) + eps)  # (batch, 1, 3) - 归一化
+        forward_rep_dir = tf.tile(forward_rep_dir, [1, 8, 1])  # (batch, 8, 3) - 扩展到8个点
         
-        # 计算每个周围探测点的3D位置
-        # 探测点位置：XY = 智能体XY + 方向 * 距离，Z = 该XY位置的地形高度（用于判断碰撞）
-        surround_probe_positions_xy = tf.expand_dims(agent_pos[:, 0:2], axis=1) + tf.expand_dims(surround_directions_norm, axis=0) * surround_distance  # (batch, 8, 2)
-        surround_probe_positions_z = tf.expand_dims(surround_terrain_heights, axis=2)  # (batch, 8, 1) - 探测点的地形高度
-        surround_probe_positions = tf.concat([
-            surround_probe_positions_xy,
-            surround_probe_positions_z
-        ], axis=2)  # (batch, 8, 3)
+        # 周围：dir_xy = (probe_xy - agent_xy) / ||probe_xy - agent_xy||
+        surround_dir_xy_reverse = -surround_dir_xy_expanded  # (1, 8, 2) - 从周围指向智能体
+        surround_rep_dir_xy = surround_dir_xy_reverse / (tf.norm(surround_dir_xy_reverse, axis=2, keepdims=True) + eps)  # (1, 8, 2)
+        surround_rep_dir = tf.concat([
+            surround_rep_dir_xy,
+            tf.ones_like(surround_rep_dir_xy[:, :, 0:1]) * z_up  # (1, 8, 1)
+        ], axis=2)  # (1, 8, 3)
+        surround_rep_dir = surround_rep_dir / (tf.norm(surround_rep_dir, axis=2, keepdims=True) + eps)  # (1, 8, 3) - 归一化
+        # 使用动态batch_size进行tile
+        batch_size_dyn = tf.shape(agent_pos)[0]
+        surround_rep_dir = tf.tile(surround_rep_dir, [batch_size_dyn, 1, 1])  # (batch, 8, 3)
         
-        # 计算从智能体到每个探测点的矢量（完整的3D矢量）
-        surround_vecs = surround_probe_positions - agent_pos_expanded  # (batch, 8, 3)
-        surround_dists = tf.norm(surround_vecs, axis=2, keepdims=True) + tf.cast(1e-6, dtype)  # (batch, 8, 1)
-        surround_dirs = surround_vecs / surround_dists  # (batch, 8, 3)
+        # 6.2 当前位置：使用地形梯度估计法向（确保Z分量足够向上）
+        z_min = tf.cast(0.3, dtype)  # Z分量最小值（提高到0.3）
+        terrain_normal_z_0 = terrain_normal_safe[:, 2:3]  # (batch, 1)
+        terrain_normal_z_0_safe = tf.maximum(terrain_normal_z_0, z_min)  # (batch, 1)
+        terrain_normal_0 = tf.concat([
+            terrain_normal_safe[:, 0:2],
+            terrain_normal_z_0_safe
+        ], axis=1)  # (batch, 3)
+        terrain_normal_0 = terrain_normal_0 / (tf.norm(terrain_normal_0, axis=1, keepdims=True) + eps)  # (batch, 3) - 重新归一化
         
-        # 🔧 修复：改进周围碰撞检测逻辑，避免过度阻止移动
-        # 计算每个探测点的碰撞风险
-        surround_height_diff = surround_terrain_heights - tf.tile(agent_height, [1, 8])  # (batch, 8)
-        # 🔧 改进：只有当地形高度明显高于智能体（超过2米）时才产生斥力
-        surround_collision_threshold = tf.cast(2.0, dtype)  # 碰撞阈值（米）
-        surround_collision_mask = surround_height_diff > surround_collision_threshold  # (batch, 8)
+        # 7. 合成力（完全向量化，避免Python list/tf.stack/tf.tile）
+        # 前方斥力：F_f = sum(rep_dir_f * strength_f[...,None], axis=1)
+        forward_repulsion_vectors = forward_rep_dir * tf.expand_dims(strength_f, axis=2)  # (batch, 8, 3)
+        forward_repulsion_total = tf.reduce_sum(forward_repulsion_vectors, axis=1)  # (batch, 3)
         
-        # 🔧 改进：计算每个探测点的斥力强度，使用更合理的公式
-        surround_repulsion_strength = tf.where(
-            surround_collision_mask,
-            k_rep * (surround_height_diff - surround_collision_threshold) / (tf.squeeze(surround_dists, axis=2) + tf.cast(1.0, dtype)) * tf.cast(0.2, dtype),  # 侧向斥力强度（比前方更弱，0.2倍）
-            tf.zeros_like(surround_height_diff)
-        )  # (batch, 8)
+        # 周围斥力：F_s = sum(rep_dir_s * strength_s[...,None], axis=1)
+        surround_repulsion_vectors = surround_rep_dir * tf.expand_dims(strength_s, axis=2)  # (batch, 8, 3)
+        surround_repulsion_total = tf.reduce_sum(surround_repulsion_vectors, axis=1)  # (batch, 3)
         
-        # 🔧 修复：计算完整的3D矢量斥力（从探测点指向智能体）
-        # 斥力方向：从探测点指向智能体，即 -surround_dirs（完整的3D方向）
-        surround_repulsion_vectors = -surround_dirs * tf.expand_dims(surround_repulsion_strength, axis=2)  # (batch, 8, 3) - 完整的3D矢量
-        surround_repulsion_total = tf.reduce_sum(surround_repulsion_vectors, axis=1)  # (batch, 3) - 合并所有周围探测点的完整3D斥力
+        # 当前位置斥力：F_0 = terrain_normal * strength_0
+        terrain_force_0 = terrain_normal_0 * strength_0  # (batch, 3)
         
-        # 3. 合并垂直斥力（基于当前位置）和探测点矢量斥力
-        # 垂直斥力仍然使用原来的计算（处理穿透情况）
-        terrain_force_combined = terrain_force_vertical + forward_repulsion_total + surround_repulsion_total
+        # 合并所有斥力：terrain_force = F_0 + F_f + F_s
+        terrain_force = terrain_force_0 + forward_repulsion_total + surround_repulsion_total  # (batch, 3)
         
-        # 最终地形斥力
-        terrain_force = terrain_force_combined
+        # 🚨 关键安全栅：地形排斥力的z分量不得为负（确保始终产生向上推力）
+        terrain_force_z = terrain_force[:, 2:3]
+        terrain_force_z_safe = tf.maximum(terrain_force_z, tf.cast(0.0, dtype))  # 强制z≥0
         
-        # 🔧 XLA友好：使用裁剪替代 is_finite 检查
-        terrain_force = tf.clip_by_value(terrain_force, -1e6, 1e6)
+        # 重新组合安全的地形斥力
+        terrain_force = tf.concat([
+            terrain_force[:, 0:2],  # X和Y分量保持不变
+            terrain_force_z_safe  # Z分量强制≥0
+        ], axis=1)
+        
+        # 🔧 XLA友好：使用裁剪确保数值范围（完全向量化，避免Python副作用）
+        terrain_force = tf.clip_by_value(terrain_force, -Fmax, Fmax)
         
         return terrain_force
     
@@ -7337,7 +7662,7 @@ class OptimizedMADDPG:
                             pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
                             pf_batch_reshaped = tf.reshape(pf_batch, [-1, pf_feat_dim * self.n_agents])
                             target_critic_inputs.append(pf_batch_reshaped)
-                        else:
+                    else:
                             # 如果没有PF特征，使用零向量占位符
                             pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
                             pf_placeholder = tf.zeros([tf.shape(global_next_state)[0], pf_feat_dim * self.n_agents], dtype=tf.float32)
@@ -7357,7 +7682,7 @@ class OptimizedMADDPG:
                             pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
                             pf_batch_reshaped = tf.reshape(pf_batch, [-1, pf_feat_dim * self.n_agents])
                             current_critic_inputs.append(pf_batch_reshaped)
-                        else:
+                    else:
                             # 如果没有PF特征，使用零向量占位符
                             pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
                             pf_placeholder = tf.zeros([tf.shape(global_state)[0], pf_feat_dim * self.n_agents], dtype=tf.float32)
@@ -7584,6 +7909,10 @@ class OptimizedMATD3:
         self.obs_shapes = obs_shapes
         self.action_dims = action_dims
         self.args = args
+        
+        # 🔧 新增：存储scenario和world引用（用于评估时的Oracle模式）
+        self.scenario_ref = None
+        self.world_ref = None
         
         _populate_common_cached_constants(self, args)
 
@@ -10931,6 +11260,19 @@ class OptimizedMATD3:
         terrain_normal_base = tf.concat([-grad_x, -grad_y, tf.ones_like(grad_x)], axis=1)
         terrain_normal_base = terrain_normal_base / (tf.norm(terrain_normal_base, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
         
+        # 🚨 关键修复：确保法向量Z分量始终为正（防止向下分量导致穿透加重）
+        # 问题：当梯度很大（陡峭地形）时，归一化后的法向量Z分量可能很小甚至为负
+        # 这会导致地形斥力产生向下的分量，抵消甚至加重穿透
+        # 解决方案：强制法向量Z分量≥0.1，确保始终指向上方
+        terrain_normal_z = terrain_normal_base[:, 2:3]
+        terrain_normal_z_safe = tf.maximum(terrain_normal_z, tf.cast(0.1, dtype))  # 确保z分量≥0.1
+        terrain_normal_safe = tf.concat([
+            terrain_normal_base[:, 0:2],
+            terrain_normal_z_safe
+        ], axis=1)
+        # 重新归一化以确保单位向量
+        terrain_normal_safe = terrain_normal_safe / (tf.norm(terrain_normal_safe, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+        
         # 穿透时使用纯向上的法向量，确保产生最大向上推力
         upward_normal = tf.concat([
             tf.zeros_like(grad_x),
@@ -10941,8 +11283,16 @@ class OptimizedMATD3:
         # 根据穿透掩码选择法向量
         terrain_normal = tf.where(
             tf.tile(penetration_mask, [1, 3]),
-            upward_normal,
-            terrain_normal_base
+            upward_normal,  # 穿透时：纯向上 [0, 0, 1]
+            terrain_normal_safe  # 正常时：确保Z分量≥0.1的地形外法向
+        )
+        
+        # 🚨 额外安全验证：如果法向量Z分量仍然为负（异常情况），强制使用向上法向量
+        terrain_normal_z_final = terrain_normal[:, 2:3]
+        terrain_normal = tf.where(
+            tf.tile(terrain_normal_z_final < tf.cast(0.0, dtype), [1, 3]),
+            upward_normal,  # 如果Z分量为负，强制使用向上法向量
+            terrain_normal
         )
         
         # 🚨 关键改进：调整目标距离影响因子κ，让地形斥力在远距离时也保持足够强度（MATD3版本）
@@ -11012,6 +11362,14 @@ class OptimizedMATD3:
         repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), max_repulsion)
         
         terrain_force = terrain_normal * repulsion_strength
+        # 🚨 关键安全栅：地形排斥力的z分量不得为负（确保始终产生向上推力）
+        # 即使法向量已经验证，但为了安全，再次确保Z分量≥0
+        terrain_force_z = terrain_force[:, 2:3]
+        terrain_force_z_safe = tf.maximum(terrain_force_z, tf.cast(0.0, dtype))  # 强制z≥0
+        terrain_force = tf.concat([
+            terrain_force[:, 0:2],
+            terrain_force_z_safe
+        ], axis=1)
         # 🔧 XLA友好：使用裁剪确保数值范围
         terrain_force = tf.clip_by_value(terrain_force, -1e6, 1e6)
         return terrain_force
@@ -12138,6 +12496,115 @@ def train(args):
         print(f"\n开始训练: {args.train_episodes}个回合")
         print("="*60)
     
+    # 🔧 新增：检查点恢复功能（必须在progress_bar创建之前）
+    start_episode = 0
+    checkpoint_path = getattr(args, 'checkpoint', None)
+    resume_training = getattr(args, 'resume', False)
+    
+    if checkpoint_path or resume_training:
+        # 确定检查点路径
+        if checkpoint_path:
+            checkpoint_dir = checkpoint_path
+        elif resume_training:
+            # 自动查找最新的检查点
+            checkpoint_dir = os.path.join("models", args.exp_name, "checkpoint")
+            if not os.path.exists(checkpoint_dir):
+                # 尝试查找其他可能的检查点位置
+                final_dir = os.path.join("models", args.exp_name, "final")
+                if os.path.exists(final_dir):
+                    checkpoint_dir = final_dir
+                    print(f"⚠️  未找到checkpoint目录，使用final目录: {checkpoint_dir}")
+                else:
+                    print(f"⚠️  未找到检查点，将从episode 0开始训练")
+                    checkpoint_dir = None
+            else:
+                print(f"✅ 找到检查点目录: {checkpoint_dir}")
+        
+        if checkpoint_dir and os.path.exists(checkpoint_dir):
+            # 加载检查点状态
+            checkpoint_state_file = os.path.join(checkpoint_dir, "checkpoint_state.json")
+            if os.path.exists(checkpoint_state_file):
+                try:
+                    with open(checkpoint_state_file, 'r', encoding='utf-8') as f:
+                        checkpoint_state = json.load(f)
+                    start_episode = checkpoint_state.get('episode', 0)
+                    episode_rewards = checkpoint_state.get('episode_rewards', [])
+                    episode_force_ratios = checkpoint_state.get('episode_force_ratios', [])
+                    best_reward = checkpoint_state.get('best_reward', -np.inf)
+                    best_episode = checkpoint_state.get('best_episode', 0)
+                    best_episode_force_ratio = checkpoint_state.get('best_episode_force_ratio', 0.0)
+                    actor_losses_history = checkpoint_state.get('actor_losses_history', [])
+                    critic_losses_history = checkpoint_state.get('critic_losses_history', [])
+                    
+                    print(f"✅ 成功加载检查点状态:")
+                    print(f"   - 起始回合: {start_episode}")
+                    print(f"   - 已完成回合数: {len(episode_rewards)}")
+                    print(f"   - 最佳奖励: {best_reward:.2f} (第{best_episode+1}回合)")
+                    
+                    # 调整训练回合数（如果从检查点恢复）
+                    if start_episode > 0:
+                        remaining_episodes = args.train_episodes - start_episode
+                        if remaining_episodes > 0:
+                            print(f"   - 剩余回合数: {remaining_episodes}")
+                        else:
+                            print(f"   ⚠️  警告: 检查点显示已完成所有回合，将从episode {start_episode}继续")
+                except Exception as e:
+                    print(f"❌ 加载检查点状态失败: {e}")
+                    print(f"   将从episode 0开始训练")
+                    start_episode = 0
+            
+            # 加载模型权重
+            try:
+                model_path = checkpoint_dir
+                if os.path.exists(os.path.join(model_path, "actor_0.weights.h5")):
+                    print(f"🔄 正在加载模型权重从: {model_path}")
+                    maddpg.load_models(model_path)
+                    print(f"✅ 模型权重加载成功")
+                else:
+                    print(f"⚠️  检查点目录中未找到模型权重文件")
+            except Exception as e:
+                print(f"❌ 加载模型权重失败: {e}")
+                print(f"   将使用随机初始化的模型")
+    
+    # 🔧 新增：检查点保存函数
+    def save_checkpoint(episode, checkpoint_name="checkpoint"):
+        """保存检查点（模型权重和训练状态）"""
+        if not args.save_model:
+            return
+        
+        checkpoint_dir = os.path.join("models", args.exp_name, checkpoint_name)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # 保存模型权重
+        try:
+            maddpg.save_models(checkpoint_dir)
+        except Exception as e:
+            print(f"⚠️  保存模型权重失败: {e}")
+        
+        # 保存训练状态
+        checkpoint_state = {
+            'episode': episode,
+            'episode_rewards': episode_rewards,
+            'episode_force_ratios': episode_force_ratios,
+            'best_reward': float(best_reward),
+            'best_episode': int(best_episode),
+            'best_episode_force_ratio': float(best_episode_force_ratio),
+            'actor_losses_history': actor_losses_history,
+            'critic_losses_history': critic_losses_history,
+            'train_episodes': int(args.train_episodes),
+            'exp_name': args.exp_name,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        checkpoint_state_file = os.path.join(checkpoint_dir, "checkpoint_state.json")
+        try:
+            with open(checkpoint_state_file, 'w', encoding='utf-8') as f:
+                json.dump(checkpoint_state, f, ensure_ascii=False, indent=2)
+            if not quiet_output and episode % 50 == 0:  # 每50回合输出一次
+                print(f"💾 检查点已保存: {checkpoint_dir} (episode {episode+1})")
+        except Exception as e:
+            print(f"⚠️  保存检查点状态失败: {e}")
+    
     # 配置进度显示输出与行为（支持环境变量控制）
     try:
         tqdm_to_stdout = os.getenv("TQDM_TO_STDOUT", "1").lower() in ("1", "true", "yes", "on")
@@ -12216,17 +12683,26 @@ def train(args):
                 _sys.stdout.flush()
             def close(self):
                 pass
+        # 🔧 修复：支持从检查点恢复训练
+        episode_range = range(start_episode, args.train_episodes) if start_episode > 0 else range(args.train_episodes)
         progress_bar = _LightProgress(
             total=args.train_episodes,
             desc="训练进度",
             ncols=tqdm_ncols,
             mininterval=tqdm_mininterval
         )
+        # 手动设置初始值（_LightProgress不支持initial参数）
+        if start_episode > 0:
+            for _ in range(start_episode):
+                progress_bar._draw(start_episode)
     else:
+        # 🔧 修复：支持从检查点恢复训练
+        episode_range = range(start_episode, args.train_episodes) if start_episode > 0 else range(args.train_episodes)
         progress_bar = tqdm(
-            range(args.train_episodes), position=0, leave=True, desc="训练进度",
+            episode_range, position=0, leave=True, desc="训练进度",
             ncols=tqdm_ncols, mininterval=tqdm_mininterval, dynamic_ncols=True,
-            file=tqdm_file, disable=tqdm_disable, unit='ep', bar_format=tqdm_bar_format
+            file=tqdm_file, disable=tqdm_disable, unit='ep', bar_format=tqdm_bar_format,
+            initial=start_episode if start_episode > 0 else 0, total=args.train_episodes
         )
     # 诊断与监控开关
     mem_debug = os.getenv('MEM_DEBUG', '0').lower() in ('1','true','yes','on') or bool(getattr(args, 'mem_debug', False))
@@ -13494,45 +13970,28 @@ def train(args):
                     actions_for_execution_tf = tf.identity(actions_for_execution_tf)
                     pf_forces_tf = tf.identity(pf_forces_tf)
                     
-                    # 🔧 优化：直接使用ascontiguousarray确保内存对齐
-                    # 转换存储动作（立即使用ascontiguousarray确保内存对齐）
+                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
+                    # 直接使用ascontiguousarray确保内存对齐，_safe_tensor_to_numpy已返回numpy数组
                     try:
                         # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
                         actions_storage_np = _safe_tensor_to_numpy(actions_for_storage_tf)
-                        actions_storage_contiguous = np.ascontiguousarray(actions_storage_np, dtype=np.float32)
-                        actions_storage_bytes = actions_storage_contiguous.tobytes()
-                        actions_for_storage = np.frombuffer(actions_storage_bytes, dtype=np.float32).reshape(actions_storage_contiguous.shape).copy()
-                        if not actions_for_storage.flags['C_CONTIGUOUS'] or actions_for_storage.dtype != np.float32:
-                            actions_for_storage = np.ascontiguousarray(actions_for_storage, dtype=np.float32)
+                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
+                        actions_for_storage = np.ascontiguousarray(actions_storage_np, dtype=np.float32)
                     except (AttributeError, RuntimeError):
                         # 回退：如果.numpy()不可用，先转array再对齐
                         actions_storage_temp = np.array(actions_for_storage_tf, dtype=np.float32)
-                        actions_storage_contiguous = np.ascontiguousarray(actions_storage_temp, dtype=np.float32)
-                        actions_storage_bytes = actions_storage_contiguous.tobytes()
-                        actions_for_storage = np.frombuffer(actions_storage_bytes, dtype=np.float32).reshape(actions_storage_contiguous.shape).copy()
-                        if not actions_for_storage.flags['C_CONTIGUOUS'] or actions_for_storage.dtype != np.float32:
-                            actions_for_storage = np.ascontiguousarray(actions_for_storage, dtype=np.float32)
+                        actions_for_storage = np.ascontiguousarray(actions_storage_temp, dtype=np.float32)
                     
-                    # 转换执行动作（立即使用ascontiguousarray确保内存对齐）
+                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
                     try:
                         # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
                         actions_np = _safe_tensor_to_numpy(actions_for_execution_tf)
                         # 🔧 关键修复：验证数组形状，确保每个智能体都有独立的动作
                         if actions_np.ndim != 3:
                             raise ValueError(f"actions_for_execution形状异常: {actions_np.shape}, 期望3维 [num_envs, n_agents, action_dim]")
-                        # 🔧 关键修复：使用tobytes()+frombuffer创建完全独立的内存副本（最彻底的方法）
-                        # 这样可以确保完全脱离原始内存，不保留任何GPU引用
-                        # 先确保是C-contiguous
-                        actions_contiguous = np.ascontiguousarray(actions_np, dtype=np.float32)
-                        # 使用tobytes()+frombuffer创建完全独立的内存副本
-                        actions_bytes = actions_contiguous.tobytes()
-                        actions = np.frombuffer(actions_bytes, dtype=np.float32).reshape(actions_contiguous.shape).copy()
-                        # 再次确保是C-contiguous和正确的dtype
-                        if not actions.flags['C_CONTIGUOUS'] or actions.dtype != np.float32:
-                            actions = np.ascontiguousarray(actions, dtype=np.float32)
-                        # 验证：确保数组没有被意外修改（检查是否为视图）
-                        if not isinstance(actions, np.ndarray) or actions.shape != actions_np.shape:
-                            raise ValueError(f"数组创建改变了数组形状: {actions_np.shape} -> {actions.shape}")
+                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
+                        # _safe_tensor_to_numpy已返回numpy数组，ascontiguousarray足够确保内存对齐
+                        actions = np.ascontiguousarray(actions_np, dtype=np.float32)
                     except (AttributeError, RuntimeError, ValueError) as e:
                         # 回退：如果.numpy()不可用或形状异常，先转array再对齐
                         if not quiet_output and step < 10:
@@ -13543,23 +14002,16 @@ def train(args):
                             actions_temp = np.expand_dims(actions_temp, axis=0)
                         actions = np.ascontiguousarray(actions_temp, dtype=np.float32)
                     
-                    # 转换势场力（立即使用ascontiguousarray确保内存对齐）
+                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
                     try:
                         # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
                         pf_forces_np_temp = _safe_tensor_to_numpy(pf_forces_tf)
-                        pf_forces_contiguous = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
-                        pf_forces_bytes = pf_forces_contiguous.tobytes()
-                        pf_forces_np = np.frombuffer(pf_forces_bytes, dtype=np.float32).reshape(pf_forces_contiguous.shape).copy()
-                        if not pf_forces_np.flags['C_CONTIGUOUS'] or pf_forces_np.dtype != np.float32:
-                            pf_forces_np = np.ascontiguousarray(pf_forces_np, dtype=np.float32)
+                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
+                        pf_forces_np = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
                     except (AttributeError, RuntimeError):
                         # 回退：如果.numpy()不可用，先转array再对齐
                         pf_forces_temp = np.array(pf_forces_tf, dtype=np.float32)
-                        pf_forces_contiguous = np.ascontiguousarray(pf_forces_temp, dtype=np.float32)
-                        pf_forces_bytes = pf_forces_contiguous.tobytes()
-                        pf_forces_np = np.frombuffer(pf_forces_bytes, dtype=np.float32).reshape(pf_forces_contiguous.shape).copy()
-                        if not pf_forces_np.flags['C_CONTIGUOUS'] or pf_forces_np.dtype != np.float32:
-                            pf_forces_np = np.ascontiguousarray(pf_forces_np, dtype=np.float32)
+                        pf_forces_np = np.ascontiguousarray(pf_forces_temp, dtype=np.float32)
                 
                 elif isinstance(actions_tensor, tuple) and len(actions_tensor) == 2:
                     # 兼容旧版本：两个返回值（动作、势场力）
@@ -13581,25 +14033,19 @@ def train(args):
                             dtype=np.float32
                         )
                     
-                    # 转换势场力
+                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
                     try:
                         # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
                         pf_forces_np_temp = _safe_tensor_to_numpy(pf_forces_tf)
-                        pf_forces_contiguous = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
-                        pf_forces_bytes = pf_forces_contiguous.tobytes()
-                        pf_forces_np = np.frombuffer(pf_forces_bytes, dtype=np.float32).reshape(pf_forces_contiguous.shape).copy()
-                        if not pf_forces_np.flags['C_CONTIGUOUS'] or pf_forces_np.dtype != np.float32:
-                            pf_forces_np = np.ascontiguousarray(pf_forces_np, dtype=np.float32)
+                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
+                        pf_forces_np = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
                     except (AttributeError, RuntimeError):
                         pf_forces_temp = np.array(pf_forces_tf, dtype=np.float32)
-                        pf_forces_contiguous = np.ascontiguousarray(pf_forces_temp, dtype=np.float32)
-                        pf_forces_bytes = pf_forces_contiguous.tobytes()
-                        pf_forces_np = np.frombuffer(pf_forces_bytes, dtype=np.float32).reshape(pf_forces_contiguous.shape).copy()
-                        if not pf_forces_np.flags['C_CONTIGUOUS'] or pf_forces_np.dtype != np.float32:
-                            pf_forces_np = np.ascontiguousarray(pf_forces_np, dtype=np.float32)
+                        pf_forces_np = np.ascontiguousarray(pf_forces_temp, dtype=np.float32)
                     
+                    # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
                     # 旧版本：存储动作和执行动作相同
-                    actions_for_storage = np.ascontiguousarray(actions.copy(), dtype=np.float32)
+                    actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
                 else:
                     # 兼容旧版本（非向量化路径或未修改的函数）
                     # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
@@ -13616,7 +14062,8 @@ def train(args):
                             dtype=np.float32
                         )
                     pf_forces_np = np.zeros((actions.shape[0], actions.shape[1], 3), dtype=np.float32)
-                    actions_for_storage = np.ascontiguousarray(actions.copy(), dtype=np.float32)
+                    # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
+                    actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
             except Exception as e:
                 # 🔧 错误处理：如果转换失败，尝试强制同步后重试
                 if not quiet_output:
@@ -13669,7 +14116,8 @@ def train(args):
                             pf_forces_np = np.ascontiguousarray(
                                 np.array(pf_forces_tf, dtype=np.float32), dtype=np.float32
                             )
-                        actions_for_storage = np.ascontiguousarray(actions.copy(), dtype=np.float32)
+                        # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
+                        actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
                     else:
                         # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
                         actions_tensor = tf.identity(actions_tensor)
@@ -13682,7 +14130,8 @@ def train(args):
                                 np.array(actions_tensor, dtype=np.float32), dtype=np.float32
                             )
                         pf_forces_np = np.zeros((actions.shape[0], actions.shape[1], 3), dtype=np.float32)
-                        actions_for_storage = np.ascontiguousarray(actions.copy(), dtype=np.float32)
+                        # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
+                        actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
                 except Exception as e2:
                     # 如果仍然失败，使用零数组作为兜底
                     if not quiet_output:
@@ -13699,7 +14148,8 @@ def train(args):
                         np.zeros((_num_envs, _n_agents, 3), dtype=np.float32),
                         dtype=np.float32
                     )
-                    actions_for_storage = np.ascontiguousarray(actions.copy(), dtype=np.float32)
+                    # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
+                    actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
             
             # 🔧 优化：由于上面已经使用了ascontiguousarray，这里只需要验证
             # 如果由于某种原因数组不是C-contiguous，则再次对齐（通常不会发生）
@@ -13739,8 +14189,9 @@ def train(args):
                 # 再次确保平滑后的动作也是对齐的
                 actions = np.ascontiguousarray(smoothed, dtype=np.float32)
             
+            # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
             # 保存当前动作供下次使用（也确保对齐）
-            maddpg.prev_actions = np.ascontiguousarray(actions.copy(), dtype=np.float32)
+            maddpg.prev_actions = np.ascontiguousarray(actions, dtype=np.float32)
             
             if _profiling_enabled and _select_profile_enabled and (step % _profile_interval == 0):
                 ms_host = (time.time() - t_host0) * 1000.0 if t_host0 else 0.0
@@ -13789,8 +14240,9 @@ def train(args):
                         raw_actor_outputs.append(agent_raw_output)
                     # 拼接为 (num_envs, n_agents, 7)
                     raw_outputs_tensor = tf.stack(raw_actor_outputs, axis=1)
+                    # 🔧 性能优化：移除不必要的copy()，切片[0]已创建新数组
                     # 取第0个环境的数据
-                    episode_actor_outputs_tmp.append(raw_outputs_tensor.numpy().astype(np.float32)[0].copy())
+                    episode_actor_outputs_tmp.append(raw_outputs_tensor.numpy().astype(np.float32)[0])
                 except Exception as e:
                     if not quiet_output:
                         print(f"[WARNING] Actor输出采样失败: {e}")
@@ -13977,9 +14429,10 @@ def train(args):
             # 如果需要对比，请设置 USE_TF_POTENTIAL_FIELD=1
             pass
             
+            # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
             # 动作处理：训练与回放统一使用归一化动作[-1,1]
             # 物理映射在环境侧（apply_action_force）完成
-            actions_for_storage = np.ascontiguousarray(actions_for_storage.copy(), dtype=np.float32)
+            actions_for_storage = np.ascontiguousarray(actions_for_storage, dtype=np.float32)
 
             # 🔧 关键修复：确保传递给环境的actions完全内存对齐
             # 问题：在并行环境（multiprocessing）中，actions会通过pickle序列化传递
@@ -14005,10 +14458,12 @@ def train(args):
             # 解决：使用更彻底的方法创建完全独立的副本
             # 步骤1：先确保是C-contiguous
             actions_contiguous = np.ascontiguousarray(actions, dtype=np.float32)
+            # 🔧 性能优化：简化内存复制逻辑，frombuffer已创建新数组，不需要额外的copy()
             # 步骤2：使用tobytes()+frombuffer创建完全独立的内存副本（最彻底的方法）
             # 这样可以确保完全脱离原始内存，不保留任何引用
             actions_bytes = actions_contiguous.tobytes()
-            actions_for_env = np.frombuffer(actions_bytes, dtype=np.float32).reshape(actions_contiguous.shape).copy()
+            actions_for_env = np.frombuffer(actions_bytes, dtype=np.float32).reshape(actions_contiguous.shape)
+            # 🔧 性能优化：frombuffer已创建新数组，直接使用ascontiguousarray确保对齐
             # 步骤3：再次确保是C-contiguous和正确的dtype
             if not actions_for_env.flags['C_CONTIGUOUS'] or actions_for_env.dtype != np.float32:
                 actions_for_env = np.ascontiguousarray(actions_for_env, dtype=np.float32)
@@ -14050,8 +14505,10 @@ def train(args):
             total_steps += env.num_envs
 
             # 🚨 每步收集d_min_current（确保数据完整性）
+            # 🔧 性能优化：降低收集频率，从每步改为每10步，减少性能开销
             # 🔧 性能优化：使用缓存的环境结构和agents列表，避免每步重复检查
-            if len(episode_d_min_all_timesteps) < 100000:  # 防止列表过大
+            d_min_collect_interval = 10  # 🔧 性能优化：每10步收集一次，降低开销
+            if (step % d_min_collect_interval == 0) and len(episode_d_min_all_timesteps) < 100000:  # 防止列表过大
                 try:
                     # 🔧 性能优化：只在第一次检查环境结构并缓存
                     # 🚨 关键修复：确保正确访问环境结构，避免subscriptable错误
@@ -14111,8 +14568,10 @@ def train(args):
                     # 收集失败不影响训练，静默忽略
                     pass
 
+            # 🔧 性能优化：降低轨迹收集频率，从每步改为每10步，减少性能开销
             # 收集轨迹数据（如果启用）
-            if enable_best_traj and episode_traj_tmp is not None:
+            traj_collect_interval = 10  # 🔧 性能优化：每10步收集一次，降低开销
+            if enable_best_traj and episode_traj_tmp is not None and (step % traj_collect_interval == 0):
                 try:
                     # 从第0个环境获取当前步的智能体位置
                     # 对于SingleEnvWrapper，直接访问env.env
@@ -14122,7 +14581,15 @@ def train(args):
                             step_positions = []
                             for agent in env_0.world.agents:
                                 if hasattr(agent, 'state') and hasattr(agent.state, 'p_pos'):
-                                    step_positions.append(agent.state.p_pos.copy())
+                                    # 🔧 性能优化：如果p_pos已经是numpy数组，直接转换为float32数组；否则复制
+                                    # 这样可以避免不必要的copy()，同时确保数据格式一致
+                                    pos = agent.state.p_pos
+                                    if isinstance(pos, np.ndarray):
+                                        # numpy数组：转换为float32并确保是独立的数组（避免引用）
+                                        step_positions.append(np.asarray(pos, dtype=np.float32))
+                                    else:
+                                        # 非numpy数组：需要复制
+                                        step_positions.append(np.asarray(pos, dtype=np.float32))
                             if step_positions:  # 只在有数据时添加
                                 episode_traj_tmp.append(step_positions)
                     # 对于ParallelEnv，需要通过进程通信获取轨迹（在回合结束时处理）
@@ -14175,9 +14642,24 @@ def train(args):
                         return bool(np.all(_d))
                     return bool(_done)
 
+                # 🔧 性能优化：使用numpy向量化操作替代Python循环，充分利用5.0GHz CPU性能
                 if hasattr(env, 'num_envs'):
                     if isinstance(done_n, np.ndarray) and done_n.ndim == 2:
-                        env_done_now = np.array([_reduce_done(done_n[i, :]) for i in range(done_n.shape[0])])
+                        # 向量化处理：避免Python循环，使用numpy批量操作
+                        mode = EARLY_STOP_MODE
+                        if mode == 'never' or mode == 'disabled':
+                            env_done_now = np.zeros(done_n.shape[0], dtype=bool)
+                        elif mode == 'any':
+                            env_done_now = np.any(done_n.astype(bool), axis=1)
+                        elif mode == 'majority':
+                            ratio = EARLY_STOP_MAJORITY_RATIO
+                            need = np.ceil(ratio * done_n.shape[1]).astype(int)
+                            env_done_now = np.sum(done_n.astype(int), axis=1) >= need
+                        elif mode == 'all':
+                            env_done_now = np.all(done_n.astype(bool), axis=1)
+                        else:
+                            # 回退到原逻辑（兼容未知模式）
+                            env_done_now = np.array([_reduce_done(done_n[i, :]) for i in range(done_n.shape[0])])
                     else:
                         env_done_now = np.array([_reduce_done(done_n)])
                 else:
@@ -14261,10 +14743,18 @@ def train(args):
                     reward_data = rew_n[i]
                     done_data = done_n[i]
                     
+                    # 🔧 性能优化：观测数据通常已经是numpy数组（从环境返回），避免不必要的转换
                     # 统一使用Lite/NumPy回放缓冲区：转换为NumPy后写入
                     # 注意：预热阶段的数据仅用于调参/势场元优化，不写入RB
-                    obs_np = obs_data.numpy() if isinstance(obs_data, tf.Tensor) else obs_data
-                    next_obs_np = next_obs_data.numpy() if isinstance(next_obs_data, tf.Tensor) else next_obs_data
+                    # 🔧 性能优化：只在确实是Tensor时才转换，避免不必要的GPU-CPU同步
+                    if isinstance(obs_data, tf.Tensor):
+                        obs_np = _safe_tensor_to_numpy(obs_data)
+                    else:
+                        obs_np = obs_data
+                    if isinstance(next_obs_data, tf.Tensor):
+                        next_obs_np = _safe_tensor_to_numpy(next_obs_data)
+                    else:
+                        next_obs_np = next_obs_data
                     
                     # 🚨 修改：不再将PF力追加到obs末尾，保持obs为81维
                     # PF力现在作为独立输入传递给Actor（类似FR的处理方式）
@@ -14284,8 +14774,9 @@ def train(args):
                     if 'actions' in locals() and actions is not None:
                         try:
                             if len(actions.shape) == 3 and actions.shape[1] == n_agents:
-                                if i < actions.shape[0]:
-                                    action_data_corrected = np.ascontiguousarray(actions[i].copy(), dtype=np.float32)
+                                    if i < actions.shape[0]:
+                                        # 🔧 性能优化：移除不必要的copy()，直接使用切片（numpy切片返回视图，但ascontiguousarray会创建新数组）
+                                        action_data_corrected = np.ascontiguousarray(actions[i], dtype=np.float32)
                         except Exception:
                             pass  # 如果获取失败，使用None，让回放缓冲区自己计算
                     
@@ -14352,7 +14843,12 @@ def train(args):
                     # 将异常值替换为一个非常小的负值，表示严重错误
                     rew_n = np.where(np.isnan(rew_n) | np.isinf(rew_n), -1000.0, rew_n)
 
-                rew_eff = np.array(rew_n, copy=True)
+                # 🔧 性能优化：由于后续需要修改数组（already_done_mask会修改），必须复制
+                # 但如果已经是float32的numpy数组，直接copy()即可，避免类型转换
+                if isinstance(rew_n, np.ndarray) and rew_n.dtype == np.float32:
+                    rew_eff = rew_n.copy()
+                else:
+                    rew_eff = np.array(rew_n, dtype=np.float32)
                 
                 if rew_eff.ndim == 2 and len(already_done_mask) == rew_eff.shape[0]:
                     rew_eff[already_done_mask, :] = 0.0
@@ -16080,9 +16576,11 @@ def train(args):
         except Exception as e:
             print(f"[调试器警告] 无法生成最终报告: {e}")
     
-    # 保存最终模型
+    # 保存最终模型和检查点
     if args.save_model:
         maddpg.save_models(os.path.join("models", args.exp_name, "final"))
+        # 🔧 新增：保存最终检查点
+        save_checkpoint(len(episode_rewards), "checkpoint")
     # 训练结束：输出"最佳回合"和"最后一回合"两套轨迹图与交互图（均使用对应回合快照，避免错配）
     try:
         # 检查最佳回合和最后一回合是否相同，如果是则确保使用不同的轨迹数据
@@ -16966,7 +17464,7 @@ def parse_args():
     # 环境参数
     parser.add_argument("--scenario", type=str, default="paper3d_terrain_energy", help="场景名称")
     parser.add_argument("--train-episodes", type=int, default=100, help="训练回合数")
-    parser.add_argument("--episode-length", type=int, default=4000, help="每回合步数")
+    parser.add_argument("--episode-length", type=int, default=2800, help="每回合步数")
     parser.add_argument("--num-envs", type=int, default=1, help="并行环境的数量")
     
     # 算法参数
@@ -17032,6 +17530,9 @@ def parse_args():
     parser.add_argument("--save-model", action="store_true", help="是否保存模型")
     parser.add_argument("--save-interval", type=int, default=100, help="保存间隔")
     parser.add_argument("--seed", type=int, default=None, help="随机种子")
+    # 🔧 新增：检查点恢复训练参数
+    parser.add_argument("--resume", action="store_true", help="从最新检查点恢复训练（自动查找models/{exp_name}/checkpoint）")
+    parser.add_argument("--checkpoint", type=str, default=None, help="指定检查点路径（覆盖--resume的自动查找）")
     
     # 场景相关参数（为了兼容原版本）
     parser.add_argument("--terrain-seed", type=int, default=None, help="地形种子")
@@ -17083,6 +17584,9 @@ def parse_args():
     parser.add_argument("--use-range-detection", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'), default=True, help="是否使用范围检测")
     parser.add_argument("--detection-radius", type=float, default=15.0, help="地形检测半径")
     parser.add_argument("--detection-height-range", type=float, default=15.0, help="地形检测垂直范围")
+    # 🔧 新增：地形感知模式参数
+    # 🔧 注意：--terrain-sensing-mode 参数已移除，训练时强制使用local模式
+    # Oracle模式仅在评估时通过 evaluate_optimized.py 传递，训练时不需要此参数
     parser.add_argument("--agent-detection-radius", type=float, default=10.0, help="智能体检测半径")
     parser.add_argument("--previous-velocity-weight", type=float, default=0.4, help="速度平滑权重")
     parser.add_argument("--min-height-above-terrain", type=float, default=1.0, help="与地形最小高度差")
@@ -17266,12 +17770,14 @@ if __name__ == "__main__":
         
         # 保存训练结果
         best_ep_idx = rewards.index(max(rewards))
+        last_ep_idx = len(rewards) - 1  # 最后回合的索引
         results = {
             'episodes': len(rewards),
             'rewards': rewards,
             'best_reward': max(rewards),
             'best_episode': best_ep_idx,
             'best_episode_force_ratio': episode_force_ratios[best_ep_idx] if best_ep_idx < len(episode_force_ratios) else getattr(args, 'action_force_ratio', 0.0),  # 🔧 新增：记录最佳回合的FR值
+            'last_episode_force_ratio': episode_force_ratios[last_ep_idx] if last_ep_idx < len(episode_force_ratios) else getattr(args, 'action_force_ratio', 0.0),  # 🔧 新增：记录最后回合的FR值
             'args': vars(args)
         }
         

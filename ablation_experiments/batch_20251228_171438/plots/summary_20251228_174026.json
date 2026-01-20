@@ -1,0 +1,50 @@
+{
+  "batch_name": "batch_20251228_171438",
+  "generated_at": "20251228_174026",
+  "experiments": [
+    {
+      "name": "Action Only",
+      "total_episodes": 500,
+      "final_reward": 32996.82877922058,
+      "avg_reward_last_100": 45157.450747594834,
+      "success_rate_last_100": 0.0,
+      "avg_collisions_last_100": 85.04,
+      "min_dist_p10_last100": -0.43271026611328123,
+      "min_dist_p50_last100": 0.9229941368103027,
+      "violation_prob_last100_dist_lt_1p5": 0.58
+    },
+    {
+      "name": "APF Traditional",
+      "total_episodes": 500,
+      "final_reward": 5096002.481446266,
+      "avg_reward_last_100": 5122670.113488233,
+      "success_rate_last_100": 0.0,
+      "avg_collisions_last_100": 482.14,
+      "min_dist_p10_last100": 1.9861188411712647,
+      "min_dist_p50_last100": 1.9986176490783691,
+      "violation_prob_last100_dist_lt_1p5": 0.07
+    },
+    {
+      "name": "APF Learnable",
+      "total_episodes": 500,
+      "final_reward": 5221299.255699158,
+      "avg_reward_last_100": 5244863.396838253,
+      "success_rate_last_100": 0.0,
+      "avg_collisions_last_100": 259.18,
+      "min_dist_p10_last100": 1.9392007827758788,
+      "min_dist_p50_last100": 1.9986176490783691,
+      "violation_prob_last100_dist_lt_1p5": 0.03
+    },
+    {
+      "name": "Action+APF Fusion",
+      "total_episodes": 500,
+      "final_reward": 3992517.5847322345,
+      "avg_reward_last_100": 4269202.604389841,
+      "success_rate_last_100": 0.0,
+      "avg_collisions_last_100": 694.92,
+      "min_dist_p10_last100": -23.39119682312012,
+      "min_dist_p50_last100": -0.5546474456787109,
+      "violation_prob_last100_dist_lt_1p5": 1.0
+    }
+  ]
+}

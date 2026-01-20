@@ -216,14 +216,27 @@ echo "✅ 场景与训练一致（paper3d_terrain_weighted，奖励函数逻辑�
 export ALGORITHM=${ALGORITHM:-matd3}
 echo "使用算法: $ALGORITHM"
 
+# 🔧 新增：XLA加速配置（与训练脚本保持一致）
+# 默认启用XLA Global加速，提升评估性能
+export XLA_GLOBAL=${XLA_GLOBAL:-1}  # 默认启用XLA加速
+if [ "${XLA_GLOBAL}" = "1" ]; then
+    echo "✅ XLA加速: 启用（Global JIT模式）"
+    # 设置TF_XLA_FLAGS（禁用Auto JIT，使用手动控制）
+    export TF_XLA_FLAGS=${TF_XLA_FLAGS:-"--tf_xla_auto_jit=0"}
+else
+    echo "❌ XLA加速: 禁用"
+fi
+
 # 设置默认地形模式（与训练脚本保持一致）
 export RANDOM_TERRAIN=${RANDOM_TERRAIN:-0}  # 🔧 修复：默认使用固定地形，与训练脚本一致
 
-# 🔧 关键修复：episode-length 与训练脚本一致（2800步）
+# 🔧 关键修复：episode-length 与训练脚本一致（4000步）
+# 🔧 支持通过环境变量 EPISODE_LENGTH 覆盖默认值
+EPISODE_LENGTH=${EPISODE_LENGTH:-4000}
 # 🚨 问题：评估脚本使用2200步，但训练脚本使用2800步，导致评估时步数不足
 # 🚨 修复：改为2800步，与训练脚本完全一致
 # 🔧 关键修复：使用双引号包裹路径变量，确保特殊字符（中文、空格等）正确处理
-CMD_ARGS="--load-model-path \"$MODEL_PATH\" --eval-episodes $EVAL_EPISODES --save-viz-path \"$SAVE_PATH\" --scenario-name $SCENARIO_NAME --episode-length 2800 --algorithm $ALGORITHM"
+CMD_ARGS="--load-model-path \"$MODEL_PATH\" --eval-episodes $EVAL_EPISODES --save-viz-path \"$SAVE_PATH\" --scenario-name $SCENARIO_NAME --episode-length $EPISODE_LENGTH --algorithm $ALGORITHM"
 
 # 根据RANDOM_TERRAIN参数决定是否使用随机地形
 if [ "$RANDOM_TERRAIN" = "1" ] || [ "$RANDOM_TERRAIN" = "true" ] || [ "$RANDOM_TERRAIN" = "yes" ]; then
@@ -267,7 +280,7 @@ fi
 if [ -n "$TRAINING_DAMPING" ]; then
     export DAMPING=$TRAINING_DAMPING
 elif [ -z "${DAMPING}" ]; then
-export DAMPING=${DAMPING:-0.18}  # 🔧 修复：与训练脚本一致（0.15→0.18）
+export DAMPING=${DAMPING:-0.12}  # 🔧 修复：与训练脚本一致（0.15→0.18）
 fi
 
 if [ -n "$TRAINING_REWARD_POS_SCALE" ]; then
@@ -439,6 +452,10 @@ fi
 export USE_TF_POTENTIAL_FIELD=${USE_TF_POTENTIAL_FIELD:-1}
 export USE_FR_FEATURE=${USE_FR_FEATURE:-1}  # 启用FR特征（与训练保持一致）
 export USE_PF_FEATURE=${USE_PF_FEATURE:-1}  # 启用势场特征（与训练保持一致）
+export TERRAIN_SENSING_MODE=${TERRAIN_SENSING_MODE:-local}  # 🔧 新增：地形感知模式 (local/oracle_same_probes/oracle_dense)
+                                                                      # local: 使用观测中的地形信息（默认）
+                                                                      # oracle_same_probes: 使用Oracle接口获取真值，probe布局与local一致
+                                                                      # oracle_dense: 使用Oracle接口，提升探测密度
 
 # 注意：FORCE_PARAM_*_RANGE 参数已废弃，改用delta+base模式
 export FORCE_PARAM_GOAL_ATTRACTION_RANGE=${FORCE_PARAM_GOAL_ATTRACTION_RANGE:-"0.5 6.0"}
@@ -502,6 +519,7 @@ CMD_ARGS="$CMD_ARGS --action-force-ratio $ACTION_FORCE_RATIO"
 CMD_ARGS="$CMD_ARGS --use-tf-potential-field $USE_TF_POTENTIAL_FIELD"
 CMD_ARGS="$CMD_ARGS --use-fr-feature $USE_FR_FEATURE"
 CMD_ARGS="$CMD_ARGS --use-pf-feature $USE_PF_FEATURE"
+CMD_ARGS="$CMD_ARGS --terrain-sensing-mode $TERRAIN_SENSING_MODE"  # 🔧 新增：地形感知模式
 CMD_ARGS="$CMD_ARGS --force-param-goal-attraction-range $FORCE_PARAM_GOAL_ATTRACTION_RANGE"
 CMD_ARGS="$CMD_ARGS --force-param-lambda-1-range $FORCE_PARAM_LAMBDA_1_RANGE"
 CMD_ARGS="$CMD_ARGS --force-param-terrain-repulsion-range $FORCE_PARAM_TERRAIN_REPULSION_RANGE"
@@ -561,8 +579,11 @@ export SUCCESS_DISTANCE_THRESHOLD=${SUCCESS_DISTANCE_THRESHOLD:-5.0}  # 🔧 关
                                                                      # 🚨 问题：评估脚本使用6.0，但训练脚本使用5.0，导致评估时成功阈值更严格（7.2米 vs 6.0米）
                                                                      # 🚨 修复：改为5.0，与训练脚本完全一致
                                                                      # 实际判断阈值 = 1.2 * SUCCESS_DISTANCE_THRESHOLD = 6.0米（与训练一致）
-export COLLISION_PENALTY_VALUE=${COLLISION_PENALTY_VALUE:-39.0}  # 🔧 修复：与训练脚本一致（80.0→39.0）
-export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.8}  # 🔧 修复：与训练脚本一致（0.3→0.8）
+# 🚨 关键修复：确保碰撞检测参数与训练脚本完全一致
+# 这些参数直接影响碰撞统计的准确性，必须与run_optimized.sh中的默认值完全一致
+export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}  # 🚨 地形接触阈值（与run_optimized.sh一致：0.2）
+export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.5}  # 🚨 碰撞距离阈值（与run_optimized.sh一致：0.5）
+export COLLISION_PENALTY_VALUE=${COLLISION_PENALTY_VALUE:-60.0}  # 🚨 碰撞惩罚值（与run_optimized.sh一致：60.0）
 export GLOBAL_REWARD_MODE=${GLOBAL_REWARD_MODE:-avg_progress}
 export SHAPING_GAMMA=${SHAPING_GAMMA:-0.9}
 
@@ -603,10 +624,11 @@ if [ -n "$CRITIC_HIDDEN" ]; then
     CMD_ARGS="$CMD_ARGS --critic-hidden $CRITIC_HIDDEN"
 fi
 
-# 检查是否使用固定位置
-if [ "$USE_FIXED_POSITIONS" = "true" ]; then
+# 🔧 关键修复：检查是否使用固定位置（支持"1"、"true"、"yes"、"on"等多种格式）
+# 确保与ablation_terrain_sensing.py传递的"1"格式兼容
+if [ "$USE_FIXED_POSITIONS" = "true" ] || [ "$USE_FIXED_POSITIONS" = "1" ] || [ "${USE_FIXED_POSITIONS,,}" = "yes" ] || [ "${USE_FIXED_POSITIONS,,}" = "on" ]; then
     if [ -f "$POSITIONS_FILE" ]; then
-        echo "检测到固定位置设置，正在加载位置文件: $POSITIONS_FILE"
+        echo "✅ 检测到固定位置设置，正在加载位置文件: $POSITIONS_FILE"
         CMD_ARGS="$CMD_ARGS --use-fixed-positions --positions-file \"$POSITIONS_FILE\""
     else
         echo "⚠️  警告: 设置了使用固定位置，但位置文件不存在: $POSITIONS_FILE"
@@ -639,6 +661,12 @@ fi
 if [ "${ENABLE_OVERLAY:-0}" = "1" ] || [ "${ENABLE_OVERLAY,,}" = "true" ] || [ "${ENABLE_OVERLAY,,}" = "yes" ] || [ "${ENABLE_OVERLAY,,}" = "on" ]; then
     CMD_ARGS="$CMD_ARGS --enable-overlay"
     echo "✅ 启用overlay图片（包含地形信息）"
+fi
+
+# 🔧 新增：禁用GIF生成（如果环境变量DISABLE_GIF=1）
+if [ "${DISABLE_GIF:-0}" = "1" ] || [ "${DISABLE_GIF,,}" = "true" ] || [ "${DISABLE_GIF,,}" = "yes" ] || [ "${DISABLE_GIF,,}" = "on" ]; then
+    CMD_ARGS="$CMD_ARGS --disable-gif"
+    echo "⏭️  禁用GIF生成（消融实验模式）"
 fi
 
 # 运行评估

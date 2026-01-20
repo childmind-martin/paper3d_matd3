@@ -33,13 +33,14 @@ class AblationBatchManager:
         self.root_dir = Path(root_dir)
         self.root_dir.mkdir(parents=True, exist_ok=True)
     
-    def create_batch(self, batch_id: Optional[str] = None, config: Optional[Dict] = None) -> Path:
+    def create_batch(self, batch_id: Optional[str] = None, config: Optional[Dict] = None, experiments: Optional[List[str]] = None) -> Path:
         """
         创建新的批次目录
         
         Args:
             batch_id: 批次ID（默认：batch_YYYYMMDD_HHMMSS）
             config: 批次配置信息（实验参数、种子等）
+            experiments: 实验子目录列表（None则使用默认列表：action_only, apf_traditional, apf_learnable, action_apf_fusion）
         
         Returns:
             批次目录路径
@@ -50,13 +51,20 @@ class AblationBatchManager:
         batch_dir = self.root_dir / batch_id
         batch_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建实验子目录
-        experiments = ["action_only", "apf_traditional", "apf_learnable", "action_apf_fusion"]
+        # 🔧 修复：根据传入的experiments参数创建实验子目录，避免创建不必要的空目录
+        if experiments is None:
+            # 默认实验列表（用于action_pf_comparison实验）
+            experiments = ["action_only", "apf_traditional", "apf_learnable", "action_apf_fusion"]
+        
+        # 只创建传入的实验子目录（如果列表为空，则不创建任何实验子目录）
         for exp in experiments:
             (batch_dir / exp).mkdir(exist_ok=True)
         
         # 创建图表输出目录
         (batch_dir / "plots").mkdir(exist_ok=True)
+        
+        # 创建results目录（用于保存评估结果等）
+        (batch_dir / "results").mkdir(exist_ok=True)
         
         # 保存配置信息
         if config is None:
@@ -65,6 +73,10 @@ class AblationBatchManager:
                 "created_at": datetime.now().isoformat(),
                 "experiments": experiments
             }
+        else:
+            # 确保config中包含experiments信息
+            if "experiments" not in config:
+                config["experiments"] = experiments
         
         config_file = batch_dir / "config.json"
         with open(config_file, 'w', encoding='utf-8') as f:
