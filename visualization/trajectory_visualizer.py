@@ -190,7 +190,8 @@ class TrajectoryVisualizer:
     def generate_trajectory_image(self, trajectories, scenario, save_path, 
                                  episode_num, reward, episode_type='current',
                                  correction_type=None, elev=30, azim=45,
-                                 goal_positions=None, env_instance=None, actor_outputs_history=None):
+                                 goal_positions=None, env_instance=None, actor_outputs_history=None,
+                                 env_idx=0):
         """生成轨迹静态图像
         
         参数:
@@ -230,8 +231,8 @@ class TrajectoryVisualizer:
                 self._log(f"🎨 使用场景参数的地形数据")
                 self._plot_terrain(ax, scenario)
             
-            # 绘制障碍
-            self._plot_obstacles(ax, scenario)
+            # 绘制障碍（优先实时环境）
+            self._plot_obstacles(ax, scenario, env_instance=env_instance, env_idx=env_idx)
             
             # 绘制目标位置 - 优先使用环境实例的目标数据
             if env_instance is not None:
@@ -259,7 +260,7 @@ class TrajectoryVisualizer:
                     self._generate_trajectory_with_actor_analysis(
                         trajectories, scenario, save_path, episode_num, reward, 
                         episode_type, goal_positions, env_instance, actor_outputs_history,
-                        total_steps, eff_steps, elev, azim
+                        total_steps, eff_steps, elev, azim, env_idx=env_idx
                     )
                     self._log(f"✅ 轨迹图像（含Actor分析）已保存: {save_path}")
                     self._log(f"📊 轨迹统计: 总步数={total_steps}, 有效步数={eff_steps}")
@@ -585,12 +586,86 @@ class TrajectoryVisualizer:
             if self.verbose:
                 traceback.print_exc()
 
-    def _plot_obstacles(self, ax, scenario, alpha=0.6):
-        """绘制障碍（基于场景的 obstacles 列表渲染半透明球体/圆顶）"""
+    def _normalize_obstacles(self, raw_obstacles):
+        """将障碍物统一规范为 [{'center':[x,y,z], 'radius':r}, ...]。"""
+        normalized = []
         try:
-            if not hasattr(scenario, 'obstacles') or not isinstance(scenario.obstacles, list):
-                return
-            obstacles = scenario.obstacles
+            if not raw_obstacles:
+                return normalized
+            for ob in raw_obstacles:
+                try:
+                    center = None
+                    radius = None
+                    if isinstance(ob, dict):
+                        center = ob.get('center', ob.get('pos', ob.get('position', None)))
+                        radius = ob.get('radius', ob.get('r', ob.get('size', None)))
+                    else:
+                        state = getattr(ob, 'state', None)
+                        p_pos = getattr(state, 'p_pos', None)
+                        center = getattr(ob, 'center', getattr(ob, 'pos', getattr(ob, 'position', p_pos)))
+                        radius = getattr(ob, 'radius', getattr(ob, 'r', getattr(ob, 'size', None)))
+                    if center is None or radius is None:
+                        continue
+                    c = np.asarray(center, dtype=np.float32).reshape(-1)
+                    if c.shape[0] < 3:
+                        continue
+                    r = float(radius)
+                    if r <= 0:
+                        continue
+                    normalized.append({
+                        'center': [float(c[0]), float(c[1]), float(c[2])],
+                        'radius': r
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return normalized
+
+    def _get_obstacles_for_plot(self, scenario=None, env_instance=None, env_idx=0):
+        """优先从实时环境获取障碍物，失败时回退到场景快照。"""
+        # 1) 首选：env_instance.get_vis_bundle（训练/评估时最可靠）
+        try:
+            if env_instance is not None and hasattr(env_instance, 'get_vis_bundle'):
+                vb = env_instance.get_vis_bundle(int(env_idx))
+                if isinstance(vb, dict):
+                    obs = self._normalize_obstacles(vb.get('obstacles', []))
+                    if obs:
+                        return obs
+        except Exception:
+            pass
+
+        # 2) 回退：从env/world对象提取
+        try:
+            worlds = []
+            if env_instance is not None:
+                if hasattr(env_instance, 'world'):
+                    worlds.append(env_instance.world)
+                if hasattr(env_instance, 'env') and hasattr(env_instance.env, 'world'):
+                    worlds.append(env_instance.env.world)
+                if hasattr(env_instance, 'envs') and isinstance(getattr(env_instance, 'envs', None), list):
+                    for sub_env in env_instance.envs:
+                        if hasattr(sub_env, 'world'):
+                            worlds.append(sub_env.world)
+            for w in worlds:
+                raw = getattr(w, 'obstacles', None)
+                obs = self._normalize_obstacles(raw)
+                if obs:
+                    return obs
+        except Exception:
+            pass
+
+        # 3) 最后回退：scenario.obstacles（可能是静态快照）
+        try:
+            raw = getattr(scenario, 'obstacles', None) if scenario is not None else None
+            return self._normalize_obstacles(raw)
+        except Exception:
+            return []
+
+    def _plot_obstacles(self, ax, scenario, alpha=0.6, env_instance=None, env_idx=0):
+        """绘制障碍（优先实时环境，回退场景快照）。"""
+        try:
+            obstacles = self._get_obstacles_for_plot(scenario=scenario, env_instance=env_instance, env_idx=env_idx)
             if len(obstacles) == 0:
                 return
             import numpy as _np
@@ -1047,7 +1122,8 @@ class TrajectoryVisualizer:
         return trajectories
 
     def generate_trajectory_interactive(self, trajectories, save_path="trajectory_interactive.html", 
-                                      title="Interactive Trajectory", goal_positions=None, scenario=None, env_instance=None):
+                                      title="Interactive Trajectory", goal_positions=None, scenario=None, env_instance=None,
+                                      env_idx=0):
         """生成可交互的3D轨迹HTML文件，支持拖拽视角
         
         参数:
@@ -1254,38 +1330,34 @@ class TrajectoryVisualizer:
         
         # 山顶位置标记已移除（用户不需要）
 
-        # 绘制障碍（球体）
-        if scenario is not None and hasattr(scenario, 'obstacles') and isinstance(getattr(scenario, 'obstacles'), list) and len(scenario.obstacles) > 0:
-            try:
-                for ob in scenario.obstacles:
-                    try:
-                        if isinstance(ob, dict):
-                            center = ob.get('center', ob.get('pos', ob.get('position')))
-                            radius = ob.get('radius', ob.get('r', None))
-                        else:
-                            center = getattr(ob, 'center', getattr(ob, 'pos', getattr(ob, 'position', None)))
-                            radius = getattr(ob, 'radius', getattr(ob, 'r', None))
-                        if center is None or radius is None:
-                            continue
-                        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
-                        r = float(radius)
-                        theta = np.linspace(0, 2*np.pi, 24)
-                        phi = np.linspace(0, np.pi, 16)
-                        th, ph = np.meshgrid(theta, phi)
-                        sx = cx + r * np.cos(th) * np.sin(ph)
-                        sy = cy + r * np.sin(th) * np.sin(ph)
-                        sz = cz + r * np.cos(ph)
-                        fig.add_trace(go.Surface(
-                            x=sx, y=sy, z=sz,
-                            colorscale=[[0, 'rgba(255,0,0,1)'], [1, 'rgba(255,0,0,1)']],
-                            opacity=0.25,
-                            showscale=False,
-                            name='障碍'
-                        ))
-                    except Exception:
+        # 绘制障碍（球体）- 优先使用实时环境中的障碍物快照
+        try:
+            obstacles = self._get_obstacles_for_plot(scenario=scenario, env_instance=env_instance, env_idx=env_idx)
+            for ob in obstacles:
+                try:
+                    center = ob.get('center', [0, 0, 0])
+                    radius = ob.get('radius', 0.0)
+                    cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+                    r = float(radius)
+                    if r <= 0:
                         continue
-            except Exception as e:
-                print(f"添加障碍失败: {e}")
+                    theta = np.linspace(0, 2*np.pi, 24)
+                    phi = np.linspace(0, np.pi, 16)
+                    th, ph = np.meshgrid(theta, phi)
+                    sx = cx + r * np.cos(th) * np.sin(ph)
+                    sy = cy + r * np.sin(th) * np.sin(ph)
+                    sz = cz + r * np.cos(ph)
+                    fig.add_trace(go.Surface(
+                        x=sx, y=sy, z=sz,
+                        colorscale=[[0, 'rgba(255,0,0,1)'], [1, 'rgba(255,0,0,1)']],
+                        opacity=0.25,
+                        showscale=False,
+                        name='障碍'
+                    ))
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"添加障碍失败: {e}")
 
         # 绘制目标点
         if goal_positions:
@@ -1349,7 +1421,11 @@ class TrajectoryVisualizer:
                 if terrain_height_sampler is not None:
                     terrain_heights = terrain_height_sampler(plotted_traj[:, 0], plotted_traj[:, 1])
                     penetration_mask = plotted_traj[:, 2] < terrain_heights
-                    plotted_traj[penetration_mask, :] = np.nan
+                    # 🚨 关键修复：不要将穿透的点设为NaN，而是调整到地形上方，确保可视化正确
+                    # 原因：如果设为NaN，起点可能不显示，导致可视化问题
+                    # 解决方案：将穿透的点调整到地形上方（地形高度 + 0.5m），确保可见
+                    if np.any(penetration_mask):
+                        plotted_traj[penetration_mask, 2] = terrain_heights[penetration_mask] + 0.5
                 color = colors[agent_idx % len(colors)]
                 
                 # 轨迹线 - 更粗的线条
@@ -1368,17 +1444,28 @@ class TrajectoryVisualizer:
                 ))
                 
                 # 起点标记 - 小球标记
+                # 🚨 关键修复：确保起点Z坐标在地形上方（如果地形采样器可用）
+                start_pos = [agent_traj[0, 0], agent_traj[0, 1], agent_traj[0, 2]]
+                if terrain_height_sampler is not None:
+                    start_terrain_h = terrain_height_sampler(start_pos[0], start_pos[1])
+                    if start_pos[2] < start_terrain_h:
+                        # 起点在地形下方，调整到地形上方
+                        start_pos[2] = start_terrain_h + 0.5
+                
                 fig.add_trace(go.Scatter3d(
-                    x=[agent_traj[0, 0]],
-                    y=[agent_traj[0, 1]],
-                    z=[agent_traj[0, 2]],
-                    mode='markers',
+                    x=[start_pos[0]],
+                    y=[start_pos[1]],
+                    z=[start_pos[2]],
+                    mode='markers+text',
                     marker=dict(
-                        size=6,  # 从10改为6，更小更精致
+                        size=8,  # 增大起点标记，更明显
                         color=color,
                         symbol='circle',
-                        line=dict(color='rgb(0, 0, 0)', width=1.5)
+                        line=dict(color='rgb(0, 0, 0)', width=2)
                     ),
+                    text=[f"起点<br>X: {start_pos[0]:.2f}<br>Y: {start_pos[1]:.2f}<br>Z: {start_pos[2]:.2f}"],
+                    textposition="top center",
+                    textfont=dict(size=10, color='black'),
                     name=f'起点 {agent_idx}',
                     showlegend=False,
                     hovertemplate='<b>起点</b><br>' +
@@ -1423,10 +1510,10 @@ class TrajectoryVisualizer:
                             y=[goal[1]],
                             z=[goal[2]],
                             mode='markers',
-                            marker=dict(size=12, color='gold', symbol='diamond'),
-                            name='共同目标点',
+                            marker=dict(size=12, color='red', symbol='diamond', line=dict(color='yellow', width=2)),
+                            name='中央目标',
                             showlegend=True,
-                            hovertemplate='<b>共同目标点</b><br>' +
+                            hovertemplate='<b>中央目标</b><br>' +
                                         'X: %{x:.2f}<br>' +
                                         'Y: %{y:.2f}<br>' +
                                         'Z: %{z:.2f}<br>' +
@@ -1434,14 +1521,24 @@ class TrajectoryVisualizer:
                         ))
                 # 各智能体的目标点
                 if 'agent_goals' in goal_positions and isinstance(goal_positions['agent_goals'], list):
+                    # 🔧 使用与智能体轨迹相同的颜色方案（与轨迹线颜色一致）
+                    agent_colors_rgb = [
+                        'rgb(0, 0, 0)',       # 黑色（智能体0）
+                        'rgb(255, 0, 0)',     # 红色（智能体1）
+                        'rgb(0, 0, 255)',     # 蓝色（智能体2）
+                        'rgb(255, 255, 0)',   # 黄色（智能体3）
+                        'rgb(0, 255, 255)',   # 青色（智能体4）
+                        'rgb(255, 0, 255)'    # 品红色（智能体5）
+                    ]
                     for i, goal in enumerate(goal_positions['agent_goals']):
                         if goal is not None and len(goal) >= 3:
+                            color = agent_colors_rgb[i % len(agent_colors_rgb)]
                             fig.add_trace(go.Scatter3d(
                                 x=[goal[0]],
                                 y=[goal[1]],
                                 z=[goal[2]],
                                 mode='markers',
-                                marker=dict(size=10, color='orange', symbol='circle'),
+                                marker=dict(size=12, color=color, symbol='diamond', line=dict(color='white', width=1)),
                                 name=f'智能体{i}目标',
                                 showlegend=True,
                                 hovertemplate=f'<b>智能体{i}目标</b><br>' +
@@ -1667,14 +1764,24 @@ class TrajectoryVisualizer:
                         ))
                 # 各智能体的目标点
                 if 'agent_goals' in goal_positions and isinstance(goal_positions['agent_goals'], list):
+                    # 🔧 使用与智能体轨迹相同的颜色方案（与轨迹线颜色一致）
+                    agent_colors_rgb = [
+                        'rgb(0, 0, 0)',       # 黑色（智能体0）
+                        'rgb(255, 0, 0)',     # 红色（智能体1）
+                        'rgb(0, 0, 255)',     # 蓝色（智能体2）
+                        'rgb(255, 255, 0)',   # 黄色（智能体3）
+                        'rgb(0, 255, 255)',   # 青色（智能体4）
+                        'rgb(255, 0, 255)'    # 品红色（智能体5）
+                    ]
                     for i, goal in enumerate(goal_positions['agent_goals']):
                         if goal is not None and len(goal) >= 3:
+                            color = agent_colors_rgb[i % len(agent_colors_rgb)]
                             fig.add_trace(go.Scatter3d(
                                 x=[goal[0]],
                                 y=[goal[1]],
                                 z=[goal[2]],
                                 mode='markers',
-                                marker=dict(size=10, color='orange', symbol='circle'),
+                                marker=dict(size=12, color=color, symbol='diamond', line=dict(color='white', width=1)),
                                 name=f'智能体{i}目标',
                                 showlegend=True,
                                 hovertemplate=f'<b>智能体{i}目标</b><br>' +
@@ -1787,7 +1894,8 @@ class TrajectoryVisualizer:
     def _generate_trajectory_with_actor_analysis(self, trajectories, scenario, save_path, 
                                                episode_num, reward, episode_type, 
                                                goal_positions, env_instance, actor_outputs_history,
-                                               total_steps, effective_steps, elev=30, azim=45):
+                                               total_steps, effective_steps, elev=30, azim=45,
+                                               env_idx=0):
         """生成包含3D轨迹和Actor输出分析的复合图像，并单独保存Actor输出序列图
         
         参数:
@@ -1817,8 +1925,8 @@ class TrajectoryVisualizer:
             else:
                 self._plot_terrain(ax, scenario)
             
-            # 绘制障碍
-            self._plot_obstacles(ax, scenario)
+            # 绘制障碍（优先实时环境）
+            self._plot_obstacles(ax, scenario, env_instance=env_instance, env_idx=env_idx)
             
             # 绘制目标位置 - 优先使用环境实例的目标数据
             if env_instance is not None:

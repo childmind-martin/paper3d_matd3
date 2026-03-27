@@ -68,6 +68,21 @@ except ImportError:
     print("警告：未安装 plotly，将跳过交互图生成。安装：pip install plotly")
 
 
+# ============================================================================
+# 🔧 统一配置常量（所有实验共享，确保一致性）
+# ============================================================================
+# 地形复杂度等级（与 run_optimized.sh 默认值一致）
+TERRAIN_COMPLEXITY_LEVEL = 3
+# 地图大小（与 run_optimized.sh 默认值一致）
+MAP_SIZE = 200
+# 山峰之间的最小距离（与 run_optimized.sh 默认值一致）
+MOUNTAIN_MIN_DISTANCE = 55
+# 场景种子（用于地形生成，确保地形一致性）
+SCENARIO_SEED = 67
+# 训练随机种子（用于网络初始化，确保训练过程一致性）
+TRAINING_SEED = 252488
+
+
 # 实验配置
 # 
 # 🔧 关键说明：势场修正控制机制
@@ -111,8 +126,8 @@ EXPERIMENT_CONFIGS = [
             "ACTION_FORCE_RATIO": "0.0",  # ✅ 真正有效的控制：禁用TF势场修正
             "ACTION_FORCE_RATIO_SCHEDULE_PCT": "DISABLED",  # 🚨 关键修复：显式禁用schedule，确保FR始终为0.0
             "USE_TF_POTENTIAL_FIELD": "1",  # 保持TF版本启用，但force_ratio=0会阻止修正
-            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保公平对比（消除随机性影响）
-            "TF_DETERMINISTIC_OPS": "0"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
+            "SEED": str(TRAINING_SEED),  # 使用统一常量
+            "TF_DETERMINISTIC_OPS": "1"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
         }
     },
     {
@@ -149,8 +164,8 @@ EXPERIMENT_CONFIGS = [
             # 这确保了所有算法的网络初始化完全一致，即使Traditional APF不使用网络输出的后4维参数
             # 网络初始化包括：Actor和Critic网络的权重初始化（使用相同的随机种子）
             # 这样对比才公平：Traditional APF使用的是"固定参数的APF"，而不是"随机初始化的网络+固定参数"
-            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保网络初始化一致（与apf_learnable、action_apf_fusion相同）
-            "TF_DETERMINISTIC_OPS": "0"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
+            "SEED": str(TRAINING_SEED),  # 使用统一常量
+            "TF_DETERMINISTIC_OPS": "1"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
         }
     },
     {
@@ -167,19 +182,23 @@ EXPERIMENT_CONFIGS = [
             # "NOISE_SCALE": "0.35",  # ✅ 修复：与其他算法保持一致（默认0.35），确保公平对比
             # 🔧 显式禁用随机动作，确保纯APF训练不受随机动作干扰
             "RANDOM_ACTION_PROB_TRAINING": "0.0",  # 禁用训练阶段的随机动作，确保动作完全由APF控制
-            # 🚨 关键修复：显式设置delta值为run_optimized.sh的默认值，确保可学习APF真正学习
-            # 注意：这些值必须与run_optimized.sh中的默认值完全一致
-            # run_optimized.sh默认值（第720-736行）：DELTA_K_ATT=5.0, DELTA_LAMBDA_1=2.2, DELTA_K_REP=1200.0, DELTA_RADIUS=80.0
-            # run_optimized.sh base值（第685-708行）：GOAL_ATTRACTION=6.0, LAMBDA_1_BASE=8.5, TERRAIN_REPULSION=8000.0, AGENT_INFLUENCE_RANGE=150.0
-            # 实际参数范围（基于base值）：
-            #   k_att = 6.0 ± 5.0 = [1.0, 11.0]
-            #   lambda_1 = 8.5 ± 2.2 = [6.3, 10.7]
-            #   k_rep = 8000.0 ± 1200.0 = [6800.0, 9200.0]
-            #   radius = 150.0 ± 80.0 = [70.0, 230.0]
-            "DELTA_K_ATT": "5.0",      # ✅ 与run_optimized.sh一致（默认5.0）
-            "DELTA_LAMBDA_1": "2.2",   # ✅ 与run_optimized.sh一致（默认2.2）
-            "DELTA_K_REP": "1200.0",   # 🚨 修复：与run_optimized.sh一致（默认1200.0，不是1000.0）
-            "DELTA_RADIUS": "80.0",    # ✅ 与run_optimized.sh一致（默认80.0）
+            # 🚨 关键修复：扩大delta值范围，让PF参数有足够的学习空间
+            # 原问题：k_rep只有±15%范围（6800-9200），改善空间太小
+            # 新设计：大幅扩大关键参数的可学习范围，尤其是k_rep
+            # 
+            # run_optimized.sh base值（第685-708行）：
+            #   GOAL_ATTRACTION=6.0, LAMBDA_1_BASE=8.5, 
+            #   TERRAIN_REPULSION=8000.0, AGENT_INFLUENCE_RANGE=150.0
+            # 
+            # 🔧 新的可学习范围（扩大3-5倍）：
+            #   k_att = 6.0 ± 10.0 = [-4.0, 16.0] → 裁剪到[0.5, 16.0]（±167%）
+            #   lambda_1 = 8.5 ± 5.0 = [3.5, 13.5]（±59%）
+            #   k_rep = 8000.0 ± 4000.0 = [4000, 12000]（±50%）✅ 关键改进！从±15%提升到±50%
+            #   radius = 150.0 ± 120.0 = [30, 270]（±80%）
+            "DELTA_K_ATT": "10.0",      # 🔧 扩大到10.0（原5.0的2倍），让目标吸引力有更大学习空间
+            "DELTA_LAMBDA_1": "5.0",    # 🔧 扩大到5.0（原2.2的2.3倍），让地形感知范围有更大学习空间
+            "DELTA_K_REP": "4000.0",    # 🚨 关键修复：扩大到4000（原1200的3.3倍），从±15%提升到±50%
+            "DELTA_RADIUS": "120.0",    # 🔧 扩大到120.0（原80的1.5倍），让智能体感知范围有更大学习空间
             # 🚨 关键修复：显式设置base值，确保与apf_traditional和action_apf_fusion使用相同的base值
             # 原因：虽然run_optimized.sh有默认值，但显式设置可以确保所有实验组使用完全相同的base值
             # 这样对比才公平：apf_learnable和action_apf_fusion使用相同的base值，只是DELTA不同
@@ -191,8 +210,8 @@ EXPERIMENT_CONFIGS = [
             # 所有算法（apf_traditional、apf_learnable、action_apf_fusion）都使用相同的SEED
             # 训练脚本会在创建网络之前设置随机种子（paper3d_train_optimized.py 第12069-12072行）
             # 这确保了所有算法的网络初始化完全一致，包括Actor和Critic网络的权重初始化
-            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保网络初始化一致（与apf_traditional、action_apf_fusion相同）
-            "TF_DETERMINISTIC_OPS": "0"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
+            "SEED": str(TRAINING_SEED),  # 使用统一常量
+            "TF_DETERMINISTIC_OPS": "1"  # ✅ 修复：启用TensorFlow确定性操作，确保完全可重复
         }
     },
     {
@@ -208,17 +227,30 @@ EXPERIMENT_CONFIGS = [
             # run_optimized.sh 默认 schedule（第684行）："0%:0.55,10%:0.5,20%:0.5,35%:0.5,50%:0.5,70%:0.5,85%:0.5,100%:0.5"
             # 原因：action_apf_fusion 应该完全使用 run_optimized.sh 的默认配置，包括 FR schedule
             # 这样消融实验才能真正反映"融合APF"在标准训练配置下的表现
-            "ACTION_FORCE_RATIO_SCHEDULE_PCT": "0%:0.50,10%:0.40,20%:0.30,40%:0.20,60%:0.15,100%:0.10",  # ✅ 修复：与 run_optimized.sh 默认值完全一致
+            "ACTION_FORCE_RATIO_SCHEDULE_PCT": "0%:0.50,10%:0.45,20%:0.40,40%:0.35,60%:0.30,80%:0.25,100%:0.20",  # 🔧 修复3/3：与run_optimized.sh同步（减缓FR衰减）
             "USE_TF_POTENTIAL_FIELD": "1",  # 确保使用TF版本
+            # 🔧 同步更新：与apf_learnable使用完全相同的扩大的可学习范围，确保公平对比
+            # 这样对比才公平：apf_learnable（100%势场）vs action_apf_fusion（混合模式）
+            # 两者使用相同的base值和扩大后的delta值，只是混合比例不同
+            # 
+            # 🔧 新的可学习范围（与apf_learnable完全一致）：
+            #   k_att = 6.0 ± 10.0 = [-4.0, 16.0] → 裁剪到[0.5, 16.0]（±167%）
+            #   lambda_1 = 8.5 ± 5.0 = [3.5, 13.5]（±59%）
+            #   k_rep = 8000.0 ± 4000.0 = [4000, 12000]（±50%）✅ 关键改进
+            #   radius = 150.0 ± 120.0 = [30, 270]（±80%）
+            "DELTA_K_ATT": "10.0",      # 🔧 与apf_learnable同步（扩大到10.0）
+            "DELTA_LAMBDA_1": "5.0",    # 🔧 与apf_learnable同步（扩大到5.0）
+            "DELTA_K_REP": "4000.0",    # 🚨 与apf_learnable同步（扩大到4000）
+            "DELTA_RADIUS": "120.0",    # 🔧 与apf_learnable同步（扩大到120.0）
             # 🚨 关键修复：网络初始化一致性
             # 所有算法（apf_traditional、apf_learnable、action_apf_fusion）都使用相同的SEED
             # 训练脚本会在创建网络之前设置随机种子（paper3d_train_optimized.py 第12069-12072行）
             # 这确保了所有算法的网络初始化完全一致，包括Actor和Critic网络的权重初始化
-            "SEED": "252488",  # ✅ 修复：为所有实验设置相同的训练随机种子，确保网络初始化一致（与apf_traditional、apf_learnable相同）
+            "SEED": str(TRAINING_SEED),  # 使用统一常量
             # 🚨 关键修复：启用 TensorFlow 确定性操作，确保完全可重复
             # 原因：即使设置了随机种子，TensorFlow 的某些操作（如卷积、矩阵乘法）可能仍然有非确定性
             # 启用 TF_DETERMINISTIC_OPS 可以确保所有操作都是确定性的
-            "TF_DETERMINISTIC_OPS": "0"  # 启用 TensorFlow 确定性操作，确保完全可重复
+            "TF_DETERMINISTIC_OPS": "1"  # 启用 TensorFlow 确定性操作，确保完全可重复
             # 其他所有配置（学习率、网络架构、奖励权重、噪声参数等）都使用 run_optimized.sh 的默认值
         }
     },
@@ -259,7 +291,7 @@ def parse_args():
                         help="训练启动脚本路径 (默认 ./run_optimized.sh)")
     parser.add_argument("--episodes", type=int, default=400,
                         help="每个实验的训练回合数（默认5）")
-    parser.add_argument("--batch-size", type=int, default=1024,
+    parser.add_argument("--batch-size", type=int, default=2048,
                         help="训练批次大小")
     parser.add_argument("--use-weighted-reward", type=int, default=1, choices=[0, 1],
                         help="是否使用分项加权奖励")
@@ -290,6 +322,8 @@ def parse_args():
                         help="选择要运行的实验（默认运行所有实验）。可选: action_only, apf_traditional, apf_learnable, action_apf_fusion")
     parser.add_argument("--quick-comparison", action="store_true",
                         help="快速对比模式：运行 apf_traditional、apf_learnable 和 action_apf_fusion 三个实验")
+    parser.add_argument("--config-file", type=str, default=None,
+                        help="从文件加载实验配置（JSON格式，由 reproduce_from_results.py 生成）")
     return parser.parse_args()
 
 
@@ -322,18 +356,13 @@ def ensure_fixed_positions(positions_file: Path, args, exp_name_prefix: str) -> 
         # 设置环境变量（用于场景初始化）
         import os
         original_env = {}
-        # 🔧 关键修复：使用与 run_optimized.sh 完全一致的默认配置
-        # 参考 run_optimized.sh 的默认值：
-        #   - TERRAIN_COMPLEXITY_LEVEL=3 (默认等级3)
-        #   - MAP_SIZE=200
-        #   - MOUNTAIN_MIN_DISTANCE=55
-        #   - SCENARIO_SEED=88 (但位置生成使用67，与消融实验保持一致)
+        # 🔧 关键修复：使用统一配置常量，确保所有地方一致
         env_vars = {
             "USE_SCENARIO_SEED": "1",
-            "SCENARIO_SEED": "67",  # 位置生成使用67，与消融实验保持一致
-            "TERRAIN_COMPLEXITY_LEVEL": "3",  # 🔧 修复：与 run_optimized.sh 默认值一致（3）
-            "MAP_SIZE": "200",  # 与 run_optimized.sh 默认值一致
-            "MOUNTAIN_MIN_DISTANCE": "55",  # 与 run_optimized.sh 默认值一致
+            "SCENARIO_SEED": str(SCENARIO_SEED),  # 使用统一常量
+            "TERRAIN_COMPLEXITY_LEVEL": str(TERRAIN_COMPLEXITY_LEVEL),  # 使用统一常量
+            "MAP_SIZE": str(MAP_SIZE),  # 使用统一常量
+            "MOUNTAIN_MIN_DISTANCE": str(MOUNTAIN_MIN_DISTANCE),  # 使用统一常量
             "RANDOM_TERRAIN": "0",
             "PER_ENV_TERRAIN": "0",
             "PER_EPISODE_TERRAIN": "0",
@@ -365,12 +394,12 @@ def ensure_fixed_positions(positions_file: Path, args, exp_name_prefix: str) -> 
         
         # 加载场景
         scenario = load(scenario_name).Scenario(
-            seed=67,
+            seed=SCENARIO_SEED,  # 使用统一常量
             use_fixed_positions=False,
             dynamic_first_time=True,
             fixed_positions_file=str(positions_file),
             random_terrain=False,
-            terrain_complexity_level=3,  # 🔧 修复：与 run_optimized.sh 默认值一致（3）
+            terrain_complexity_level=TERRAIN_COMPLEXITY_LEVEL,  # 使用统一常量
         )
         
         # 创建环境并初始化
@@ -485,26 +514,30 @@ def setup_base_env_vars(positions_file: Path, gpu_id: int = None) -> dict:
     env["PER_ENV_TERRAIN"] = "0"
     env["PER_EPISODE_TERRAIN"] = "0"
     env["USE_SCENARIO_SEED"] = "1"
-    # 🔧 关键修复：使用与 run_optimized.sh 一致的默认值
-    # run_optimized.sh 默认: SCENARIO_SEED=${SCENARIO_SEED:-88}
-    # 但位置文件生成使用67，为了保持一致，这里也使用67
-    env["SCENARIO_SEED"] = "67"  # 🔧 修复：与位置文件生成保持一致，确保地形一致
+    # 🔧 关键修复：使用统一配置常量，确保所有地方一致
+    env["SCENARIO_SEED"] = str(SCENARIO_SEED)  # 使用统一常量
     # 🚨 关键修复：不在这里设置SEED，让实验配置中的SEED生效
     # 这样既能保证地形一致（SCENARIO_SEED相同），又能保证训练过程一致（SEED相同，确保公平对比）
     # 如果实验配置中没有设置SEED，训练脚本会使用默认值1337
     # 注意：删除可能从父进程继承的SEED，确保实验配置中的SEED生效
     if "SEED" in env:
         del env["SEED"]  # 删除基础配置中的SEED，让实验配置中的SEED生效
-    # 🔧 关键修复：确保地图生成参数与 run_optimized.sh 完全一致（显式设置，覆盖父进程环境变量）
-    env["TERRAIN_COMPLEXITY_LEVEL"] = "3"  # ✅ 修复：与run_optimized.sh保持一致（默认3）
-    env["MAP_SIZE"] = "200"  # 地图大小
-    env["MOUNTAIN_MIN_DISTANCE"] = "55"  # 山峰之间的最小距离
+    # 🔧 关键修复：使用统一配置常量，确保地图生成参数完全一致
+    env["TERRAIN_COMPLEXITY_LEVEL"] = str(TERRAIN_COMPLEXITY_LEVEL)  # 使用统一常量
+    env["MAP_SIZE"] = str(MAP_SIZE)  # 使用统一常量
+    env["MOUNTAIN_MIN_DISTANCE"] = str(MOUNTAIN_MIN_DISTANCE)  # 使用统一常量
     
-    # 🔧 关键修复：确保碰撞检测阈值与run_optimized.sh一致
-    # ✅ 修复：使用与run_optimized.sh相同的默认值（0.2米），确保消融实验的碰撞检测与正常训练一致
-    # 原问题：之前设置为3.5米，远大于run_optimized.sh的0.2米，可能导致误报碰撞
-    # 影响：过大的阈值会在智能体接近地形（但未真正碰撞）时就触发碰撞计数，导致碰撞次数虚高
-    env["TERRAIN_CONTACT_EPS"] = "0.2"  # ✅ 与run_optimized.sh保持一致（默认0.2米）
+    # 🚨 关键修复：区分"真实碰撞"和"净空不足"两个概念
+    # TERRAIN_COLLISION_EPS（0.2米）：真实碰撞阈值，用于统计碰撞次数，影响成功判定
+    #   - 只有智能体在地形+0.2米以内才算真正碰撞（更严格）
+    #   - 会增加 total_penetration_count，影响团队成功判定
+    # TERRAIN_CLEARANCE_EPS（1.5米）：净空监测阈值，用于净空不足惩罚
+    #   - 智能体在地形+1.5米以内会受到净空不足的惩罚
+    #   - 但不会增加碰撞计数，不影响成功判定
+    # 原问题：之前用1.5米作为碰撞阈值，导致智能体在0.5-1.0米高度飞行也被误报为"碰撞"
+    #        这使得APF Fusion（保持0.5-1.0米净空）被误报大量碰撞，奖励值低于APF Learnable
+    env["TERRAIN_COLLISION_EPS"] = "0.2"   # ✅ 真实碰撞阈值：缩小到0.2米，更严格的碰撞判定
+    env["TERRAIN_CLEARANCE_EPS"] = "1.5"   # ✅ 净空监测阈值：鼓励保持安全距离，但不影响碰撞统计
     
     # 🚨 关键修复：清除所有DELTA相关环境变量，确保每个实验从干净状态开始
     # 这样可以避免父进程环境变量影响实验结果，确保传统APF和可学习APF的真正区别
@@ -540,28 +573,51 @@ def find_latest_log_dir(exp_name: str, logs_root: str) -> str:
                 # 检查是否紧跟时间戳格式（YYYYMMDD_HHMMSS，共15个字符：8位日期+下划线+6位时间）
                 suffix = item.name[len(exp_name) + 1:]  # 去掉 "exp_name_"
                 # 时间戳格式：8位数字_6位数字（例如：20251211_214041）
-                # 使用字符串方法检查，避免导入re模块（如果文件顶部没有导入）
                 if len(suffix) >= 15 and suffix[8] == '_' and suffix[:8].isdigit() and suffix[9:15].isdigit():
-                    # 检查是否有子目录（训练脚本会在 exp_name_timestamp 下创建 timestamp 子目录）
-                    # 🔧 关键修复：排除evaluation目录，只查找训练日志目录
                     subdirs = sorted([d for d in item.iterdir() if d.is_dir() and d.name != 'evaluation'])
-                    # 进一步筛选：优先选择时间戳格式的子目录（如 20251220_170523）
                     timestamp_subdirs = [d for d in subdirs if len(d.name) >= 15 and d.name[8] == '_' and d.name[:8].isdigit() and d.name[9:15].isdigit()]
                     if timestamp_subdirs:
-                        # 如果有时间戳格式的子目录，使用最新的
-                        matching_dirs.append((item.name, timestamp_subdirs[-1]))
+                        # 收集所有内层目录，以便按 mtime 选本次运行（避免取到历史批次导致曲线错乱）
+                        for inner in timestamp_subdirs:
+                            matching_dirs.append((item.name, inner))
                     elif subdirs:
-                        # 如果有其他子目录（非evaluation），使用最新的
-                        matching_dirs.append((item.name, subdirs[-1]))
+                        for inner in subdirs:
+                            matching_dirs.append((item.name, inner))
                     else:
-                        # 如果没有子目录，直接使用该目录（兼容旧格式）
                         matching_dirs.append((item.name, item))
     
     if not matching_dirs:
         raise FileNotFoundError(f"未找到以 '{exp_name}' 开头的日志目录: {logs_path}")
+
+    # 🚨 仅保留完整训练结果目录（必须包含 episode_rewards.json）
+    # 避免误选到中断运行目录（仅有 heartbeat/nan_state 等），导致曲线空白或误判。
+    complete_dirs = []
+    for name, inner in matching_dirs:
+        inner_path = Path(inner) if not isinstance(inner, Path) else inner
+        if (inner_path / "episode_rewards.json").exists():
+            complete_dirs.append((name, inner_path))
+    if complete_dirs:
+        matching_dirs = complete_dirs
+    else:
+        raise FileNotFoundError(
+            f"找到实验目录但均无 episode_rewards.json（可能训练中断）: exp_name={exp_name}, logs_root={logs_path}"
+        )
     
-    # 按目录名排序（时间戳在名称中），取最新的
-    matching_dirs.sort(key=lambda x: x[0], reverse=True)
+    # 🔧 消融实验修复：按 episode_rewards.json 的修改时间取最新一次运行，避免取到历史批次数据导致「有的上升有的完全不变」
+    def _mtime_for(pair):
+        name, inner = pair
+        inner_path = Path(inner) if not isinstance(inner, Path) else inner
+        json_path = inner_path / "episode_rewards.json"
+        if json_path.exists():
+            try:
+                return json_path.stat().st_mtime
+            except OSError:
+                return inner_path.stat().st_mtime
+        try:
+            return inner_path.stat().st_mtime
+        except OSError:
+            return 0.0
+    matching_dirs.sort(key=_mtime_for, reverse=True)
     latest_dir = matching_dirs[0][1]
     return str(latest_dir)
 
@@ -677,7 +733,6 @@ def run_experiment_worker(args_tuple):
     if is_traditional_apf:
         # 🔧 传统APF评估模式：禁用网络训练相关功能，只进行环境交互
         env["PER_ENABLED"] = "0"  # 禁用经验回放（不需要存储经验）
-        env["LEARNING_WARMUP_ENABLED"] = "0"  # 禁用预热（不需要预热）
         env["SAVE_MODEL"] = "0"  # 禁用模型保存（网络不会被使用）
         env["ADAPTIVE_PATIENCE"] = "999999"  # 禁用自适应学习（设置极大值）
         env["NOISE_SCALE"] = "0.0"  # 禁用OU噪声（评估模式）
@@ -839,7 +894,6 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     if is_traditional_apf:
         # 🔧 传统APF评估模式：禁用网络训练相关功能，只进行环境交互
         env["PER_ENABLED"] = "0"  # 禁用经验回放（不需要存储经验）
-        env["LEARNING_WARMUP_ENABLED"] = "0"  # 禁用预热（不需要预热）
         env["SAVE_MODEL"] = "0"  # 禁用模型保存（网络不会被使用）
         env["ADAPTIVE_PATIENCE"] = "999999"  # 禁用自适应学习（设置极大值）
         env["NOISE_SCALE"] = "0.0"  # 禁用OU噪声（评估模式）
@@ -1532,6 +1586,32 @@ def generate_interactive_comparison(series: List[Dict], title: str, output_path:
 
 def main():
     args = parse_args()
+    
+    # 🔧 新增：支持从文件加载实验配置
+    global EXPERIMENT_CONFIGS
+    if args.config_file:
+        config_file = Path(args.config_file)
+        if not config_file.exists():
+            print(f"❌ 错误：配置文件不存在: {config_file}")
+            sys.exit(1)
+        
+        print(f"📂 从文件加载实验配置: {config_file}")
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                loaded_configs = json.load(f)
+            
+            if isinstance(loaded_configs, list):
+                EXPERIMENT_CONFIGS = loaded_configs
+                print(f"✅ 成功加载 {len(EXPERIMENT_CONFIGS)} 个实验配置:")
+                for cfg in EXPERIMENT_CONFIGS:
+                    print(f"    - {cfg.get('label', 'unknown')}: {cfg.get('name', 'unknown')}")
+            else:
+                print(f"❌ 错误：配置文件格式不正确，应为配置列表")
+                sys.exit(1)
+        except Exception as e:
+            print(f"❌ 错误：无法加载配置文件: {e}")
+            sys.exit(1)
+    
     script_path = Path(args.script).resolve()
     if not script_path.is_file():
         print(f"[错误] 找不到训练脚本: {script_path}")
@@ -1550,11 +1630,11 @@ def main():
         "batch_size": args.batch_size,
         "algorithm": args.algorithm,
         "use_weighted_reward": args.use_weighted_reward,
-        "seed": 252488,  # 训练随机种子（与 run_optimized.sh 默认值一致）
-        "scenario_seed": 67,  # 🔧 地形种子（与位置生成保持一致，确保地形一致）
-        "terrain_complexity": 3,  # 🔧 修复：与 run_optimized.sh 默认值一致（3）
-        "map_size": 200,  # 与 run_optimized.sh 默认值一致
-        "mountain_min_distance": 55,  # 与 run_optimized.sh 默认值一致
+        "seed": TRAINING_SEED,  # 使用统一常量
+        "scenario_seed": SCENARIO_SEED,  # 使用统一常量
+        "terrain_complexity": TERRAIN_COMPLEXITY_LEVEL,  # 使用统一常量
+        "map_size": MAP_SIZE,  # 使用统一常量
+        "mountain_min_distance": MOUNTAIN_MIN_DISTANCE,  # 使用统一常量
         "positions_file": str(positions_file),
         "notes": "消融实验：对比动作与势场修正的效果（使用 run_optimized.sh 运行完整训练）"
     }
@@ -1879,4 +1959,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

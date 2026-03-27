@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 # physical/external base state of all entites
@@ -102,7 +104,6 @@ class World(object):
         # color dimensionality
         self.dim_color = 3
         # simulation timestep
-        import os
         self.dt = float(os.getenv('SIMULATION_DT', '0.08'))  # 支持通过环境变量覆盖，默认0.08秒
         # physical damping
         self.damping = 0.25
@@ -122,11 +123,39 @@ class World(object):
         self.map_size = None
         # 是否在检测到穿透/碰撞时自动将位置复位到地面上方（默认关闭）
         self.enable_collision_autoreset = False
+        # 热路径常量缓存：避免在每个 world.step 内重复读取环境变量
+        self.z_action_bias = float(os.getenv('Z_ACTION_BIAS', '0.0'))
+        self.quadrotor_attitude_response_time = float(os.getenv('QUADROTOR_ATTITUDE_RESPONSE_TIME', '0.0'))
+        self.quadrotor_psi_cmd = float(os.getenv('QUADROTOR_PSI_CMD', '0.0'))
+        # 实体/碰撞 pair 缓存：world 构成稳定时可长期复用，减少热循环中的重复过滤。
+        self._entities_cache_signature = None
+        self._entities_cache = []
+        self._collision_pair_indices = ()
 
     # return all entities in the world
     @property
     def entities(self):
         return self.agents + self.landmarks
+
+    def _refresh_entity_runtime_cache(self):
+        """刷新实体列表与有效碰撞 pair 缓存。"""
+        entities = list(self.agents) + list(self.landmarks)
+        signature = tuple(
+            (id(entity), bool(getattr(entity, 'collide', False)), bool(getattr(entity, 'movable', False)))
+            for entity in entities
+        )
+        if signature != self._entities_cache_signature:
+            self._entities_cache_signature = signature
+            self._entities_cache = entities
+            self._collision_pair_indices = tuple(
+                (a, b)
+                for a, entity_a in enumerate(entities)
+                for b in range(a + 1, len(entities))
+                if getattr(entity_a, 'collide', False)
+                and getattr(entities[b], 'collide', False)
+                and (getattr(entity_a, 'movable', False) or getattr(entities[b], 'movable', False))
+            )
+        return self._entities_cache, self._collision_pair_indices
 
     # return all agents controllable by external policies
     @property
@@ -140,21 +169,22 @@ class World(object):
 
     # update state of the world
     def step(self):
+        entities, collision_pairs = self._refresh_entity_runtime_cache()
         # 确保所有实体的位置是numpy数组
-        for entity in self.entities:
+        for entity in entities:
             if hasattr(entity.state, 'p_pos') and isinstance(entity.state.p_pos, list):
                 entity.state.p_pos = np.array(entity.state.p_pos)
         # set actions for scripted agents 
         for agent in self.scripted_agents:
             agent.action = agent.action_callback(agent, self)
         # gather forces applied to entities
-        p_force = [None] * len(self.entities)
+        p_force = [None] * len(entities)
         # apply agent physical controls
         p_force = self.apply_action_force(p_force)
         # apply environment forces
-        p_force = self.apply_environment_force(p_force)
+        p_force = self.apply_environment_force(p_force, entities=entities, collision_pairs=collision_pairs)
         # integrate physical state
-        self.integrate_state(p_force)
+        self.integrate_state(p_force, entities=entities)
         # update agent state
         for agent in self.agents:
             self.update_agent_state(agent)
@@ -223,10 +253,8 @@ class World(object):
                             force[1] = force[1] * float(ar[1])
                             # Z轴动作映射：零中心[-1,1]，再加上可配置偏置后按比例缩放到物理量级
                             # 为保持训练/执行一致，这里的偏置应与训练侧（Actor映射、回放入库）一致
-                            # 🚨 彻底修复：从环境变量读取z_bias，与训练端保持一致
-                            import os
-                            z_bias = float(os.getenv('Z_ACTION_BIAS', '0.0'))
-                            force[2] = (force[2] + z_bias) * float(ar[2])
+                            # 使用缓存的 z_bias，避免每步/每 agent 读取环境变量
+                            force[2] = (force[2] + self.z_action_bias) * float(ar[2])
                     except Exception:
                         pass
 
@@ -246,23 +274,27 @@ class World(object):
         return p_force
 
     # gather physical forces acting on entities
-    def apply_environment_force(self, p_force):
-        # simple (but inefficient) collision response
-        for a,entity_a in enumerate(self.entities):
-            for b,entity_b in enumerate(self.entities):
-                if(b <= a): continue
-                [f_a, f_b] = self.get_collision_force(entity_a, entity_b)
-                if(f_a is not None):
-                    if(p_force[a] is None): p_force[a] = 0.0
-                    p_force[a] = f_a + p_force[a] 
-                if(f_b is not None):
-                    if(p_force[b] is None): p_force[b] = 0.0
-                    p_force[b] = f_b + p_force[b]        
+    def apply_environment_force(self, p_force, entities=None, collision_pairs=None):
+        # simple collision response with pair filtering
+        if entities is None or collision_pairs is None:
+            entities, collision_pairs = self._refresh_entity_runtime_cache()
+        for a, b in collision_pairs:
+            entity_a = entities[a]
+            entity_b = entities[b]
+            [f_a, f_b] = self.get_collision_force(entity_a, entity_b)
+            if(f_a is not None):
+                if(p_force[a] is None): p_force[a] = 0.0
+                p_force[a] = f_a + p_force[a]
+            if(f_b is not None):
+                if(p_force[b] is None): p_force[b] = 0.0
+                p_force[b] = f_b + p_force[b]
         return p_force
 
     # integrate physical state
-    def integrate_state(self, p_force):
-        for i,entity in enumerate(self.entities):
+    def integrate_state(self, p_force, entities=None):
+        if entities is None:
+            entities, _ = self._refresh_entity_runtime_cache()
+        for i,entity in enumerate(entities):
             if not entity.movable: continue
             
             # 🔧 检查是否使用四旋翼动力学模型
@@ -277,13 +309,10 @@ class World(object):
                         # 🔧 修复：直接使用 self.gravity 的值，不使用默认值9.81
                         # self.gravity 已经在 World.__init__ 中初始化为 0.0，然后由训练脚本根据 --gravity 参数设置
                         g = float(self.gravity)
-                        # 🔧 新增：从环境变量读取姿态响应时间（默认0=理想跟踪）
-                        import os
-                        attitude_response_time = float(os.getenv('QUADROTOR_ATTITUDE_RESPONSE_TIME', '0.0'))
                         entity.quadrotor_dynamics = QuadrotorDynamics(
                             mass=entity.mass,
                             g=g,
-                            attitude_response_time=attitude_response_time
+                            attitude_response_time=self.quadrotor_attitude_response_time
                         )
                     
                     # 初始化状态（如果不存在）
@@ -319,14 +348,10 @@ class World(object):
                     except Exception:
                         pass
                     
-                    # 期望偏航角（默认0，可通过环境变量配置）
-                    import os
-                    psi_cmd = float(os.getenv('QUADROTOR_PSI_CMD', '0.0'))
-                    
                     # 执行一步动力学积分（传入阻尼参数）
                     damping = getattr(self, 'damping', 0.25)
                     new_state, motor_speeds = entity.quadrotor_dynamics.integrate_step(
-                        current_state, a_cmd, self.dt, psi_cmd, damping
+                        current_state, a_cmd, self.dt, self.quadrotor_psi_cmd, damping
                     )
                     
                     # 更新状态
@@ -472,17 +497,20 @@ class World(object):
 
     # get collision forces for any contact between two entities
     def get_collision_force(self, entity_a, entity_b):
-        # 确保位置是numpy数组
-        if isinstance(entity_a.state.p_pos, list):
-            entity_a.state.p_pos = np.array(entity_a.state.p_pos)
-        if isinstance(entity_b.state.p_pos, list):
-            entity_b.state.p_pos = np.array(entity_b.state.p_pos)
         if (not entity_a.collide) or (not entity_b.collide):
             return [None, None] # not a collider
         if (entity_a is entity_b):
             return [None, None] # don't collide against itself
+        pos_a = entity_a.state.p_pos
+        if not isinstance(pos_a, np.ndarray):
+            pos_a = np.asarray(pos_a, dtype=np.float32)
+            entity_a.state.p_pos = pos_a
+        pos_b = entity_b.state.p_pos
+        if not isinstance(pos_b, np.ndarray):
+            pos_b = np.asarray(pos_b, dtype=np.float32)
+            entity_b.state.p_pos = pos_b
         # compute actual distance between entities
-        delta_pos = entity_a.state.p_pos - entity_b.state.p_pos
+        delta_pos = pos_a - pos_b
         dist = np.sqrt(np.sum(np.square(delta_pos)))
         # minimum allowable distance
         dist_min = entity_a.size + entity_b.size

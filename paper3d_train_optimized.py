@@ -51,9 +51,17 @@ import random
 def _broadcast_force_ratio(force_ratio, batch_size):
     """将任意形状/标量的force_ratio广播到[batch_size, 1]并裁剪到[0,1]."""
     fr_tensor = tf.convert_to_tensor(force_ratio, dtype=tf.float32)
-    fr_tensor = tf.reshape(fr_tensor, [-1, 1])
-    target_shape = tf.stack([batch_size, 1])
-    fr_tensor = tf.broadcast_to(fr_tensor, target_shape)
+    if fr_tensor.shape.rank == 0:
+        fr_tensor = tf.fill([batch_size, 1], fr_tensor)
+    else:
+        fr_tensor = tf.reshape(fr_tensor, [-1, 1])
+        if fr_tensor.shape[0] == 1:
+            fr_tensor = tf.fill([batch_size, 1], fr_tensor[0, 0])
+        else:
+            row_count = tf.shape(fr_tensor)[0]
+            safe_last_index = tf.maximum(row_count - 1, 0)
+            gather_indices = tf.minimum(tf.range(batch_size), safe_last_index)
+            fr_tensor = tf.gather(fr_tensor, gather_indices)
     return tf.clip_by_value(fr_tensor, 0.0, 1.0)
 
 # 多进程GPU稳定性：在任何GPU上下文创建前切换为spawn，避免XLA/AMP下fork引发的非法访问
@@ -191,10 +199,50 @@ class ReplayBuffer:
     def size(self):
         return int(self.current_size)
     
-    def clear(self):
-        """清空经验回放缓冲区（用于课程学习解锁时清理旧经验）"""
-        self.position = 0
-        self.current_size = 0
+    def clear(self, keep_recent_n=0):
+        """清空经验回放缓冲区（用于课程学习解锁时清理旧经验）
+        
+        参数:
+            keep_recent_n: 保留最近N条经验（渐进式清空），0表示完全清空
+        """
+        if keep_recent_n > 0 and self.current_size > keep_recent_n:
+            # 渐进式清空：保留最近N条经验
+            # 由于是循环缓冲区，最近的经验在position附近
+            # 需要将最近N条经验移动到缓冲区开头
+            recent_start = (self.position - keep_recent_n) % self.capacity
+            if recent_start < 0:
+                recent_start += self.capacity
+            
+            # 如果最近的经验跨越了缓冲区边界，需要分两部分复制
+            if recent_start + keep_recent_n <= self.capacity:
+                # 不跨越边界，直接复制
+                self.obs[:keep_recent_n] = self.obs[recent_start:recent_start + keep_recent_n]
+                self.next_obs[:keep_recent_n] = self.next_obs[recent_start:recent_start + keep_recent_n]
+                self.act[:keep_recent_n] = self.act[recent_start:recent_start + keep_recent_n]
+                self.rew[:keep_recent_n] = self.rew[recent_start:recent_start + keep_recent_n]
+                self.done[:keep_recent_n] = self.done[recent_start:recent_start + keep_recent_n]
+            else:
+                # 跨越边界，分两部分复制
+                part1_len = self.capacity - recent_start
+                part2_len = keep_recent_n - part1_len
+                self.obs[:part1_len] = self.obs[recent_start:]
+                self.obs[part1_len:keep_recent_n] = self.obs[:part2_len]
+                self.next_obs[:part1_len] = self.next_obs[recent_start:]
+                self.next_obs[part1_len:keep_recent_n] = self.next_obs[:part2_len]
+                self.act[:part1_len] = self.act[recent_start:]
+                self.act[part1_len:keep_recent_n] = self.act[:part2_len]
+                self.rew[:part1_len] = self.rew[recent_start:]
+                self.rew[part1_len:keep_recent_n] = self.rew[:part2_len]
+                self.done[:part1_len] = self.done[recent_start:]
+                self.done[part1_len:keep_recent_n] = self.done[:part2_len]
+            
+            # 更新位置和大小
+            self.position = keep_recent_n
+            self.current_size = keep_recent_n
+        else:
+            # 完全清空
+            self.position = 0
+            self.current_size = 0
         # 注意：不需要重置数组内容（会被新数据覆盖），只重置索引和计数器
     
     def update_priorities(self, indices, td_errors):
@@ -344,6 +392,12 @@ def _worker(remote, parent_remote, env_fn):
         while True:
             cmd, data = remote.recv()
             if cmd == 'step':
+                _worker_timing_enabled = False
+                try:
+                    _worker_timing_enabled = bool(getattr(env, '_timing_detail_enabled', lambda: False)())
+                except Exception:
+                    _worker_timing_enabled = False
+                _worker_outer_t0 = time.perf_counter() if _worker_timing_enabled else None
                 next_obs_n, rew_n, done_n, info_n = env.step(data)
                 # 记录每步轨迹点，供可视化使用（避免只出现起点-终点直线）
                 try:
@@ -418,6 +472,12 @@ def _worker(remote, parent_remote, env_fn):
                     # 返回当前状态，不进行重置
                     # 注意：这里应该使用next_obs_n，因为这是step后的新状态
                     # next_obs_n = obs_n  # 这行是错误的，应该删除
+                if _worker_timing_enabled and isinstance(info_n, dict):
+                    detail = info_n.get('_timing', {})
+                    if isinstance(detail, dict):
+                        detail = detail.copy()
+                        detail['env_outer'] = float(detail.get('env_outer', 0.0)) + (time.perf_counter() - _worker_outer_t0)
+                        info_n['_timing'] = detail
                 remote.send((next_obs_n, rew_n, done_n, info_n))
             elif cmd == 'reset':
                 # 无论 _needs_reset 与否，收到重置指令都执行真实 reset，避免跨回合状态泄漏
@@ -469,11 +529,33 @@ def _worker(remote, parent_remote, env_fn):
                                 # 使用时间戳生成真正的随机种子
                                 import time as _time
                                 _base = (int(_time.time() * 1000000) + _episode_idx * 10007) % 2147483647
-                        _per_ep_seed = _base + env_id * 100003 + (_episode_idx % 1000003)
+                        _selected_terrain_seed = None
+                        try:
+                            _multi_enabled = bool(getattr(scenario, 'curriculum_multi_terrain_enabled', False))
+                            if not _multi_enabled:
+                                _multi_enabled = _os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1','true','yes','on')
+                            if _multi_enabled:
+                                _seed_list = list(getattr(scenario, 'curriculum_multi_terrain_seeds', []) or [])
+                                if not _seed_list:
+                                    _seed_list_raw = _os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '').strip()
+                                    _seed_list = [int(tok.strip()) for tok in _seed_list_raw.split(',') if tok.strip()]
+                                if _seed_list:
+                                    _selected_terrain_seed = int(_seed_list[(_episode_idx + env_id) % len(_seed_list)])
+                        except Exception:
+                            _selected_terrain_seed = None
+                        if _selected_terrain_seed is not None:
+                            _per_ep_seed = int(_selected_terrain_seed)
+                        else:
+                            _per_ep_seed = _base + env_id * 100003 + (_episode_idx % 1000003)
                         if scenario is not None:
                             # 🔧 关键修复：保存原始地形种子，防止被episode seed覆盖
                             if not hasattr(scenario, '_original_terrain_seed'):
                                 scenario._original_terrain_seed = scenario.seed if hasattr(scenario, 'seed') and scenario.seed is not None else _base
+                            if _selected_terrain_seed is not None:
+                                try:
+                                    setattr(scenario, 'terrain_base_seed', int(_selected_terrain_seed))
+                                except Exception:
+                                    pass
                             
                             # 检查是否启用随机地形
                             _random_terrain = _os.getenv('RANDOM_TERRAIN', '0').lower() in ('1','true','yes','on')
@@ -1046,7 +1128,13 @@ class SingleEnvWrapper:
 
     def step(self, actions):
         # actions 的形状是 (1, n_agents, act_dim)，需要解包
+        timing_detail_enabled = False
+        try:
+            timing_detail_enabled = bool(getattr(self.env, '_timing_detail_enabled', lambda: False)())
+        except Exception:
+            timing_detail_enabled = False
         obs, rew, done, info = self.env.step(actions[0])
+        _wrapper_t0 = time.perf_counter() if timing_detail_enabled else None
         # 统一为数组，避免 object 数组带来的后续拼接问题
         try:
             obs = np.asarray(obs, dtype=np.float32)
@@ -1064,6 +1152,12 @@ class SingleEnvWrapper:
         except Exception:
             pass
         # 将结果包装成批次形式
+        if timing_detail_enabled and isinstance(info, dict):
+            detail = info.get('_timing', {})
+            if isinstance(detail, dict):
+                detail = detail.copy()
+                detail['env_outer'] = float(detail.get('env_outer', 0.0)) + (time.perf_counter() - _wrapper_t0)
+                info['_timing'] = detail
         return np.expand_dims(obs, axis=0), np.expand_dims(rew, axis=0), np.expand_dims(done, axis=0), [info]
 
     def update_collision_params(self, weight, penalty):
@@ -1376,6 +1470,70 @@ class SumTree:
         self.tree[idx] = np.float32(p_safe)
         self._propagate(idx, change)
 
+    def update_batch(self, idx_batch, p_batch):
+        """批量更新多个叶子节点优先级，重复索引按最后一次更新生效。"""
+        try:
+            idx = np.asarray(idx_batch, dtype=np.int64).reshape(-1)
+            p = np.asarray(p_batch, dtype=np.float32).reshape(-1)
+        except Exception:
+            return
+
+        if idx.size == 0 or p.size == 0:
+            return
+
+        n = min(idx.size, p.size)
+        idx = idx[:n]
+        p = p[:n]
+
+        tree_size = len(self.tree)
+        valid_mask = (idx >= self.leaf_start) & (idx < tree_size)
+        if not np.any(valid_mask):
+            return
+        idx = idx[valid_mask]
+        p = p[valid_mask]
+
+        # 与逐条 update 保持一致：重复叶子索引只保留最后一次更新。
+        rev_idx = idx[::-1]
+        _, rev_pos = np.unique(rev_idx, return_index=True)
+        keep = idx.size - 1 - rev_pos
+        keep.sort()
+        idx = idx[keep]
+        p = p[keep]
+
+        p = np.nan_to_num(p, nan=1.0, posinf=1.0, neginf=1.0).astype(np.float32, copy=False)
+        p = np.where(p > 0.0, p, 1.0).astype(np.float32, copy=False)
+
+        old_values = self.tree[idx]
+        invalid_old = ~np.isfinite(old_values)
+        if np.any(invalid_old):
+            self.tree[idx[invalid_old]] = 0.0
+            old_values = self.tree[idx]
+
+        change = p - old_values.astype(np.float32, copy=False)
+        self.tree[idx] = p
+
+        active_mask = np.isfinite(change) & (change != 0.0)
+        if not np.any(active_mask):
+            return
+
+        current_idx = idx[active_mask]
+        delta = change[active_mask].astype(np.float32, copy=False)
+
+        while current_idx.size > 0:
+            parent = (current_idx - 1) // 2
+            uniq_parent, inverse = np.unique(parent, return_inverse=True)
+            summed_delta = np.zeros(uniq_parent.shape[0], dtype=np.float32)
+            np.add.at(summed_delta, inverse, delta)
+
+            self.tree[uniq_parent] += summed_delta
+            invalid_parent = ~np.isfinite(self.tree[uniq_parent])
+            if np.any(invalid_parent):
+                self.tree[uniq_parent[invalid_parent]] = 0.0
+
+            propagate_mask = uniq_parent > 0
+            current_idx = uniq_parent[propagate_mask]
+            delta = summed_delta[propagate_mask]
+
     def get(self, s):
         """根据采样值s获取 (叶子索引, 优先级, 缓冲区中的实际索引)（优化版本）"""
         idx = self._retrieve(0, s)
@@ -1481,6 +1639,11 @@ class LiteReplayBuffer:
         # 🔧 新增：同时存储修正后的动作（混合动作），用于Critic学习
         # 形状：(capacity, n_agents, act_dim)，存储混合动作：corrected = raw + FR * (pf_force - raw)
         self.act_corrected = np.zeros((self.capacity, self.n_agents, self.act_dim), dtype=self.storage_dtype)
+        # 🔧 新增：存储下一步的修正后动作，用于 Target Q 计算
+        # 形状：(capacity, n_agents, act_dim)，存储 next_act_corrected，确保训练时的一致性
+        self.next_act_corrected = np.zeros((self.capacity, self.n_agents, self.act_dim), dtype=self.storage_dtype)
+        # 当前默认训练路径延迟计算 next_act_corrected，仅在显式写入后启用该快路径
+        self.stores_next_act_corrected = False
         self.rew = np.zeros((self.capacity, self.n_agents), dtype=self.storage_dtype)
         self.done = np.zeros((self.capacity, self.n_agents), dtype=self.storage_dtype)
         # 新增：记录每条样本的FR（action_force_ratio），使用FP32保证数值精度
@@ -1489,6 +1652,18 @@ class LiteReplayBuffer:
         # 形状：(capacity, n_agents, 3)，存储归一化后的势场动作向量 a_pf
         # 这样可以从原始动作+势场力+FR恢复出修正后的动作：corrected = raw + FR * (pf_force - raw)
         self.pf_forces = np.zeros((self.capacity, self.n_agents, 3), dtype=np.float32)
+        # 当前/下一状态的 base PF 特征（与在线 Actor 输入语义一致）
+        self.pf_features = np.zeros((self.capacity, self.n_agents, 3), dtype=np.float32)
+        self.next_pf_features = np.zeros((self.capacity, self.n_agents, 3), dtype=np.float32)
+        # 下一状态的压缩 PF 几何上下文缓存：
+        # [obs_valid(1), goal_dir(3), goal_dist(1), terrain_normal(3), terrain_inv_r_min(1),
+        #  kappa(1), terrain_penalty_factor(1), terrain_max_repulsion(1), obstacle_has(3),
+        #  obstacle_repulsion_dir(9), obstacle_dist_surface(3), obstacle_max_repulsion(3),
+        #  agent_repulsion_dir(6), agent_rel_dist(2)] = 38
+        self.next_pf_geometry_cache = np.zeros((self.capacity, self.n_agents, 38), dtype=np.float32)
+        self.stores_pf_features = False
+        self.stores_next_pf_features = False
+        self.stores_next_pf_geometry_cache = False
         
         # 设置PER相关参数
         self.negative_slope = float(negative_slope)
@@ -1546,6 +1721,11 @@ class LiteReplayBuffer:
                 seed = 1337
         # 确保种子在有效范围内
         self._per_rng = np.random.RandomState(int(seed) & 0x7fffffff)
+        try:
+            import os as _os
+            self._per_debug_print_interval = max(0, int(_os.getenv('PER_DEBUG_PRINT_INTERVAL', '2000')))
+        except Exception:
+            self._per_debug_print_interval = 2000
 
     def _fit_vec(self, vec, expected_dim):
         arr = np.asarray(vec, dtype=np.float32)
@@ -1576,7 +1756,146 @@ class LiteReplayBuffer:
                 out[i] = np.zeros(n_cols, dtype=np.float32)
         return out
 
-    def add(self, obs_n, next_obs_n, act_n, rew_n, done_n, fr_value=None, pf_forces=None, act_corrected=None):
+    def _sample_unique_excluding(self, buffer_size, sample_size, excluded):
+        """从 [0, buffer_size) 中无放回采样，并排除 excluded 中的索引。"""
+        if sample_size <= 0 or buffer_size <= 0:
+            return np.empty((0,), dtype=np.int64)
+
+        excluded_set = set(int(x) for x in excluded) if excluded is not None else set()
+        available = buffer_size - len(excluded_set)
+        if available <= 0:
+            return np.empty((0,), dtype=np.int64)
+
+        if available <= sample_size:
+            if not excluded_set:
+                return np.arange(buffer_size, dtype=np.int64)
+            pool = np.setdiff1d(
+                np.arange(buffer_size, dtype=np.int64),
+                np.fromiter(excluded_set, dtype=np.int64),
+                assume_unique=True,
+            )
+            return pool.astype(np.int64, copy=False)
+
+        if buffer_size >= 8192 and available >= sample_size * 4:
+            selected = []
+            seen = set(excluded_set)
+            while len(selected) < sample_size:
+                remaining = sample_size - len(selected)
+                draw_count = max(remaining * 2, 32)
+                candidates = self._per_rng.randint(0, buffer_size, size=draw_count).astype(np.int64)
+                for idx in candidates:
+                    idx_int = int(idx)
+                    if idx_int in seen:
+                        continue
+                    seen.add(idx_int)
+                    selected.append(idx_int)
+                    if len(selected) >= sample_size:
+                        break
+            return np.asarray(selected, dtype=np.int64)
+
+        pool = np.setdiff1d(
+            np.arange(buffer_size, dtype=np.int64),
+            np.fromiter(excluded_set, dtype=np.int64),
+            assume_unique=True,
+        )
+        if pool.size >= sample_size:
+            return self._per_rng.choice(pool, size=sample_size, replace=False).astype(np.int64)
+        if pool.size > 0:
+            extra = self._per_rng.choice(pool, size=pool.size, replace=False)
+            rem = sample_size - extra.size
+            return np.concatenate(
+                [extra, self._per_rng.randint(0, buffer_size, size=rem).astype(np.int64)],
+                axis=0,
+            )
+        return self._per_rng.randint(0, buffer_size, size=sample_size).astype(np.int64)
+
+    def _coerce_batch_matrix(self, batch, batch_size, rows, cols, dtype, allow_none=False):
+        out_shape = (batch_size, rows, cols)
+        out = np.zeros(out_shape, dtype=dtype)
+        if batch is None:
+            return out
+
+        arr = None
+        try:
+            arr = np.asarray(batch, dtype=dtype)
+            if arr.shape == out_shape:
+                return arr.astype(dtype, copy=False)
+        except Exception:
+            arr = None
+
+        if isinstance(batch, (list, tuple)):
+            limit = min(batch_size, len(batch))
+            for i in range(limit):
+                item = batch[i]
+                if item is None and allow_none:
+                    continue
+                if isinstance(item, np.ndarray) and item.shape == (rows, cols):
+                    out[i] = item.astype(dtype, copy=False)
+                elif item is not None:
+                    out[i] = self._fit_mat(item, rows, cols).astype(dtype, copy=False)
+            return out
+
+        if arr is not None:
+            flat = np.asarray(arr, dtype=dtype).reshape(-1)
+            n = min(flat.size, out.size)
+            if n > 0:
+                out.flat[:n] = flat[:n]
+        return out
+
+    def _coerce_batch_vector(self, batch, batch_size, dim, dtype):
+        out_shape = (batch_size, dim)
+        out = np.zeros(out_shape, dtype=dtype)
+        if batch is None:
+            return out
+
+        arr = None
+        try:
+            arr = np.asarray(batch, dtype=dtype)
+            if arr.shape == out_shape:
+                return arr.astype(dtype, copy=False)
+        except Exception:
+            arr = None
+
+        if isinstance(batch, (list, tuple)):
+            limit = min(batch_size, len(batch))
+            for i in range(limit):
+                try:
+                    out[i] = self._fit_vec(batch[i], dim).astype(dtype, copy=False)
+                except Exception:
+                    out[i] = 0.0
+            return out
+
+        if arr is not None:
+            flat = np.asarray(arr, dtype=dtype).reshape(-1)
+            n = min(flat.size, out.size)
+            if n > 0:
+                out.flat[:n] = flat[:n]
+        return out
+
+    def _coerce_batch_scalar(self, values, batch_size, dtype=np.float32):
+        out = np.zeros((batch_size,), dtype=dtype)
+        if values is None:
+            return out
+        try:
+            arr = np.asarray(values, dtype=dtype).reshape(-1)
+            n = min(batch_size, arr.size)
+            if n > 0:
+                out[:n] = arr[:n]
+            return out
+        except Exception:
+            if isinstance(values, (list, tuple)):
+                limit = min(batch_size, len(values))
+                for i in range(limit):
+                    try:
+                        out[i] = dtype(values[i])
+                    except Exception:
+                        out[i] = 0.0
+            return out
+
+    def add(self, obs_n, next_obs_n, act_n, rew_n, done_n, fr_value=None, pf_forces=None,
+            act_corrected=None, next_pf_forces=None, next_act_corrected=None,
+            pf_features=None, next_pf_features=None, next_pf_geometry_cache=None):
+        # `next_pf_forces` 仅为兼容旧调用保留；next_pf_features 表示下一状态的 base PF 特征。
         # 数据验证
         if len(obs_n) != self.n_agents:
             print(f"[警告] 观察数据智能体数量不匹配: 期望{self.n_agents}, 实际{len(obs_n)}")
@@ -1705,6 +2024,62 @@ class LiteReplayBuffer:
         else:
             # 如果未提供pf_forces，使用零向量（表示没有势场修正）
             self.pf_forces[self.position] = np.zeros((self.n_agents, 3), dtype=np.float32)
+
+        if pf_features is not None:
+            try:
+                pf_feat_arr = np.asarray(pf_features, dtype=np.float32)
+                if pf_feat_arr.shape != (self.n_agents, 3):
+                    pf_feat_arr = self._fit_mat(pf_features, self.n_agents, 3).astype(np.float32, copy=False)
+                else:
+                    pf_feat_arr = pf_feat_arr.astype(np.float32, copy=False)
+                self.pf_features[self.position] = pf_feat_arr
+                self.stores_pf_features = True
+            except Exception:
+                self.pf_features[self.position] = np.zeros((self.n_agents, 3), dtype=np.float32)
+        else:
+            self.pf_features[self.position] = np.zeros((self.n_agents, 3), dtype=np.float32)
+
+        if next_pf_features is not None:
+            try:
+                next_pf_feat_arr = np.asarray(next_pf_features, dtype=np.float32)
+                if next_pf_feat_arr.shape != (self.n_agents, 3):
+                    next_pf_feat_arr = self._fit_mat(next_pf_features, self.n_agents, 3).astype(np.float32, copy=False)
+                else:
+                    next_pf_feat_arr = next_pf_feat_arr.astype(np.float32, copy=False)
+                self.next_pf_features[self.position] = next_pf_feat_arr
+                self.stores_next_pf_features = True
+            except Exception:
+                self.next_pf_features[self.position] = np.zeros((self.n_agents, 3), dtype=np.float32)
+        else:
+            self.next_pf_features[self.position] = np.zeros((self.n_agents, 3), dtype=np.float32)
+
+        if next_pf_geometry_cache is not None:
+            try:
+                next_pf_geom_arr = np.asarray(next_pf_geometry_cache, dtype=np.float32)
+                if next_pf_geom_arr.shape != (self.n_agents, 38):
+                    next_pf_geom_arr = self._fit_mat(next_pf_geometry_cache, self.n_agents, 38).astype(np.float32, copy=False)
+                else:
+                    next_pf_geom_arr = next_pf_geom_arr.astype(np.float32, copy=False)
+                self.next_pf_geometry_cache[self.position] = next_pf_geom_arr
+                self.stores_next_pf_geometry_cache = True
+            except Exception:
+                self.next_pf_geometry_cache[self.position] = np.zeros((self.n_agents, 38), dtype=np.float32)
+        else:
+            self.next_pf_geometry_cache[self.position] = np.zeros((self.n_agents, 38), dtype=np.float32)
+
+        # 🔧 新增：存储下一步的修正后动作（next_act_corrected），用于 Target Q 计算
+        if next_act_corrected is not None:
+            if isinstance(next_act_corrected, np.ndarray) and next_act_corrected.shape == (self.n_agents, self.act_dim):
+                self.next_act_corrected[self.position] = next_act_corrected.astype(self.storage_dtype, copy=False)
+                self.stores_next_act_corrected = True
+            else:
+                next_act_corr_arr = self._fit_mat(next_act_corrected, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+                self.next_act_corrected[self.position] = next_act_corr_arr
+                self.stores_next_act_corrected = True
+        else:
+            # 如果没有提供，使用零向量（向后兼容）
+            self.next_act_corrected[self.position] = np.zeros((self.n_agents, self.act_dim), dtype=self.storage_dtype)
+        
         # 记录插入时间步
         self._insert_step[self.position] = self._global_insert_counter
         # 🔧 关键修复：新样本初始优先级也需要限制，防止继承过大的max_priority
@@ -1720,34 +2095,258 @@ class LiteReplayBuffer:
             self.current_size += 1
         self._global_insert_counter += 1
 
-    def add_batch(self, obs_batch, next_obs_batch, act_batch, rew_batch, done_batch, 
-                  fr_values=None, pf_forces_batch=None, act_corrected_batch=None):
+    def add_single_aligned(self, obs_n, next_obs_n, act_n, rew_n, done_n,
+                           fr_value=None, pf_forces=None, act_corrected=None,
+                           next_act_corrected=None, pf_features=None,
+                           next_pf_features=None, next_pf_geometry_cache=None):
         """
-        🔧 性能优化：批量添加经验到回放缓冲区
+        当前默认单环境训练主线专用的快速写入路径。
+
+        约定:
+            - obs_n / next_obs_n: (n_agents, obs_dim)
+            - act_n / act_corrected / next_act_corrected: (n_agents, act_dim)
+            - rew_n / done_n: (n_agents,)
+            - pf_forces: (n_agents, 3)
+            - pf_features / next_pf_features: (n_agents, 3)
+            - next_pf_geometry_cache: (n_agents, 38)
+
+        该路径避免 batch coercion、expand_dims 和 SumTree.update_batch 的额外开销。
+        """
+        obs_arr = np.asarray(obs_n, dtype=self.storage_dtype)
+        if obs_arr.shape != (self.n_agents, self.obs_dim):
+            obs_arr = self._fit_mat(obs_n, self.n_agents, self.obs_dim).astype(self.storage_dtype, copy=False)
+        else:
+            obs_arr = obs_arr.astype(self.storage_dtype, copy=False)
+
+        next_obs_arr = np.asarray(next_obs_n, dtype=self.storage_dtype)
+        if next_obs_arr.shape != (self.n_agents, self.obs_dim):
+            next_obs_arr = self._fit_mat(next_obs_n, self.n_agents, self.obs_dim).astype(self.storage_dtype, copy=False)
+        else:
+            next_obs_arr = next_obs_arr.astype(self.storage_dtype, copy=False)
+
+        act_arr = np.asarray(act_n, dtype=self.storage_dtype)
+        if act_arr.shape != (self.n_agents, self.act_dim):
+            act_arr = self._fit_mat(act_n, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+        else:
+            act_arr = act_arr.astype(self.storage_dtype, copy=False)
+
+        rew_vec = np.asarray(rew_n, dtype=self.storage_dtype).reshape(-1)
+        if rew_vec.shape != (self.n_agents,):
+            rew_vec = self._fit_vec(rew_n, self.n_agents).astype(self.storage_dtype, copy=False)
+        else:
+            rew_vec = rew_vec.astype(self.storage_dtype, copy=False)
+
+        done_vec = np.asarray(done_n, dtype=self.storage_dtype).reshape(-1)
+        if done_vec.shape != (self.n_agents,):
+            done_vec = self._fit_vec(done_n, self.n_agents).astype(self.storage_dtype, copy=False)
+        else:
+            done_vec = done_vec.astype(self.storage_dtype, copy=False)
+
+        if pf_forces is not None:
+            pf_arr = np.asarray(pf_forces, dtype=np.float32)
+            if pf_arr.shape != (self.n_agents, 3):
+                pf_arr = self._fit_mat(pf_forces, self.n_agents, 3).astype(np.float32, copy=False)
+            else:
+                pf_arr = pf_arr.astype(np.float32, copy=False)
+        else:
+            pf_arr = None
+
+        if act_corrected is not None:
+            act_corrected_arr = np.asarray(act_corrected, dtype=self.storage_dtype)
+            if act_corrected_arr.shape != (self.n_agents, self.act_dim):
+                act_corrected_arr = self._fit_mat(act_corrected, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+            else:
+                act_corrected_arr = act_corrected_arr.astype(self.storage_dtype, copy=False)
+        else:
+            act_corrected_arr = None
+
+        if pf_features is not None:
+            pf_features_arr = np.asarray(pf_features, dtype=np.float32)
+            if pf_features_arr.shape != (self.n_agents, 3):
+                pf_features_arr = self._fit_mat(pf_features, self.n_agents, 3).astype(np.float32, copy=False)
+            else:
+                pf_features_arr = pf_features_arr.astype(np.float32, copy=False)
+        else:
+            pf_features_arr = None
+
+        if next_pf_features is not None:
+            next_pf_features_arr = np.asarray(next_pf_features, dtype=np.float32)
+            if next_pf_features_arr.shape != (self.n_agents, 3):
+                next_pf_features_arr = self._fit_mat(next_pf_features, self.n_agents, 3).astype(np.float32, copy=False)
+            else:
+                next_pf_features_arr = next_pf_features_arr.astype(np.float32, copy=False)
+        else:
+            next_pf_features_arr = None
+
+        if next_pf_geometry_cache is not None:
+            next_pf_geometry_cache_arr = np.asarray(next_pf_geometry_cache, dtype=np.float32)
+            if next_pf_geometry_cache_arr.shape != (self.n_agents, 38):
+                next_pf_geometry_cache_arr = self._fit_mat(next_pf_geometry_cache, self.n_agents, 38).astype(np.float32, copy=False)
+            else:
+                next_pf_geometry_cache_arr = next_pf_geometry_cache_arr.astype(np.float32, copy=False)
+        else:
+            next_pf_geometry_cache_arr = None
+
+        if next_act_corrected is not None:
+            next_act_corrected_arr = np.asarray(next_act_corrected, dtype=self.storage_dtype)
+            if next_act_corrected_arr.shape != (self.n_agents, self.act_dim):
+                next_act_corrected_arr = self._fit_mat(next_act_corrected, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+            else:
+                next_act_corrected_arr = next_act_corrected_arr.astype(self.storage_dtype, copy=False)
+        else:
+            next_act_corrected_arr = None
+
+        # 直接写入，复用 add() 已验证过的单样本语义。
+        self.add(
+            obs_arr,
+            next_obs_arr,
+            act_arr,
+            rew_vec,
+            done_vec,
+            fr_value=fr_value,
+            pf_forces=pf_arr,
+            act_corrected=act_corrected_arr,
+            next_pf_forces=None,
+            next_act_corrected=next_act_corrected_arr,
+            pf_features=pf_features_arr,
+            next_pf_features=next_pf_features_arr,
+            next_pf_geometry_cache=next_pf_geometry_cache_arr,
+        )
+
+    def add_batch(self, obs_batch, next_obs_batch, act_batch, rew_batch, done_batch,
+                  fr_values=None, pf_forces_batch=None, act_corrected_batch=None,
+                  next_pf_forces_batch=None, next_act_corrected_batch=None,
+                  pf_features_batch=None, next_pf_features_batch=None,
+                  next_pf_geometry_cache_batch=None):
+        """
+        🚀 真正的批量存储优化：使用numpy切片操作，避免Python循环
         参数:
             obs_batch: (batch_size, n_agents, obs_dim) 或 list of (n_agents, obs_dim)
             next_obs_batch: (batch_size, n_agents, obs_dim) 或 list of (n_agents, obs_dim)
             act_batch: (batch_size, n_agents, act_dim) 或 list of (n_agents, act_dim)
             rew_batch: (batch_size, n_agents) 或 list of (n_agents,)
             done_batch: (batch_size, n_agents) 或 list of (n_agents,)
-            fr_values: (batch_size,) 或 list of float
-            pf_forces_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)
-            act_corrected_batch: (batch_size, n_agents, act_dim) 或 list of (n_agents, act_dim)
+            fr_values: (batch_size,) 或 list of float，默认None
+            pf_forces_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
+            act_corrected_batch: (batch_size, n_agents, act_dim) 或 list of (n_agents, act_dim)，默认None
+            next_pf_forces_batch: 兼容旧调用保留，当前主线忽略
+            next_act_corrected_batch: (batch_size, n_agents, act_dim) 或 list of (n_agents, act_dim)，默认None（延迟计算）
+            pf_features_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
+            next_pf_features_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
+            next_pf_geometry_cache_batch: (batch_size, n_agents, 38) 或 list of (n_agents, 38)，默认None
         """
         batch_size = len(obs_batch) if isinstance(obs_batch, (list, tuple)) else obs_batch.shape[0]
-        
-        # 批量处理：为每个样本调用add方法（保持接口一致性）
-        # 注意：虽然这里还是循环调用add，但减少了外层训练循环的循环次数
-        for i in range(batch_size):
-            obs_i = obs_batch[i] if isinstance(obs_batch, (list, tuple)) else obs_batch[i]
-            next_obs_i = next_obs_batch[i] if isinstance(next_obs_batch, (list, tuple)) else next_obs_batch[i]
-            act_i = act_batch[i] if isinstance(act_batch, (list, tuple)) else act_batch[i]
-            rew_i = rew_batch[i] if isinstance(rew_batch, (list, tuple)) else rew_batch[i]
-            done_i = done_batch[i] if isinstance(done_batch, (list, tuple)) else done_batch[i]
-            fr_i = fr_values[i] if fr_values is not None and i < len(fr_values) else None
-            pf_i = pf_forces_batch[i] if pf_forces_batch is not None and i < len(pf_forces_batch) else None
-            act_corrected_i = act_corrected_batch[i] if act_corrected_batch is not None and i < len(act_corrected_batch) else None
-            self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i)
+        if batch_size == 0:
+            return
+        if batch_size > self.capacity:
+            # 极端情况下避免高级索引写入重复位置语义不清晰，退化为逐条写入。
+            for i in range(batch_size):
+                obs_i = obs_batch[i] if isinstance(obs_batch, (list, tuple)) else obs_batch[i]
+                next_obs_i = next_obs_batch[i] if isinstance(next_obs_batch, (list, tuple)) else next_obs_batch[i]
+                act_i = act_batch[i] if isinstance(act_batch, (list, tuple)) else act_batch[i]
+                rew_i = rew_batch[i] if isinstance(rew_batch, (list, tuple)) else rew_batch[i]
+                done_i = done_batch[i] if isinstance(done_batch, (list, tuple)) else done_batch[i]
+                fr_i = fr_values[i] if fr_values is not None and i < len(fr_values) else None
+                pf_i = pf_forces_batch[i] if pf_forces_batch is not None and i < len(pf_forces_batch) else None
+                act_corrected_i = act_corrected_batch[i] if act_corrected_batch is not None and i < len(act_corrected_batch) else None
+                next_act_corrected_i = next_act_corrected_batch[i] if next_act_corrected_batch is not None and i < len(next_act_corrected_batch) else None
+                pf_feat_i = pf_features_batch[i] if pf_features_batch is not None and i < len(pf_features_batch) else None
+                next_pf_feat_i = next_pf_features_batch[i] if next_pf_features_batch is not None and i < len(next_pf_features_batch) else None
+                next_pf_geom_i = next_pf_geometry_cache_batch[i] if next_pf_geometry_cache_batch is not None and i < len(next_pf_geometry_cache_batch) else None
+                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i, next_pf_geom_i)
+            return
+
+        try:
+            obs_arr = self._coerce_batch_matrix(obs_batch, batch_size, self.n_agents, self.obs_dim, self.storage_dtype)
+            next_obs_arr = self._coerce_batch_matrix(next_obs_batch, batch_size, self.n_agents, self.obs_dim, self.storage_dtype)
+            act_arr = self._coerce_batch_matrix(act_batch, batch_size, self.n_agents, self.act_dim, self.storage_dtype)
+            rew_arr = self._coerce_batch_vector(rew_batch, batch_size, self.n_agents, self.storage_dtype)
+            done_arr = self._coerce_batch_vector(done_batch, batch_size, self.n_agents, self.storage_dtype)
+        except Exception as e:
+            print(f"[警告] 批量转换数据失败: {e}，回退到逐个添加")
+            for i in range(batch_size):
+                obs_i = obs_batch[i] if isinstance(obs_batch, (list, tuple)) else obs_batch[i]
+                next_obs_i = next_obs_batch[i] if isinstance(next_obs_batch, (list, tuple)) else next_obs_batch[i]
+                act_i = act_batch[i] if isinstance(act_batch, (list, tuple)) else act_batch[i]
+                rew_i = rew_batch[i] if isinstance(rew_batch, (list, tuple)) else rew_batch[i]
+                done_i = done_batch[i] if isinstance(done_batch, (list, tuple)) else done_batch[i]
+                fr_i = fr_values[i] if fr_values is not None and i < len(fr_values) else None
+                pf_i = pf_forces_batch[i] if pf_forces_batch is not None and i < len(pf_forces_batch) else None
+                act_corrected_i = act_corrected_batch[i] if act_corrected_batch is not None and i < len(act_corrected_batch) else None
+                next_act_corrected_i = next_act_corrected_batch[i] if next_act_corrected_batch is not None and i < len(next_act_corrected_batch) else None
+                pf_feat_i = pf_features_batch[i] if pf_features_batch is not None and i < len(pf_features_batch) else None
+                next_pf_feat_i = next_pf_features_batch[i] if next_pf_features_batch is not None and i < len(next_pf_features_batch) else None
+                next_pf_geom_i = next_pf_geometry_cache_batch[i] if next_pf_geometry_cache_batch is not None and i < len(next_pf_geometry_cache_batch) else None
+                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i, next_pf_geom_i)
+            return
+
+        fr_arr = self._coerce_batch_scalar(fr_values, batch_size, dtype=np.float32)
+        pf_arr = self._coerce_batch_matrix(pf_forces_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
+        pf_feat_arr = self._coerce_batch_matrix(pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
+        next_pf_feat_arr = self._coerce_batch_matrix(next_pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
+        next_pf_geom_arr = self._coerce_batch_matrix(next_pf_geometry_cache_batch, batch_size, self.n_agents, 38, np.float32, allow_none=True)
+
+        if act_corrected_batch is not None:
+            act_corr_arr = self._coerce_batch_matrix(act_corrected_batch, batch_size, self.n_agents, self.act_dim, self.storage_dtype, allow_none=True)
+            if isinstance(act_corrected_batch, (list, tuple)):
+                limit = min(batch_size, len(act_corrected_batch))
+                for i in range(limit):
+                    if act_corrected_batch[i] is None:
+                        act_corr_arr[i] = act_arr[i]
+        else:
+            act_corr_arr = act_arr.copy()
+            if self.act_dim >= 3:
+                active_mask = fr_arr > 0.0
+                if np.any(active_mask):
+                    action_head = act_corr_arr[active_mask, :, :3]
+                    corrected_head = action_head + fr_arr[active_mask, None, None] * (pf_arr[active_mask] - action_head)
+                    act_corr_arr[active_mask, :, :3] = np.clip(corrected_head, -1.0, 1.0)
+
+        if next_act_corrected_batch is not None:
+            next_act_corr_arr = self._coerce_batch_matrix(
+                next_act_corrected_batch, batch_size, self.n_agents, self.act_dim, self.storage_dtype, allow_none=True
+            )
+            stores_next_act_corrected = True
+        else:
+            next_act_corr_arr = np.zeros((batch_size, self.n_agents, self.act_dim), dtype=self.storage_dtype)
+            stores_next_act_corrected = False
+
+        start_pos = self.position
+        positions = (start_pos + np.arange(batch_size, dtype=np.int64)) % self.capacity
+
+        self.obs[positions] = obs_arr
+        self.next_obs[positions] = next_obs_arr
+        self.act[positions] = act_arr
+        self.rew[positions] = rew_arr
+        self.done[positions] = done_arr
+        self.fr[positions] = fr_arr
+        self.pf_forces[positions] = pf_arr
+        self.pf_features[positions] = pf_feat_arr
+        self.next_pf_features[positions] = next_pf_feat_arr
+        self.next_pf_geometry_cache[positions] = next_pf_geom_arr
+        self.act_corrected[positions] = act_corr_arr
+        self.next_act_corrected[positions] = next_act_corr_arr
+        if pf_features_batch is not None:
+            self.stores_pf_features = True
+        if next_pf_features_batch is not None:
+            self.stores_next_pf_features = True
+        if next_pf_geometry_cache_batch is not None:
+            self.stores_next_pf_geometry_cache = True
+        if stores_next_act_corrected:
+            self.stores_next_act_corrected = True
+
+        step_values = np.arange(self._global_insert_counter, self._global_insert_counter + batch_size, dtype=np.int64)
+        self._insert_step[positions] = step_values
+        self._global_insert_counter += batch_size
+
+        safe_max_priority = min(float(self.max_priority), 5000.0)
+        initial_priority = min(safe_max_priority ** float(self.negative_slope), 50000.0)
+        tree_indices = positions + self.sum_tree.leaf_start
+        self.sum_tree.update_batch(tree_indices, np.full((batch_size,), initial_priority, dtype=np.float32))
+
+        self.position = (start_pos + batch_size) % self.capacity
+        self.current_size = min(self.current_size + batch_size, self.capacity)
+        self.sum_tree.data_pointer = int(self.position)
 
     def sample(self, batch_size):
         buffer_size = self.size()
@@ -1762,6 +2361,12 @@ class LiteReplayBuffer:
                 np.empty((0,), dtype=np.float32),
                 np.empty((0,), dtype=np.int32),
                 np.empty((0,), dtype=np.float32),
+                np.empty((0, self.n_agents, 3), dtype=np.float32),
+                np.empty((0, self.n_agents, 3), dtype=np.float32),
+                np.empty((0, self.n_agents, 3), dtype=np.float32),
+                np.empty((0, self.n_agents, self.act_dim), dtype=np.float32),
+                None,
+                np.empty((0, self.n_agents, self.act_dim), dtype=np.float32),
             )
 
         # 🔧 性能优化：固定批大小，不再根据缓冲区大小缩小 batch_size
@@ -1794,9 +2399,8 @@ class LiteReplayBuffer:
                 weights = np.ones((batch_size,), dtype=np.float32)
             elif self.per_uniform_mix <= 1e-8:
                 # 退化为原PER流程
-                indices = np.zeros(batch_size, dtype=np.int32)
-                tree_indices = np.zeros(batch_size, dtype=np.int32)
-                weights = np.zeros(batch_size, dtype=np.float32)
+                indices = np.zeros(batch_size, dtype=np.int64)
+                weights = np.ones((batch_size,), dtype=np.float32)
                 segment = total_p / batch_size
                 segment_starts = np.arange(batch_size, dtype=np.float64) * segment
                 # 🚨 关键修复：使用独立的RandomState，确保可重复性
@@ -1804,26 +2408,30 @@ class LiteReplayBuffer:
                 random_samples = segment_starts + segment_rand
                 # 向量化 SumTree 检索，保持分布与语义不变
                 _tidx, _p, _didx = self.sum_tree.get_batch(random_samples)
-                tmp_indices = list(zip(_tidx.tolist(), _p.tolist(), _didx.tolist()))
+                tree_indices = _tidx.astype(np.int32, copy=False)
+                priorities = _p.astype(np.float32, copy=False)
+                data_indices = _didx.astype(np.int64, copy=False)
+
                 if not self.per_replace:
-                    seen = set()
-                    unique = []
-                    for (tidx, p, didx) in tmp_indices:
-                        if didx not in seen:
-                            seen.add(didx)
-                            unique.append((tidx, p, didx))
-                    while len(unique) < batch_size:
-                        unique.append(tmp_indices[len(unique) % len(tmp_indices)])
-                    tmp_indices = unique[:batch_size]
-                for i, (tree_idx, p, data_idx) in enumerate(tmp_indices):
-                    indices[i] = data_idx
-                    tree_indices[i] = tree_idx
-                    # 🔧 数值安全：限制权重计算，防止溢出
-                    if p > 1e-8 and total_p > 1e-8:
-                        prob = np.clip(buffer_size * p / total_p, 1e-8, 1e8)  # 限制概率范围
-                        weights[i] = prob ** (-self.beta)
-                    else:
-                        weights[i] = 1.0
+                    if data_indices.size > 0:
+                        keep = np.sort(np.unique(data_indices, return_index=True)[1])
+                        tree_indices = tree_indices[keep]
+                        priorities = priorities[keep]
+                        data_indices = data_indices[keep]
+                        unique_count = data_indices.size
+                        if unique_count < batch_size:
+                            fill_src = np.arange(unique_count, batch_size, dtype=np.int64) % _didx.size
+                            tree_indices = np.concatenate([tree_indices, _tidx[fill_src].astype(np.int32, copy=False)], axis=0)
+                            priorities = np.concatenate([priorities, _p[fill_src].astype(np.float32, copy=False)], axis=0)
+                            data_indices = np.concatenate([data_indices, _didx[fill_src].astype(np.int64, copy=False)], axis=0)
+                    data_indices = data_indices[:batch_size]
+                    priorities = priorities[:batch_size]
+
+                indices[:data_indices.size] = data_indices[:batch_size]
+                valid_prob_mask = (priorities > 1e-8) & (total_p > 1e-8)
+                if np.any(valid_prob_mask):
+                    prob = np.clip(buffer_size * priorities[valid_prob_mask] / total_p, 1e-8, 1e8)
+                    weights[valid_prob_mask] = prob ** (-self.beta)
                 # 确保权重是有限的
                 weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
                 max_w = np.max(weights)
@@ -1835,14 +2443,16 @@ class LiteReplayBuffer:
             else:
                 # 混合分布：P_mix = (1-m)*P_per + m*P_uniform
                 m = float(self.per_uniform_mix)
-                indices = np.zeros(batch_size, dtype=np.int32)
-                weights = np.zeros(batch_size, dtype=np.float32)
+                indices = np.zeros(batch_size, dtype=np.int64)
+                weights = np.ones((batch_size,), dtype=np.float32)
                 chosen = set() if not self.per_replace else None
                 # 先生成PER部分
                 n_per = int(max(0, round((1.0 - m) * batch_size)))
                 n_uni = batch_size - n_per
                 # PER采样
-                per_indices = []
+                per_tree = np.empty((0,), dtype=np.int32)
+                per_priority = np.empty((0,), dtype=np.float32)
+                per_data = np.empty((0,), dtype=np.int64)
                 if n_per > 0:
                     seg = total_p / n_per if n_per > 0 else 0.0
                     seg_starts = np.arange(n_per, dtype=np.float64) * seg
@@ -1850,39 +2460,38 @@ class LiteReplayBuffer:
                     seg_rand = self._per_rng.uniform(0, seg, size=n_per) if n_per > 0 else np.zeros((0,), dtype=np.float64)
                     rs = seg_starts + seg_rand
                     _tidx, _p, _didx = self.sum_tree.get_batch(rs)
-                    tmp = list(zip(_tidx.tolist(), _p.tolist(), _didx.tolist()))
                     if not self.per_replace:
-                        seen = set()
-                        unique = []
-                        for (tidx, p, didx) in tmp:
-                            if didx not in seen and (chosen is None or didx not in chosen):
-                                seen.add(didx)
-                                unique.append((tidx, p, didx))
-                        while len(unique) < n_per:
-                            unique.append(tmp[len(unique) % len(tmp)])
-                        tmp = unique[:n_per]
-                        for _, _, didx in tmp:
-                            chosen.add(int(didx))
-                    per_indices = tmp
+                        if _didx.size > 0:
+                            keep = np.sort(np.unique(_didx.astype(np.int64, copy=False), return_index=True)[1])
+                            per_tree = _tidx[keep].astype(np.int32, copy=False)
+                            per_priority = _p[keep].astype(np.float32, copy=False)
+                            per_data = _didx[keep].astype(np.int64, copy=False)
+                            unique_count = per_data.size
+                            if unique_count < n_per:
+                                fill_src = np.arange(unique_count, n_per, dtype=np.int64) % _didx.size
+                                per_tree = np.concatenate([per_tree, _tidx[fill_src].astype(np.int32, copy=False)], axis=0)
+                                per_priority = np.concatenate([per_priority, _p[fill_src].astype(np.float32, copy=False)], axis=0)
+                                per_data = np.concatenate([per_data, _didx[fill_src].astype(np.int64, copy=False)], axis=0)
+                        per_tree = per_tree[:n_per]
+                        per_priority = per_priority[:n_per]
+                        per_data = per_data[:n_per]
+                        if chosen is not None and per_data.size > 0:
+                            chosen.update(per_data.tolist())
+                    else:
+                        per_tree = _tidx.astype(np.int32, copy=False)
+                        per_priority = _p.astype(np.float32, copy=False)
+                        per_data = _didx.astype(np.int64, copy=False)
                 # 均匀采样
-                uni_indices = []
+                uni_tree = np.empty((0,), dtype=np.int32)
+                uni_priority = np.empty((0,), dtype=np.float32)
+                uni_data = np.empty((0,), dtype=np.int64)
                 if n_uni > 0:
                     if self.per_replace:
                         # 🚨 关键修复：使用独立的RandomState，确保可重复性
                         rand_idx = self._per_rng.randint(0, buffer_size, size=n_uni).astype(np.int64)
                     else:
                         if chosen is not None and len(chosen) < buffer_size:
-                            # 从未选择的索引中采样
-                            pool = np.setdiff1d(np.arange(buffer_size, dtype=np.int64), np.fromiter(chosen, dtype=np.int64), assume_unique=True)
-                            if pool.size >= n_uni:
-                                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                                rand_idx = self._per_rng.choice(pool, size=n_uni, replace=False)
-                            else:
-                                # 不足则补齐允许重复
-                                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                                extra = self._per_rng.choice(pool, size=pool.size, replace=False) if pool.size > 0 else np.array([], dtype=np.int64)
-                                rem = n_uni - extra.size
-                                rand_idx = np.concatenate([extra, self._per_rng.randint(0, buffer_size, size=rem).astype(np.int64)], axis=0)
+                            rand_idx = self._sample_unique_excluding(buffer_size, n_uni, chosen)
                         else:
                             # 退化
                             if buffer_size >= n_uni:
@@ -1891,33 +2500,31 @@ class LiteReplayBuffer:
                             else:
                                 # 🚨 关键修复：使用独立的RandomState，确保可重复性
                                 rand_idx = self._per_rng.randint(0, buffer_size, size=n_uni).astype(np.int64)
-                    # 为均匀样本构造其当前树优先级p（用于计算混合分布下的重要性采样权重）
-                    for didx in rand_idx:
-                        tree_idx = int(didx) + self.capacity - 1
-                        p = float(self.sum_tree.tree[tree_idx])
-                        uni_indices.append((tree_idx, p, int(didx)))
-                        if not self.per_replace and chosen is not None:
-                            chosen.add(int(didx))
+                    uni_data = rand_idx.astype(np.int64, copy=False)
+                    uni_tree = uni_data + self.sum_tree.leaf_start
+                    uni_priority = self.sum_tree.tree[uni_tree].astype(np.float32, copy=False)
+                    if not self.per_replace and chosen is not None and uni_data.size > 0:
+                        chosen.update(uni_data.tolist())
                 # 合并并计算混合权重
-                merged = (per_indices or []) + (uni_indices or [])
-                # 若数量不足，补齐（极端情况下sum_tree可能空或异常）
-                while len(merged) < batch_size:
-                    # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                    didx = int(self._per_rng.randint(0, buffer_size))
-                    tree_idx = didx + self.capacity - 1
-                    p = float(self.sum_tree.tree[tree_idx])
-                    merged.append((tree_idx, p, didx))
-                merged = merged[:batch_size]
-                for i, (tree_idx, p, data_idx) in enumerate(merged):
-                    indices[i] = int(data_idx)
-                    # 🔧 数值安全：混合分布概率计算，添加限制
-                    if total_p > 1e-12 and p > 0:
-                        per_prob = np.clip(p / total_p, 1e-10, 1.0)
-                    else:
-                        per_prob = 1.0 / buffer_size
-                    q_i = (1.0 - m) * per_prob + m * (1.0 / buffer_size)
-                    q_i = np.clip(q_i, 1e-10, 1.0)  # 限制概率范围
-                    weights[i] = (buffer_size * q_i) ** (-self.beta)
+                merged_priority = np.concatenate([per_priority, uni_priority], axis=0)
+                merged_data = np.concatenate([per_data, uni_data], axis=0)
+                if merged_data.size < batch_size:
+                    fill_count = batch_size - merged_data.size
+                    fill_data = self._per_rng.randint(0, buffer_size, size=fill_count).astype(np.int64)
+                    fill_tree = fill_data + self.sum_tree.leaf_start
+                    fill_priority = self.sum_tree.tree[fill_tree].astype(np.float32, copy=False)
+                    merged_priority = np.concatenate([merged_priority, fill_priority], axis=0)
+                    merged_data = np.concatenate([merged_data, fill_data], axis=0)
+                merged_priority = merged_priority[:batch_size]
+                merged_data = merged_data[:batch_size]
+                indices[:merged_data.size] = merged_data
+                per_prob = np.full((batch_size,), 1.0 / buffer_size, dtype=np.float32)
+                if total_p > 1e-12:
+                    valid_prob_mask = merged_priority > 0.0
+                    if np.any(valid_prob_mask):
+                        per_prob[valid_prob_mask] = np.clip(merged_priority[valid_prob_mask] / total_p, 1e-10, 1.0)
+                q_i = np.clip((1.0 - m) * per_prob + m * (1.0 / buffer_size), 1e-10, 1.0)
+                weights = (buffer_size * q_i) ** (-self.beta)
                 # 确保权重是有限的
                 weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
                 max_w = np.max(weights)
@@ -1938,8 +2545,12 @@ class LiteReplayBuffer:
         fr_batch = self.fr[indices].astype(np.float32, copy=False)
         # 🚨 新增：返回势场力（pf_forces），用于恢复修正后的动作
         pf_forces_batch = self.pf_forces[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, 3)
+        pf_features_batch = self.pf_features[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, 3)
+        next_pf_features_batch = self.next_pf_features[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, 3)
         # 🔧 新增：返回修正后的动作（混合动作），用于Critic学习
         act_corrected_batch = self.act_corrected[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, act_dim)
+        # 🔧 新增：返回下一步的修正后动作，用于 Target Q 计算
+        next_act_corrected_batch = self.next_act_corrected[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, act_dim)
         return (
             obs_batch,
             next_obs_batch,
@@ -1950,27 +2561,132 @@ class LiteReplayBuffer:
             indices.astype(np.int32),
             fr_batch,
             pf_forces_batch,  # 新增：势场力批次
+            pf_features_batch,  # 当前状态的 base PF 特征
+            next_pf_features_batch,  # 下一状态的 base PF 特征
             act_corrected_batch,  # 🔧 新增：修正后的动作批次
+            None,  # next_pf_forces_batch 保留兼容位
+            next_act_corrected_batch,  # 🔧 新增：下一步的修正后动作批次
         )
 
     def size(self):
         return int(self.current_size)
     
-    def clear(self):
-        """清空经验回放缓冲区（用于课程学习解锁时清理旧经验）"""
-        self.position = 0
-        self.current_size = 0
-        # 重置SumTree
-        if hasattr(self, 'sum_tree'):
-            self.sum_tree = SumTree(self.capacity)
-        # 重置最大优先级
-        if hasattr(self, 'max_priority'):
-            self.max_priority = 1.0
-        # 重置插入计数器
-        if hasattr(self, '_global_insert_counter'):
-            self._global_insert_counter = 0
-        if hasattr(self, '_insert_step'):
-            self._insert_step.fill(0)
+    def clear(self, keep_recent_n=0):
+        """清空经验回放缓冲区（用于课程学习解锁时清理旧经验）
+        
+        参数:
+            keep_recent_n: 保留最近N条经验（渐进式清空），0表示完全清空
+        """
+        if keep_recent_n > 0 and self.current_size > keep_recent_n:
+            # 渐进式清空：保留最近N条经验
+            # 由于是循环缓冲区，最近的经验在position附近
+            # 需要将最近N条经验移动到缓冲区开头
+            recent_start = (self.position - keep_recent_n) % self.capacity
+            if recent_start < 0:
+                recent_start += self.capacity
+            
+            # 如果最近的经验跨越了缓冲区边界，需要分两部分复制
+            if recent_start + keep_recent_n <= self.capacity:
+                # 不跨越边界，直接复制
+                self.obs[:keep_recent_n] = self.obs[recent_start:recent_start + keep_recent_n]
+                self.next_obs[:keep_recent_n] = self.next_obs[recent_start:recent_start + keep_recent_n]
+                self.act[:keep_recent_n] = self.act[recent_start:recent_start + keep_recent_n]
+                self.rew[:keep_recent_n] = self.rew[recent_start:recent_start + keep_recent_n]
+                self.done[:keep_recent_n] = self.done[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'act_corrected'):
+                    self.act_corrected[:keep_recent_n] = self.act_corrected[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'next_act_corrected'):
+                    self.next_act_corrected[:keep_recent_n] = self.next_act_corrected[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'fr'):
+                    self.fr[:keep_recent_n] = self.fr[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'pf_forces'):
+                    self.pf_forces[:keep_recent_n] = self.pf_forces[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'pf_features'):
+                    self.pf_features[:keep_recent_n] = self.pf_features[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'next_pf_features'):
+                    self.next_pf_features[:keep_recent_n] = self.next_pf_features[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, 'next_pf_geometry_cache'):
+                    self.next_pf_geometry_cache[:keep_recent_n] = self.next_pf_geometry_cache[recent_start:recent_start + keep_recent_n]
+                if hasattr(self, '_insert_step'):
+                    self._insert_step[:keep_recent_n] = self._insert_step[recent_start:recent_start + keep_recent_n]
+            else:
+                # 跨越边界，分两部分复制
+                part1_len = self.capacity - recent_start
+                part2_len = keep_recent_n - part1_len
+                self.obs[:part1_len] = self.obs[recent_start:]
+                self.obs[part1_len:keep_recent_n] = self.obs[:part2_len]
+                self.next_obs[:part1_len] = self.next_obs[recent_start:]
+                self.next_obs[part1_len:keep_recent_n] = self.next_obs[:part2_len]
+                self.act[:part1_len] = self.act[recent_start:]
+                self.act[part1_len:keep_recent_n] = self.act[:part2_len]
+                self.rew[:part1_len] = self.rew[recent_start:]
+                self.rew[part1_len:keep_recent_n] = self.rew[:part2_len]
+                self.done[:part1_len] = self.done[recent_start:]
+                self.done[part1_len:keep_recent_n] = self.done[:part2_len]
+                if hasattr(self, 'act_corrected'):
+                    self.act_corrected[:part1_len] = self.act_corrected[recent_start:]
+                    self.act_corrected[part1_len:keep_recent_n] = self.act_corrected[:part2_len]
+                if hasattr(self, 'next_act_corrected'):
+                    self.next_act_corrected[:part1_len] = self.next_act_corrected[recent_start:]
+                    self.next_act_corrected[part1_len:keep_recent_n] = self.next_act_corrected[:part2_len]
+                if hasattr(self, 'fr'):
+                    self.fr[:part1_len] = self.fr[recent_start:]
+                    self.fr[part1_len:keep_recent_n] = self.fr[:part2_len]
+                if hasattr(self, 'pf_forces'):
+                    self.pf_forces[:part1_len] = self.pf_forces[recent_start:]
+                    self.pf_forces[part1_len:keep_recent_n] = self.pf_forces[:part2_len]
+                if hasattr(self, 'pf_features'):
+                    self.pf_features[:part1_len] = self.pf_features[recent_start:]
+                    self.pf_features[part1_len:keep_recent_n] = self.pf_features[:part2_len]
+                if hasattr(self, 'next_pf_features'):
+                    self.next_pf_features[:part1_len] = self.next_pf_features[recent_start:]
+                    self.next_pf_features[part1_len:keep_recent_n] = self.next_pf_features[:part2_len]
+                if hasattr(self, 'next_pf_geometry_cache'):
+                    self.next_pf_geometry_cache[:part1_len] = self.next_pf_geometry_cache[recent_start:]
+                    self.next_pf_geometry_cache[part1_len:keep_recent_n] = self.next_pf_geometry_cache[:part2_len]
+                if hasattr(self, '_insert_step'):
+                    self._insert_step[:part1_len] = self._insert_step[recent_start:]
+                    self._insert_step[part1_len:keep_recent_n] = self._insert_step[:part2_len]
+            
+            # 更新位置和大小
+            self.position = keep_recent_n
+            self.current_size = keep_recent_n
+            
+            # 重置SumTree（需要重新计算优先级）
+            if hasattr(self, 'sum_tree'):
+                self.sum_tree = SumTree(self.capacity)
+                # 为保留的经验重新添加优先级
+                safe_max_priority = min(float(self.max_priority), 5000.0)
+                initial_priority = safe_max_priority ** float(self.negative_slope)
+                initial_priority = min(initial_priority, 50000.0)
+                if keep_recent_n > 0:
+                    tree_indices = self.sum_tree.leaf_start + np.arange(keep_recent_n, dtype=np.int64)
+                    priorities = np.full((keep_recent_n,), initial_priority, dtype=np.float32)
+                    self.sum_tree.update_batch(tree_indices, priorities)
+                    self.sum_tree.data_pointer = int(keep_recent_n % self.capacity)
+        else:
+            # 完全清空
+            self.position = 0
+            self.current_size = 0
+            # 重置SumTree
+            if hasattr(self, 'sum_tree'):
+                self.sum_tree = SumTree(self.capacity)
+            # 重置最大优先级
+            if hasattr(self, 'max_priority'):
+                self.max_priority = 1.0
+            # 重置插入计数器
+            if hasattr(self, '_global_insert_counter'):
+                self._global_insert_counter = 0
+            if hasattr(self, '_insert_step'):
+                self._insert_step.fill(0)
+            if hasattr(self, 'stores_pf_features'):
+                self.stores_pf_features = False
+            if hasattr(self, 'stores_next_pf_features'):
+                self.stores_next_pf_features = False
+            if hasattr(self, 'stores_next_pf_geometry_cache'):
+                self.stores_next_pf_geometry_cache = False
+            if hasattr(self, 'stores_next_act_corrected'):
+                self.stores_next_act_corrected = False
         # 注意：不需要重置数组内容（会被新数据覆盖），只重置索引和计数器
 
     def update_priorities(self, indices, td_errors):
@@ -1985,6 +2701,12 @@ class LiteReplayBuffer:
                 return
             # 将 NaN/Inf 替换为安全值
             td_errors = np.nan_to_num(td_errors, nan=1.0, posinf=10000.0, neginf=1.0)
+        except Exception:
+            return
+        try:
+            indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+            if indices.size == 0:
+                return
         except Exception:
             return
         
@@ -2010,64 +2732,65 @@ class LiteReplayBuffer:
             pass
         
         # 设置下界和上界
-        clipped_errors = np.clip(td_errors, 1e-6, MAX_TD_ERROR)
-        
-        for i, idx in enumerate(indices):
-            # 奖励幅值（对所有agent取平均幅度）
+        clipped_errors = np.clip(td_errors, 1e-6, MAX_TD_ERROR).reshape(-1)
+
+        n = min(indices.size, clipped_errors.size)
+        if n <= 0:
+            return
+        indices = indices[:n]
+        clipped_errors = clipped_errors[:n]
+
+        valid_mask = (indices >= 0) & (indices < self.size())
+        if not np.any(valid_mask):
+            return
+        indices = indices[valid_mask].astype(np.int32, copy=False)
+        clipped_errors = clipped_errors[valid_mask]
+
+        # 奖励幅值（对所有 agent 取平均幅度）
+        try:
+            rew_abs = np.mean(np.abs(self.rew[indices]), axis=1).astype(np.float32, copy=False)
+            rew_abs = np.minimum(rew_abs, 1000.0)
+        except Exception:
+            rew_abs = np.zeros(indices.shape[0], dtype=np.float32)
+
+        # 年龄权重（越旧越小）；当 priority_age_decay==1.0 时等价于无衰减
+        if self.priority_age_decay < 1.0 and self.priority_age_decay > 0:
             try:
-                rew_abs = float(np.mean(np.abs(self.rew[int(idx)])))
-                # 🔧 关键修复3：限制奖励绝对值的影响范围
-                rew_abs = min(rew_abs, 1000.0)  # 单步奖励不应超过1000
+                age = self._global_insert_counter - self._insert_step[indices]
+                age = np.clip(age, 0, 100000)
+                age_w = np.power(np.float64(self.priority_age_decay), age.astype(np.float64)).astype(np.float32)
+                invalid_age_w = (~np.isfinite(age_w)) | (age_w <= 0.0)
+                if np.any(invalid_age_w):
+                    age_w[invalid_age_w] = 1.0
             except Exception:
-                rew_abs = 0.0
-            
-            # 年龄权重（越旧越小）；当priority_age_decay==1.0时等价于无衰减
-            try:
-                age = int(self._global_insert_counter - self._insert_step[int(idx)])
-                # 🔧 限制age范围，防止极端值
-                age = max(0, min(age, 100000))  # age不应该过大
-                if self.priority_age_decay < 1.0 and self.priority_age_decay > 0:
-                    age_w = self.priority_age_decay ** age
-                    # 确保age_w是有效的
-                    if not np.isfinite(age_w) or age_w <= 0:
-                        age_w = 1.0
-                else:
-                    age_w = 1.0
-            except Exception:
-                age_w = 1.0
-            
-            # 🔧 关键修复4：组合信号设置合理上界
-            signal = self.priority_td_weight * float(clipped_errors[i]) + self.priority_reward_weight * rew_abs
-            signal = np.clip(signal, 1e-6, MAX_TD_ERROR)  # 确保signal不会过大
-            
-            # 🔧 关键修复5：优先级计算添加数值安全检查
-            try:
-                # 确保所有参与计算的值都是有效的
-                if not np.isfinite(signal) or not np.isfinite(self.negative_slope) or not np.isfinite(age_w):
-                    p = 1.0  # 使用默认值
-                else:
-                    p = (signal ** float(self.negative_slope)) * float(age_w)
-                    # 检查计算结果是否有效
-                    if not np.isfinite(p) or p <= 0:
-                        p = 1.0
-            except (ValueError, OverflowError, FloatingPointError):
-                p = 1.0
-            
-            # 最终的优先级值也需要限制，防止极端情况
-            MAX_PRIORITY_VALUE = 50000.0  # 单个样本优先级上限
-            p = np.clip(p, 1e-8, MAX_PRIORITY_VALUE)
-            
-            # 🔧 最后一道防线：确保p是有限的正数
-            if not np.isfinite(p) or p <= 0:
-                p = 1.0
-            
-            tree_idx = int(idx) + self.capacity - 1
-            self.sum_tree.update(tree_idx, float(p))
+                age_w = np.ones(indices.shape[0], dtype=np.float32)
+        else:
+            age_w = np.ones(indices.shape[0], dtype=np.float32)
+
+        # 组合信号并计算优先级
+        signal = self.priority_td_weight * clipped_errors + self.priority_reward_weight * rew_abs
+        signal = np.clip(signal, 1e-6, MAX_TD_ERROR).astype(np.float32, copy=False)
+
+        try:
+            if not np.isfinite(self.negative_slope):
+                priorities = np.ones(indices.shape[0], dtype=np.float32)
+            else:
+                priorities = np.power(signal.astype(np.float64), float(self.negative_slope)).astype(np.float32)
+                priorities *= age_w
+        except (ValueError, OverflowError, FloatingPointError):
+            priorities = np.ones(indices.shape[0], dtype=np.float32)
+
+        MAX_PRIORITY_VALUE = 50000.0  # 单个样本优先级上限
+        priorities = np.nan_to_num(priorities, nan=1.0, posinf=1.0, neginf=1.0)
+        priorities = np.clip(priorities, 1e-8, MAX_PRIORITY_VALUE).astype(np.float32, copy=False)
+
+        tree_indices = indices.astype(np.int64) + self.capacity - 1
+        self.sum_tree.update_batch(tree_indices, priorities)
 
         # PER调试：周期性打印优先级统计，验证是否有效（降低频率以提升性能）
         try:
             self._per_update_count = getattr(self, '_per_update_count', 0) + 1
-            if self._per_update_count % 500 == 0:
+            if self._per_debug_print_interval > 0 and (self._per_update_count % self._per_debug_print_interval == 0):
                 total_p = float(self.sum_tree.total())
                 # 采样几次估算去重比例
                 est_unique_ratio = None
@@ -2167,12 +2890,12 @@ def _compute_loss_stats(losses):
             critic_vals = [
                 float(loss['critic_loss'])
                 for loss in losses
-                if isinstance(loss, dict) and 'critic_loss' in loss
+                if isinstance(loss, dict) and 'critic_loss' in loss and loss['critic_loss'] is not None
             ]
             actor_vals = [
                 float(loss['actor_loss'])
                 for loss in losses
-                if isinstance(loss, dict) and 'actor_loss' in loss
+                if isinstance(loss, dict) and 'actor_loss' in loss and loss['actor_loss'] is not None
             ]
             # 过滤掉 NaN，仅用有限值统计，避免 RuntimeWarning: Mean of empty slice
             critic_vals = [v for v in critic_vals if not np.isnan(v)]
@@ -2204,43 +2927,73 @@ def _compute_loss_stats(losses):
     return avg_critic_loss, avg_actor_loss
 
 
+def _agent_safe_for_success(agent):
+    """Safe_i: 整个回合无真实碰撞或真实穿透。"""
+    try:
+        if getattr(agent, '_episode_has_collision', False):
+            return False
+    except Exception:
+        pass
+    try:
+        if getattr(agent, '_had_obstacle_collision', False):
+            return False
+    except Exception:
+        pass
+    try:
+        if getattr(agent, '_had_terrain_contact_or_penetration', False):
+            return False
+    except Exception:
+        pass
+
+    penetration_count = 0
+    if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+        penetration_count = agent.debug_info.get('total_penetration_count', 0)
+    try:
+        penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
+    except Exception:
+        penetration_count = 0
+    return penetration_count == 0
+
+
 def _episode_success_without_collision(env, args):
-    """并行环境下的成功判定：聚合每个子环境的结果。
-    规则（单个子环境）：
-      - 优先使用每个智能体专属目标 `agent.goal_a.state.p_pos`，否则回退中央目标 `scenario.goal_pos`
-      - 判定阈值：3D<=1.2*thr（只判断3D距离，不判断XY距离）
-      - 碰撞：检查整个回合的穿透计数和终止原因，只要回合中发生过穿透即判定为碰撞
-    聚合模式（环境变量 SUCCESS_COUNT_MODE 或 CLI --success-count-mode）：
-      - any: 至少一个子环境成功即计成功
-      - all: 所有子环境成功才计成功
-      - majority: 成功子环境占比 >= EARLY_STOP_MAJORITY_RATIO
+    """与 [成功记录] 完全一致的成功判定：同一套 env 解包、同一 agent 源(world.agents)、同一 reach/safe 公式。
+    规则（与 paper3d_train 成功记录块一致）：
+      - 智能体来源：优先 _env.world.agents（与碰撞统计一致），无则回退 scn.agents
+      - Reach_i：终止帧 dist_goal_3d <= thr_success（不乘 1.2）
+      - Safe_i：整回合无真实碰撞/真实穿透
+    聚合模式：SUCCESS_COUNT_MODE any/all/majority
     """
     try:
         import os
 
-        # 子环境列表
-        sub_envs = []
+        # 与 [成功记录] 完全相同的 env 解包
+        envs_to_check = []
         if hasattr(env, 'envs') and isinstance(getattr(env, 'envs'), (list, tuple)) and len(env.envs) > 0:
-            sub_envs = list(env.envs)
+            for env_idx, single_env in enumerate(env.envs):
+                envs_to_check.append((env_idx, single_env))
+        elif hasattr(env, 'env') and getattr(env, 'env', None) is not None:
+            envs_to_check.append((0, env.env))
+        elif hasattr(env, 'world'):
+            envs_to_check.append((0, env))
         else:
-            sub_envs = [env]
+            envs_to_check.append((0, env))
 
         mode = str(getattr(args, 'success_count_mode', os.getenv('SUCCESS_COUNT_MODE', 'any'))).lower()
         if mode not in ('any', 'all', 'majority'):
             mode = 'any'
         majority_ratio = float(os.getenv('EARLY_STOP_MAJORITY_RATIO', '0.5'))
-        early_stop_mode = os.getenv('EARLY_STOP_MODE', 'never').lower()
-
+        thr_success = float(getattr(args, 'success_distance_threshold', 4.0))
         env_results = []
 
-        for env_i, _env in enumerate(sub_envs):
-            scn = getattr(_env, 'scenario', None)
-            if scn is None:
+        for env_idx, single_env in envs_to_check:
+            if not hasattr(single_env, 'world') or not hasattr(single_env.world, 'agents'):
                 env_results.append(False)
                 continue
-
-            goal_pos = getattr(scn, 'goal_pos', None)
-            if goal_pos is None and hasattr(scn, 'get_goal_pos'):
+            # 与 [成功记录] 一致：优先 world.agents（碰撞/穿透在此更新）
+            agents = list(single_env.world.agents)
+            scn = getattr(single_env, 'scenario', None)
+            goal_pos = getattr(scn, 'goal_pos', None) if scn is not None else None
+            if goal_pos is None and scn is not None and hasattr(scn, 'get_goal_pos'):
                 try:
                     goal_pos = scn.get_goal_pos()
                 except Exception:
@@ -2250,61 +3003,17 @@ def _episode_success_without_collision(env, args):
                 continue
 
             gx, gy, gz = float(goal_pos[0]), float(goal_pos[1]), float(goal_pos[2])
-            thr_success = float(getattr(args, 'success_distance_threshold', 8.0))
-
-            # 🔧 关键修复：碰撞检测不应依赖EARLY_STOP_MODE，而应直接检查智能体状态
-            # 原问题：当EARLY_STOP_MODE=never时，collided永远是False，导致成功判断失效
             collided = False
-            
-            # 方法1：尝试从终止原因获取（如果可用）
+            risk_details = []
             try:
-                if hasattr(env, 'get_latest_termination_reasons'):
-                    termination_reasons = env.get_latest_termination_reasons(env_i)
-                elif hasattr(env, '_termination_reasons'):
-                    termination_reasons = getattr(env, '_termination_reasons', {})
-                else:
-                    termination_reasons = {}
-                
-                for agent_name, reasons in termination_reasons.items():
-                    if any(r in ['越界', '实体碰撞', '地形穿透'] for r in reasons):
+                for idx, ag in enumerate(agents):
+                    if not _agent_safe_for_success(ag):
                         collided = True
+                        risk_details.append(f"Agent{idx}:collision")
                         break
             except Exception:
-                pass
-            
-            # 方法2：如果方法1未检测到碰撞，直接检查智能体的调试信息
-            # 🔧 注意：穿透计数会在每回合开始时重置为0（在 reset_world 中）
-            # 成功判定是在回合结束时检查的，检查的是整个回合的穿透计数
-            # 如果回合中发生了穿透，即使回合结束时已经不在穿透状态，仍然会被判定为碰撞
-            # 这是合理的，因为成功判定要求"整个回合都没有碰撞"
-            if not collided:
-                try:
-                    agents_to_check = getattr(scn, 'agents', [])
-                    for ag in agents_to_check:
-                        # 检查是否有穿透计数（整个回合的累计值）
-                        if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
-                            penetration_count = ag.debug_info.get('total_penetration_count', 0)
-                            if penetration_count > 0:
-                                collided = True
-                                break
-                        
-                        # 检查是否低于地形高度（穿透判定）- 检查回合结束时的最终状态
-                        # 🚨 关键修复：使用与碰撞检测相同的阈值TERRAIN_CONTACT_EPS（1.5米），而不是硬编码0.1米
-                        pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
-                        if pos is not None and len(pos) >= 3 and hasattr(scn, 'get_terrain_height'):
-                            try:
-                                terrain_h = scn.get_terrain_height(pos[0], pos[1])
-                                # 🚨 关键修复：使用TERRAIN_CONTACT_EPS环境变量（默认1.5米），与碰撞检测阈值一致
-                                terrain_contact_eps = float(os.getenv('TERRAIN_CONTACT_EPS', '1.5'))
-                                if pos[2] < terrain_h + terrain_contact_eps:  # 低于地形+阈值视为穿透
-                                    collided = True
-                                    break
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                collided = True
 
-            agents = getattr(scn, 'agents', [])
             all_reached = True
             for ag in agents:
                 pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
@@ -2326,33 +3035,30 @@ def _episode_success_without_collision(env, args):
                 dx = x - gx_i; dy = y - gy_i; dz = z - gz_i
                 dist_goal_3d = (dx*dx + dy*dy + dz*dz) ** 0.5
 
-                # 🔧 修复：只判断3D距离，不判断XY距离
-                is_agent_reached = (dist_goal_3d <= (1.2 * thr_success))
-                if not is_agent_reached:
+                # 统一阈值：不再乘 1.2
+                is_agent_reached_current = (dist_goal_3d <= thr_success)
+                # 末帧语义：只看回合结束时是否在终点区域内
+                if not is_agent_reached_current:
                     all_reached = False
                     break
 
             env_ok = (all_reached and (not collided))
             env_results.append(env_ok)
             
-            # 🚨 关键调试：输出成功判断详情（每回合输出，帮助诊断问题）
+            # 🚨 关键调试：输出成功判断详情（与 [成功记录] 同源 world.agents，结果一致）
             try:
-                # 获取当前回合数
-                current_episode = getattr(scn, '_episode_count', 0)
-                is_debug_episode = (current_episode % 10 == 0) or (not env_ok)  # 每10回合或失败时输出
+                current_episode = getattr(scn, '_episode_count', 0) if scn is not None else 0
                 if current_episode < 5 or (current_episode % 10 == 0):
                     if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                        print(f"[成功判断] 回合{current_episode+1} Env{env_i}: all_reached={all_reached}, collided={collided}, env_ok={env_ok}, thr_success={thr_success}, 判断阈值={1.2*thr_success:.2f}m")
-                
+                        print(f"[成功判断] 回合{current_episode+1} Env{env_idx}: all_reached={all_reached}, collided={collided}, env_ok={env_ok}, thr_success={thr_success}, 判断阈值={thr_success:.2f}m")
                 debug_enabled = str(os.getenv('DEBUG_SUCCESS_CHECK', '0')).lower() in ('1','true','yes','on')
-                
+                is_debug_episode = (current_episode % 10 == 0) or (not env_ok)
                 if debug_enabled or is_debug_episode:
                     if env_ok:
-                        print(f"✅ [成功判断] Env{env_i} Episode{current_episode}: 到达且无碰撞")
+                        print(f"✅ [成功判断] Env{env_idx} Episode{current_episode}: 到达且无碰撞")
                     else:
                         reasons = []
                         if not all_reached:
-                            # 详细列出哪些智能体未到达
                             unreached_agents = []
                             for idx, ag in enumerate(agents):
                                 pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
@@ -2363,32 +3069,16 @@ def _episode_success_without_collision(env, args):
                                             ag_goal = getattr(ag.goal_a.state, 'p_pos', None)
                                         if ag_goal is None:
                                             ag_goal = goal_pos
-                                        
-                                        dx = pos[0] - ag_goal[0]
-                                        dy = pos[1] - ag_goal[1]
-                                        dz = pos[2] - ag_goal[2]
+                                        dx = pos[0] - ag_goal[0]; dy = pos[1] - ag_goal[1]; dz = pos[2] - ag_goal[2]
                                         dist_3d = (dx*dx + dy*dy + dz*dz) ** 0.5
-                                        
-                                        # 🔧 修复：只判断3D距离，不判断XY距离
-                                        is_reached = (dist_3d <= (1.2 * thr_success))
-                                        if not is_reached:
+                                        if dist_3d > thr_success:
                                             unreached_agents.append(f"Agent{idx}(dist3D={dist_3d:.1f}m)")
                                     except Exception:
                                         pass
-                            
                             reasons.append(f"未到达: {', '.join(unreached_agents) if unreached_agents else '全部'}")
-                        
                         if collided:
-                            # 详细列出碰撞类型
-                            collision_details = []
-                            for ag in agents:
-                                if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
-                                    penetration = ag.debug_info.get('total_penetration_count', 0)
-                                    if penetration > 0:
-                                        collision_details.append(f"穿透{penetration}次")
-                            reasons.append(f"碰撞: {', '.join(collision_details) if collision_details else '检测到'}")
-                        
-                        print(f"❌ [成功判断] Env{env_i} Episode{current_episode}: {' | '.join(reasons)}")
+                            reasons.append(f"发生真实碰撞/穿透: {', '.join(risk_details) if risk_details else '检测到'}")
+                        print(f"❌ [成功判断] Env{env_idx} Episode{current_episode}: {' | '.join(reasons)}")
             except Exception:
                 pass
 
@@ -2521,6 +3211,282 @@ def _safe_tensor_to_numpy(tensor, max_retries=5, retry_delay=0.02):
                 raise
     # 如果所有重试都失败，抛出最后一个异常
     raise RuntimeError(f"无法将tensor转换为numpy数组，已重试{max_retries}次")
+
+
+def _unpack_replay_sample(sample_result):
+    """兼容旧/新回放样本结构，统一返回 15 元组。"""
+    batch_len = len(sample_result)
+    if batch_len == 15:
+        return sample_result
+    if batch_len == 14:
+        return (
+            sample_result[0],
+            sample_result[1],
+            sample_result[2],
+            sample_result[3],
+            sample_result[4],
+            sample_result[5],
+            sample_result[6],
+            sample_result[7],
+            sample_result[8],
+            sample_result[9],
+            sample_result[10],
+            None,
+            sample_result[11],
+            sample_result[12],
+            sample_result[13],
+        )
+    if batch_len == 12:
+        (
+            obs_n,
+            next_obs_n,
+            act_n,
+            rew_n,
+            done_n,
+            weights,
+            indices,
+            fr_batch,
+            pf_forces_batch,
+            act_corrected_batch,
+            next_pf_forces_batch,
+            next_act_corrected_batch,
+        ) = sample_result
+        return (
+            obs_n,
+            next_obs_n,
+            act_n,
+            rew_n,
+            done_n,
+            weights,
+            indices,
+            fr_batch,
+            pf_forces_batch,
+            None,
+            None,
+            None,
+            act_corrected_batch,
+            next_pf_forces_batch,
+            next_act_corrected_batch,
+        )
+    if batch_len == 11:
+        (
+            obs_n,
+            next_obs_n,
+            act_n,
+            rew_n,
+            done_n,
+            weights,
+            indices,
+            fr_batch,
+            pf_forces_batch,
+            act_corrected_batch,
+            next_act_corrected_batch,
+        ) = sample_result
+        return (
+            obs_n,
+            next_obs_n,
+            act_n,
+            rew_n,
+            done_n,
+            weights,
+            indices,
+            fr_batch,
+            pf_forces_batch,
+            None,
+            None,
+            None,
+            act_corrected_batch,
+            None,
+            next_act_corrected_batch,
+        )
+    raise ValueError(f"当前训练主线仅接受11/12/14/15元组回放样本，实际 len(sample_result)={batch_len}")
+
+
+def _coerce_pf_feature_batch_numpy(pf_batch, batch_size, n_agents, pf_feature_dim):
+    """将 PF 特征批次规整为 (batch, n_agents, pf_feature_dim)。"""
+    pf_feature_dim = int(pf_feature_dim) if pf_feature_dim and pf_feature_dim > 0 else 3
+    if batch_size <= 0:
+        return np.zeros((0, n_agents, pf_feature_dim), dtype=np.float32)
+    if pf_batch is None:
+        return np.zeros((batch_size, n_agents, pf_feature_dim), dtype=np.float32)
+    if (
+        isinstance(pf_batch, np.ndarray)
+        and pf_batch.dtype == np.float32
+        and pf_batch.ndim == 3
+        and pf_batch.shape[0] == batch_size
+        and pf_batch.shape[1] == n_agents
+        and pf_batch.shape[2] == pf_feature_dim
+        and pf_batch.flags['C_CONTIGUOUS']
+    ):
+        return pf_batch
+    try:
+        arr = np.asarray(pf_batch, dtype=np.float32)
+    except Exception:
+        return np.zeros((batch_size, n_agents, pf_feature_dim), dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((batch_size, n_agents, pf_feature_dim), dtype=np.float32)
+    try:
+        if arr.ndim == 2:
+            arr = arr.reshape(batch_size, n_agents, -1)
+        elif arr.ndim != 3:
+            arr = arr.reshape(batch_size, n_agents, -1)
+    except Exception:
+        return np.zeros((batch_size, n_agents, pf_feature_dim), dtype=np.float32)
+    if arr.shape[0] != batch_size or arr.shape[1] != n_agents:
+        try:
+            arr = arr.reshape(batch_size, n_agents, -1)
+        except Exception:
+            return np.zeros((batch_size, n_agents, pf_feature_dim), dtype=np.float32)
+    feat_dim_in = int(arr.shape[2]) if arr.ndim == 3 else 0
+    if feat_dim_in <= 0:
+        return np.zeros((batch_size, n_agents, pf_feature_dim), dtype=np.float32)
+    if feat_dim_in > pf_feature_dim:
+        arr = arr[:, :, :pf_feature_dim]
+    elif feat_dim_in < pf_feature_dim:
+        pad = np.zeros((batch_size, n_agents, pf_feature_dim - feat_dim_in), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=2)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _coerce_pf_geometry_cache_batch_numpy(geom_batch, batch_size, n_agents):
+    """将压缩 PF 几何上下文规整为 (batch, n_agents, 38)。"""
+    if batch_size <= 0:
+        return np.zeros((0, n_agents, 38), dtype=np.float32)
+    if geom_batch is None:
+        return None
+    if (
+        isinstance(geom_batch, np.ndarray)
+        and geom_batch.dtype == np.float32
+        and geom_batch.ndim == 3
+        and geom_batch.shape[0] == batch_size
+        and geom_batch.shape[1] == n_agents
+        and geom_batch.shape[2] == 38
+        and geom_batch.flags['C_CONTIGUOUS']
+    ):
+        return geom_batch
+    try:
+        arr = np.asarray(geom_batch, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return None
+    try:
+        if arr.ndim == 2:
+            arr = arr.reshape(batch_size, n_agents, -1)
+        elif arr.ndim != 3:
+            arr = arr.reshape(batch_size, n_agents, -1)
+    except Exception:
+        return None
+    if arr.shape[0] != batch_size or arr.shape[1] != n_agents:
+        try:
+            arr = arr.reshape(batch_size, n_agents, -1)
+        except Exception:
+            return None
+    feat_dim_in = int(arr.shape[2]) if arr.ndim == 3 else 0
+    if feat_dim_in <= 0:
+        return None
+    if feat_dim_in > 38:
+        arr = arr[:, :, :38]
+    elif feat_dim_in < 38:
+        pad = np.zeros((batch_size, n_agents, 38 - feat_dim_in), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=2)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _flatten_pf_feature_batch_tf(pf_batch, n_agents, pf_feature_dim):
+    """将 PF 特征批次展平为 (batch, n_agents * pf_feature_dim)。"""
+    pf_feature_dim = int(pf_feature_dim) if pf_feature_dim and pf_feature_dim > 0 else 3
+    pf_tensor = pf_batch if tf.is_tensor(pf_batch) else tf.convert_to_tensor(pf_batch, dtype=tf.float32)
+    if pf_tensor.dtype != tf.float32:
+        pf_tensor = tf.cast(pf_tensor, tf.float32)
+    if pf_tensor.shape.rank == 3 and pf_tensor.shape[-1] == pf_feature_dim:
+        if pf_tensor.shape[1] == n_agents:
+            return tf.reshape(pf_tensor, [-1, n_agents * pf_feature_dim])
+        if pf_tensor.shape[1] is None:
+            try:
+                pf_tensor = tf.ensure_shape(pf_tensor, [None, n_agents, pf_feature_dim])
+                return tf.reshape(pf_tensor, [-1, n_agents * pf_feature_dim])
+            except Exception:
+                pass
+    pf_tensor = tf.ensure_shape(pf_tensor, [None, n_agents, None])
+    last_dim = pf_tensor.shape[-1]
+    if last_dim is None:
+        current_dim = tf.shape(pf_tensor)[2]
+        pf_tensor = pf_tensor[:, :, :tf.minimum(current_dim, pf_feature_dim)]
+        pad_dim = tf.maximum(pf_feature_dim - tf.shape(pf_tensor)[2], 0)
+        pf_tensor = tf.pad(pf_tensor, [[0, 0], [0, 0], [0, pad_dim]])
+    elif last_dim > pf_feature_dim:
+        pf_tensor = pf_tensor[:, :, :pf_feature_dim]
+    elif last_dim < pf_feature_dim:
+        pf_tensor = tf.pad(pf_tensor, [[0, 0], [0, 0], [0, pf_feature_dim - last_dim]])
+    return tf.reshape(pf_tensor, [tf.shape(pf_tensor)[0], n_agents * pf_feature_dim])
+
+
+def _flush_pending_per_updates(owner, replay_buffer, warn_prefix="[PER警告]", success_message=None):
+    """将延迟的 PER 优先级批量写回回放缓冲区。"""
+    pending = getattr(owner, '_per_update_buffer', None)
+    if not pending:
+        return 0
+
+    idx_parts = []
+    pri_parts = []
+    for idx, pri in pending:
+        try:
+            pri_np = _safe_tensor_to_numpy(tf.identity(pri))
+            idx_np = np.asarray(idx, dtype=np.int64).reshape(-1)
+            pri_np = np.asarray(pri_np, dtype=np.float32).reshape(-1)
+            if idx_np.size == 0 or pri_np.size == 0:
+                continue
+            n = min(idx_np.size, pri_np.size)
+            if n <= 0:
+                continue
+            idx_parts.append(idx_np[:n])
+            pri_parts.append(pri_np[:n])
+        except Exception as e:
+            if not getattr(owner, '_per_update_warned', False):
+                print(f"{warn_prefix} 优先级转换失败: {e}")
+                owner._per_update_warned = True
+
+    update_count = 0
+    if idx_parts and pri_parts:
+        try:
+            merged_idx = np.concatenate(idx_parts, axis=0)
+            merged_pri = np.concatenate(pri_parts, axis=0)
+            replay_buffer.update_priorities(merged_idx, merged_pri)
+            update_count = int(merged_idx.size)
+        except Exception as e:
+            # 回退到逐批写入，避免单次合并异常影响训练。
+            for idx_np, pri_np in zip(idx_parts, pri_parts):
+                try:
+                    replay_buffer.update_priorities(idx_np, pri_np)
+                    update_count += int(min(idx_np.size, pri_np.size))
+                except Exception as inner_e:
+                    if not getattr(owner, '_per_update_warned', False):
+                        print(f"{warn_prefix} 优先级写入失败: {inner_e}")
+                        owner._per_update_warned = True
+
+    pending.clear()
+
+    if success_message and update_count > 0 and not getattr(owner, '_per_update_success_logged', False):
+        print(success_message.format(count=update_count))
+        owner._per_update_success_logged = True
+
+    return update_count
+
+def _ensure_cpu_contig(arr, dtype=np.float32, force_copy=False):
+    """确保为CPU端C连续numpy数组，可选强制深拷贝以断开TF缓冲区引用。"""
+    try:
+        if isinstance(arr, np.ndarray):
+            if arr.dtype != dtype or not arr.flags['C_CONTIGUOUS']:
+                arr = np.ascontiguousarray(arr, dtype=dtype)
+            if force_copy:
+                # 强制深拷贝，确保完全独立的CPU内存
+                arr = np.array(arr, dtype=dtype, copy=True, order='C')
+            return arr
+    except Exception:
+        pass
+    # 非ndarray或异常时回退为新数组
+    return np.array(arr, dtype=dtype, copy=True, order='C')
 
 def _clear_gpu_cache():
     """清理GPU缓存和XLA编译缓存，防止长时间运行后内存累积和CUDA错误。
@@ -3443,7 +4409,9 @@ def try_apply_scenario_params(scenario, world, args, tqdm_file=None):
         'min_height_above_terrain', 'terrain_safety_margin',
         'goal_alignment_weight', 'potential_field_weight', 'force_param_ratio',
         # 🚨 关键修复：添加碰撞检测参数，确保评估时正确设置
-        'collision_distance_threshold', 'collision_penalty_value'
+        'collision_distance_threshold', 'collision_penalty_value',
+        # 与 MultiAgentEnv.step 到达判定、训练日志同源
+        'success_distance_threshold',
     ]
 
     applied = {}
@@ -3530,6 +4498,23 @@ def make_env_init(rank: int, args_dict: dict):
             if per_episode_terrain is None:
                 per_episode_terrain = os.getenv('PER_EPISODE_TERRAIN', '0').lower() in ('1','true','yes','on')
             scenario.per_episode_terrain = bool(per_episode_terrain)
+            scenario.use_semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1','true','yes','on')
+            try:
+                scenario.terrain_base_seed = int(os.getenv('TERRAIN_BASE_SEED', str(getattr(args, 'terrain_seed', 67) or 67)))
+            except Exception:
+                scenario.terrain_base_seed = int(getattr(args, 'terrain_seed', 67) or 67)
+            try:
+                scenario.peak_jitter_range = float(os.getenv('PEAK_JITTER_RANGE', '15.0'))
+            except Exception:
+                scenario.peak_jitter_range = 15.0
+            scenario.curriculum_multi_terrain_enabled = os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1','true','yes','on')
+            try:
+                multi_seed_raw = os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '').strip()
+                scenario.curriculum_multi_terrain_seeds = [
+                    int(tok.strip()) for tok in multi_seed_raw.split(',') if tok.strip()
+                ]
+            except Exception:
+                scenario.curriculum_multi_terrain_seeds = []
     except Exception:
         pass
     try:
@@ -3660,27 +4645,21 @@ class OptimizedMADDPG:
         if self.use_pf_feature_flag and self.pf_feature_dim <= 0:
             # 默认使用每个智能体3维PF力作为特征
             self.pf_feature_dim = 3
+        # 双Q头/分离梯度开关（MADDPG）
+        self.use_dual_q = bool(getattr(self.args, 'maddpg_use_dual_q', False))
+        self.use_separated_gradient = bool(getattr(self.args, 'maddpg_use_separated_gradient', True))
+        if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+            print(f"[MADDPG] Dual Q: {self.use_dual_q}, Separated Gradient: {self.use_separated_gradient}")
         if not hasattr(self, '_episode_count'):
             self._episode_count = 0
 
-        # 🔧 分阶段探索策略相关（MADDPG）
-        self.is_warmup_phase = True  # 初始状态为预热阶段
-        self.random_action_prob_warmup = float(getattr(self.args, 'random_action_prob', 0.12))
-        # 🔧 修复：降低训练阶段的随机动作概率，减少不稳定
-        # 问题：训练阶段8-12%的随机动作混合导致智能体到处跑，无法稳定学习
-        # 解决方案：降低到0.03（3%），保持少量探索但减少干扰
-        self.random_action_prob_training = float(getattr(self.args, 'random_action_prob_training', 0.03))  # 🔧 修复：从0.08降低到0.03
-        self.current_random_action_prob = self.random_action_prob_warmup  # 初始使用预热阶段的概率
-        try:
-            self.random_warmup_policy_enabled = os.getenv('WARMUP_RANDOM_POLICY', '0').lower() in ('1','true','yes','on')
-            self.warmup_random_scale = float(os.getenv('WARMUP_RANDOM_SCALE', '1.0'))
-            self.warmup_random_scale = max(0.0, min(self.warmup_random_scale, 1.0))
-            self.warmup_force_ratio_override = float(os.getenv('WARMUP_FORCE_RATIO', '1.0'))
-        except Exception:
-            self.random_warmup_policy_enabled = False
-            self.warmup_random_scale = 1.0
-            self.warmup_force_ratio_override = 1.0
-
+        # 当前主训练路径与旧回退路径统一使用 random_action_prob。
+        # random_action_prob_training 仅保留作历史兼容别名。
+        self.random_action_prob_training = float(
+            getattr(self.args, 'random_action_prob',
+                    getattr(self.args, 'random_action_prob_training', 0.03))
+        )
+        self.current_random_action_prob = self.random_action_prob_training
         # 初始化调试计数器（tf.Variable，用于tf.function中）
         self._pf_debug_counter = tf.Variable(0, dtype=tf.int32, trainable=False)
         self._obs_debug_counter = tf.Variable(0, dtype=tf.int32, trainable=False)
@@ -3739,6 +4718,7 @@ class OptimizedMADDPG:
                     'height': getattr(args, 'height_weight', 0.2),
                     'lateral': getattr(args, 'lateral_weight', 0.3),
                     'clearance': getattr(args, 'clearance_weight', 0.4),
+                    'collision_reduction': getattr(args, 'collision_reduction_weight', 0.0),
                     'success': getattr(args, 'success_weight', 0.0),
                     'collision': getattr(args, 'collision_weight', 0.0),
                     'global': getattr(args, 'global_weight', 0.0),
@@ -3762,7 +4742,7 @@ class OptimizedMADDPG:
                 getattr(args, 'collision_weight', 0.0),
                 getattr(args, 'collision_penalty_value', 30.0)
             )
-        
+
         # 训练统计
         self.training_stats = {
             'episodes': 0,
@@ -3793,7 +4773,7 @@ class OptimizedMADDPG:
         # 预热优化器以避免tf.function问题（在网络和优化器都初始化后）
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
             print("正在预热优化器...")
-        self._warmup_optimizers()
+        self._initialize_optimizers()
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
             print("优化器预热完成")
         
@@ -3858,6 +4838,13 @@ class OptimizedMADDPG:
             trainable=False,
             dtype=tf.float32,
             name='maddpg_noise_min_var'
+        )
+        # 🚨 关键修复：创建total_steps的Variable，用于噪声衰减调度器（在@tf.function中安全使用）
+        self.total_steps_var = tf.Variable(
+            0,
+            trainable=False,
+            dtype=tf.int64,
+            name='maddpg_total_steps_var'
         )
         # 🔧 XLA修复：预先计算num_envs，避免在tf.function中使用getattr
         self.num_envs_int = int(getattr(self.args, 'num_envs', 1))
@@ -3943,6 +4930,14 @@ class OptimizedMADDPG:
                 self._soft_update_targets = tf.function(self._soft_update_targets, reduce_retracing=True, jit_compile=True)
         except Exception:
             pass
+
+    def reset_hidden_states(self, batch_size=None):
+        """兼容训练编排层的隐藏状态重置接口。
+
+        当前 MADDPG 主线使用前馈 Actor/Critic，不维护跨时间步的 RNN/LSTM hidden state。
+        因此环境重建、课程切换时调用这里应为无副作用的 no-op。
+        """
+        return None
     
     def _init_networks(self):
         """初始化所有网络"""
@@ -4009,8 +5004,9 @@ class OptimizedMADDPG:
             agent['target_actor'] = tf.keras.models.clone_model(agent['actor'])
             agent['target_actor'].set_weights(agent['actor'].get_weights())
             
-            # 创建Critic网络 (使用迁移过来的函数) - 使用全局状态和动作
-            agent['critic'] = build_continuous_critic_network(
+            # 创建Critic网络（MADDPG可选双Q头）
+            critic_builder = build_continuous_critic_network_matd3 if self.use_dual_q else build_continuous_critic_network
+            agent['critic'] = critic_builder(
                 state_shape=(critic_state_dim,),
                 action_dim=self.action_dims[i],
                 n_agents=self.n_agents,
@@ -4104,11 +5100,28 @@ class OptimizedMADDPG:
             print(f"  - 初始学习率: Actor={self.args.learning_rate_actor:.6f}, Critic={self.args.learning_rate_critic:.6f}")
             print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
             print(f"  - 最小学习率: Actor={min_actor_lr:.6f}, Critic={min_critic_lr:.6f}")
+            
+            # 🚨 关键修复：创建噪声衰减调度器（与学习率衰减使用相同的机制）
+            initial_noise_scale = float(getattr(self.args, 'noise_scale', 0.35))
+            min_noise_scale = float(getattr(self.args, 'noise_min', 0.05))
+            
+            self.noise_scale_schedule = ClippedExponentialDecay(
+                initial_learning_rate=initial_noise_scale,
+                decay_steps=decay_steps,  # 与学习率衰减使用相同的decay_steps
+                decay_rate=decay_rate,    # 与学习率衰减使用相同的decay_rate
+                min_lr=min_noise_scale,
+                staircase=staircase       # 与学习率衰减使用相同的staircase
+            )
+            print(f"[噪声衰减] 已启用（与学习率衰减同步）")
+            print(f"  - 初始噪声: {initial_noise_scale:.4f}, 最小噪声: {min_noise_scale:.4f}")
+            print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
         else:
             # 固定学习率
             actor_lr_schedule = self.args.learning_rate_actor
             critic_lr_schedule = self.args.learning_rate_critic
             print(f"[学习率] 固定学习率: Actor={self.args.learning_rate_actor:.6f}, Critic={self.args.learning_rate_critic:.6f}")
+            # 固定噪声（不使用调度器）
+            self.noise_scale_schedule = None
         
         for i, agent in enumerate(self.agents):
             # 🔧 核心修复：强制优化器使用FP32，避免bf16/fp16下的数值不稳定
@@ -4188,8 +5201,8 @@ class OptimizedMADDPG:
             agent['actor_lr'] = float(self.args.learning_rate_actor)
             agent['critic_lr'] = float(self.args.learning_rate_critic)
     
-    def _warmup_optimizers(self):
-        """预热优化器以初始化状态变量"""
+    def _initialize_optimizers(self):
+        """初始化优化器状态变量，避免首次 apply_gradients 时创建变量。"""
         # 只在第一次调用时执行
         if hasattr(self, '_optimizers_warmed'):
             return
@@ -4202,7 +5215,7 @@ class OptimizedMADDPG:
         obs_batch = tf.convert_to_tensor(dummy_obs, dtype=tf.float32)
         action_batch = tf.convert_to_tensor(dummy_actions, dtype=tf.float32)
         
-        # 为每个智能体预热优化器
+        # 为每个智能体初始化优化器状态
         for i, agent in enumerate(self.agents):
             try:
                 # 预热Critic优化器
@@ -4222,8 +5235,10 @@ class OptimizedMADDPG:
                         pf_b = tf.zeros([tf.shape(global_state)[0], getattr(self.args, 'pf_feature_dim', 3) * self.n_agents], dtype=tf.float32)
                         dummy_inputs.append(pf_b)
                     dummy_q_output = agent['critic'](dummy_inputs, training=True)
-                    # 标准MADDPG：Critic输出单个Q值
-                    dummy_loss = tf.reduce_mean(dummy_q_output)
+                    if isinstance(dummy_q_output, (list, tuple)):
+                        dummy_loss = tf.reduce_mean(tf.add_n([tf.cast(q, tf.float32) for q in dummy_q_output]))
+                    else:
+                        dummy_loss = tf.reduce_mean(dummy_q_output)
 
                 crit_vars = agent['critic'].trainable_variables
                 if hasattr(agent['critic_optimizer'], 'get_scaled_loss'):
@@ -4291,7 +5306,7 @@ class OptimizedMADDPG:
         if hasattr(self, '_episode_count'):
             # 前100回合保持较高噪声
             if self._episode_count < 100:
-                return base_noise * 1.2
+                return base_noise
             # 100-500回合逐渐衰减
             elif self._episode_count < 500:
                 decay_factor = 1.0 - (self._episode_count - 100) / 400.0 * 0.3
@@ -4668,11 +5683,24 @@ class OptimizedMADDPG:
         # 🔧 修改3：在势场修正后的动作上添加OU噪声（只加在前3维）
         if add_noise:
             i = int(agent_idx)
-            # 计算当前噪声强度（考虑衰减）
-            current_std = max(float(self.args.noise_scale), float(self.args.noise_min))
-            # 应用衰减
-            current_std = current_std * (self.args.noise_decay ** self.training_stats['total_steps'])
-            current_std = max(current_std, float(self.args.noise_min))
+            # 🚨 关键修复：使用噪声衰减调度器（与学习率衰减一致）
+            if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
+                # 使用调度器计算当前噪声强度（基于total_steps_var）
+                # 注意：在非@tf.function环境中，可以直接使用numpy()转换
+                current_step = tf.cast(self.total_steps_var, tf.float32)
+                current_std_tensor = self.noise_scale_schedule(current_step)
+                current_std_tensor = tf.maximum(current_std_tensor, self.noise_min_var)
+                # 安全转换：在非图模式下使用numpy()，在图模式下使用tf.identity
+                try:
+                    current_std = float(current_std_tensor.numpy())
+                except (AttributeError, RuntimeError):
+                    # 如果无法转换为numpy（可能在图模式下），使用tf.identity然后转换
+                    current_std = float(tf.keras.backend.get_value(current_std_tensor))
+            else:
+                # 回退：如果没有调度器，使用简单的指数衰减（向后兼容）
+                current_std = max(float(self.args.noise_scale), float(self.args.noise_min))
+                current_std = current_std * (self.args.noise_decay ** self.training_stats['total_steps'])
+                current_std = max(current_std, float(self.args.noise_min))
             
             self.ou_noises[i].set_std_dev(current_std)
             ou = self.ou_noises[i]()  # 返回7维
@@ -4789,14 +5817,20 @@ class OptimizedMADDPG:
             
         return actions, pf_force_vector
     
-    @tf.function(reduce_retracing=True)
+    @tf.function(
+        jit_compile=bool(os.getenv('JIT_COMPILE', '0').lower() in ('1', 'true', 'yes', 'on')),
+        reduce_retracing=True
+    )
     def batch_select_actions_vectorized(self, states, add_noise=True):
         """
         完全向量化的批量动作选择 - 优化版本
         states: (num_envs, n_agents, obs_dim)
-        返回: (actions, pf_forces)
-            - actions: (num_envs, n_agents, act_dim) 最终动作
-            - pf_forces: (num_envs, n_agents, 3) 势场力矢量（归一化后的3维向量）
+        返回: (actions_for_storage, actions_for_execution, pf_forces, raw_actor_outputs, pf_features_current)
+            - actions_for_storage: (num_envs, n_agents, act_dim) 回放区原始动作
+            - actions_for_execution: (num_envs, n_agents, act_dim) 环境执行动作
+            - pf_forces: (num_envs, n_agents, 3) 行为执行时的 PF 力（behavior force）
+            - raw_actor_outputs: (num_envs, n_agents, act_dim) Actor 原始7维输出（噪声/PF前）
+            - pf_features_current: (num_envs, n_agents, 3) 当前状态的 base PF 特征
         """
         # 统一张量类型与形状，避免 retracing
         states = tf.convert_to_tensor(states, dtype=tf.float32)
@@ -4807,9 +5841,9 @@ class OptimizedMADDPG:
         
         # 🔧 修改1：先进行随机动作选择（在网络前向传播之前）
         eps = tf.cast(self.current_random_action_prob, tf.float32)
-        with tf.device('/CPU:0'):
-            rand_mask = tf.random.uniform([num_envs, self.n_agents], dtype=tf.float32) < eps
-            rand_actions_raw = tf.random.uniform([num_envs, self.n_agents, orig_act_dim], minval=-1.0, maxval=1.0, dtype=tf.float32)
+        # 保持在默认设备上生成随机数，避免动作路径里额外的 host/device 往返。
+        rand_mask = tf.random.uniform([num_envs, self.n_agents], dtype=tf.float32) < eps
+        rand_actions_raw = tf.random.uniform([num_envs, self.n_agents, orig_act_dim], minval=-1.0, maxval=1.0, dtype=tf.float32)
         
         # 需要处理混合情况：部分随机、部分网络
         mask3 = tf.expand_dims(rand_mask, axis=2)
@@ -4832,24 +5866,25 @@ class OptimizedMADDPG:
             )
         )
         
-        # 🔧 XLA修复：始终计算两个分支，用mask选择，避免动态控制流
-        # 🔧 关键修复：使用正确的观测维度（obs_shapes[0]），而不是states.shape[2]
-        # 因为states可能包含额外的维度（如PF特征），但实际观测维度应该是obs_shapes[0]
+        # 🚨 方案A：使用base PF参数计算PF力，确保训练/执行一致性
+        # 原理：PF特征定义为"obs + base参数"计算出来的PF力，训练和执行都用它
+        # 优点：完全消除训练/执行不一致，避免分布漂移
+        # 计算基于base PF参数的PF力（使用dummy_actions，PF参数=0，使用base参数）
         correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else obs_dim
-        flat_obs = tf.reshape(states[:, :, :correct_obs_dim], [-1, correct_obs_dim])  # 🔧 修复：使用正确的观测维度
-        dummy_actions = tf.zeros([num_envs_dyn * self.n_agents, 7], dtype=tf.float32)
-        _, pf_force_flat_pre = self._apply_potential_field_correction(
-            dummy_actions,
-            flat_obs,
-            current_force_ratio
+        flat_obs = tf.reshape(states[:, :, :correct_obs_dim], [-1, correct_obs_dim])
+        flat_obs_pf_context = self._extract_pf_obs_context_tf(flat_obs)
+        dummy_actions = tf.zeros([num_envs_dyn * self.n_agents, orig_act_dim], dtype=tf.float32)
+        _, pf_force_flat_pre = self._compute_pf_force_from_context_tf(
+            dummy_actions,  # ✅ 使用base PF参数（dummy_actions的PF参数=0）
+            *flat_obs_pf_context
         )
         pf_forces_computed = tf.reshape(pf_force_flat_pre, [num_envs_dyn, self.n_agents, 3])
         pf_forces_zero = tf.zeros([num_envs_dyn, self.n_agents, 3], dtype=tf.float32)
         
-        # 🔧 XLA修复：使用tf.where替代mask乘法，确保形状完全一致，避免内存对齐问题
+        # 🔧 XLA修复：使用tf.where替代mask乘法，确保形状完全一致
         pf_forces_pre = tf.where(
             tf.broadcast_to(should_compute_pf_pre, [num_envs_dyn, self.n_agents, 3]),
-            pf_forces_computed,
+            pf_forces_computed,  # ✅ 基于base PF参数计算的PF力
             pf_forces_zero
         )
         
@@ -4859,14 +5894,15 @@ class OptimizedMADDPG:
             # 🔧 修复：使用正确的观测维度（obs_shapes[i]），确保索引引用正确
             obs_dim = self.obs_shapes[i] if i < len(self.obs_shapes) else states.shape[2]
             agent_obs = states[:, i, :obs_dim]  # 🔧 修复：使用正确的观测维度，避免索引错误
-            agent_pf = pf_forces_pre[:, i, :]  # (num_envs, 3)
             
-            # 🚨 新增：支持PF特征作为独立输入
+            # 🚨 方案A：使用基于base PF参数计算的PF力作为PF特征
             actor_inputs = [agent_obs]
             if self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志，避免getattr
                 fr_b = tf.fill([tf.shape(agent_obs)[0], 1], tf.cast(self.action_force_ratio_cached, tf.float32))
                 actor_inputs.append(fr_b)
             if self.use_pf_feature_flag:
+                # ✅ 使用基于base PF参数计算的PF力（与训练时一致）
+                agent_pf = pf_forces_pre[:, i, :]  # (num_envs, 3)
                 actor_inputs.append(agent_pf)
             
             if len(actor_inputs) == 1:
@@ -4890,14 +5926,18 @@ class OptimizedMADDPG:
         # 但要确保assign的值来自tf.constant或其他tensor，不要来自Python变量
         if add_noise:
             if self.use_vectorized_ou:
-                # 🚨 XLA安全做法：
-                # 1. 读取Variable值作为tensor（不触发Python）
-                # 2. 在GPU上计算新的std（完全TF操作）
-                # 3. 传递给OU噪声生成器（内部assign是XLA友好的）
-                current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                
-                # 直接调用generate_noise（内部assign是安全的）
-                ou_tensor = self.vectorized_ou_noise.generate_noise()
+                # 🚨 关键修复：使用噪声衰减调度器（与学习率衰减一致）
+                if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
+                    # 使用调度器计算当前噪声强度（基于total_steps_var）
+                    current_step = tf.cast(self.total_steps_var, tf.float32)
+                    current_std = self.noise_scale_schedule(current_step)
+                    current_std = tf.maximum(current_std, self.noise_min_var)
+                    # 使用generate_noise_with_std，传入计算出的std（XLA友好）
+                    ou_tensor = self.vectorized_ou_noise.generate_noise_with_std(current_std)
+                else:
+                    # 回退：如果没有调度器，使用Variable存储的噪声强度（向后兼容）
+                    current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
+                    ou_tensor = self.vectorized_ou_noise.generate_noise()
                 ou_tensor_head = ou_tensor[:, :, :3]
             else:
                 ou_tensor_head = tf.zeros([num_envs, self.n_agents, 3], dtype=tf.float32)
@@ -4928,16 +5968,14 @@ class OptimizedMADDPG:
         )
         
         # 🔧 XLA修复：始终计算两个分支，用mask选择，避免tf.cond的动态控制流
-        # 计算PF修正后的动作
+        # 🚨 关键优化：计算PF修正（使用Actor输出的真实PF参数），得到真实的PF力
         # 🔧 关键修复：使用正确的观测维度（obs_shapes[0]），而不是states.shape[2]
         # 因为states可能包含额外的维度（如PF特征），但实际观测维度应该是obs_shapes[0]
-        correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else obs_dim
         flat_actions = tf.reshape(noisy_network_actions, [-1, act_dim])
-        flat_obs = tf.reshape(states[:, :, :correct_obs_dim], [-1, correct_obs_dim])  # 🔧 修复：使用正确的观测维度
-        corrected_head_flat, pf_force_flat = self._apply_potential_field_correction(
+        corrected_head_flat, pf_force_flat = self._apply_potential_field_correction_from_context_tf(
             flat_actions,
-            flat_obs,
-            current_force_ratio
+            current_force_ratio,
+            *flat_obs_pf_context
         )
         corrected_head = tf.reshape(corrected_head_flat, [num_envs_dyn, self.n_agents, 3])
         pf_force_vector = tf.reshape(pf_force_flat, [num_envs_dyn, self.n_agents, 3])
@@ -4984,11 +6022,106 @@ class OptimizedMADDPG:
             pf_force_network
         )
         
-        # 返回三个值：
+        # 返回五个值：
         # 1. actions_for_storage: 存入回放区（原始+噪声，无修正）
         # 2. actions_for_execution: 交给环境（原始+噪声+修正）
-        # 3. pf_forces_final: 势场力矢量
-        return actions_for_storage, actions_for_execution, pf_forces_final
+        # 3. pf_forces_final: 行为执行时的 PF 力
+        # 4. network_actions: Actor原始输出（用于时序图）
+        # 5. pf_forces_pre: 当前状态的 base PF 特征
+        return actions_for_storage, actions_for_execution, pf_forces_final, network_actions, pf_forces_pre
+
+    def _extract_pf_obs_context_tf(self, obs):
+        """
+        MADDPG 兼容层：为向量化动作选择提供统一的 PF 观测上下文接口。
+
+        MATD3 使用了拆分后的 geometry/context 复用接口，而 MADDPG 当前仍保留
+        旧版 `_apply_potential_field_correction_tf(action, obs, force_ratio)` 实现。
+        这里返回最小上下文 `(obs,)`，供下面两个兼容包装器复用，避免重复改写
+        整套 PF 几何缓存逻辑。
+        """
+        obs = tf.convert_to_tensor(obs, dtype=tf.float32)
+        return (obs,)
+
+    @tf.function(
+        jit_compile=bool(os.getenv('PF_JIT', '0').lower() in ('1', 'true', 'yes', 'on')),
+        reduce_retracing=True
+    )
+    def _compute_pf_force_from_context_tf(self, action, obs):
+        """
+        MADDPG 兼容层：基于旧版 PF 修正实现，提取纯 PF 力。
+
+        对于预计算 PF 特征的场景，这里等价于用 `force_ratio=1.0` 调用原有
+        `_apply_potential_field_correction_tf`。调用方只消费第二个返回值
+        `pf_force_vector`，因此不会改变训练语义。
+        """
+        one = tf.cast(1.0, tf.float32)
+        return self._apply_potential_field_correction_tf(action, obs, one)
+
+    @tf.function(
+        jit_compile=bool(os.getenv('PF_JIT', '0').lower() in ('1', 'true', 'yes', 'on')),
+        reduce_retracing=True
+    )
+    def _apply_potential_field_correction_from_context_tf(self, action, force_ratio, obs):
+        """
+        MADDPG 兼容层：保持与 MATD3 一致的 from_context 接口，但内部继续走
+        MADDPG 原有的 PF 修正实现。
+        """
+        return self._apply_potential_field_correction_tf(action, obs, force_ratio)
+
+    def _compute_base_pf_forces_batch_tf(self, obs_batch, force_ratio):
+        """基于 obs 批量计算 base PF 特征，并按历史 FR 门控（MADDPG 兼容接口）。"""
+        obs_batch = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
+        batch_size_dyn = tf.shape(obs_batch)[0]
+        if not self.use_pf_feature_flag or not self.use_tf_potential_field_cached:
+            return tf.zeros([batch_size_dyn, self.n_agents, 3], dtype=tf.float32)
+
+        fr_batch = _broadcast_force_ratio(force_ratio, batch_size_dyn)
+        fr_positive_mask = tf.reshape(tf.greater(fr_batch[:, 0], 0.0), [-1, 1, 1])
+        uniform_obs_dims = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
+        uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1
+
+        if uniform_obs_dims and uniform_action_dims:
+            correct_obs_dim = self.obs_shapes[0]
+            act_dim = self.action_dims[0]
+            flat_obs = tf.ensure_shape(
+                tf.reshape(obs_batch[:, :, :correct_obs_dim], [-1, correct_obs_dim]),
+                [None, correct_obs_dim],
+            )
+            obs_ctx = self._extract_pf_obs_context_tf(flat_obs)
+            dummy_action = tf.zeros([batch_size_dyn * self.n_agents, act_dim], dtype=tf.float32)
+            _, pf_force_flat = self._compute_pf_force_from_context_tf(dummy_action, *obs_ctx)
+            pf_tensor = tf.reshape(pf_force_flat, [batch_size_dyn, self.n_agents, 3])
+        else:
+            pf_forces_per_agent = []
+            default_act_dim = self.action_dims[0] if len(self.action_dims) > 0 else 7
+            for idx_i in range(self.n_agents):
+                obs_dim_i = self.obs_shapes[idx_i] if idx_i < len(self.obs_shapes) else tf.shape(obs_batch)[2]
+                act_dim_i = self.action_dims[idx_i] if idx_i < len(self.action_dims) else default_act_dim
+                agent_obs = obs_batch[:, idx_i, :obs_dim_i]
+                dummy_action = tf.zeros([batch_size_dyn, act_dim_i], dtype=tf.float32)
+                obs_ctx = self._extract_pf_obs_context_tf(agent_obs)
+                _, pf_force_vec = self._compute_pf_force_from_context_tf(dummy_action, *obs_ctx)
+                pf_forces_per_agent.append(pf_force_vec)
+            pf_tensor = tf.stack(pf_forces_per_agent, axis=1)
+
+        return tf.where(
+            tf.broadcast_to(fr_positive_mask, tf.shape(pf_tensor)),
+            pf_tensor,
+            tf.zeros_like(pf_tensor),
+        )
+
+    def compute_base_pf_forces_batch_numpy(self, obs_batch, force_ratio):
+        """NumPy 包装：供交互阶段缓存 next_pf_forces 使用（MADDPG 兼容接口）。"""
+        try:
+            batch_size = int(obs_batch.shape[0]) if hasattr(obs_batch, 'shape') else len(obs_batch)
+        except Exception:
+            batch_size = 0
+        if batch_size <= 0:
+            return np.zeros((0, self.n_agents, 3), dtype=np.float32)
+        if not self.use_pf_feature_flag or not self.use_tf_potential_field_cached:
+            return np.zeros((batch_size, self.n_agents, 3), dtype=np.float32)
+        pf_tensor = self._compute_base_pf_forces_batch_tf(obs_batch, force_ratio)
+        return np.ascontiguousarray(_safe_tensor_to_numpy(tf.identity(pf_tensor)), dtype=np.float32)
     
     def _apply_potential_field_correction(self, action, obs, force_ratio):
         # 根据自适应状态动态选择：挂起期间走 Eager 版本，平时走 JIT 版本
@@ -5166,16 +6299,26 @@ class OptimizedMADDPG:
         batch_size_dyn = tf.shape(pos)[0]
         obstacle_force = tf.reshape(obstacle_force, [batch_size_dyn, 3])  # 确保形状是 (batch, 3)
         
+        # 🔧 规划改进：近目标时减弱地形/障碍斥力（kappa = exp(-d_goal/50)），便于到达且不碰撞
+        # 与 NumPy 势场 potential_field_corrector 中 kappa 逻辑一致，避免接近目标时被斥力推开
+        d_goal = tf.norm(goal_pos - pos, axis=1, keepdims=True)
+        d_goal = tf.maximum(d_goal, tf.cast(1e-6, d_goal.dtype))
+        kappa = tf.exp(-d_goal / tf.cast(50.0, d_goal.dtype))
+        terrain_force = terrain_force * kappa
+        obstacle_force = obstacle_force * kappa
+        
         # 🔧 修复：增强地形斥力效果，避免被过度归一化削弱
+        # 🚨 关键修复：增强地形斥力，确保能及时阻止深度穿透（倍数从10.0降为6.0，减少过度弹开利于规划）
         # 检测是否接近地形或穿透（通过检查地形斥力的Z分量）
         terrain_force_z = terrain_force[:, 2:3]
         # 🔧 修复：降低检测阈值，更敏感地检测地形接近/穿透
         near_terrain_mask = tf.greater(tf.abs(terrain_force_z), tf.cast(0.1, terrain_force_z.dtype))
         
         # 接近地形或穿透时，增强地形斥力（不经过归一化削弱）
+        # 🔧 规划改进：增强倍数从10.0降为6.0，避免斥力过强导致智能体被弹开过远、难以到达目标
         terrain_force_enhanced = tf.where(
             tf.tile(near_terrain_mask, [1, 3]),
-            terrain_force * tf.cast(5.0, terrain_force.dtype),  # 🔧 修复：增强5.0倍（从2.5倍提高）
+            terrain_force * tf.cast(6.0, terrain_force.dtype),  # 从10.0降为6.0
             terrain_force
         )
         
@@ -5192,7 +6335,10 @@ class OptimizedMADDPG:
         goal_force_limited = tf.clip_by_norm(goal_force, max_goal_force_norm)
         
         # 2. 地形斥力使用更大的上限，确保其有效性（特别是穿透时）
-        max_terrain_force_norm = tf.cast(self.c_max_force * 10.0, dtype_action)  # 🔧 修复：地形斥力上限提高到10倍（从5倍提高）
+        # 🚨 关键修复：大幅提高地形斥力上限（10倍→20倍），确保深度穿透时能产生足够强的斥力
+        # 原因：从图表看，智能体持续深度穿透（-50m），说明当前地形斥力不够强
+        # 解决方案：提高上限到20倍，确保即使深度穿透也能产生足够强的斥力阻止继续穿透
+        max_terrain_force_norm = tf.cast(self.c_max_force * 20.0, dtype_action)  # 🔧 修复：地形斥力上限提高到20倍（从10倍提高）
         terrain_force_limited = tf.clip_by_norm(terrain_force_enhanced, max_terrain_force_norm)
         
         # 3. 限制其他力
@@ -5233,7 +6379,7 @@ class OptimizedMADDPG:
         # 解决方案：使用各分量上限之和作为归一化基准，保留相对强度信息
         # 归一化基准 = 各分量上限之和（目标吸引力 + 地形斥力 + 其他力）
         max_goal_norm = tf.cast(self.c_max_force * 1.65, dtype_action)  # 🔧 修复：目标吸引力上限（从5.0降低到3.0）
-        max_terrain_norm = tf.cast(self.c_max_force * 10.0, dtype_action)  # 地形斥力上限
+        max_terrain_norm = tf.cast(self.c_max_force * 20.0, dtype_action)  # 🚨 关键修复：地形斥力上限提高到20倍（与上面保持一致）
         max_other_norm = tf.cast(self.c_max_force * 2.0, dtype_action)  # 其他力上限
         # 归一化基准 = 各分量上限的平方和开方（L2范数的理论上限）
         norm_base_theoretical = tf.sqrt(max_goal_norm * max_goal_norm + max_terrain_norm * max_terrain_norm + 
@@ -5570,11 +6716,25 @@ class OptimizedMADDPG:
         # 🔧 修复：降低lambda_1的最小值限制（从2.0降到1.0），允许更小的d0值，增强近距离吸引力
         k_att = tf.maximum(k_att, tf.cast(0.1, dtype))
         lambda_1 = tf.maximum(lambda_1, tf.cast(1.0, dtype))  # 🔧 修复：从2.0降到1.0，允许更小的d0
-        k_rep = tf.maximum(k_rep, tf.cast(0.1, dtype))
-        # 🔧 修复：提高radius的最小值限制（从1.0提高到10.0），确保检测范围足够大
-        # 问题：当pf_u = -1.0时，radius可能被限制到1.0米，太小无法检测地形
-        # 解决方案：提高最小值到10.0米，确保即使参数在边界，检测范围也足够
-        radius = tf.maximum(radius, tf.cast(10.0, dtype))
+        # 🚨 关键修复：大幅提高k_rep的最小值限制，确保即使Actor输出负值，斥力也足够强
+        # 问题：从训练图像看，Actor学习到的k_rep参数持续为负，导致斥力不足，智能体持续碰撞
+        # 解决方案：提高最小值到base_k_rep的50%，确保即使pf_u=-1.0，k_rep也有足够大的值
+        # 例如：base=80.0, delta=40.0 → 最小值=40.0（50%）
+        #        base=8000.0, delta=1200.0 → 最小值=4000.0（50%）
+        # 🚨 紧急修复：大幅提高k_rep最小值限制，解决训练不收敛问题
+        # 问题：从训练图像看，Actor学习到的k_rep参数持续为负（pf_u=-1.0），导致排斥力不足
+        # 原因：碰撞惩罚过高，网络学习到"降低排斥力以减少动作幅度"的策略
+        # 修复：提高最小值到base_k_rep的50%，确保即使pf_u=-1.0，k_rep也有足够大的值
+        # 例如：base=2000.0, delta=400.0 → 最小值=1000.0（50%），即使pf_u=-1.0，k_rep=1600.0
+        k_rep_min = tf.maximum(base_k_rep * tf.cast(0.5, dtype), tf.cast(500.0, dtype))  # 🚨 提高最小值限制（20%→50%），确保足够排斥力
+        k_rep = tf.maximum(k_rep, k_rep_min)
+        # 🚨 紧急修复：大幅提高radius最小值限制，解决训练不收敛问题
+        # 问题：从训练图像看，Actor学习到的radius参数持续为负（pf_u=-1.0），导致检测范围过小
+        # 原因：碰撞惩罚过高，网络学习到"降低检测范围以减少计算"的策略
+        # 修复：提高最小值到base_radius的50%，确保即使pf_u=-1.0，radius也有足够大的值
+        # 例如：base=150.0, delta=50.0 → 最小值=75.0（50%），即使pf_u=-1.0，radius=100.0
+        radius_min = tf.maximum(base_radius * tf.cast(0.5, dtype), tf.cast(50.0, dtype))  # 🚨 提高最小值限制（30%→50%），确保足够检测范围
+        radius = tf.maximum(radius, radius_min)
         
         return tf.concat([k_att, lambda_1, k_rep, radius], axis=1)
     def _calculate_terrain_forces_sphere_tf(self, agent_pos, goal_pos, k_rep, radius, obs):
@@ -5848,25 +7008,35 @@ class OptimizedMADDPG:
             surround_near_heights = terrain_info[:, 14:22] * tf.cast(100.0, dtype)  # 近距8方向的绝对地形高度
             surround_far_heights = terrain_info[:, 22:30] * tf.cast(100.0, dtype)  # 远距8方向的绝对地形高度
         
-        # 🔧 改进地形距离计算：区分穿透和未穿透情况
+        # 🔧 优化方案3：使用前方最小净空代替当前点净空，提前检测前方地形碰撞
         agent_height = agent_pos[:, 2:3]  # 智能体Z坐标
-        height_diff = agent_height - current_height  # 高度差（可能为负，表示穿透）
+        
+        # 当前点净空
+        clear_0 = agent_height - current_height  # (batch, 1) - 高度差（可能为负，表示穿透）
+        
+        # 🚨 关键优化：计算前方8个点的净空，选择最小值（最危险的点）
+        forward_terrain_heights_reshaped = tf.reshape(forward_terrain_heights, [-1, 8])  # (batch, 8) - 绝对高度
+        clear_f = agent_height - forward_terrain_heights_reshaped  # (batch, 8) - 前方8个点的净空
+        min_clearance_forward = tf.reduce_min(clear_f, axis=1, keepdims=True)  # (batch, 1) - 前方最小净空
+        
+        # 使用当前点和前方最小净空中的较小值（最危险的点）
+        r_min_candidate = tf.minimum(clear_0, min_clearance_forward)  # (batch, 1)
         
         # 区分穿透和未穿透情况
-        penetration_mask = height_diff < tf.cast(0.0, dtype)  # 穿透掩码
+        penetration_mask = r_min_candidate < tf.cast(0.0, dtype)  # 穿透掩码
         safe_mask = tf.logical_not(penetration_mask)  # 安全掩码
         
         # 未穿透情况：使用正常距离计算（最小值为0.1米，防止倒数过大）
-        safe_r_min = tf.maximum(height_diff, tf.cast(0.1, dtype))
+        safe_r_min = tf.maximum(r_min_candidate, tf.cast(0.1, dtype))
         
-        # 🔧 修复：穿透时使用固定的较小r_min值，避免穿透很深时r_min过大导致斥力失效
-        # 问题：当穿透很深时（比如-1000米），penetration_r_min = max(1000*0.1, 0.05) = 100米
-        # 这会导致inv_r_min = 1/100 = 0.01，非常小，地形斥力几乎失效
-        # 解决方案：穿透时始终使用固定的较小r_min值（0.05米），产生最大斥力
+        # 🔧 修复：穿透时使用固定的较小r_min值，产生最大斥力
         penetration_r_min = tf.cast(0.05, dtype)  # 固定为0.05米，产生最大斥力
         
         # 根据掩码选择对应的r_min值
         r_min = tf.where(penetration_mask, penetration_r_min, safe_r_min)
+        
+        # 🔧 修复：保留height_diff用于后续的penetration_sigmoid计算
+        height_diff = r_min_candidate  # 使用最小净空作为高度差
         
         # 🔧 改进：使用前方和周围地形信息计算多方向地形斥力
         # 1. 垂直方向斥力（基于当前点地形高度）
@@ -5969,20 +7139,21 @@ class OptimizedMADDPG:
             axis=1
         )  # (batch, 2) - X和Y方向的侧向斥力
         
-        # 🚨 关键改进：调整目标距离影响因子κ，让地形斥力在远距离时也保持足够强度
-        # 原设计：kappa = exp(-goal_dist / 50.0)，当距离目标很远时（200米），kappa ≈ 0.018，导致地形斥力被大幅削弱
-        # 改进1：exp(-goal_dist / 200.0)，当goal_dist=200时，kappa ≈ 0.37，比原来的0.018强20倍
-        # 改进2（当前）：使用平方根衰减，让远距离时地形斥力更强
-        #   公式：kappa = 1.0 / (1.0 + goal_dist / 50.0)
-        #   距离100米：kappa = 1.0 / (1.0 + 100/50) = 1.0/3.0 ≈ 0.33（比exp衰减的0.135强144%）
-        #   距离200米：kappa = 1.0 / (1.0 + 200/50) = 1.0/5.0 = 0.20（比exp衰减的0.018强11倍）
+        # 🔧 优化方案1B：大幅削弱κ因子的衰减，让地形斥力在远距离时也保持足够强度
+        # 核心思想：地形碰撞的危险性与距离目标无关！无论距离目标200米还是20米，撞上地形都是灾难性的
+        # 
+        # 原设计：kappa = 1.0 / (1.0 + goal_dist / 50.0)
+        #   距离200米：κ = 1.0/5.0 = 0.2（地形斥力被削弱80%）❌
+        # 
+        # 优化后：kappa = 1.0 / (1.0 + goal_dist / 500.0)  # 从50改为500，衰减速度减慢10倍
+        #   距离100米：κ = 1.0 / (1.0 + 100/500) = 1.0/1.2 = 0.83（仅削弱17%）✅
+        #   距离200米：κ = 1.0 / (1.0 + 200/500) = 1.0/1.4 = 0.71（仅削弱29%）✅
+        #   距离500米：κ = 1.0 / (1.0 + 500/500) = 1.0/2.0 = 0.50（削弱50%）✅
         goal_dist = tf.norm(goal_pos - agent_pos, axis=1, keepdims=True)
-        # 使用平方根衰减：1.0 / (1.0 + goal_dist / 50.0)
-        # 这样在远距离时，地形斥力仍然保持足够强度，能够有效阻止贴地飞行
-        kappa_denom = tf.cast(1.0, dtype) + goal_dist / tf.cast(50.0, dtype)
-        kappa = tf.cast(1.0, dtype) / (kappa_denom + tf.cast(1e-6, dtype))  # 防止除以零
-        # 确保kappa在合理范围内[0.1, 1.0]
-        kappa = tf.clip_by_value(kappa, tf.cast(0.1, dtype), tf.cast(1.0, dtype))
+        kappa_denom = tf.cast(1.0, dtype) + goal_dist / tf.cast(500.0, dtype)  # 🔧 从50.0改为500.0
+        kappa = tf.cast(1.0, dtype) / (kappa_denom + tf.cast(1e-6, dtype))
+        # 确保kappa在合理范围内[0.3, 1.0]（下限从0.1提高到0.3，确保最小也有70%强度）
+        kappa = tf.clip_by_value(kappa, tf.cast(0.3, dtype), tf.cast(1.0, dtype))  # 🔧 下限从0.1提高到0.3
         
         # 计算斥力强度 (基于实际势场公式，包含距离指数n)
         R_safe = radius  # 安全检测半径
@@ -6033,11 +7204,20 @@ class OptimizedMADDPG:
         
         repulsion_strength = base_repulsion * penetration_penalty_factor
         
-        # 🔧 修复：使用平滑过渡函数替代硬截断，实现平滑的上限过渡
-        # 上限从10.0平滑过渡到50.0：max_repulsion = 10 + 40 * (1 - sigmoid)
-        max_repulsion_base = tf.cast(10.0, dtype)
-        max_repulsion_extra = tf.cast(40.0, dtype)
+        # 🔧 优化方案2：大幅提升穿透时的排斥力上限，确保压倒性地强于目标吸引力
+        # 原设计：穿透时上限300.0，目标吸引力32.4，比值9.26
+        # 新优化：穿透时上限500.0，目标吸引力32.4，比值15.4 ✅✅✅
+        # 
+        # 上限从100.0平滑过渡到500.0：max_repulsion = 100 + 400 * (1 - sigmoid)
+        max_repulsion_base = tf.cast(100.0, dtype)  # 🔧 未穿透时上限（从40.0提升到100.0，充分利用大k_rep值）
+        max_repulsion_extra = tf.cast(400.0, dtype)  # 🔧 穿透时额外上限（调整为400.0，保持总上限500.0）
         max_repulsion = max_repulsion_base + max_repulsion_extra * (tf.cast(1.0, dtype) - penetration_sigmoid)
+        # 穿透时：max_repulsion ≈ 500.0（压倒性地强于目标吸引力32.4，比值15.4）
+        # 未穿透时：max_repulsion ≈ 100.0（提升2.5倍，充分利用大k_rep值，避免近距离斥力被过度限制）
+        # 
+        # 📊 为什么需要这么大的上限？
+        # 当智能体目标在地形内部时（由于目标Z坐标设置错误），目标吸引力会持续将智能体拖入地形。
+        # 此时需要极强的排斥力（15倍目标吸引力）才能将智能体强制推出地形。
         repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), max_repulsion)
         
         # 计算垂直方向斥力（基于当前点地形高度）
@@ -6052,7 +7232,8 @@ class OptimizedMADDPG:
         
         # 🔧 优化：基于净空(clearance)的曲面外法向斥力，避免地形高于无人机时产生向下推力导致穿地
         # 从观察信息中提取速度方向（索引3:6是速度，归一化到[-1,1]，需要还原）
-        vel_norm = obs[:, 3:6] * tf.cast(22.5, dtype)  # 还原速度（max_speed=22.5）
+        max_speed = tf.cast(getattr(self, 'agent_max_speed_cached', 37.5), dtype)
+        vel_norm = obs[:, 3:6] * max_speed  # 还原速度（使用配置的max_speed，与run_optimized.sh一致）
         vel_norm_magnitude = tf.norm(vel_norm, axis=1, keepdims=True) + tf.cast(1e-6, dtype)
         vel_dir = vel_norm / vel_norm_magnitude  # 速度方向（单位向量）
         vel_dir_xy = vel_dir[:, 0:2]  # XY平面的速度方向
@@ -6100,12 +7281,12 @@ class OptimizedMADDPG:
         
         # 3. 裁剪净空并计算预测净空（避免数值爆炸与XLA下NaN传播）
         c_min = tf.cast(0.05, dtype)  # 最小净空（米）
-        d_safe = radius  # (batch, 1) - 安全检测半径（10-50米）
+        d_safe = tf.reshape(radius, [-1, 1])  # (batch, 1) - 安全检测半径（10-50米）
         c_max = d_safe  # (batch, 1) - 最大净空（裁剪上限）
         
         # 裁剪净空
-        c_f = tf.clip_by_value(clear_f, c_min, tf.expand_dims(c_max, axis=1))  # (batch, 8)
-        c_s = tf.clip_by_value(clear_s, c_min, tf.expand_dims(c_max, axis=1))  # (batch, 8)
+        c_f = tf.clip_by_value(clear_f, c_min, c_max)  # (batch, 8)
+        c_s = tf.clip_by_value(clear_s, c_min, c_max)  # (batch, 8)
         c_0 = tf.clip_by_value(clear_0, c_min, c_max)  # (batch, 1)
         
         # 预测净空：pred_c = c + v_z * dt（v_z下降时为负，预测净空会更小，提前触发）
@@ -6115,8 +7296,8 @@ class OptimizedMADDPG:
         
         # 4. 平滑门控因子（替代硬mask）：gate = sigmoid((d_safe - pred_c)/sigma)
         sigma = tf.cast(1.5, dtype)  # 门控平滑参数（1-2米）
-        gate_f = tf.sigmoid((tf.expand_dims(d_safe, axis=1) - pred_c_f) / sigma)  # (batch, 8)
-        gate_s = tf.sigmoid((tf.expand_dims(d_safe, axis=1) - pred_c_s) / sigma)  # (batch, 8)
+        gate_f = tf.sigmoid((d_safe - pred_c_f) / sigma)  # (batch, 8)
+        gate_s = tf.sigmoid((d_safe - pred_c_s) / sigma)  # (batch, 8)
         gate_0 = tf.sigmoid((d_safe - pred_c_0) / sigma)  # (batch, 1)
         
         # 5. 斥力强度（标准clearance势场形式，完全向量化）
@@ -6124,8 +7305,8 @@ class OptimizedMADDPG:
         inv_c_f = tf.cast(1.0, dtype) / (c_f + eps)  # (batch, 8)
         inv_c_s = tf.cast(1.0, dtype) / (c_s + eps)  # (batch, 8)
         inv_c_0 = tf.cast(1.0, dtype) / (c_0 + eps)  # (batch, 1)
-        inv_d_f = tf.cast(1.0, dtype) / (tf.expand_dims(d_safe, axis=1) + eps)  # (batch, 8)
-        inv_d_s = tf.cast(1.0, dtype) / (tf.expand_dims(d_safe, axis=1) + eps)  # (batch, 8)
+        inv_d_f = tf.cast(1.0, dtype) / (d_safe + eps)  # (batch, 1) -> broadcast to (batch, 8)
+        inv_d_s = tf.cast(1.0, dtype) / (d_safe + eps)  # (batch, 1) -> broadcast to (batch, 8)
         inv_d_0 = tf.cast(1.0, dtype) / (d_safe + eps)  # (batch, 1)
         
         # 目标距离影响因子κ
@@ -6140,8 +7321,8 @@ class OptimizedMADDPG:
         velocity_factor = tf.cast(1.0, dtype) + k_v * v_z_negative  # (batch, 1)
         
         # 斥力强度：strength = k_rep * gate * (inv_c - inv_d) * inv_c * inv_c * kappa * velocity_factor
-        strength_f = k_rep * gate_f * (inv_c_f - inv_d_f) * inv_c_f * inv_c_f * tf.expand_dims(kappa * velocity_factor, axis=1)  # (batch, 8)
-        strength_s = k_rep * gate_s * (inv_c_s - inv_d_s) * inv_c_s * inv_c_s * tf.expand_dims(kappa * velocity_factor, axis=1)  # (batch, 8)
+        strength_f = k_rep * gate_f * (inv_c_f - inv_d_f) * inv_c_f * inv_c_f * (kappa * velocity_factor)  # (batch, 8)
+        strength_s = k_rep * gate_s * (inv_c_s - inv_d_s) * inv_c_s * inv_c_s * (kappa * velocity_factor)  # (batch, 8)
         strength_0 = k_rep * gate_0 * (inv_c_0 - inv_d_0) * inv_c_0 * inv_c_0 * kappa * velocity_factor  # (batch, 1)
         
         # 上限裁剪（保证稳定）
@@ -6259,187 +7440,88 @@ class OptimizedMADDPG:
         radius = tf.reshape(radius, [batch_size_dyn, 1])  # 确保 (batch, 1)
         
         # 从观察数据中提取障碍物信息
-        # 🚨 修复：obs实际结构（与场景一致）: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境6] = 81维
-        # 因此障碍物信息从索引 41 开始（9 + 32）
-        obstacle_start_idx = 9 + 32  # 41：跳过状态9 + 地形32（原来38）
-        obstacle_info = obs[:, obstacle_start_idx:obstacle_start_idx + 15]  # 障碍物信息15维
-        obstacle_info = tf.reshape(obstacle_info, [batch_size_dyn, 15])  # 确保 (batch, 15)
+        # obs结构: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境6] = 81维
+        obstacle_start_idx = 9 + 32  # 41
+        obstacle_info = obs[:, obstacle_start_idx:obstacle_start_idx + 15]
+        obstacle_info = tf.reshape(obstacle_info, [batch_size_dyn, 15])
         
-        # 🔧 扇区/雷达式编码结构（15维）：
-        # 0-7: 8个水平方向扇区的最近距离（相对于前进方向）
-        # 8-10: 3个垂直层的最近距离（上、中、下）
-        # 11-13: 最近障碍物的方向向量
-        # 14: 最近障碍物的归一化距离
+        # Top-3最近障碍物编码（15维）：3个障碍物 × 5维(相对位置3 + 表面距离1 + 半径1)
+        # 槽位k (k=0,1,2): [k*5:k*5+3]=归一化相对位置, [k*5+3]=归一化表面距离, [k*5+4]=归一化半径
+        # 无障碍物sentinel: (0,0,0,1.0,0) → surface_dist=1.0表示无障碍物
         
-        # 🔧 关键修复：从观测中提取速度信息，计算前进方向（用于重建扇区角度）
-        # 状态信息：位置(0-2) + 速度(3-5) + 加速度(6-8)
-        agent_velocity = obs[:, 3:6]  # (batch, 3) 速度信息（已归一化，需要反归一化）
-        agent_velocity_unnorm = agent_velocity * tf.cast(22.5, dtype)  # 反归一化：max_speed=22.5
-        vel_norm = tf.norm(agent_velocity_unnorm, axis=1, keepdims=True)  # (batch, 1)
-        # 计算前进方向（在XY平面）
-        vel_xy = agent_velocity_unnorm[:, :2]  # (batch, 2) XY平面速度
-        vel_xy_norm = tf.norm(vel_xy, axis=1, keepdims=True)  # (batch, 1)
-        # 前进方向角度（在XY平面）
-        forward_angle_xy = tf.atan2(vel_xy[:, 1:2], vel_xy[:, 0:1])  # (batch, 1)
-        # 如果速度很小，使用目标方向或默认方向
-        vel_threshold = tf.cast(1e-6, dtype)
-        # 从目标信息中提取目标方向（索引56-58是目标方向向量：9+32+15=56）
-        goal_dir = obs[:, 56:59]  # (batch, 3) 目标方向向量
-        goal_dir_xy = goal_dir[:, :2]  # (batch, 2)
-        goal_angle_xy = tf.atan2(goal_dir_xy[:, 1:2], goal_dir_xy[:, 0:1])  # (batch, 1)
-        # 如果速度很小，使用目标方向；如果目标方向也很小，使用默认方向[1,0,0]（0度）
-        default_angle = tf.cast(0.0, dtype)
-        forward_angle_xy = tf.where(
-            vel_xy_norm > vel_threshold,
-            forward_angle_xy,
-            tf.where(
-                tf.norm(goal_dir_xy, axis=1, keepdims=True) > vel_threshold,
-                goal_angle_xy,
-                tf.fill(tf.shape(forward_angle_xy), default_angle)
+        no_obstacle_threshold = tf.cast(0.99, dtype)
+        default_dist_center = radius + tf.cast(10.0, dtype)  # 检测半径外的默认距离
+        
+        obstacle_positions = []  # 3个障碍物的绝对位置
+        obstacle_radii_list = []  # 3个障碍物的半径
+        
+        for k in range(3):
+            offset = k * 5
+            rel_pos_norm = obstacle_info[:, offset:offset+3]     # (batch, 3) 归一化相对位置
+            surface_dist_norm = obstacle_info[:, offset+3:offset+4]  # (batch, 1)
+            radius_norm = obstacle_info[:, offset+4:offset+5]       # (batch, 1)
+            
+            rel_pos_norm = tf.reshape(rel_pos_norm, [batch_size_dyn, 3])
+            surface_dist_norm = tf.reshape(surface_dist_norm, [batch_size_dyn, 1])
+            radius_norm = tf.reshape(radius_norm, [batch_size_dyn, 1])
+            
+            has_obstacle = surface_dist_norm < no_obstacle_threshold  # (batch, 1)
+            
+            rel_pos = rel_pos_norm * self.c_map_size  # 反归一化到物理单位
+            obs_radius = radius_norm * self.c_map_size  # 反归一化半径
+            obs_radius = tf.maximum(obs_radius, tf.cast(1.0, dtype))  # 最小半径1米
+            
+            abs_pos = agent_pos + rel_pos  # (batch, 3) 障碍物绝对位置
+            
+            # 无障碍物时使用远距离默认位置（检测半径外），确保不产生斥力
+            default_dir = tf.constant([1.0, 0.0, 0.0], dtype=dtype)
+            default_pos = agent_pos + tf.tile(
+                tf.reshape(default_dir, [1, 3]), [batch_size_dyn, 1]
+            ) * default_dist_center
+            
+            abs_pos = tf.where(
+                tf.tile(has_obstacle, [1, 3]),
+                abs_pos,
+                default_pos
             )
-        )  # (batch, 1)
+            
+            obstacle_positions.append(abs_pos)
+            obstacle_radii_list.append(
+                tf.where(has_obstacle, obs_radius, tf.cast(1.0, dtype))
+            )
         
-        # 从扇区编码重建障碍物位置用于势场力计算
-        # 策略：使用最近障碍物信息（11-14维）重建1个障碍物，从8个扇区中选择最近的2个扇区重建另外2个障碍物
-        
-        # 获取最近障碍物信息（维度11-14）
-        nearest_dir = obstacle_info[:, 11:14]  # 方向向量
-        nearest_dist_norm = obstacle_info[:, 14:15]  # 归一化距离
-        nearest_dist_surface = nearest_dist_norm * self.c_map_size  # 反归一化到表面距离
-        # 假设最近障碍物半径为5米（中等大小）
-        nearest_radius = tf.cast(5.0, dtype)
-        nearest_dist_center = nearest_dist_surface + nearest_radius  # (batch, 1)
-        # 🔧 优化：统一 reshape（batch_size_dyn 已在函数开始处定义）
-        nearest_dir = tf.reshape(nearest_dir, [batch_size_dyn, 3])  # (batch, 3)
-        nearest_dist_norm = tf.reshape(nearest_dist_norm, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        nearest_dist_center = tf.reshape(nearest_dist_center, [batch_size_dyn, 1])  # (batch, 1)
-        pos1 = nearest_dir * nearest_dist_center  # (batch, 3) * (batch, 1) -> (batch, 3)
-        
-        # 🔧 优化：统一 reshape 扇区距离信息
-        # 从8个扇区中选择最近的2个扇区（维度0-7）
-        sector_distances = obstacle_info[:, 0:8]  # (batch, 8)
-        sector_distances = tf.reshape(sector_distances, [batch_size_dyn, 8])  # 确保 (batch, 8)
-        # 🔧 修复：将距离为1.0的扇区（无障碍物）设置为很大的值，避免被选中
-        # 1.0表示归一化后的最大距离（无障碍物），应该被排除
-        max_dist_threshold = tf.cast(0.99, dtype)  # 接近1.0的阈值
-        sector_distances_filtered = tf.where(
-            sector_distances > max_dist_threshold,
-            tf.cast(1e6, dtype),  # 无障碍物的扇区设置为很大的值
-            sector_distances
-        )
-        # 找到距离最小的2个扇区索引
-        # 使用top_k找到最小的2个值及其索引
-        k = 2
-        sector_distances_sorted, sector_indices = tf.nn.top_k(-sector_distances_filtered, k=k)  # 负号因为要找最小值
-        sector_distances_sorted = -sector_distances_sorted  # 恢复正值
-        # 🔧 修复：如果选中的扇区距离很大（无障碍物），使用默认值
-        sector_distances_sorted = tf.where(
-            sector_distances_sorted > tf.cast(0.99 * self.c_map_size, dtype),
-            tf.cast(self.c_map_size, dtype),  # 使用地图尺寸作为默认距离
-            sector_distances_sorted
-        )
-        
-        # 扇区角度（相对于前进方向）：0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
-        sector_angles_deg = tf.constant([0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0], dtype=dtype)
-        pi_over_180 = tf.cast(3.141592653589793 / 180.0, dtype)  # π/180
-        sector_angles_rad = sector_angles_deg * pi_over_180  # (8,)
-        
-        # 🔧 优化：统一 reshape 扇区相关计算（forward_angle_xy 已在开始处确保形状）
-        # 重建第2个障碍物（从第一个最近扇区）
-        sector_idx_1 = sector_indices[:, 0:1]  # (batch, 1)
-        sector_idx_1 = tf.reshape(sector_idx_1, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_relative_1 = tf.gather(sector_angles_rad, sector_idx_1)  # (batch, 1) 相对角度
-        sector_angle_relative_1 = tf.reshape(sector_angle_relative_1, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_absolute_1 = sector_angle_relative_1 + forward_angle_xy  # (batch, 1) 绝对角度
-        sector_dist_1 = sector_distances_sorted[:, 0:1] * self.c_map_size  # 反归一化
-        sector_dist_1 = tf.reshape(sector_dist_1, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        # 假设障碍物在扇区中心方向，半径为5米
-        radius2 = tf.cast(5.0, dtype)
-        dist_center_1 = sector_dist_1 + radius2  # (batch, 1)
-        # 构建方向向量（在XY平面）
-        dir2_xy = tf.stack([
-            tf.cos(sector_angle_absolute_1[:, 0]),
-            tf.sin(sector_angle_absolute_1[:, 0]),
-            tf.zeros_like(sector_angle_absolute_1[:, 0])
-        ], axis=1)  # (batch, 3)
-        dir2_xy = tf.reshape(dir2_xy, [batch_size_dyn, 3])  # 确保 (batch, 3)
-        pos2 = dir2_xy * dist_center_1  # (batch, 3) * (batch, 1) -> (batch, 3)
-        
-        # 🔧 优化：统一 reshape 第3个障碍物相关计算
-        # 重建第3个障碍物（从第二个最近扇区）
-        sector_idx_2 = sector_indices[:, 1:2]  # (batch, 1)
-        sector_idx_2 = tf.reshape(sector_idx_2, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_relative_2 = tf.gather(sector_angles_rad, sector_idx_2)  # (batch, 1) 相对角度
-        sector_angle_relative_2 = tf.reshape(sector_angle_relative_2, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_absolute_2 = sector_angle_relative_2 + forward_angle_xy  # (batch, 1) 绝对角度
-        sector_dist_2 = sector_distances_sorted[:, 1:2] * self.c_map_size  # 反归一化
-        sector_dist_2 = tf.reshape(sector_dist_2, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        radius3 = tf.cast(5.0, dtype)
-        dist_center_2 = sector_dist_2 + radius3  # (batch, 1)
-        dir3_xy = tf.stack([
-            tf.cos(sector_angle_absolute_2[:, 0]),
-            tf.sin(sector_angle_absolute_2[:, 0]),
-            tf.zeros_like(sector_angle_absolute_2[:, 0])
-        ], axis=1)  # (batch, 3)
-        dir3_xy = tf.reshape(dir3_xy, [batch_size_dyn, 3])  # 确保 (batch, 3)
-        pos3 = dir3_xy * dist_center_2  # (batch, 3) * (batch, 1) -> (batch, 3)
-        
-        # 绝对位置并堆叠 (batch, 3, 3)
-        obs_abs = tf.stack([agent_pos + pos1, agent_pos + pos2, agent_pos + pos3], axis=1)
-        
-        # 🔧 修复：提取半径信息，用于后续计算到表面的距离
-        # 确保半径形状正确：(batch, 3, 1)
-        # 所有半径都是标量，需要先确保它们是标量，然后堆叠并广播到batch维度
-        # nearest_radius, radius2, radius3 都是标量（tf.cast(5.0, dtype)）
-        # 先确保它们是标量（去除任何可能的额外维度）
-        nearest_radius_scalar = tf.reshape(nearest_radius, [])  # 确保是标量
-        radius2_scalar = tf.reshape(radius2, [])  # 确保是标量
-        radius3_scalar = tf.reshape(radius3, [])  # 确保是标量
-        
-        # 堆叠为 (3,) 形状
-        obstacle_radii_1d = tf.stack([nearest_radius_scalar, radius2_scalar, radius3_scalar], axis=0)  # (3,)
-        
-        # 扩展并广播到 (batch, 3, 1)
-        obstacle_radii = tf.expand_dims(obstacle_radii_1d, axis=0)  # (1, 3)
-        obstacle_radii = tf.tile(obstacle_radii, [batch_size_dyn, 1])  # (batch, 3)
+        # 堆叠3个障碍物位置 (batch, 3, 3) 和半径 (batch, 3, 1)
+        obs_abs = tf.stack(obstacle_positions, axis=1)  # (batch, 3, 3)
+        obstacle_radii = tf.concat(obstacle_radii_list, axis=1)  # (batch, 3)
         obstacle_radii = tf.expand_dims(obstacle_radii, axis=2)  # (batch, 3, 1)
 
-        # 向量化距离/方向 (batch, 3, 1), (batch, 3, 3)
-        diff = obs_abs - tf.expand_dims(agent_pos, axis=1)
-        dist_to_center = tf.norm(diff, axis=2, keepdims=True)
-        # 🔧 关键修复：计算到表面的距离（减去半径）
+        # 向量化距离/方向计算
+        diff = obs_abs - tf.expand_dims(agent_pos, axis=1)  # (batch, 3, 3)
+        dist_to_center = tf.norm(diff, axis=2, keepdims=True)  # (batch, 3, 1)
         dist_to_surface = tf.maximum(dist_to_center - obstacle_radii, tf.cast(0.1, dtype))
-        dist = dist_to_surface  # 使用到表面的距离计算斥力
-        repulsion_dir = -diff / (dist_to_center + tf.cast(1e-6, dtype))  # 方向仍基于到中心的向量
+        dist = dist_to_surface
+        repulsion_dir = -diff / (dist_to_center + tf.cast(1e-6, dtype))
 
-        # 检测半径广播 (batch, 1, 1)
-        R_detection = tf.expand_dims(radius, axis=1)
+        R_detection = tf.expand_dims(radius, axis=1)  # (batch, 1, 1)
 
-        # 🔧 修复：使用平滑过渡函数替代硬截断，避免在检测半径边界处突变
-        # 强度（裁剪）(batch, 3, 1)
         inv_dist = tf.cast(1.0, dtype) / (dist + tf.cast(1e-6, dtype))
         inv_dist = tf.clip_by_value(inv_dist, tf.cast(0.0, dtype), tf.cast(10.0, dtype))
         inv_R = tf.cast(1.0, dtype) / (R_detection + tf.cast(1e-6, dtype))
         strength_core = (inv_dist - inv_R) * tf.square(inv_dist)
         
-        # 使用sigmoid函数实现平滑过渡：smooth_factor = sigmoid((R_detection - dist) / transition_width)
-        # 当dist < R_detection时，smooth_factor接近1.0；当dist > R_detection时，smooth_factor接近0.0
-        transition_width = tf.cast(2.0, dtype)  # 过渡宽度（米），控制过渡的平滑程度
-        dist_to_boundary = R_detection - dist  # 距离边界的距离（正值表示在检测半径内）
+        transition_width = tf.cast(2.0, dtype)
+        dist_to_boundary = R_detection - dist
         smooth_factor = tf.cast(1.0, dtype) / (tf.cast(1.0, dtype) + tf.exp(-dist_to_boundary / transition_width))
+        
         repulsion_strength = strength_core * smooth_factor
-        repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), tf.cast(3.0, dtype))
+        # 球障斥力上限与地形一致：未穿透 100，穿透 500（原 3.0 过弱，易剩球障碰撞）
+        raw_dist_to_surface = dist_to_center - obstacle_radii
+        penetration_mask = raw_dist_to_surface < tf.cast(0.0, dtype)
+        max_repulsion_obstacle = tf.where(penetration_mask, tf.cast(500.0, dtype), tf.cast(100.0, dtype))
+        repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), max_repulsion_obstacle)
 
-        # 聚合三者斥力 (batch, 3)
-        # 🔧 修复：确保 repulsion_dir 和 repulsion_strength 的形状正确
-        # repulsion_dir: (batch, 3, 3), repulsion_strength: (batch, 3, 1)
-        # 相乘后: (batch, 3, 3)，在 axis=1 上求和得到 (batch, 3)
         repulsion_combined = repulsion_dir * repulsion_strength  # (batch, 3, 3)
-        # 🔧 关键修复：在 axis=1 上求和，将 (batch, 3, 3) 变为 (batch, 3)
         total_repulsion = tf.reduce_sum(repulsion_combined, axis=1)  # (batch, 3)
-        # 🔧 关键修复：确保返回值的形状是 (batch, 3)，使用动态 batch_size
-        batch_size_dyn = tf.shape(agent_pos)[0]
-        # 🔧 关键修复：强制 reshape 确保形状正确，避免形状为 (batch, 3, 3) 的情况
         total_repulsion = tf.reshape(total_repulsion, [batch_size_dyn, 3])
         return total_repulsion
     
@@ -6555,15 +7637,10 @@ class OptimizedMADDPG:
             current_fr_value = tf.cast(self.action_force_ratio_cached, tf.float32)
             fr_batch = tf.fill([batch_size, 1], current_fr_value)
         
-        # 使用传入的历史PF力（pf_batch参数），而不是重新计算
-        # pf_batch形状应该是 (batch_size, n_agents*3)
-        if pf_batch is not None:
-            pf_batch = tf.convert_to_tensor(pf_batch, dtype=tf.float32)
-            # 🔧 XLA修复：使用 tf.reshape 而不是 tf.ensure_shape，因为 batch_size 是动态的
-            pf_batch = tf.reshape(pf_batch, [-1, self.n_agents * 3])  # 确保形状是 (batch_size, n_agents*3)
-        else:
-            # 如果没有传入历史PF力，使用零向量（向后兼容）
-            pf_batch = tf.zeros([batch_size, self.n_agents * 3], dtype=tf.float32)
+        # 🚨 关键修复：使用 RB 存储的当时刻 PF 力作为 Critic 上下文，与执行一致
+        # 原因：训练时应使用「产生该条动作时」的 PF，而非 base 重算，否则 Critic 在错误上下文下学习
+        # 传入的 pf_batch 来自 buffer 的 pf_forces，形状 (batch_size, n_agents*3)
+        pf_batch = tf.reshape(tf.cast(pf_batch, tf.float32), [batch_size, self.n_agents * 3])
         mix_beta = tf.convert_to_tensor(mix_beta, dtype=tf.float32)
         imitation_mu = tf.convert_to_tensor(imitation_mu, dtype=tf.float32)
         # 核心稳定措施：对奖励进行裁剪，防止极端负奖励（<-2000）淹没正常奖励信号（-100到-1000）
@@ -6597,8 +7674,10 @@ class OptimizedMADDPG:
             if self.use_pf_feature_flag:
                 target_inputs.append(pf_batch)
             target_q_output = agent['target_critic'](target_inputs, training=False)
-            # 标准MADDPG：Critic输出单个Q值
-            target_q_next = tf.cast(target_q_output, tf.float32)
+            if isinstance(target_q_output, (list, tuple)):
+                target_q_next = tf.add_n([tf.cast(q, tf.float32) for q in target_q_output])
+            else:
+                target_q_next = tf.cast(target_q_output, tf.float32)
             
             # 🔧 XLA友好：使用裁剪替代 is_finite，避免条件分支
             # 🔧 优化：计算有效裁剪范围，确保Bellman更新后不超出原始q_clip
@@ -6633,9 +7712,14 @@ class OptimizedMADDPG:
             if self.use_pf_feature_flag:
                 current_inputs.append(pf_batch)
             current_q_output = agent['critic'](current_inputs, training=True)
-            # 标准MADDPG：Critic输出单个Q值
-            current_q = tf.cast(current_q_output, tf.float32)
+            if isinstance(current_q_output, (list, tuple)):
+                current_q = tf.add_n([tf.cast(q, tf.float32) for q in current_q_output])
+            else:
+                current_q = tf.cast(current_q_output, tf.float32)
             
+            # 🚨 关键修复：先清理current_q中的NaN/Inf，再进行裁剪
+            # 原因：如果critic输出NaN（特别是训练初期），会导致TD误差和损失都变成NaN
+            current_q = tf.where(tf.math.is_finite(current_q), current_q, tf.cast(0.0, current_q.dtype))
             # 🔧 XLA友好：直接裁剪到合理范围，不做 is_finite 检查
             current_q = tf.clip_by_value(current_q, -q_clip_effective, q_clip_effective)
             
@@ -6678,7 +7762,11 @@ class OptimizedMADDPG:
             critic_grads = tape.gradient(critic_loss, agent['critic'].trainable_variables)
         
         # 【调试】记录Critic梯度范数（在tf.function内，返回tensor而不是numpy）
-        critic_grad_norms_tensor = [tf.norm(g) if g is not None else tf.constant(0.0) for g in critic_grads]
+        # 🚨 修复：在计算梯度范数时先清理NaN，避免诊断日志显示NaN
+        critic_grad_norms_tensor = [
+            tf.norm(tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))) if g is not None else tf.constant(0.0) 
+            for g in critic_grads
+        ]
         
         # 🚨 修复Critic发散：使用单一全局梯度裁剪，避免双重裁剪导致梯度不稳定
         # 🔧 关键修复：移除逐层裁剪，只保留全局裁剪，避免梯度被过度裁剪
@@ -6708,17 +7796,13 @@ class OptimizedMADDPG:
             if self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志
                 actor_inputs.append(fr_batch)
             if self.use_pf_feature_flag:
-                # 从历史PF力中提取当前智能体的PF力
-                # pf_batch形状是 (batch_size, n_agents*3)，需要提取当前智能体的3维PF力
-                pf_batch_reshaped = tf.reshape(pf_batch, [batch_size, self.n_agents, 3])  # (batch_size, n_agents, 3)
-                agent_pf_force = pf_batch_reshaped[:, agent_idx, :]  # (batch_size, 3)
-                # 如果pf_feature_dim是3，直接使用；否则需要调整
+                # 🚨 使用 RB 存储的当时刻 PF 力（当前 agent 的切片），与 Critic 上下文一致
+                agent_pf_force = pf_batch[:, agent_idx * 3:(agent_idx + 1) * 3]  # (batch, 3)
                 if self.pf_feature_dim == 3:
                     actor_inputs.append(agent_pf_force)
                 else:
-                    # 如果pf_feature_dim不是3，需要调整维度
                     if self.pf_feature_dim > 3:
-                        pad_size = tf.cast(self.pf_feature_dim - 3, tf.int32)  # 🔧 XLA修复：确保是int32类型
+                        pad_size = tf.cast(self.pf_feature_dim - 3, tf.int32)
                         pf_batch_actor = tf.pad(agent_pf_force, [[0, 0], [0, pad_size]])
                     else:
                         pf_batch_actor = agent_pf_force[:, :self.pf_feature_dim]
@@ -6791,8 +7875,10 @@ class OptimizedMADDPG:
             if self.use_pf_feature_flag:
                 actor_inputs.append(pf_batch)
             actor_q_output = agent['critic'](actor_inputs, training=False)
-            # 标准MADDPG：Critic输出单个Q值
-            actor_q = tf.cast(actor_q_output, tf.float32)
+            if isinstance(actor_q_output, (list, tuple)):
+                actor_q = tf.add_n([tf.cast(q, tf.float32) for q in actor_q_output])
+            else:
+                actor_q = tf.cast(actor_q_output, tf.float32)
             
             # 🔧 调试：检查Q值是否包含异常值（减少输出频率）
             q_has_nan = tf.reduce_any(tf.math.is_nan(actor_q))
@@ -6815,6 +7901,9 @@ class OptimizedMADDPG:
             
             # 🔧 XLA友好：直接裁剪Q值，不做 is_finite 检查
             q_clip = tf.cast(self.q_clip_value_cached, tf.float32)
+            # 🚨 关键修复：先清理NaN/Inf，再进行裁剪（clip_by_value对NaN无效）
+            # 原因：如果critic输出NaN，clip无法处理，会导致actor_loss和梯度都变成NaN
+            actor_q = tf.where(tf.math.is_finite(actor_q), actor_q, tf.cast(0.0, actor_q.dtype))
             actor_q = tf.clip_by_value(actor_q, -q_clip, q_clip)
             actor_loss_pg = -tf.reduce_mean(actor_q)
             
@@ -6838,38 +7927,25 @@ class OptimizedMADDPG:
             action_head = new_action[:, :3]
             action_tail = new_action[:, 3:]
             
-            # 🚨 彻底修复：用Smooth L1替代exp，避免梯度爆炸导致Actor饱和
-            # Smooth L1: 当|x|<threshold时用L2，当|x|>threshold时用L1
-            # 这样既有足够的惩罚，又不会导致梯度爆炸
-            # 🔧 放宽前三维正则化：提高阈值，降低惩罚强度，允许更大的动作范围
             head_abs = tf.abs(action_head)
-            threshold = tf.cast(0.95, head_abs.dtype)  # 🔧 放宽：从0.85提高到0.95，允许更大的动作值
-            
-            # Smooth L1边界惩罚
+            threshold = tf.cast(0.95, head_abs.dtype)
             boundary_excess = tf.maximum(head_abs - threshold, tf.cast(0.0, head_abs.dtype))
             smooth_l1_penalty = tf.where(
                 boundary_excess < tf.cast(0.1, boundary_excess.dtype),
-                tf.cast(0.5, boundary_excess.dtype) * tf.square(boundary_excess),  # L2部分
-                tf.cast(0.1, boundary_excess.dtype) * boundary_excess - tf.cast(0.005, boundary_excess.dtype)  # L1部分
+                tf.cast(0.5, boundary_excess.dtype) * tf.square(boundary_excess),
+                tf.cast(0.1, boundary_excess.dtype) * boundary_excess - tf.cast(0.005, boundary_excess.dtype)
             )
             head_boundary_penalty = tf.reduce_mean(smooth_l1_penalty)
+            head_l2 = tf.reduce_mean(tf.square(action_head))
             
-            # 🔧 关键修复：大幅降低L2正则化，避免网络输出趋向0
-            # 问题：L2正则化惩罚所有非零值，导致网络学习到输出接近0更安全
-            # 修复：只保留边界惩罚，移除或大幅降低L2正则化，让网络敢于输出更大的动作值
-            # 基础L2正则（大幅降低权重，仅用于防止极端值）
-            head_l2 = tf.reduce_mean(tf.square(action_head)) * tf.cast(0.1, action_head.dtype)  # 🔧 降低90%的L2正则权重
-
-            # 🔧 新增：对持续向下（负向）Z轴加速度添加额外正则，防止策略整体被推向Z负半轴
-            # 只对 z<0 的部分做 L2 惩罚，z>=0 不受影响；系数由 neg_z_reg_coef_cached 控制，默认0（关闭）
-            neg_z_coef = tf.cast(getattr(self, 'neg_z_reg_coef_cached', 0.0), head_l2.dtype)
-            z_comp = action_head[:, 2:3]
-            neg_z = tf.nn.relu(-z_comp)
-            neg_z_penalty = tf.reduce_mean(tf.square(neg_z))
-
-            # 🔧 放宽前三维度正则化强度：边界惩罚系数从1.0降低到0.5，允许更大的动作范围
-            head_reg = head_l2 + tf.cast(0.5, head_l2.dtype) * head_boundary_penalty  # 🔧 降低边界惩罚权重
-            head_reg = head_reg + neg_z_coef * neg_z_penalty  # 额外惩罚持续向下推力
+            neg_action_mask = action_head < tf.cast(0.0, action_head.dtype)
+            neg_action_penalty = tf.reduce_mean(tf.where(
+                neg_action_mask,
+                tf.square(action_head) * tf.cast(0.3, action_head.dtype),
+                tf.zeros_like(action_head)
+            ))
+            
+            head_reg = head_l2 + tf.cast(0.5, head_l2.dtype) * head_boundary_penalty + neg_action_penalty
             
             # 🔧 修复势场参数饱和：使用更温和的边界惩罚，避免参数被推到边界
             # 问题：之前的边界惩罚太强（exp(5.0 * (|x| - 0.7))），导致参数被推到边界
@@ -6895,38 +7971,18 @@ class OptimizedMADDPG:
             # 解决方案：降低到0.1，让Q值梯度能够主导学习方向
             pf_params_penalty = tf.reduce_mean(tf.abs(action_tail)) * tf.cast(0.1, action_tail.dtype)
             
-            # 🔧 修复：大幅降低尾部正则化权重，避免压制Q值梯度
-            tail_reg = tf.cast(0.3, tail_mean.dtype) * tail_mean + tf.cast(0.5, tail_mean.dtype) * tail_boundary_penalty + pf_params_penalty
+            tail_reg = tf.cast(0.4, tail_mean.dtype) * tail_mean + tf.cast(0.6, tail_mean.dtype) * tail_boundary_penalty + pf_params_penalty
             
-            action_reg = (head_reg + tail_reg) * tf.cast(arc_eff, new_action.dtype)
-            
-            # 🚨 关键修复：检查Q值信号强度，如果Q值太小，放大策略梯度信号
-            # 问题：当Q值接近0时，策略梯度信号很弱，导致Actor无法学习
-            # 修复：如果Q值范围太小，对策略梯度损失进行缩放，增强学习信号
-            q_mean = tf.reduce_mean(actor_q)
-            q_std = tf.math.reduce_std(actor_q)
-            q_signal_strength = tf.abs(q_mean) + q_std  # Q值信号强度指标
-            
-            # 如果Q值信号太弱（< 10），放大策略梯度损失
-            q_signal_threshold = tf.cast(10.0, q_mean.dtype)
-            pg_scale = tf.where(
-                q_signal_strength < q_signal_threshold,
-                q_signal_threshold / tf.maximum(q_signal_strength, tf.cast(1.0, q_signal_strength.dtype)),  # 放大信号
-                tf.cast(1.0, q_signal_strength.dtype)  # 保持原样
+            q_gradient_strength = tf.abs(actor_loss_pg)
+            reg_scale = tf.where(
+                q_gradient_strength < tf.cast(0.1, q_gradient_strength.dtype),
+                tf.cast(0.5, q_gradient_strength.dtype),
+                tf.cast(1.0, q_gradient_strength.dtype)
             )
-            # 限制放大倍数，避免过度放大
-            pg_scale = tf.clip_by_value(pg_scale, tf.cast(1.0, pg_scale.dtype), tf.cast(5.0, pg_scale.dtype))
-            actor_loss_pg_scaled = actor_loss_pg * pg_scale
-            
-            # 🚨 关键修复：大幅降低动作正则化权重，避免压制Q值梯度
-            # 问题：动作正则化可能过强，压制了策略梯度信号
-            # 修复：将正则化权重降低到原来的10%，让Q值梯度能够主导学习方向
-            action_reg_weight = tf.cast(0.1, action_reg.dtype)  # 🔧 降低90%的正则化权重
-            
-            # Actor总损失 = 放大后的策略梯度损失 + 降低后的动作正则化
-            actor_loss = actor_loss_pg_scaled + action_reg_weight * tf.cast(action_reg, actor_loss_pg.dtype)
-            # 🚨 关键修复：确保 actor_loss 是有限值，防止NaN进入梯度计算（MADDPG）
-            actor_loss = tf.where(tf.math.is_finite(actor_loss), actor_loss, tf.cast(0.0, actor_loss.dtype))
+            action_reg = (head_reg + tail_reg) * tf.cast(arc_eff, new_action.dtype) * tf.cast(1.2, arc_eff.dtype) * reg_scale
+            action_reg = tf.clip_by_value(action_reg, -1e6, 1e6)
+            actor_loss = actor_loss_pg + tf.cast(action_reg, tf.float32)
+            actor_loss = tf.clip_by_value(actor_loss, -1e6, 1e6)
 
             # ===== 计算图与敏感度诊断（可选）=====
             if getattr(self, 'debug_actor_graph', False):
@@ -7039,35 +8095,21 @@ class OptimizedMADDPG:
                 pass
             
             # 【调试】记录Actor梯度范数（在tf.function内，返回tensor而不是numpy）
-            actor_grad_norms_tensor = [tf.norm(g) if g is not None else tf.constant(0.0) for g in actor_grads]
+            # 🚨 修复：在计算梯度范数时先清理NaN，避免诊断日志显示NaN
+            actor_grad_norms_tensor = [
+                tf.norm(tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))) if g is not None else tf.constant(0.0) 
+                for g in actor_grads
+            ]
             
-            # 🚨 修复Actor梯度不稳定：使用单一全局梯度裁剪，避免双重裁剪导致梯度不稳定
-            # 🔧 关键修复：移除逐层裁剪，只保留全局裁剪，避免梯度被过度裁剪
-            # 原因：双重裁剪（先clip到1.0，再clip到10.0）会导致梯度不稳定，Loss波动大
-            # 修复：只使用全局裁剪，保持各层梯度相对比例，提高训练稳定性
-            actor_grads, global_norm = tf.clip_by_global_norm(actor_grads, self.c_grad_clip_norm)
-            
-            # 🔧 调试：检查梯度裁剪后的梯度是否包含异常值（使用TensorFlow操作）
-            grad_nan_checks = [tf.reduce_any(tf.math.is_nan(g)) for g in actor_grads if g is not None]
-            grad_inf_checks = [tf.reduce_any(tf.math.is_inf(g)) for g in actor_grads if g is not None]
-            
-            if len(grad_nan_checks) > 0:
-                actor_grad_has_nan = tf.reduce_any(tf.stack(grad_nan_checks))
-                actor_grad_has_inf = tf.reduce_any(tf.stack(grad_inf_checks))
-                
-                # 🔧 NaN 安全检查：清理NaN/Inf梯度后更新（而不是跳过更新）
-                # 🚨 关键修复：如果梯度包含NaN/Inf，清理后继续更新，而不是跳过更新
-                # 原因：跳过更新会导致网络无法学习，清理NaN/Inf后更新可以保持学习连续性
-                if actor_grad_has_nan or actor_grad_has_inf:
-                    # 🔧 修复：清理NaN/Inf梯度，而不是跳过更新
-                    actor_grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) if g is not None else g for g in actor_grads]
-                    if not bool(getattr(self.args, 'jit_compile', False)):
-                        self._grad_debug_counter.assign_add(1)
-                # 无论梯度是否包含NaN/Inf，都进行更新（已清理）
-                agent['actor_optimizer'].apply_gradients(zip(actor_grads, agent['actor'].trainable_variables))
-            else:
-                # 如果没有检查，默认更新（向后兼容）
-                agent['actor_optimizer'].apply_gradients(zip(actor_grads, agent['actor'].trainable_variables))
+            actor_grads_pairs = [(g, v) for g, v in zip(actor_grads, agent['actor'].trainable_variables) if g is not None]
+            if actor_grads_pairs:
+                grads_only = [g for g, v in actor_grads_pairs]
+                vars_only = [v for g, v in actor_grads_pairs]
+                grads_only = [tf.clip_by_norm(g, 1.0) for g in grads_only]
+                grads_only, _ = tf.clip_by_global_norm(grads_only, tf.cast(self.c_grad_clip_norm, tf.float32))
+                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in grads_only]
+                if tf.reduce_all(tf.stack(grads_finite)):
+                    agent['actor_optimizer'].apply_gradients(zip(grads_only, vars_only))
         else:
             # 🚨 关键修复：非更新步时，返回与if分支相同数量的占位符，确保TensorFlow条件分支结构一致
             # 非更新步：占位范数（保持返回结构，数量必须与if分支相同）
@@ -7079,8 +8121,46 @@ class OptimizedMADDPG:
         # 返回损失和教师数据质量统计，以及梯度tensor信息（统一返回12个值）
         return (critic_loss, actor_loss, valid_teacher_ratio, avg_advantage, q_teacher_mean, q_actor_mean, q_diff_mean,
                critic_grad_norms_tensor, actor_grad_norms_tensor, target_q, current_q, na)
+
+    def flush_pending_per_updates(self, replay_buffer):
+        return _flush_pending_per_updates(
+            self,
+            replay_buffer,
+            warn_prefix="[PER警告] MADDPG",
+            success_message="[PER调试] MADDPG成功更新{count}个样本的优先级",
+        )
+
     def update(self, replay_buffer, batch_size=128):
         """更新所有智能体（预计算共享张量，避免重复前向）"""
+        detail_enabled = False
+        try:
+            cached = getattr(self, '_timing_detail_enabled_cache', None)
+            if cached is None:
+                try:
+                    timing_level = int(os.getenv('TIMING_LEVEL', '1'))
+                except Exception:
+                    timing_level = 1
+                try:
+                    detail_flag = os.getenv('TIMING_DETAIL', '0').lower() in ('1', 'true', 'yes', 'on')
+                except Exception:
+                    detail_flag = False
+                cached = bool(timing_level >= 2 or detail_flag)
+                self._timing_detail_enabled_cache = cached
+            detail_enabled = bool(cached)
+        except Exception:
+            detail_enabled = False
+        update_timing = None
+        if detail_enabled:
+            update_timing = {
+                'upd_sample': 0.0,
+                'upd_prepare': 0.0,
+                'upd_target': 0.0,
+                'upd_train': 0.0,
+                'upd_per': 0.0,
+                'upd_post': 0.0,
+            }
+            _upd_perf_counter = time.perf_counter
+        self._last_update_timing = None
         if replay_buffer.size() < batch_size:
             # 轻量调试：回放缓冲不足时输出一次（受QUIET控制）
             try:
@@ -7091,27 +8171,34 @@ class OptimizedMADDPG:
             return None
 
         # 采样批次（Lite/NumPy缓冲区统一返回元组）
+        # 🚀 性能优化：统一为 11/12 元组兼容解包，避免旧回放结构直接中断训练
+        if detail_enabled:
+            _t_upd_phase = _upd_perf_counter()
         sample_result = replay_buffer.sample(batch_size)
-        if len(sample_result) == 7:
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices = sample_result
-            fr_batch = np.full((len(obs_n),), getattr(self.args, 'action_force_ratio', 0.0), dtype=np.float32)
-            pf_forces_batch = np.zeros((len(obs_n), self.n_agents, 3), dtype=np.float32)
-            act_corrected_batch = None
-        elif len(sample_result) == 8:
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices, fr_batch = sample_result
-            pf_forces_batch = np.zeros((len(obs_n), self.n_agents, 3), dtype=np.float32)
-            act_corrected_batch = None  # 旧版本回放缓冲区没有存储修正动作
-        elif len(sample_result) == 9:
-            # 🚨 新增：包含pf_forces_batch
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices, fr_batch, pf_forces_batch = sample_result
-            act_corrected_batch = None  # 旧版本回放缓冲区没有存储修正动作
-        else:
-            # 🔧 新增：包含act_corrected_batch（修正后的动作）
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices, fr_batch, pf_forces_batch, act_corrected_batch = sample_result
+        (
+            obs_n,
+            next_obs_n,
+            act_n,
+            rew_n,
+            done_n,
+            weights,
+            indices,
+            fr_batch,
+            pf_forces_batch,
+            pf_features_batch,
+            next_pf_features_batch,
+            next_pf_geometry_cache_batch,
+            act_corrected_batch,
+            next_pf_forces_batch,
+            next_act_corrected_batch,
+        ) = _unpack_replay_sample(sample_result)
+        if detail_enabled:
+            update_timing['upd_sample'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
         
-        # 🔧 调试：检查PER权重是否有效（每100次更新检查一次）
+        # 🔧 调试：检查PER权重是否有效（每500次更新检查一次，降低I/O开销）
         self._update_count = getattr(self, '_update_count', 0)
-        if self._update_count % 100 == 0 and getattr(self.args, 'per_enabled', False):
+        if self._update_count % 500 == 0 and getattr(self.args, 'per_enabled', False):
             weights_array = np.asarray(weights, dtype=np.float32)
             weights_min = float(np.min(weights_array))
             weights_max = float(np.max(weights_array))
@@ -7128,25 +8215,15 @@ class OptimizedMADDPG:
 
         # 🔧 关键修复：使用历史存储的FR值，确保训练-执行一致性
         # 原因：如果FR值随时间变化（schedule），使用当前FR值会导致训练目标与实际执行不一致
-        # 修复：优先使用历史存储的FR值，如果没有则使用当前FR值（向后兼容）
-        if len(sample_result) >= 8:
-            # 使用历史存储的FR值（确保与历史执行一致）
-            fr_batch_historical = np.asarray(fr_batch, dtype=np.float32)  # 历史FR值 (batch_size,)
-            fr_batch_column = tf.expand_dims(tf.convert_to_tensor(fr_batch_historical, dtype=tf.float32), axis=1)  # (batch_size, 1)
-            fr_batch_tensor = fr_batch_column  # 兼容性：保持变量名一致
-            # 检查是否有正FR值（用于判断是否需要应用势场修正）
-            fr_positive = bool(np.any(fr_batch_historical > 0.0))
-        else:
-            # 向后兼容：如果没有历史FR值，使用当前FR值
-            current_fr_value = float(getattr(self.args, 'action_force_ratio', 0.0))
-            fr_batch_column = tf.fill([len(obs_n), 1], tf.cast(current_fr_value, tf.float32))
-            fr_batch_tensor = fr_batch_column  # 兼容性：保持变量名一致
-            fr_positive = bool(current_fr_value > 0.0)
+        fr_batch_historical = np.asarray(fr_batch, dtype=np.float32)
+        fr_batch_column = tf.expand_dims(tf.convert_to_tensor(fr_batch_historical, dtype=tf.float32), axis=1)
+        fr_batch_tensor = fr_batch_column
+        fr_positive = bool(np.any(fr_batch_historical > 0.0))
 
-        # 🔧 性能优化：减少数据验证频率，只在每100次update时检查一次
+        # 🔧 性能优化：减少数据验证频率，只在每500次update时检查一次
         self._update_count = getattr(self, '_update_count', 0)
         self._update_count += 1
-        if self._update_count % 100 == 0:
+        if self._update_count % 500 == 0:
             obs_has_nan = np.isnan(obs_n).any()
             obs_has_inf = np.isinf(obs_n).any()
             act_has_nan = np.isnan(act_n).any()
@@ -7164,8 +8241,6 @@ class OptimizedMADDPG:
         # 🔧 修复：确保act_n是numpy数组
         act_n = np.asarray(act_n, dtype=np.float32)
         pf_forces_batch = np.asarray(pf_forces_batch, dtype=np.float32)  # (batch_size, n_agents, 3)
-        fr_batch_expanded = np.expand_dims(fr_batch, axis=1)  # (batch_size, 1)
-        
         # 🔧 修复：验证形状
         if len(act_n.shape) != 3 or act_n.shape[1] != self.n_agents:
             raise ValueError(f"act_n形状错误: {act_n.shape}, 期望 (batch_size, {self.n_agents}, act_dim)")
@@ -7174,8 +8249,12 @@ class OptimizedMADDPG:
         if act_n.shape[0] != pf_forces_batch.shape[0]:
             raise ValueError(f"批次大小不匹配: act_n.shape[0]={act_n.shape[0]}, pf_forces_batch.shape[0]={pf_forces_batch.shape[0]}")
         
-        # 🚨 关键修复：保存原始动作（在重构之前），用于Actor路径1学习
+        # 🚨 关键修复：保存原始动作（在重构之前），用于 Actor 路径1 学习
+        # 这里需要同时保留 numpy 副本与 tensor 视图：
+        # - numpy 版本用于后续恢复修正动作
+        # - tensor 版本用于后续 Actor/Critic 计算
         act_n_raw = act_n.copy()  # (batch_size, n_agents, act_dim) - 原始动作
+        act_n_raw_tensor = tf.convert_to_tensor(act_n_raw, dtype=tf.float32)
         
         # 🔧 修复：优先使用存储的修正动作，如果没有则从原始动作+势场力+FR计算
         if act_corrected_batch is not None:
@@ -7189,26 +8268,25 @@ class OptimizedMADDPG:
                 # 向量化计算：corrected = raw + FR * (pf_force - raw)
                 action_head = act_n[:, :, :3]  # (batch_size, n_agents, 3)
                 pf_forces_expanded = pf_forces_batch  # (batch_size, n_agents, 3)
-                # fr_batch_expanded 已经是 (batch_size, 1)，需要扩展到 (batch_size, 1, 1) 用于广播
-                fr_expanded = np.expand_dims(fr_batch_expanded, axis=2)  # (batch_size, 1, 1) 用于广播
+                # FR 是按样本存储的一维历史值，需要扩展到 (batch_size, 1, 1) 用于广播
+                fr_expanded = np.expand_dims(fr_batch, axis=(1, 2))  # (batch_size, 1, 1)
                 corrected_head = action_head + fr_expanded * (pf_forces_expanded - action_head)
                 act_n_corrected[:, :, :3] = np.clip(corrected_head, -1.0, 1.0)
         
-        # 🚨 关键修复：使用历史PF力，而不是用当前FR值重新计算
-        # 原因：训练时应该使用历史时刻存储的PF力，这样才能正确还原历史时刻的修正动作
-        # 如果使用当前FR值重新计算，会导致训练目标与实际执行不一致（特别是当FR值随时间变化时）
-        # 将历史PF力从numpy数组转换为TensorFlow张量
-        pf_forces_batch_tf = tf.convert_to_tensor(pf_forces_batch, dtype=tf.float32)  # (batch_size, n_agents, 3)
-        # 展平为(n_agents*3)特征，供Critic显式感知势场修正
-        pf_batch_flat = tf.reshape(pf_forces_batch_tf, [tf.shape(pf_forces_batch_tf)[0], self.n_agents * 3])
+        pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
+        current_pf_source = pf_features_batch if getattr(replay_buffer, 'stores_pf_features', False) and pf_features_batch is not None else pf_forces_batch
+        next_pf_source = next_pf_features_batch if getattr(replay_buffer, 'stores_next_pf_features', False) and next_pf_features_batch is not None else None
+        current_pf_features_np = _coerce_pf_feature_batch_numpy(current_pf_source, act_n.shape[0], self.n_agents, pf_feat_dim)
+        next_pf_features_np = _coerce_pf_feature_batch_numpy(next_pf_source, act_n.shape[0], self.n_agents, pf_feat_dim)
+        pf_batch_flat = _flatten_pf_feature_batch_tf(current_pf_features_np, self.n_agents, pf_feat_dim)
+        next_pf_tensor = tf.convert_to_tensor(next_pf_features_np, dtype=tf.float32)
 
         # 转换为张量（CPU->GPU传输发生在这里）
         obs_n = tf.convert_to_tensor(obs_n, dtype=tf.float32)
         next_obs_n = tf.convert_to_tensor(next_obs_n, dtype=tf.float32)
         # 🔧 关键修改：使用修正后的动作（混合动作）进行Critic学习，与实际执行一致
         act_n = tf.convert_to_tensor(act_n_corrected, dtype=tf.float32)
-        # 🚨 关键修复：保存原始动作的张量，用于Actor路径1学习
-        act_n_raw_tensor = tf.convert_to_tensor(act_n_raw, dtype=tf.float32)
+        # act_n_raw_tensor 已在原始动作保存阶段构建，这里不再重复创建
         rew_n = tf.convert_to_tensor(rew_n, dtype=tf.float32)
         done_n = tf.convert_to_tensor(done_n, dtype=tf.float32)
         
@@ -7252,42 +8330,39 @@ class OptimizedMADDPG:
                 print(f"[CTDE警告] Actor{i}输入维度不匹配: 期望{expected_actor_dim}, 实际{actor_obs_dim}")
         # 训练与回放统一使用归一化动作[-1,1]，不在训练侧做物理映射
 
-        # 🔧 关键修改：Critic分离梯度学习
-        # 前三维使用原始动作（让Critic评估原始动作的安全性）
-        # 后四维使用修正后动作（让Critic评估修正后动作的价值）
-        # 🔧 性能优化：向量化构建混合全局动作，避免Python循环
-        # 批量提取所有智能体的动作
+        # 🔧 构建全局动作（分离梯度可选）
         raw_actions_list = []
         corrected_actions_list = []
         for i in range(self.n_agents):
             act_dim = self.action_dims[i]
             raw_actions_list.append(act_n_raw_tensor[:, i, :act_dim])
             corrected_actions_list.append(act_n[:, i, :act_dim])
-        
-        # 向量化构建混合动作：前三维来自原始动作，后四维来自修正后动作
-        mixed_actions_list = []
-        for i in range(self.n_agents):
-            act_dim = self.action_dims[i]
-            raw_action = raw_actions_list[i]
-            corrected_action = corrected_actions_list[i]
-            
-            if act_dim >= 3:
-                # 🔧 修复：前三维使用原始动作，后四维使用修正后动作（对齐MATD3）
-                if act_dim > 3:
-                    mixed_action = tf.concat([
-                        raw_action[:, :3],  # 🔧 修复：前三维使用原始动作（不是corrected_action）
-                        corrected_action[:, 3:]  # 后四维：修正后动作
-                    ], axis=1)
+
+        if self.use_separated_gradient:
+            # 前三维使用原始动作，后四维使用修正后动作
+            mixed_actions_list = []
+            for i in range(self.n_agents):
+                act_dim = self.action_dims[i]
+                raw_action = raw_actions_list[i]
+                corrected_action = corrected_actions_list[i]
+                if act_dim >= 3:
+                    if act_dim > 3:
+                        mixed_action = tf.concat([raw_action[:, :3], corrected_action[:, 3:]], axis=1)
+                    else:
+                        mixed_action = raw_action
                 else:
-                    mixed_action = raw_action  # 🔧 修复：只有3维，使用原始动作（不是corrected_action）
-            else:
-                # 🔧 修复：动作维度<3也使用原始动作（保持训练一致性，对齐MATD3逻辑）
-                mixed_action = raw_action
-            mixed_actions_list.append(mixed_action)
-        
-        global_actions = tf.concat(mixed_actions_list, axis=1)  # 混合动作，用于Critic学习
-        # 🚨 关键修复：构建原始动作的全局动作，用于Actor路径1学习
+                    mixed_action = raw_action
+                mixed_actions_list.append(mixed_action)
+            global_actions = tf.concat(mixed_actions_list, axis=1)
+        else:
+            # 统一梯度：使用修正后动作
+            unified_actions_list = [corrected_actions_list[i] for i in range(self.n_agents)]
+            global_actions = tf.concat(unified_actions_list, axis=1)
+
         global_actions_raw_all = tf.concat(raw_actions_list, axis=1)
+        if detail_enabled:
+            update_timing['upd_prepare'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
 
         # 计算 target 动作：从target_actor输出[-1,1]映射为真实动作（与执行一致）
         # 🔧 关键修复：支持PF特征作为独立输入
@@ -7299,9 +8374,7 @@ class OptimizedMADDPG:
             if self.use_fr_feature_flag:  # 🔧 编译时常量，XLA友好
                 target_actor_inputs.append(fr_next)
             if self.use_pf_feature_flag:  # 🔧 编译时常量，XLA友好
-                # 使用零向量作为PF输入的占位符
-                pf_batch = tf.zeros([tf.shape(all_next_obs[i])[0], self.pf_feature_dim], dtype=tf.float32)
-                target_actor_inputs.append(pf_batch)
+                target_actor_inputs.append(next_pf_tensor[:, i, :pf_feat_dim])
             
             if len(target_actor_inputs) == 1:
                 target_action = self.agents[i]['target_actor'](target_actor_inputs[0], training=False)
@@ -7376,9 +8449,15 @@ class OptimizedMADDPG:
             
             global_next_actions_mixed.append(mixed_target_action)
         
-        global_next_actions = tf.concat(global_next_actions_mixed, axis=1)  # 混合target动作，用于Target Q计算
+        if self.use_separated_gradient:
+            global_next_actions = tf.concat(global_next_actions_mixed, axis=1)  # 混合target动作
+        else:
+            global_next_actions = global_next_actions_corrected
         
         # 目标动作保持归一化尺度，Critic与Target Critic一致使用归一化动作
+        if detail_enabled:
+            update_timing['upd_target'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
 
         # 逐智能体更新（复用上面的全局张量）
         losses = []
@@ -7391,12 +8470,12 @@ class OptimizedMADDPG:
             if hasattr(self, '_episode_count') and hasattr(self.args, 'train_episodes') and self.args.train_episodes > 0:
                 progress = tf.cast(self._episode_count / float(self.args.train_episodes), tf.float32)
             # 延后启用并更缓慢衰减：前30%进度线性升温到目标值，之后再线性衰减到0
-            warmup_pct = tf.constant(0.3, dtype=tf.float32)
-            after_warm_pct = tf.constant(0.7, dtype=tf.float32)
+            rampup_pct = tf.constant(0.3, dtype=tf.float32)
+            after_ramp_pct = tf.constant(0.7, dtype=tf.float32)
             # 升温阶段比例（0->1）
-            warm_ratio = tf.clip_by_value(progress / warmup_pct, 0.0, 1.0)
+            warm_ratio = tf.clip_by_value(progress / rampup_pct, 0.0, 1.0)
             # 衰减阶段比例（1->0）
-            decay_ratio = tf.clip_by_value(1.0 - (progress - warmup_pct) / after_warm_pct, 0.0, 1.0)
+            decay_ratio = tf.clip_by_value(1.0 - (progress - rampup_pct) / after_ramp_pct, 0.0, 1.0)
             # 混合项与模仿项采用"先升温后衰减"的弱化日程
             mix_beta_sched = tf.cast(self.actor_mix_beta, tf.float32) * warm_ratio * decay_ratio
             imitation_mu_sched = tf.cast(self.actor_imitation_mu, tf.float32) * warm_ratio * decay_ratio
@@ -7426,6 +8505,9 @@ class OptimizedMADDPG:
         all_target_q = []
         all_current_q = []
         all_new_actions = []
+        # PER复用：收集训练步已计算的Q值（避免额外前向）
+        per_target_qs = []
+        per_current_qs = []
         
         # 【调试】首次训练时打印结果元素数量
         first_agent_result_len = None
@@ -7445,6 +8527,9 @@ class OptimizedMADDPG:
             if len(result) == 12:  # 新版本：包含调试信息
                 (critic_loss, actor_loss, valid_teacher_ratio, avg_advantage, q_teacher_mean, q_actor_mean, q_diff_mean,
                  critic_grad_norms_tensor, actor_grad_norms_tensor, target_q, current_q, new_action) = result
+                # PER复用：直接保存已计算的Q值（保持GPU张量）
+                per_target_qs.append(target_q)
+                per_current_qs.append(current_q)
                 # 教师监督已删除，不再累加这些统计数据
                 # 🚀 GPU优化：只在需要调试时才同步（每2000步一次）
                 if self.training_stats.get('train_steps', 0) % 2000 == 0:
@@ -7485,9 +8570,23 @@ class OptimizedMADDPG:
                     losses[-1]['critic_loss'] = float(_safe_tensor_to_numpy(tf.identity(critic_loss)))
                     losses[-1]['actor_loss'] = float(_safe_tensor_to_numpy(tf.identity(actor_loss)))
                 except Exception:
-                    # 如果同步失败，使用NaN标记
-                    losses[-1]['critic_loss'] = float('nan')
-                    losses[-1]['actor_loss'] = float('nan')
+                    # 仅当张量本身非有限时才标记为 NaN，避免同步失败被误记为真 NaN
+                    try:
+                        cf = bool(tf.reduce_all(tf.math.is_finite(critic_loss)).numpy())
+                    except Exception:
+                        cf = False
+                    try:
+                        af = bool(tf.reduce_all(tf.math.is_finite(actor_loss)).numpy())
+                    except Exception:
+                        af = False
+                    if not cf:
+                        losses[-1]['critic_loss'] = float('nan')
+                    else:
+                        losses[-1]['critic_loss'] = None  # 同步失败但张量有限，不记为 NaN
+                    if not af:
+                        losses[-1]['actor_loss'] = float('nan')
+                    else:
+                        losses[-1]['actor_loss'] = None
 
         # 🔧 性能优化：将重型调试输出受 QUIET_OUTPUT 与 LOG_INTERVAL_STEPS 控制
         try:
@@ -7577,9 +8676,8 @@ class OptimizedMADDPG:
                 except Exception as e:
                     print(f"\n[警告] 动作统计出错: {e}")
             
-            # 🔧 性能优化：大幅降低Critic敏感度测试频率，从每400步降到每2000步
-            # 测试所有Agent，特别关注梯度为0的Agent
-            if len(all_new_actions) > 0 and hasattr(self, 'training_stats') and self.training_stats['train_steps'] % 2000 == 0:
+            # 🔧 性能优化：大幅降低Critic敏感度测试频率，从每2000步降到每5000步（仅调试用）
+            if len(all_new_actions) > 0 and hasattr(self, 'training_stats') and self.training_stats['train_steps'] % 5000 == 0:
                 try:
                     # 使用第一个batch的数据进行测试
                     test_obs = obs_n[:min(4, obs_n.shape[0])]  # 取前4个样本
@@ -7595,11 +8693,18 @@ class OptimizedMADDPG:
                         agent = self.agents[test_agent_idx]
                         
                         # 原始动作的Q值
+                        # 🔧 修复：构建完整的Critic输入，包括pf_input
+                        test_inputs_original = [test_global_state, test_global_actions]
                         if getattr(self.args, 'use_fr_feature', False):
                             fr_diag = fr_batch_column[:tf.shape(test_global_state)[0]]
-                            q_original = agent['critic']([test_global_state, test_global_actions, fr_diag], training=False)
-                        else:
-                            q_original = agent['critic']([test_global_state, test_global_actions], training=False)
+                            test_inputs_original.append(fr_diag)
+                        if getattr(self.args, 'use_pf_feature', False):
+                            pf_dim = getattr(self.args, 'pf_feature_dim', 3) * self.n_agents
+                            pf_placeholder = tf.zeros([tf.shape(test_global_state)[0], pf_dim], dtype=tf.float32)
+                            test_inputs_original.append(pf_placeholder)
+                        q_original = agent['critic'](test_inputs_original, training=False)
+                        if isinstance(q_original, (list, tuple)):
+                            q_original = tf.add_n([tf.cast(q, tf.float32) for q in q_original])
                         
                         # 扰动当前Agent的动作（增加0.5）
                         # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
@@ -7607,11 +8712,18 @@ class OptimizedMADDPG:
                         test_act_perturb[:, test_agent_idx, :] += 0.5
                         test_global_actions_perturb = tf.concat([tf.constant(test_act_perturb[:, i], dtype=tf.float32) 
                                                                  for i in range(self.n_agents)], axis=1)
+                        # 🔧 修复：构建完整的Critic输入，包括pf_input
+                        test_inputs_perturb = [test_global_state, test_global_actions_perturb]
                         if getattr(self.args, 'use_fr_feature', False):
                             fr_diag = fr_batch_column[:tf.shape(test_global_state)[0]]
-                            q_perturb = agent['critic']([test_global_state, test_global_actions_perturb, fr_diag], training=False)
-                        else:
-                            q_perturb = agent['critic']([test_global_state, test_global_actions_perturb], training=False)
+                            test_inputs_perturb.append(fr_diag)
+                        if getattr(self.args, 'use_pf_feature', False):
+                            pf_dim = getattr(self.args, 'pf_feature_dim', 3) * self.n_agents
+                            pf_placeholder = tf.zeros([tf.shape(test_global_state)[0], pf_dim], dtype=tf.float32)
+                            test_inputs_perturb.append(pf_placeholder)
+                        q_perturb = agent['critic'](test_inputs_perturb, training=False)
+                        if isinstance(q_perturb, (list, tuple)):
+                            q_perturb = tf.add_n([tf.cast(q, tf.float32) for q in q_perturb])
                         
                         # 计算Q值变化
                         # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
@@ -7632,6 +8744,9 @@ class OptimizedMADDPG:
                     print(f"\n[警告] Critic敏感度测试出错: {e}")
             
             print(f"{'='*80}\n")
+        if detail_enabled:
+            update_timing['upd_train'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
         
         # 软更新目标网络
         self._soft_update_targets()
@@ -7639,63 +8754,40 @@ class OptimizedMADDPG:
         # 更新训练步数
         if hasattr(self, 'training_stats'):
             self.training_stats['train_steps'] += 1
+        if detail_enabled:
+            update_timing['upd_post'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
 
         # 可选：PER优先级更新（轻量版），按批次样本的平均|TD误差|
         # 注意：PER机制与教师经验监督机制可能存在冲突，需要协调
         if getattr(self.args, 'per_enabled', False) and losses is not None:
             try:
-                gamma = self.c_gamma  # 🔧 XLA修复：使用缓存的常量
-                # 计算每个样本的TD误差（按智能体平均）
-                td_errors = []
-                for i in range(self.n_agents):
-                    agent = self.agents[i]
-                    # 🔧 修复：根据实际网络配置准备输入，确保与网络定义一致
-                    # 目标Q输入
-                    target_critic_inputs = [global_next_state, global_next_actions]
-                    if self.use_fr_feature_flag:
-                        target_critic_inputs.append(fr_batch_column)
-                    if self.use_pf_feature_flag:
-                        # PF特征：从回放缓冲区获取（如果可用）
-                        if len(sample_result) >= 9 and pf_forces_batch is not None:
-                            pf_batch = tf.convert_to_tensor(pf_forces_batch, dtype=tf.float32)
-                            # 重塑为 (batch_size, pf_feature_dim * n_agents)
-                            pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
-                            pf_batch_reshaped = tf.reshape(pf_batch, [-1, pf_feat_dim * self.n_agents])
-                            target_critic_inputs.append(pf_batch_reshaped)
-                    else:
-                            # 如果没有PF特征，使用零向量占位符
-                            pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
-                            pf_placeholder = tf.zeros([tf.shape(global_next_state)[0], pf_feat_dim * self.n_agents], dtype=tf.float32)
-                            target_critic_inputs.append(pf_placeholder)
-                    target_q_i = agent['target_critic'](target_critic_inputs, training=False)
-                    target_q_i = tf.cast(target_q_i, tf.float32)
-                    
-                    # 当前Q输入（与目标Q输入结构一致）
-                    current_critic_inputs = [global_state, global_actions]
-                    if self.use_fr_feature_flag:
-                        current_critic_inputs.append(fr_batch_column)
-                    if self.use_pf_feature_flag:
-                        # PF特征：从回放缓冲区获取（如果可用）
-                        if len(sample_result) >= 9 and pf_forces_batch is not None:
-                            pf_batch = tf.convert_to_tensor(pf_forces_batch, dtype=tf.float32)
-                            # 重塑为 (batch_size, pf_feature_dim * n_agents)
-                            pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
-                            pf_batch_reshaped = tf.reshape(pf_batch, [-1, pf_feat_dim * self.n_agents])
-                            current_critic_inputs.append(pf_batch_reshaped)
-                    else:
-                            # 如果没有PF特征，使用零向量占位符
-                            pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
-                            pf_placeholder = tf.zeros([tf.shape(global_state)[0], pf_feat_dim * self.n_agents], dtype=tf.float32)
-                            current_critic_inputs.append(pf_placeholder)
-                    current_q_i = agent['critic'](current_critic_inputs, training=False)
-                    current_q_i = tf.cast(current_q_i, tf.float32)
-                    # TD: r + gamma*(1-d)*Q' - Q
-                    r_i = tf.cast(rew_n[:, i], tf.float32)
-                    d_i = tf.cast(done_n[:, i], tf.float32)
-                    td_i = r_i + gamma * (1.0 - d_i) * tf.squeeze(target_q_i, axis=1) - tf.squeeze(current_q_i, axis=1)
-                    td_errors.append(tf.abs(td_i))
-                # 聚合为平均|TD|
-                td_err = tf.reduce_mean(tf.stack(td_errors, axis=0), axis=0)  # [batch]
+                td_err = None
+                # ✅ 快路径：复用训练中已计算的Q值，避免PER额外前向
+                if len(per_target_qs) == self.n_agents and len(per_current_qs) == self.n_agents:
+                    gamma = self.c_gamma  # 🔧 XLA修复：使用缓存的常量
+                    td_errors = []
+                    for i in range(self.n_agents):
+                        target_q_i = tf.cast(per_target_qs[i], tf.float32)
+                        current_q_i = tf.cast(per_current_qs[i], tf.float32)
+                        # 🚨 关键修复：清理target_q_i和current_q_i中的NaN，避免PER退化
+                        target_q_i = tf.where(tf.math.is_finite(target_q_i), target_q_i, tf.cast(0.0, target_q_i.dtype))
+                        current_q_i = tf.where(tf.math.is_finite(current_q_i), current_q_i, tf.cast(0.0, current_q_i.dtype))
+                        # ✅ 修复：target_q 已经是 Bellman target (scaled_rewards + gamma*Q')，直接计算 target_q - current_q
+                        # 与训练时的计算方式一致（第7029行）
+                        td_i = tf.squeeze(target_q_i, axis=1) - tf.squeeze(current_q_i, axis=1)
+                        td_errors.append(tf.abs(td_i))
+                    # 聚合为平均|TD|
+                    td_err = tf.reduce_mean(tf.stack(td_errors, axis=0), axis=0)  # [batch]
+                    td_err = tf.where(tf.math.is_finite(td_err), td_err, tf.zeros_like(td_err))
+
+                # 🚨 严格模式：无法复用Q值时直接报错，不提供兜底路径
+                if td_err is None:
+                    raise RuntimeError(
+                        f"PER更新失败：无法复用Q值。per_target_qs长度={len(per_target_qs)}, "
+                        f"per_current_qs长度={len(per_current_qs)}, n_agents={self.n_agents}。"
+                        f"请确保train_step正确返回target_q和current_q。"
+                    )
                 
                 # 协调PER和教师机制：结合TD误差和教师质量
                 if 'avg_advantage' in locals() and avg_advantage > 0:
@@ -7713,35 +8805,7 @@ class OptimizedMADDPG:
                 # 🔧 修复：降低批量更新阈值（从20改为5），确保PER更新更及时
                 # 每5次更新或回合结束时才批量同步
                 if len(self._per_update_buffer) >= 5:
-                    # 🔧 XLA修复：批量同步所有优先级更新，避免在XLA编译时访问内存
-                    # 先收集所有tensor，然后统一同步
-                    batch_updates = []
-                    for idx, pri in self._per_update_buffer:
-                        # 使用安全的tensor转换
-                        try:
-                            pri_np = _safe_tensor_to_numpy(tf.identity(pri))
-                            batch_updates.append((idx, pri_np))
-                        except Exception as e:
-                            # 如果转换失败，跳过这个更新
-                            if not getattr(self, '_per_update_warned', False):
-                                print(f"[PER警告] MADDPG优先级更新失败，跳过: {e}")
-                                self._per_update_warned = True
-                            continue
-                    # 批量更新
-                    update_count = 0
-                    for idx, pri_np in batch_updates:
-                        try:
-                            replay_buffer.update_priorities(idx, pri_np)
-                            update_count += 1
-                        except Exception as e:
-                            if not getattr(self, '_per_update_warned', False):
-                                print(f"[PER警告] MADDPG优先级写入失败: {e}")
-                                self._per_update_warned = True
-                            pass
-                    if update_count > 0 and not getattr(self, '_per_update_success_logged', False):
-                        print(f"[PER调试] MADDPG成功更新{update_count}个样本的优先级")
-                        self._per_update_success_logged = True
-                    self._per_update_buffer.clear()
+                    self.flush_pending_per_updates(replay_buffer)
             except Exception as e:
                 # 🔧 修复：添加错误日志，帮助诊断PER更新失败的原因
                 if not getattr(self, '_per_update_error_logged', False):
@@ -7765,50 +8829,15 @@ class OptimizedMADDPG:
         except Exception:
             pass
 
-        # 🚀 GPU优化：回合结束前，清空PER更新缓冲区
-        try:
-            if hasattr(self, '_per_update_buffer') and len(self._per_update_buffer) > 0:
-                # 🔧 XLA修复：批量同步所有优先级更新，避免在XLA编译时访问内存
-                batch_updates = []
-                for idx, pri in self._per_update_buffer:
-                    # 使用安全的tensor转换
-                    try:
-                        pri_np = _safe_tensor_to_numpy(tf.identity(pri))
-                        batch_updates.append((idx, pri_np))
-                    except Exception as e:
-                        # 如果转换失败，跳过这个更新
-                        if not getattr(self, '_per_update_warned', False):
-                            print(f"[PER警告] MADDPG回合结束时优先级转换失败: {e}")
-                            self._per_update_warned = True
-                        continue
-                # 批量更新
-                update_count = 0
-                for idx, pri_np in batch_updates:
-                    try:
-                        replay_buffer.update_priorities(idx, pri_np)
-                        update_count += 1
-                    except Exception as e:
-                        if not getattr(self, '_per_update_warned', False):
-                            print(f"[PER警告] MADDPG回合结束时优先级写入失败: {e}")
-                            self._per_update_warned = True
-                        pass
-                if update_count > 0:
-                    if not getattr(self, '_per_update_success_logged', False):
-                        print(f"[PER调试] MADDPG回合结束时成功更新{update_count}个样本的优先级")
-                        self._per_update_success_logged = True
-                self._per_update_buffer.clear()
-        except Exception as e:
-            # 🔧 修复：添加错误日志，帮助诊断PER更新失败的原因
-            if not getattr(self, '_per_update_error_logged', False):
-                import traceback
-                print(f"[PER错误] MADDPG回合结束时PER更新异常: {e}")
-                print(f"[PER错误] 异常类型: {type(e).__name__}")
-                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                    traceback.print_exc()
-                self._per_update_error_logged = True
+        if detail_enabled:
+            update_timing['upd_per'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
 
         # 递增全局更新计数（用于延迟更新判定）
         self.total_it += 1
+        if detail_enabled:
+            update_timing['upd_post'] += _upd_perf_counter() - _t_upd_phase
+            self._last_update_timing = update_timing
         return losses
 
     @tf.function(reduce_retracing=True)
@@ -7921,6 +8950,35 @@ class OptimizedMATD3:
         self.use_fr_feature_flag = bool(getattr(args, 'use_fr_feature', False))
         self.use_pf_feature_flag = bool(getattr(args, 'use_pf_feature', False))
         self.pf_feature_dim = int(getattr(args, 'pf_feature_dim', 0)) if self.use_pf_feature_flag else 0
+        try:
+            self.total_obs_dim = int(sum(self.obs_shapes))
+        except Exception:
+            self.total_obs_dim = None
+        try:
+            self.total_action_dim = int(sum(self.action_dims))
+        except Exception:
+            self.total_action_dim = None
+        self._agent_action_spans = []
+        self._agent_action_masks = []
+        if self.total_action_dim is not None:
+            _start = 0
+            for _dim in self.action_dims:
+                _dim = int(_dim)
+                _pad_right = self.total_action_dim - _start - _dim
+                self._agent_action_spans.append((_start, _dim, _pad_right))
+                _mask = np.zeros((1, self.total_action_dim), dtype=np.float32)
+                _mask[:, _start:_start + _dim] = 1.0
+                self._agent_action_masks.append(tf.constant(_mask, dtype=tf.float32))
+                _start += _dim
+        # 双Q头/分离梯度开关（MATD3）
+        self.use_dual_q = bool(getattr(args, 'matd3_use_dual_q', True))
+        self.use_separated_gradient = bool(getattr(args, 'matd3_use_separated_gradient', True))
+        if not self.use_dual_q and self.use_separated_gradient:
+            self.use_separated_gradient = False
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+                print("[MATD3] 已禁用分离梯度：双Q头关闭时不支持分离梯度")
+        if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+            print(f"[MATD3] Dual Q: {self.use_dual_q}, Separated Gradient: {self.use_separated_gradient}")
 
         # 调试：是否进行actor-critic计算图与敏感度检查（环境变量开启）
         try:
@@ -7940,20 +8998,35 @@ class OptimizedMATD3:
         if not hasattr(self, '_episode_count'):
             self._episode_count = 0
         
-        # 🔧 分阶段探索策略相关（MATD3）
-        self.is_warmup_phase = True  # 初始状态为预热阶段
-        self.random_action_prob_warmup = float(getattr(args, 'random_action_prob', 0.12))
-        # 🔧 修复：降低训练阶段的随机动作概率，减少不稳定（MATD3版本）
-        # 问题：训练阶段8-12%的随机动作混合导致智能体到处跑，无法稳定学习
-        # 解决方案：降低到0.03（3%），保持少量探索但减少干扰
-        self.random_action_prob_training = float(getattr(args, 'random_action_prob_training', 0.03))  # 🔧 修复：从0.12降低到0.03
-        self.current_random_action_prob = self.random_action_prob_warmup  # 初始使用预热阶段的概率
-        
+        # 当前主训练路径与旧回退路径统一使用 random_action_prob。
+        # random_action_prob_training 仅保留作历史兼容别名。
+        self.random_action_prob_training = float(
+            getattr(args, 'random_action_prob',
+                    getattr(args, 'random_action_prob_training', 0.03))
+        )
+        self.current_random_action_prob = self.random_action_prob_training
         # MATD3特有参数
         self.policy_noise = getattr(args, 'policy_noise', 0.2)
         self.noise_clip = getattr(args, 'noise_clip', 0.5)
         self.policy_freq = getattr(args, 'policy_freq', 2)
         self.total_it = 0  # 总更新次数计数器
+
+        # 训练公平权重：低成功率agent获得更高loss权重（反向补偿）
+        self.fairness_reweight_enabled = bool(getattr(args, 'fairness_reweight_enabled', True))
+        self.fairness_window = max(1, int(getattr(args, 'fairness_window', 200)))
+        self.fairness_beta = float(getattr(args, 'fairness_beta', 2.0))
+        self.fairness_min_weight = float(getattr(args, 'fairness_min_weight', 0.7))
+        self.fairness_max_weight = float(getattr(args, 'fairness_max_weight', 1.6))
+        if self.fairness_min_weight > self.fairness_max_weight:
+            self.fairness_min_weight, self.fairness_max_weight = self.fairness_max_weight, self.fairness_min_weight
+        self.agent_fairness_weights_var = tf.Variable(
+            np.ones((self.n_agents,), dtype=np.float32),
+            trainable=False,
+            dtype=tf.float32,
+            name='matd3_agent_fairness_weights'
+        )
+        self._last_agent_success_rates = [0.0 for _ in range(self.n_agents)]
+        self._last_agent_fairness_weights = [1.0 for _ in range(self.n_agents)]
         
         # 初始化调试计数器（tf.Variable，用于tf.function中）
         self._pf_debug_counter = tf.Variable(0, dtype=tf.int32, trainable=False)
@@ -7972,7 +9045,7 @@ class OptimizedMATD3:
         self._init_optimizers()
         
         # 预热优化器（防止tf.function变量创建错误）
-        self._warmup_optimizers()
+        self._initialize_optimizers()
         
         # 初始化观察处理器（使用向量化NumPy处理）
         use_vectorization = getattr(args, 'use_vectorization', True)
@@ -8007,6 +9080,7 @@ class OptimizedMATD3:
                     'height': getattr(args, 'height_weight', 0.2),
                     'lateral': getattr(args, 'lateral_weight', 0.3),
                     'clearance': getattr(args, 'clearance_weight', 0.4),
+                    'collision_reduction': getattr(args, 'collision_reduction_weight', 0.0),
                     'success': getattr(args, 'success_weight', 0.0),
                     'collision': getattr(args, 'collision_weight', 0.0),
                     'global': getattr(args, 'global_weight', 0.0),
@@ -8022,7 +9096,7 @@ class OptimizedMATD3:
                 global_reward_mode=getattr(args, 'global_reward_mode', 'avg_progress'),
                 shaping_gamma=getattr(args, 'shaping_gamma', 0.95)
             )
-        
+
         # 训练统计
         self.training_stats = {
             'episodes': 0,
@@ -8069,6 +9143,13 @@ class OptimizedMATD3:
             dtype=tf.float32,
             name='matd3_noise_min_var'
         )
+        # 🚨 关键修复：创建total_steps的Variable，用于噪声衰减调度器（在@tf.function中安全使用）
+        self.total_steps_var = tf.Variable(
+            0,
+            trainable=False,
+            dtype=tf.int64,
+            name='matd3_total_steps_var'
+        )
         # 🔧 XLA修复：预先计算num_envs，避免在tf.function中使用getattr
         self.num_envs_int = int(getattr(self.args, 'num_envs', 1))
         # 🔧 XLA修复：预先缓存常用参数，避免在tf.function中使用getattr
@@ -8085,6 +9166,15 @@ class OptimizedMATD3:
         # 🔧 放宽前三维正则化：降低默认正则化系数，允许更大的动作范围
         self.action_reg_coef_cached = float(getattr(self.args, 'action_reg_coef', 2e-2))  # 从5e-2降低到2e-2
         self.jit_compile_cached = bool(getattr(self.args, 'jit_compile', False))
+        if self.jit_compile_cached and self.use_dual_q and self.use_separated_gradient:
+            # 当前 separated-gradient 热路径仍不适合外层 JIT，保留 PF_JIT 即可。
+            self.jit_compile_cached = False
+            try:
+                setattr(self.args, 'jit_compile', False)
+            except Exception:
+                pass
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+                print("[MATD3] JIT_COMPILE 已在 separated-gradient 热路径上自动关闭；保留 PF_JIT。")
         self.debug_pf_forces_cached = bool(getattr(self.args, 'debug_pf_forces', False))
         # 势场参数缓存
         self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 1.0))
@@ -8163,11 +9253,83 @@ class OptimizedMATD3:
         # 可选：对关键函数启用 per-function JIT（jit_compile=True），不改变训练逻辑
         # 仅在显式开启时启用，避免与 XLA Global 混用导致不稳定
         try:
-            if bool(getattr(self.args, 'jit_compile', False)):
+            if self.jit_compile_cached:
+                # 当前 MATD3 separated-gradient 热路径里，PF 热内核已由 PF_JIT 覆盖。
+                # 外层再对 batch_select_actions_vectorized / _multi_agent_update_step 做 jit_compile
+                # 在实测中会把优化器更新、soft update、较大的控制流一起送进 XLA，整体反而变慢。
+                # 因此这里保留 legacy train_step 路径的 JIT，不再包裹默认热路径。
                 self.train_step = tf.function(self.train_step, reduce_retracing=True, jit_compile=True)
                 self.train_step_optimized = tf.function(self.train_step_optimized, reduce_retracing=True, jit_compile=True)
         except Exception:
             pass
+
+    def reset_hidden_states(self, batch_size=None):
+        """兼容训练编排层的隐藏状态重置接口。
+
+        当前 MATD3 主线同样是前馈网络：动作仅依赖当前观测，而不依赖跨步保存的 hidden state。
+        因此环境重建时调用该接口应为安全无副作用的 no-op。
+        """
+        return None
+
+    def update_agent_fairness_weights(self, agent_success_flags):
+        """根据最近成功率更新每个agent的训练权重（低成功率→更高权重）。"""
+        base_weights = np.ones((self.n_agents,), dtype=np.float32)
+        try:
+            if (not self.fairness_reweight_enabled) or self.n_agents <= 0:
+                self.agent_fairness_weights_var.assign(base_weights)
+                self._last_agent_success_rates = [0.0 for _ in range(self.n_agents)]
+                self._last_agent_fairness_weights = base_weights.tolist()
+                return base_weights
+
+            if not isinstance(agent_success_flags, list) or len(agent_success_flags) == 0:
+                self.agent_fairness_weights_var.assign(base_weights)
+                self._last_agent_success_rates = [0.0 for _ in range(self.n_agents)]
+                self._last_agent_fairness_weights = base_weights.tolist()
+                return base_weights
+
+            window_flags = agent_success_flags[-self.fairness_window:]
+            rates = np.full((self.n_agents,), np.nan, dtype=np.float32)
+            for agent_idx in range(self.n_agents):
+                vals = []
+                for flags in window_flags:
+                    if isinstance(flags, (list, tuple, np.ndarray)) and len(flags) > agent_idx:
+                        try:
+                            v = float(flags[agent_idx])
+                        except (ValueError, TypeError):
+                            continue
+                        if np.isfinite(v):
+                            vals.append(1.0 if v >= 0.5 else 0.0)
+                if vals:
+                    rates[agent_idx] = float(np.mean(vals))
+
+            valid_rates = rates[np.isfinite(rates)]
+            if valid_rates.size == 0:
+                self.agent_fairness_weights_var.assign(base_weights)
+                self._last_agent_success_rates = [0.0 for _ in range(self.n_agents)]
+                self._last_agent_fairness_weights = base_weights.tolist()
+                return base_weights
+
+            mean_rate = float(np.mean(valid_rates))
+            rates = np.where(np.isfinite(rates), rates, mean_rate)
+            beta = max(0.0, float(self.fairness_beta))
+            raw_weights = np.exp(beta * (mean_rate - rates))
+            raw_weights = np.clip(raw_weights, self.fairness_min_weight, self.fairness_max_weight).astype(np.float32)
+            raw_mean = float(np.mean(raw_weights))
+            if np.isfinite(raw_mean) and raw_mean > 1e-6:
+                norm_weights = raw_weights / raw_mean
+            else:
+                norm_weights = base_weights
+            norm_weights = np.clip(norm_weights, 0.1, 10.0).astype(np.float32)
+
+            self.agent_fairness_weights_var.assign(norm_weights)
+            self._last_agent_success_rates = rates.astype(np.float32).tolist()
+            self._last_agent_fairness_weights = norm_weights.tolist()
+            return norm_weights
+        except Exception:
+            self.agent_fairness_weights_var.assign(base_weights)
+            self._last_agent_success_rates = [0.0 for _ in range(self.n_agents)]
+            self._last_agent_fairness_weights = base_weights.tolist()
+            return base_weights
     
     def _init_networks(self):
         """初始化所有网络（MATD3使用Twin Critic）"""
@@ -8230,14 +9392,15 @@ class OptimizedMATD3:
             agent['target_actor'] = tf.keras.models.clone_model(agent['actor'])
             agent['target_actor'].set_weights(agent['actor'].get_weights())
             
-            # 🚨 标准MATD3：创建两个独立的Twin Critic网络（每个都输出双Q值用于梯度分离）
+            # 🚨 标准MATD3：创建两个独立的Twin Critic网络
             # 为避免 BF16 在某些 GPU/驱动组合下触发 MatMul 内核崩溃，这里强制在 float32 策略下构建 Critic
+            critic_builder = build_continuous_critic_network_matd3 if self.use_dual_q else build_continuous_critic_network
             def _build_single_critic():
-                """构建单个Critic网络（输出双Q值：q1评估前3维，q2评估后4维）"""
+                """构建单个Critic网络（可选双Q头）"""
                 try:
                     from tensorflow.keras import mixed_precision as _mp
                     with _mp.PolicyScope(_mp.Policy('float32')):
-                        return build_continuous_critic_network_matd3(
+                        return critic_builder(
                             state_shape=(critic_state_dim,),
                             action_dim=self.action_dims[i],
                             hidden_units=critic_hidden,
@@ -8248,7 +9411,7 @@ class OptimizedMATD3:
                             pf_feature_dim=self.pf_feature_dim
                         )
                 except Exception:
-                    return build_continuous_critic_network_matd3(
+                    return critic_builder(
                         state_shape=(critic_state_dim,),
                         action_dim=self.action_dims[i],
                         hidden_units=critic_hidden,
@@ -8269,7 +9432,10 @@ class OptimizedMATD3:
             agent['target_critic2'] = tf.keras.models.clone_model(agent['critic2'])
             agent['target_critic2'].set_weights(agent['critic2'].get_weights())
             
-            print(f"[MATD3网络] 智能体{i} - 已创建标准Twin Critic：critic1和critic2（每个都输出双Q值用于梯度分离）")
+            if self.use_dual_q:
+                print(f"[MATD3网络] 智能体{i} - Twin Critic已创建（双Q头）")
+            else:
+                print(f"[MATD3网络] 智能体{i} - Twin Critic已创建（单Q头）")
             
             # 参数噪声已移除：仅使用 OU 噪声
             
@@ -8345,11 +9511,28 @@ class OptimizedMATD3:
             print(f"  - 初始学习率: Actor={getattr(self.args, 'learning_rate_actor', 0.0005):.6f}, Critic={getattr(self.args, 'learning_rate_critic', 0.001):.6f}")
             print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
             print(f"  - 最小学习率: Actor={min_actor_lr:.6f}, Critic={min_critic_lr:.6f}")
+            
+            # 🚨 关键修复：创建噪声衰减调度器（与学习率衰减使用相同的机制）
+            initial_noise_scale = float(getattr(self.args, 'noise_scale', 0.35))
+            min_noise_scale = float(getattr(self.args, 'noise_min', 0.05))
+            
+            self.noise_scale_schedule = ClippedExponentialDecay(
+                initial_learning_rate=initial_noise_scale,
+                decay_steps=decay_steps,  # 与学习率衰减使用相同的decay_steps
+                decay_rate=decay_rate,    # 与学习率衰减使用相同的decay_rate
+                min_lr=min_noise_scale,
+                staircase=staircase       # 与学习率衰减使用相同的staircase
+            )
+            print(f"[MATD3 噪声衰减] 已启用（与学习率衰减同步）")
+            print(f"  - 初始噪声: {initial_noise_scale:.4f}, 最小噪声: {min_noise_scale:.4f}")
+            print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
         else:
             # 固定学习率
             actor_lr_schedule = getattr(self.args, 'learning_rate_actor', 0.0005)
             critic_lr_schedule = getattr(self.args, 'learning_rate_critic', 0.001)
             print(f"[MATD3 学习率] 固定学习率: Actor={actor_lr_schedule:.6f}, Critic={critic_lr_schedule:.6f}")
+            # 固定噪声（不使用调度器）
+            self.noise_scale_schedule = None
         
         for i in range(self.n_agents):
             agent = self.agents[i]
@@ -8422,9 +9605,9 @@ class OptimizedMATD3:
                 name=f'matd3_critic_lr_var_{i}'
             )
     
-    def _warmup_optimizers(self):
-        """预热优化器（防止tf.function变量创建错误）"""
-        print("[MATD3] 预热优化器...")
+    def _initialize_optimizers(self):
+        """初始化优化器状态（防止tf.function首次执行时创建变量）。"""
+        print("[MATD3] 初始化优化器状态...")
         
         # 创建虚拟数据用于预热
         batch_size = 32
@@ -8660,9 +9843,24 @@ class OptimizedMATD3:
         if training:
             env_idx = 0  # 默认使用第一个环境
             if env_idx < len(self.ou_noises) and agent_idx < len(self.ou_noises[env_idx]):
-                current_std = max(float(self.args.noise_scale), float(self.args.noise_min))
-                current_std = current_std * (self.args.noise_decay ** self.training_stats['total_steps'])
-                current_std = max(current_std, float(self.args.noise_min))
+                # 🚨 关键修复：使用噪声衰减调度器（与学习率衰减一致）
+                if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
+                    # 使用调度器计算当前噪声强度（基于total_steps_var）
+                    # 注意：在非@tf.function环境中，可以直接使用numpy()转换
+                    current_step = tf.cast(self.total_steps_var, tf.float32)
+                    current_std_tensor = self.noise_scale_schedule(current_step)
+                    current_std_tensor = tf.maximum(current_std_tensor, self.noise_min_var)
+                    # 安全转换：在非图模式下使用numpy()，在图模式下使用tf.keras.backend.get_value
+                    try:
+                        current_std = float(current_std_tensor.numpy())
+                    except (AttributeError, RuntimeError):
+                        # 如果无法转换为numpy（可能在图模式下），使用tf.keras.backend.get_value
+                        current_std = float(tf.keras.backend.get_value(current_std_tensor))
+                else:
+                    # 回退：如果没有调度器，使用简单的指数衰减（向后兼容）
+                    current_std = max(float(self.args.noise_scale), float(self.args.noise_min))
+                    current_std = current_std * (self.args.noise_decay ** self.training_stats['total_steps'])
+                    current_std = max(current_std, float(self.args.noise_min))
 
                 self.ou_noises[env_idx][agent_idx].set_std_dev(current_std)
                 ou = self.ou_noises[env_idx][agent_idx]()  # 形状(7,)
@@ -8721,9 +9919,12 @@ class OptimizedMATD3:
         """
         MATD3的向量化批量动作选择（与MADDPG接口一致）
         states: (num_envs, n_agents, obs_dim)
-        返回: (actions, pf_forces)
-            - actions: (num_envs, n_agents, act_dim) 最终动作
-            - pf_forces: (num_envs, n_agents, 3) 势场力矢量（归一化后的3维向量）
+        返回: (actions_for_storage, actions_for_execution, pf_forces, raw_actor_outputs, pf_features_current)
+            - actions_for_storage: (num_envs, n_agents, act_dim) 回放区原始动作
+            - actions_for_execution: (num_envs, n_agents, act_dim) 环境执行动作
+            - pf_forces: (num_envs, n_agents, 3) 行为执行时的 PF 力（behavior force）
+            - raw_actor_outputs: (num_envs, n_agents, act_dim) Actor 原始7维输出（噪声/PF前）
+            - pf_features_current: (num_envs, n_agents, 3) 当前状态的 base PF 特征
         """
         # 统一张量类型与形状，避免 retracing
         states = tf.convert_to_tensor(states, dtype=tf.float32)
@@ -8735,93 +9936,114 @@ class OptimizedMATD3:
         
         # 🔧 修改1：先进行随机动作选择（在网络前向传播之前）
         eps = tf.cast(self.current_random_action_prob, tf.float32)
-        with tf.device('/CPU:0'):
-            rand_mask = tf.random.uniform([num_envs, self.n_agents], dtype=tf.float32) < eps
-            rand_actions_raw = tf.random.uniform([num_envs, self.n_agents, orig_act_dim], minval=-1.0, maxval=1.0, dtype=tf.float32)
+        # 保持在默认设备上生成随机数，减少动作路径里的 host/device 往返
+        rand_mask = tf.random.uniform([num_envs, self.n_agents], dtype=tf.float32) < eps
+        rand_actions_raw = tf.random.uniform([num_envs, self.n_agents, orig_act_dim], minval=-1.0, maxval=1.0, dtype=tf.float32)
         
         # 需要处理混合情况：部分随机、部分网络
         mask3 = tf.expand_dims(rand_mask, axis=2)
         
         # 🚨 关键修复：随机动作不应该做势场修正（与select_action逻辑一致）
         # 原因：随机动作用于探索，势场修正会约束到安全区域，降低探索效率
-        # 计算网络动作（对所有智能体都计算，即使会被随机动作覆盖）
-        # 🚨 新增：支持PF特征作为独立输入
-        # 预先计算PF力（使用零向量作为占位符，实际PF力会在后续计算）
-        current_force_ratio = tf.cast(self.action_force_ratio_cached, tf.float32)
-        use_tf_potential_field = self.use_tf_potential_field_cached
-        if self.use_pf_feature_flag and use_tf_potential_field and current_force_ratio > 0.0:
-            # 预先计算PF力（基于当前obs和零动作，作为PF输入的近似）
-            num_envs_dyn = tf.shape(states)[0]
-            obs_dim = tf.shape(states)[2]
-            # 🔧 关键修复：使用正确的观测维度（obs_shapes[0]），而不是states.shape[2]
-            correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else obs_dim
-            flat_obs = tf.reshape(states[:, :, :correct_obs_dim], [-1, correct_obs_dim])  # 🔧 修复：使用正确的观测维度
-            # 使用零动作计算PF力（仅用于获取PF方向信息）
-            dummy_action_for_pf_calc = tf.zeros([num_envs_dyn * self.n_agents, orig_act_dim], dtype=tf.float32)
-            _, pf_force_flat_pre = self._apply_potential_field_correction_tf(
-                dummy_action_for_pf_calc,
-                flat_obs,
-                tf.constant(1.0, dtype=tf.float32)  # 使用FR=1.0获取完整PF力
-            )
-            pf_forces_pre = tf.reshape(pf_force_flat_pre, [num_envs_dyn, self.n_agents, 3])
-        else:
-            pf_forces_pre = tf.zeros([tf.shape(states)[0], self.n_agents, 3], dtype=tf.float32)
         
+        # 🚨 方案A：使用base PF参数计算PF力，确保训练/执行一致性
+        # 原理：PF特征定义为"obs + base参数"计算出来的PF力，训练和执行都用它
+        # 优点：完全消除训练/执行不一致，避免分布漂移
+        current_force_ratio = tf.cast(self.action_force_ratio_cached, tf.float32)
+        use_tf_potential_field = tf.cast(self.use_tf_potential_field_cached, tf.float32)
+        use_pf_feature_flag = tf.cast(self.use_pf_feature_flag, tf.float32)
+        num_envs_dyn = tf.shape(states)[0]
+        obs_dim = tf.shape(states)[2]
+        
+        should_compute_pf_pre = tf.logical_and(
+            tf.greater(use_pf_feature_flag, 0.5),
+            tf.logical_and(
+                tf.greater(use_tf_potential_field, 0.5),
+                tf.greater(current_force_ratio, 0.0)
+            )
+        )
+        
+        # 计算基于base PF参数的PF力（使用dummy_actions，PF参数=0，使用base参数）
+        correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else obs_dim
+        flat_obs = tf.ensure_shape(
+            tf.reshape(states[:, :, :correct_obs_dim], [-1, correct_obs_dim]),
+            [None, correct_obs_dim],
+        )
+        pf_obs_context = self._extract_pf_obs_context_compiled_tf(flat_obs)
+        pf_geometry_context = self._extract_pf_geometry_context_compiled_tf(
+            pf_obs_context[1],
+            pf_obs_context[2],
+            pf_obs_context[4],
+            pf_obs_context[5],
+            pf_obs_context[6],
+        )
+        pf_obs_valid_inputs = pf_obs_context[3]
+        dummy_actions = tf.zeros([num_envs_dyn * self.n_agents, orig_act_dim], dtype=tf.float32)
+        _, pf_force_flat_pre = self._compute_pf_force_from_geometry_context_compiled_tf(
+            dummy_actions,  # ✅ 这里只需要 PF 力，不需要完整 correction
+            pf_obs_valid_inputs,
+            pf_geometry_context,
+        )
+        pf_forces_computed = tf.reshape(pf_force_flat_pre, [num_envs_dyn, self.n_agents, 3])
+        pf_forces_zero = tf.zeros([num_envs_dyn, self.n_agents, 3], dtype=tf.float32)
+        
+        # 🔧 XLA修复：使用tf.where替代mask乘法，确保形状完全一致
+        pf_forces_pre = tf.where(
+            tf.broadcast_to(should_compute_pf_pre, [num_envs_dyn, self.n_agents, 3]),
+            pf_forces_computed,  # ✅ 基于base PF参数计算的PF力
+            pf_forces_zero
+        )
+        
+        # 计算网络动作（对所有智能体都计算，即使会被随机动作覆盖）
+        fr_feature_batch = None
+        if self.use_fr_feature_flag:
+            fr_feature_batch = tf.fill([num_envs, 1], current_force_ratio)
+
         actions_per_agent = []
         for i in range(self.n_agents):
             # 🔧 修复：使用正确的观测维度（obs_shapes[i]），确保索引引用正确
             obs_dim = self.obs_shapes[i] if i < len(self.obs_shapes) else states.shape[2]
             agent_obs = states[:, i, :obs_dim]  # 🔧 修复：使用正确的观测维度，避免索引错误
-            agent_pf = pf_forces_pre[:, i, :]  # (num_envs, 3)
             
-            # 🚨 新增：支持PF特征作为独立输入
+            # 🚨 方案A：使用基于base PF参数计算的PF力作为PF特征
             actor_inputs = [agent_obs]
             if self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志，避免getattr
-                fr_b = tf.fill([tf.shape(agent_obs)[0], 1], tf.cast(self.action_force_ratio_cached, tf.float32))
-                actor_inputs.append(fr_b)
+                actor_inputs.append(fr_feature_batch)
             if self.use_pf_feature_flag:
+                # ✅ 使用基于base PF参数计算的PF力（与训练时一致）
+                agent_pf = pf_forces_pre[:, i, :]  # (num_envs, 3)
                 actor_inputs.append(agent_pf)
             
             if len(actor_inputs) == 1:
                 agent_actions = self.agents[i]['actor'](actor_inputs[0], training=False)
             else:
                 agent_actions = self.agents[i]['actor'](actor_inputs, training=False)
-            
-            # 🔧 NaN 安全检查：检测并替换 NaN 值
-            agent_actions = tf.where(
-                tf.math.is_nan(agent_actions),
-                tf.zeros_like(agent_actions),
-                agent_actions
-            )
-            
             actions_per_agent.append(agent_actions)
         
         # 堆叠所有智能体的动作
         raw_actor_actions = tf.stack(actions_per_agent, axis=1)  # (num_envs, n_agents, act_dim) - 原始Actor输出
+        # 🔧 性能优化：NaN 清洗合并到一次批量操作，避免每个 agent 单独插入 where
+        raw_actor_actions = tf.where(
+            tf.math.is_nan(raw_actor_actions),
+            tf.zeros_like(raw_actor_actions),
+            raw_actor_actions
+        )
         
-        # 🚨🚨🚨 关键修改：为了解决Z轴负向输出问题，需要分离"存储动作"和"执行动作"
-        # 
-        # 问题根源：
-        #   - 如果回放区存储"修正后的动作"，Critic学习Q(s, a_corrected)
-        #   - Actor基于Q(s, a_corrected)优化，梯度告诉它"输出负Z也行"（因为修正后是好的）
-        #   - 结果：Actor学会依赖势场修正，持续输出负Z
-        # 
-        # 解决方案：
-        #   - 回放区存储"原始动作"（加噪声但不修正）
-        #   - Critic学习Q(s, a_raw)，能正确评估原始动作的价值
-        #   - Actor基于Q(s, a_raw)优化，梯度告诉它"输出负Z很差"
-        #   - 但环境执行"修正后的动作"（保证训练安全）
-        # 
-        # 返回值：
-        #   - actions_for_storage: 存入回放区的动作（原始+噪声，无势场修正）
-        #   - actions_for_execution: 交给环境的动作（原始+噪声+势场修正）
-        #   - pf_forces: 势场力（用于观测增强）
-        
-        # 1. 先对原始动作添加噪声（用于探索）
-        # 这是要存入回放区的动作：有噪声但没有势场修正
+        # 回放区存原始探索动作，环境执行 PF 修正后的动作。
         if add_noise:
             if self.use_vectorized_ou:
-                ou_tensor = self.vectorized_ou_noise.generate_noise()
+                # 🚨 关键修复：使用噪声衰减调度器计算当前噪声强度（与学习率衰减一致）
+                if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
+                    # 使用调度器计算当前噪声强度（基于total_steps_var）
+                    current_step = tf.cast(self.total_steps_var, tf.float32)
+                    current_std = self.noise_scale_schedule(current_step)
+                    current_std = tf.maximum(current_std, self.noise_min_var)
+                    # 使用generate_noise_with_std，传入计算出的std（XLA友好）
+                    ou_tensor = self.vectorized_ou_noise.generate_noise_with_std(current_std)
+                else:
+                    # 回退：如果没有调度器，使用Variable存储的噪声强度（向后兼容）
+                    current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
+                    ou_tensor = self.vectorized_ou_noise.generate_noise()
                 ou_tensor_head = ou_tensor[:, :, :3]
             else:
                 ou_tensor_head = tf.zeros([num_envs, self.n_agents, 3], dtype=tf.float32)
@@ -8841,16 +10063,16 @@ class OptimizedMATD3:
         
         def _apply_pf_correction():
             num_envs_dyn = tf.shape(raw_actions_with_noise)[0]
-            act_dim = tf.shape(raw_actions_with_noise)[2]
-            # 🔧 关键修复：使用正确的观测维度（obs_shapes[0]），而不是states.shape[2]
-            obs_dim_dyn = tf.shape(states)[2]
-            correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else int(obs_dim_dyn)
-            flat_actions = tf.reshape(raw_actions_with_noise, [-1, act_dim])
-            flat_obs = tf.reshape(states[:, :, :correct_obs_dim], [-1, correct_obs_dim])  # 🔧 修复：使用正确的观测维度
-            corrected_head_flat, pf_force_flat = self._apply_potential_field_correction(
+            # 🚨 关键优化：计算PF修正（使用Actor输出的真实PF参数），得到真实的PF力
+            flat_actions = tf.ensure_shape(
+                tf.reshape(raw_actions_with_noise, [-1, orig_act_dim]),
+                [None, orig_act_dim],
+            )
+            corrected_head_flat, pf_force_flat = self._apply_potential_field_correction_from_geometry_context_tf(
                 flat_actions,
-                flat_obs,
-                current_force_ratio
+                current_force_ratio,
+                pf_obs_valid_inputs,
+                pf_geometry_context,
             )
             corrected_head = tf.reshape(corrected_head_flat, [num_envs_dyn, self.n_agents, 3])
             pf_forces = tf.reshape(pf_force_flat, [num_envs_dyn, self.n_agents, 3])
@@ -8876,57 +10098,100 @@ class OptimizedMATD3:
         
         # 势场力：随机动作的势场力为0（因为没做修正）
         pf_forces_final = tf.where(
-            tf.tile(tf.expand_dims(rand_mask, axis=2), [1, 1, 3]),
+            mask3,
             tf.zeros_like(pf_force_network),
             pf_force_network
         )
         
-        # 返回三个值：
+        # 返回五个值：
         # 1. actions_for_storage: 存入回放区（原始+噪声，无修正）
         # 2. actions_for_execution: 交给环境（原始+噪声+修正）
-        # 3. pf_forces_final: 势场力矢量
-        return actions_for_storage, actions_for_execution, pf_forces_final
-    
+        # 3. pf_forces_final: 行为执行时的 PF 力
+        # 4. raw_actor_actions: Actor 原始输出（用于时序图）
+        # 5. pf_forces_pre: 当前状态的 base PF 特征
+        return actions_for_storage, actions_for_execution, pf_forces_final, raw_actor_actions, pf_forces_pre
+
+    def flush_pending_per_updates(self, replay_buffer):
+        return _flush_pending_per_updates(
+            self,
+            replay_buffer,
+            warn_prefix="[PER警告] MATD3",
+        )
+
     def update(self, replay_buffer, batch_size=128):
         """MATD3更新（优化版本：预计算目标策略平滑）"""
+        detail_enabled = False
+        try:
+            cached = getattr(self, '_timing_detail_enabled_cache', None)
+            if cached is None:
+                try:
+                    timing_level = int(os.getenv('TIMING_LEVEL', '1'))
+                except Exception:
+                    timing_level = 1
+                try:
+                    detail_flag = os.getenv('TIMING_DETAIL', '0').lower() in ('1', 'true', 'yes', 'on')
+                except Exception:
+                    detail_flag = False
+                cached = bool(timing_level >= 2 or detail_flag)
+                self._timing_detail_enabled_cache = cached
+            detail_enabled = bool(cached)
+        except Exception:
+            detail_enabled = False
+        update_timing = None
+        if detail_enabled:
+            update_timing = {
+                'upd_sample': 0.0,
+                'upd_prepare': 0.0,
+                'upd_target': 0.0,
+                'upd_train': 0.0,
+                'upd_per': 0.0,
+                'upd_post': 0.0,
+            }
+            _upd_perf_counter = time.perf_counter
+        self._last_update_timing = None
+        loss_sync_interval = getattr(self, '_loss_sync_interval_cached', None)
+        if loss_sync_interval is None:
+            try:
+                loss_sync_interval = int(os.getenv('LOSS_SYNC_INTERVAL', '50'))
+            except Exception:
+                loss_sync_interval = 50
+            if loss_sync_interval <= 0:
+                loss_sync_interval = 1
+            self._loss_sync_interval_cached = loss_sync_interval
         if replay_buffer.size() < batch_size:
             return []
         
         # 采样经验
+        if detail_enabled:
+            _t_upd_phase = _upd_perf_counter()
         batch = replay_buffer.sample(batch_size)
-        if len(batch) == 7:
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices = batch
-            fr_batch = np.full((len(obs_n),), getattr(self.args, 'action_force_ratio', 0.0), dtype=np.float32)
-            pf_forces_batch = np.zeros((len(obs_n), self.n_agents, 3), dtype=np.float32)
-            act_corrected_batch = None  # 旧版本回放缓冲区没有存储修正动作
-        elif len(batch) == 8:
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices, fr_batch = batch
-            pf_forces_batch = np.zeros((len(obs_n), self.n_agents, 3), dtype=np.float32)
-            act_corrected_batch = None  # 旧版本回放缓冲区没有存储修正动作
-        elif len(batch) == 9:
-            # 🚨 新增：包含pf_forces_batch
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices, fr_batch, pf_forces_batch = batch
-            act_corrected_batch = None  # 旧版本回放缓冲区没有存储修正动作
-        else:
-            # 🔧 新增：包含act_corrected_batch（修正后的动作）
-            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices, fr_batch, pf_forces_batch, act_corrected_batch = batch
+        (
+            obs_n,
+            next_obs_n,
+            act_n,
+            rew_n,
+            done_n,
+            weights,
+            indices,
+            fr_batch,
+            pf_forces_batch,
+            pf_features_batch,
+            next_pf_features_batch,
+            next_pf_geometry_cache_batch,
+            act_corrected_batch,
+            next_pf_forces_batch,
+            next_act_corrected_batch,
+        ) = _unpack_replay_sample(batch)
+        if detail_enabled:
+            update_timing['upd_sample'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
 
         # 🔧 关键修复：使用历史存储的FR值，确保训练-执行一致性
         # 原因：如果FR值随时间变化（schedule），使用当前FR值会导致训练目标与实际执行不一致
-        # 修复：优先使用历史存储的FR值，如果没有则使用当前FR值（向后兼容）
-        if len(batch) >= 8:
-            # 使用历史存储的FR值（确保与历史执行一致）
-            fr_batch_historical = np.asarray(fr_batch, dtype=np.float32)  # 历史FR值 (batch_size,)
-            fr_batch_tensor = tf.expand_dims(tf.convert_to_tensor(fr_batch_historical, dtype=tf.float32), axis=1)  # (batch_size, 1)
-            fr_batch_column = fr_batch_tensor  # 兼容性：保持变量名一致
-            # 检查是否有正FR值（用于判断是否需要应用势场修正）
-            fr_positive = bool(np.any(fr_batch_historical > 0.0))
-        else:
-            # 向后兼容：如果没有历史FR值，使用当前FR值
-            current_fr_value = float(getattr(self.args, 'action_force_ratio', 0.0))
-            fr_positive = bool(current_fr_value > 0.0)
-            fr_batch_tensor = tf.fill([len(obs_n), 1], tf.cast(current_fr_value, tf.float32))
-            fr_batch_column = fr_batch_tensor
+        fr_batch_historical = np.asarray(fr_batch, dtype=np.float32)
+        fr_batch_tensor = tf.expand_dims(tf.convert_to_tensor(fr_batch_historical, dtype=tf.float32), axis=1)
+        fr_batch_column = fr_batch_tensor
+        fr_positive = bool(np.any(fr_batch_historical > 0.0))
         
         # 🚨 新增：从原始动作+pf_forces+FR恢复修正后的动作
         # 公式：corrected_action = action_head + FR * (pf_force - action_head)
@@ -8934,8 +10199,6 @@ class OptimizedMATD3:
         # 🔧 修复：确保act_n是numpy数组
         act_n = np.asarray(act_n, dtype=np.float32)
         pf_forces_batch = np.asarray(pf_forces_batch, dtype=np.float32)  # (batch_size, n_agents, 3)
-        fr_batch_expanded = np.expand_dims(fr_batch, axis=1)  # (batch_size, 1)
-        
         # 🔧 修复：验证形状
         if len(act_n.shape) != 3 or act_n.shape[1] != self.n_agents:
             raise ValueError(f"act_n形状错误: {act_n.shape}, 期望 (batch_size, {self.n_agents}, act_dim)")
@@ -8946,6 +10209,7 @@ class OptimizedMATD3:
         
         # 🚨 关键修复：保存原始动作（在重构之前），用于Actor路径1学习
         act_n_raw = act_n.copy()  # (batch_size, n_agents, act_dim) - 原始动作
+        act_n_raw_tensor = tf.convert_to_tensor(act_n_raw, dtype=tf.float32)
         
         # 🔧 修复：优先使用存储的修正动作，如果没有则从原始动作+势场力+FR计算
         # 🔧 XLA友好：这部分在Python代码中执行，不在@tf.function中，对XLA无影响
@@ -8966,32 +10230,154 @@ class OptimizedMATD3:
         
         # 🔧 关键修改：使用修正后的动作（混合动作）进行Critic学习，与实际执行一致
         act_n = act_n_corrected
-        
-        # 转换为TensorFlow张量
+        pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
+        current_pf_features_np = None
+        next_pf_features_np = None
+        if self.use_pf_feature_flag:
+            if not fr_positive:
+                zero_pf = np.zeros((act_n.shape[0], self.n_agents, pf_feat_dim), dtype=np.float32)
+                current_pf_features_np = zero_pf
+                next_pf_features_np = None
+            else:
+                if getattr(replay_buffer, 'stores_pf_features', False) and pf_features_batch is not None:
+                    current_pf_source = pf_features_batch
+                else:
+                    current_pf_source = self.compute_base_pf_forces_batch_numpy(obs_n, fr_batch_historical)
+                if getattr(replay_buffer, 'stores_next_pf_features', False) and next_pf_features_batch is not None:
+                    next_pf_source = next_pf_features_batch
+                else:
+                    next_pf_source = None
+                current_pf_features_np = _coerce_pf_feature_batch_numpy(
+                    current_pf_source,
+                    act_n.shape[0],
+                    self.n_agents,
+                    pf_feat_dim,
+                )
+                if next_pf_source is not None:
+                    next_pf_features_np = _coerce_pf_feature_batch_numpy(
+                        next_pf_source,
+                        act_n.shape[0],
+                        self.n_agents,
+                        pf_feat_dim,
+                    )
+
+        # 共享同一批 Tensor，避免同一批样本在 prepare/target 阶段反复 host->device 拷贝。
+        obs_n_tensor = tf.convert_to_tensor(obs_n, dtype=tf.float32)
+        next_obs_n_tensor = tf.convert_to_tensor(next_obs_n, dtype=tf.float32)
+        rew_n_tensor = tf.convert_to_tensor(rew_n, dtype=tf.float32)
+        done_n_tensor = tf.convert_to_tensor(done_n, dtype=tf.float32)
         act_n = tf.convert_to_tensor(act_n, dtype=tf.float32)
-        all_obs = [tf.convert_to_tensor(obs_n[:, i, :self.obs_shapes[i]], dtype=tf.float32) for i in range(self.n_agents)]
-        all_next_obs = [tf.convert_to_tensor(next_obs_n[:, i, :self.obs_shapes[i]], dtype=tf.float32) for i in range(self.n_agents)]
-        
-        # 🚨 关键修复：保存原始动作的张量，用于Actor路径1学习
-        act_n_raw_tensor = tf.convert_to_tensor(act_n_raw, dtype=tf.float32)
+
+        # 观测裁剪只做一次，后续所有分支复用同一结果。
+        obs_n_tensor = tf.clip_by_value(obs_n_tensor, -1e6, 1e6)
+        next_obs_n_tensor = tf.clip_by_value(next_obs_n_tensor, -1e6, 1e6)
+
+        current_pf_features_tensor = None
+        next_pf_features_tensor = None
+        current_pf_batch_flat_shared = None
+        next_pf_batch_flat_shared = None
+
+        batch_size_dyn = tf.shape(act_n)[0]
+        all_obs = [obs_n_tensor[:, i, :self.obs_shapes[i]] for i in range(self.n_agents)]
+        all_next_obs = [next_obs_n_tensor[:, i, :self.obs_shapes[i]] for i in range(self.n_agents)]
         
         # 构建全局状态
-        global_state = tf.concat(all_obs, axis=1)
-        global_next_state = tf.concat(all_next_obs, axis=1)
+        if len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1:
+            correct_obs_dim = self.obs_shapes[0]
+            global_state = tf.reshape(
+                obs_n_tensor[:, :, :correct_obs_dim],
+                [batch_size_dyn, self.n_agents * correct_obs_dim]
+            )
+            global_next_state = tf.reshape(
+                next_obs_n_tensor[:, :, :correct_obs_dim],
+                [batch_size_dyn, self.n_agents * correct_obs_dim]
+            )
+        else:
+            global_state = tf.concat(all_obs, axis=1)
+            global_next_state = tf.concat(all_next_obs, axis=1)
+        if detail_enabled:
+            update_timing['upd_prepare'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
         
         # ✅ 优化：预计算所有智能体的目标动作（使用next_obs）
         # 🔧 关键修复：支持PF特征作为独立输入
+        # 注意：这个循环是必要的，因为每个智能体的target_actor网络是独立的
+        # 性能优化：确保所有tensor转换在循环外完成，减少重复转换
         target_next_actions = []
         fr_next = fr_batch_column
+        next_act_corrected_valid = bool(
+            next_act_corrected_batch is not None and getattr(replay_buffer, 'stores_next_act_corrected', False)
+        )
+
+        next_obs_valid_inputs = None
+        next_obs_geometry_context = None
+        uniform_obs_dims = len(set(self.obs_shapes)) <= 1 if len(self.obs_shapes) > 0 else True
+        uniform_action_dims = len(set(self.action_dims)) <= 1 if len(self.action_dims) > 0 else True
+        use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
+        shared_next_pf_supported = bool(uniform_obs_dims and uniform_action_dims)
+        shared_next_correction_supported = bool(
+            shared_next_pf_supported and len(self.action_dims) > 0 and self.action_dims[0] >= 3
+        )
+        need_shared_next_context = bool(
+            (
+                (self.use_pf_feature_flag and next_pf_features_np is None and shared_next_pf_supported)
+                or (use_tf_potential_field and fr_positive and (not next_act_corrected_valid) and shared_next_correction_supported)
+            )
+        )
+        if need_shared_next_context:
+            try:
+                correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else tf.shape(all_next_obs[0])[1]
+                next_obs_stacked = next_obs_n_tensor[:, :, :correct_obs_dim]
+                flat_next_obs = tf.reshape(next_obs_stacked, [-1, correct_obs_dim])
+                next_obs_pf_context = self._extract_pf_obs_context_compiled_tf(flat_next_obs)
+                next_obs_valid_inputs = next_obs_pf_context[3]
+                next_obs_geometry_context = self._extract_pf_geometry_context_compiled_tf(
+                    next_obs_pf_context[1],
+                    next_obs_pf_context[2],
+                    next_obs_pf_context[4],
+                    next_obs_pf_context[5],
+                    next_obs_pf_context[6],
+                )
+            except Exception:
+                next_obs_valid_inputs = None
+                next_obs_geometry_context = None
+
+        if self.use_pf_feature_flag:
+            current_pf_features_tensor = tf.convert_to_tensor(current_pf_features_np, dtype=tf.float32)
+            current_pf_batch_flat_shared = _flatten_pf_feature_batch_tf(
+                current_pf_features_tensor,
+                self.n_agents,
+                pf_feat_dim,
+            )
+            if next_pf_features_np is not None:
+                next_pf_features_tensor = tf.convert_to_tensor(next_pf_features_np, dtype=tf.float32)
+            elif (
+                next_obs_valid_inputs is not None
+                and next_obs_geometry_context is not None
+                and shared_next_pf_supported
+            ):
+                next_pf_features_tensor = self._compute_base_pf_forces_from_shared_context_tf(
+                    next_obs_valid_inputs,
+                    next_obs_geometry_context,
+                    fr_batch_tensor,
+                    batch_size_dyn,
+                    self.action_dims[0],
+                )
+            else:
+                next_pf_features_tensor = self._compute_base_pf_forces_batch_tf(next_obs_n_tensor, fr_batch_tensor)
+            next_pf_batch_flat_shared = _flatten_pf_feature_batch_tf(
+                next_pf_features_tensor,
+                self.n_agents,
+                pf_feat_dim,
+            )
+
         for i in range(self.n_agents):
             # 🔧 使用缓存的标志，确保与Actor网络构建时的配置一致
             target_actor_inputs = [all_next_obs[i]]
             if self.use_fr_feature_flag:  # 🔧 编译时常量，XLA友好
                 target_actor_inputs.append(fr_next)
             if self.use_pf_feature_flag:  # 🔧 编译时常量，XLA友好
-                # 使用零向量作为PF输入的占位符
-                pf_batch = tf.zeros([tf.shape(all_next_obs[i])[0], self.pf_feature_dim], dtype=tf.float32)
-                target_actor_inputs.append(pf_batch)
+                target_actor_inputs.append(next_pf_features_tensor[:, i, :pf_feat_dim])
             
             if len(target_actor_inputs) == 1:
                 target_action = self.agents[i]['target_actor'](target_actor_inputs[0], training=False)
@@ -8999,93 +10385,122 @@ class OptimizedMATD3:
                 target_action = self.agents[i]['target_actor'](target_actor_inputs, training=False)
             target_next_actions.append(target_action)
         
-        # 🔧 关键修复：统一动作处理顺序为"先噪声后修正"（符合标准MATD3）
-        # 步骤1：先对原始目标动作添加噪声（目标策略平滑）
-        # 步骤2：然后对平滑后的动作应用APF修正（仅用于后4维学习）
-        # 这样确保前3维和后4维都基于相同的平滑动作基础，只是后4维的PF参数经过修正
+        # 目标动作统一采用“先平滑、后 PF 修正”的顺序。
         current_force_ratio = fr_batch_column
-        use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
         
         # 预构建：将 list of tensors 转换为 tensor for batch processing
         target_actions_tensor = tf.concat(target_next_actions, axis=1)  # 保存原始target动作
-        
-        # ✅ 步骤1：先对原始目标动作添加噪声（目标策略平滑）
-        # 这是标准MATD3的做法：先平滑，再用于计算目标Q值
-        # 🔧 性能优化：向量化噪声添加，避免Python循环
+
         dtype = target_actions_tensor.dtype
         noise = tf.random.normal(tf.shape(target_actions_tensor), stddev=self.policy_noise, dtype=dtype)
         noise = tf.clip_by_value(noise, tf.cast(-self.noise_clip, dtype), tf.cast(self.noise_clip, dtype))
-        # 对原始动作添加噪声并裁剪
         smoothed_target_actions_tensor = tf.clip_by_value(target_actions_tensor + noise, tf.cast(-1.0, dtype), tf.cast(1.0, dtype))
-        
-        # 分解为各智能体的动作（用于后续修正）
-        smoothed_target_actions_raw = []
-        start_idx = 0
-        for i in range(self.n_agents):
-            action_dim = self.action_dims[i]
-            smoothed_target_actions_raw.append(smoothed_target_actions_tensor[:, start_idx:start_idx + action_dim])
-            start_idx += action_dim
-        
-        # ✅ 步骤2：对平滑后的动作应用APF修正（仅用于后4维学习）
-        # 前3维：使用平滑后的原始动作（不修正）
-        # 后4维：使用平滑后的动作，但前3维部分经过APF修正
-        smoothed_target_actions_corrected = []
-        if use_tf_potential_field and fr_positive:
+
+        smoothed_target_actions_raw = None
+        smoothed_target_actions_raw_tensor = None
+        if uniform_action_dims and self.total_action_dim is not None:
+            act_dim = self.action_dims[0]
+            smoothed_target_actions_raw_tensor = tf.reshape(
+                smoothed_target_actions_tensor,
+                [batch_size_dyn, self.n_agents, act_dim],
+            )
+        else:
+            # 分解为各智能体的动作（用于后续修正）
+            smoothed_target_actions_raw = []
             start_idx = 0
             for i in range(self.n_agents):
                 action_dim = self.action_dims[i]
-                smoothed_action_raw = smoothed_target_actions_raw[i]
-                agent_obs = all_next_obs[i]
-                
-                if action_dim >= 3:
-                    # 对平滑后的动作应用APF修正（仅前3维）
-                    corrected_head, _ = self._apply_potential_field_correction(
-                        smoothed_action_raw, agent_obs, current_force_ratio
-                    )
-                    if action_dim > 3:
-                        # 前3维使用修正后的，后4维保持平滑后的原始值
-                        corrected_action = tf.concat([corrected_head, smoothed_action_raw[:, 3:]], axis=1)
-                    else:
-                        corrected_action = corrected_head
-                else:
-                    corrected_action = smoothed_action_raw
-                
-                smoothed_target_actions_corrected.append(corrected_action)
+                smoothed_target_actions_raw.append(smoothed_target_actions_tensor[:, start_idx:start_idx + action_dim])
                 start_idx += action_dim
+
+        smoothed_target_actions_corrected = []
+        if next_act_corrected_valid:
+            # ✅ 使用存储的 next_act_corrected（交互时用当时的地形计算）
+            # 这确保了 Target Q 评估的动作与交互时的一致
+            next_act_corr_tensor = tf.convert_to_tensor(next_act_corrected_batch, dtype=tf.float32)
+            if uniform_action_dims and self.total_action_dim is not None:
+                act_dim = self.action_dims[0]
+                smoothed_target_actions_corrected = tf.reshape(
+                    next_act_corr_tensor[:, :, :act_dim],
+                    [batch_size_dyn, self.total_action_dim],
+                )
+            else:
+                start_idx = 0
+                for i in range(self.n_agents):
+                    action_dim = self.action_dims[i]
+                    corrected_action = next_act_corr_tensor[:, i, :action_dim]
+                    smoothed_target_actions_corrected.append(corrected_action)
+                    start_idx += action_dim
+        elif use_tf_potential_field and fr_positive:
+            # 🔧 向后兼容：如果 Buffer 没有 next_act_corrected，重新计算
+            if next_obs_valid_inputs is not None and next_obs_geometry_context is not None and uniform_action_dims and self.action_dims[0] >= 3:
+                act_dim = self.action_dims[0]
+                flat_force_ratio = tf.repeat(fr_batch_column, repeats=self.n_agents, axis=0)
+                if smoothed_target_actions_raw_tensor is None:
+                    smoothed_target_actions_raw_tensor = tf.stack(smoothed_target_actions_raw, axis=1)
+                flat_smoothed_actions = tf.reshape(smoothed_target_actions_raw_tensor, [-1, act_dim])
+                corrected_head_flat, _ = self._apply_potential_field_correction_from_geometry_context_tf(
+                    flat_smoothed_actions,
+                    flat_force_ratio,
+                    next_obs_valid_inputs,
+                    next_obs_geometry_context,
+                )
+                corrected_head_tensor = tf.reshape(corrected_head_flat, [batch_size_dyn, self.n_agents, 3])
+                if act_dim > 3:
+                    corrected_actions_tensor = tf.concat(
+                        [corrected_head_tensor, smoothed_target_actions_raw_tensor[:, :, 3:]],
+                        axis=2
+                    )
+                else:
+                    corrected_actions_tensor = corrected_head_tensor
+                smoothed_target_actions_corrected = tf.reshape(
+                    corrected_actions_tensor[:, :, :act_dim],
+                    [batch_size_dyn, self.total_action_dim],
+                )
+            else:
+                start_idx = 0
+                for i in range(self.n_agents):
+                    action_dim = self.action_dims[i]
+                    smoothed_action_raw = smoothed_target_actions_raw[i]
+                    agent_obs = all_next_obs[i]
+                    
+                    if action_dim >= 3:
+                        next_obs_pf_context_single = self._extract_pf_obs_context_compiled_tf(agent_obs)
+                        corrected_head, _ = self._apply_potential_field_correction_from_context_tf(
+                            smoothed_action_raw,
+                            current_force_ratio,
+                            *next_obs_pf_context_single
+                        )
+                        if action_dim > 3:
+                            corrected_action = tf.concat([corrected_head, smoothed_action_raw[:, 3:]], axis=1)
+                        else:
+                            corrected_action = corrected_head
+                    else:
+                        corrected_action = smoothed_action_raw
+                    
+                    smoothed_target_actions_corrected.append(corrected_action)
+                    start_idx += action_dim
         else:
             # 如果不使用APF修正，修正后的动作等于平滑后的原始动作
-            smoothed_target_actions_corrected = smoothed_target_actions_raw
-        
-        # 🔧 关键修改：Target Q使用分离梯度
-        # 前三维使用原始target动作（平滑后，不修正）
-        # 后四维使用修正后target动作（平滑后，前3维修正）
-        global_smoothed_actions_mixed = []
-        for i in range(self.n_agents):
-            act_dim = self.action_dims[i]
-            raw_smoothed_action = smoothed_target_actions_raw[i]
-            corrected_smoothed_action = smoothed_target_actions_corrected[i]
-            
-            if act_dim >= 3:
-                # 前三维使用平滑后的原始动作（不修正），后四维使用平滑后修正的动作
-                mixed_smoothed_action = tf.concat([
-                    raw_smoothed_action[:, :3],  # 前三维：原始target动作（平滑后，不修正）
-                    corrected_smoothed_action[:, 3:] if act_dim > 3 else tf.zeros([tf.shape(corrected_smoothed_action)[0], 0], dtype=tf.float32)  # 后四维：修正后target动作（平滑后，前3维修正）
-                ], axis=1)
-            else:
-                # 🔧 修复：动作维度<3也使用修正后target动作（保持训练一致性）
-                mixed_smoothed_action = corrected_smoothed_action
-            
-            global_smoothed_actions_mixed.append(mixed_smoothed_action)
-        
+            smoothed_target_actions_corrected = (
+                smoothed_target_actions_tensor
+                if uniform_action_dims and self.total_action_dim is not None
+                else smoothed_target_actions_raw
+            )
+
         # 🔧 重写：分别构建global_a_next_smooth和global_a_next_corr用于target_head和target_tail计算
         # global_a_next_smooth：使用平滑后的原始动作（不修正），用于target_head计算
-        global_smoothed_actions_raw = tf.concat(smoothed_target_actions_raw, axis=1)
+        global_smoothed_actions_raw = (
+            smoothed_target_actions_tensor
+            if uniform_action_dims and self.total_action_dim is not None
+            else tf.concat(smoothed_target_actions_raw, axis=1)
+        )
         # global_a_next_corr：使用平滑后修正的动作，用于target_tail计算
-        global_smoothed_actions_corrected = tf.concat(smoothed_target_actions_corrected, axis=1)
-        
-        # 构建全局平滑动作（混合动作，保留用于向后兼容）
-        global_smoothed_actions = tf.concat(global_smoothed_actions_mixed, axis=1)
-        
+        if uniform_action_dims and self.total_action_dim is not None and isinstance(smoothed_target_actions_corrected, tf.Tensor):
+            global_smoothed_actions_corrected = smoothed_target_actions_corrected
+        else:
+            global_smoothed_actions_corrected = tf.concat(smoothed_target_actions_corrected, axis=1)
+
         # 训练与回放统一使用归一化动作[-1,1]，不在训练侧做物理映射
         global_a_next_smooth = global_smoothed_actions_raw
         global_a_next_corr = global_smoothed_actions_corrected
@@ -9093,51 +10508,47 @@ class OptimizedMATD3:
             try:
                 global_a_next_smooth = tf.ensure_shape(global_a_next_smooth, [None, self.total_action_dim])
                 global_a_next_corr = tf.ensure_shape(global_a_next_corr, [None, self.total_action_dim])
-                global_smoothed_actions = tf.ensure_shape(global_smoothed_actions, [None, self.total_action_dim])
             except Exception:
                 pass
         
-        # 🔧 关键修改：Critic分离梯度学习
-        # 前三维使用原始动作（让Critic评估原始动作的安全性）
-        # 后四维使用修正后动作（让Critic评估修正后动作的价值）
-        # 构建混合全局动作：前三维来自原始动作，后四维来自修正后动作
-        global_actions_mixed = []
-        global_actions_raw_all = []
-        for i in range(self.n_agents):
-            act_dim = self.action_dims[i]
-            raw_action = act_n_raw_tensor[:, i, :act_dim]  # 原始动作
-            corrected_action = act_n[:, i, :act_dim]  # 修正后动作
-            
-            if act_dim >= 3:
-                # 前三维使用原始动作，后四维使用修正后动作
-                mixed_action = tf.concat([
-                    raw_action[:, :3],  # 前三维：原始动作
-                    corrected_action[:, 3:] if act_dim > 3 else tf.zeros([tf.shape(corrected_action)[0], 0], dtype=tf.float32)  # 后四维：修正后动作
-                ], axis=1)
-            else:
-                # 🔧 修复：动作维度<3也使用修正后动作（保持训练一致性）
-                mixed_action = corrected_action
-            
-            global_actions_mixed.append(mixed_action)
-            global_actions_raw_all.append(raw_action)
+        # 🔧 关键修复：Critic使用修正后动作进行学习，确保训练-执行一致性
+        # 原因：环境实际执行的是修正后的动作 [修正前3维, 原始后4维]
+        # 因此Critic必须评估修正后的动作，才能正确学习Q值
+        # 
+        # act_n = [修正前3维, 原始后4维]（来自回放缓冲区，与环境执行一致）
+        # act_n_raw_tensor = [原始前3维, 原始后4维]（仅用于Actor路径1学习）
         
-        global_actions = tf.concat(global_actions_mixed, axis=1)  # 混合动作，用于Critic学习
+        # 构建全局动作：直接使用修正后的动作
+        if uniform_action_dims and self.total_action_dim is not None:
+            act_dim = self.action_dims[0]
+            global_actions = tf.reshape(act_n[:, :, :act_dim], [batch_size_dyn, self.total_action_dim])
+            global_actions_raw_all = tf.reshape(act_n_raw_tensor[:, :, :act_dim], [batch_size_dyn, self.total_action_dim])
+        else:
+            global_actions_corrected = []
+            global_actions_raw_all = []
+            for i in range(self.n_agents):
+                act_dim = self.action_dims[i]
+                corrected_action = act_n[:, i, :act_dim]  # 修正后动作 [修正前3维, 原始后4维]
+                raw_action = act_n_raw_tensor[:, i, :act_dim]  # 原始动作 [原始前3维, 原始后4维]
+                
+                global_actions_corrected.append(corrected_action)
+                global_actions_raw_all.append(raw_action)
+            
+            # ✅ Critic学习使用修正后动作（与环境执行一致）
+            global_actions = tf.concat(global_actions_corrected, axis=1)  # [修正前3维, 原始后4维]
+            global_actions_raw_all = tf.concat(global_actions_raw_all, axis=1)
         if getattr(self, 'total_action_dim', None) is not None:
             try:
                 global_actions = tf.ensure_shape(global_actions, [None, self.total_action_dim])
             except Exception:
                 pass
         
-        # 🚨 关键修复：构建原始动作的全局动作，用于Actor路径1学习
-        global_actions_raw_all = tf.concat(global_actions_raw_all, axis=1)
-        
-        # 🔧 新增：构建修正后动作的全局动作缓存（global_actions_mixed_all）
-        # 用于Path2构建global_actions_mixed时，其他智能体永远取global_actions_mixed_all
-        # 禁止global_actions_raw_all is None时fallback到mixed
-        global_actions_mixed_all = tf.concat(global_actions_mixed, axis=1)
+        # 🔧 构建修正后动作的全局动作缓存
+        # 用于Actor Path2学习时，其他智能体也使用修正后动作
+        global_actions_corrected_all = global_actions  # 与global_actions相同，都是修正后动作
         
         # 延迟更新Actor控制（MATD3的核心特性）
-        # 🔧 修复retracing：将Python布尔值转换为TensorFlow常量
+        # separated-gradient 路径直接使用 Python bool，让 _multi_agent_update_step 只保留两张稳定图。
         should_update_actor_bool = (self.total_it % self.policy_freq == 0)
         should_update_actor = tf.constant(should_update_actor_bool, dtype=tf.bool)
         
@@ -9147,201 +10558,143 @@ class OptimizedMATD3:
             sample_weights = tf.ensure_shape(sample_weights, [batch_size])
         except Exception:
             pass
-        mix_beta_const = tf.constant(0.0, dtype=tf.float32)
-        imitation_mu_const = tf.constant(0.0, dtype=tf.float32)
-        critic_vec, actor_vec, valid_counts_tf = self._multi_agent_update_step(
-            obs_n, next_obs_n, act_n, rew_n, done_n,
-            global_state, global_next_state, global_actions, global_smoothed_actions,
-            sample_weights, mix_beta_const, imitation_mu_const,
+        if detail_enabled:
+            update_timing['upd_target'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
+
+        # MATD3 所有变体统一走共享 update skeleton：
+        # - dual_q + separated: 保持当前主线行为不变
+        # - dual_q + unified: 仅切换 actor loss 语义
+        # - single_q: 仅切换 critic head 语义
+        # 这样其他消融就真正变成围绕主线“关模块”，而不是切换到另一套训练框架。
+        td_err_vec = None
+        critic_vec, actor_vec, valid_counts_tf, td_err_vec = self._multi_agent_update_step(
+            obs_n_tensor, next_obs_n_tensor, act_n, rew_n_tensor, done_n_tensor,
+            global_state, global_next_state, global_actions,
+            sample_weights,
             fr_batch_tensor,
-            should_update_actor,
-            global_actions_raw_all,  # 🚨 关键修复：传递原始动作的全局动作，用于Actor路径1学习
-            global_actions_mixed_all,  # 🔧 新增：传递修正后动作的全局动作缓存，用于Actor路径2学习
-            global_a_next_smooth,  # 🔧 传递平滑后的原始动作，用于target_head计算
-            global_a_next_corr  # 🔧 传递平滑后修正的动作，用于target_tail计算
+            should_update_actor_bool,
+            global_actions_raw_all,
+            global_actions_corrected_all,
+            global_a_next_smooth,
+            global_a_next_corr,
+            current_pf_batch_flat_shared,
+            next_pf_batch_flat_shared,
         )
-        # 🔧 修复：检查有效样本数量异常，仅在异常时输出日志
         try:
-            # 🔧 关键修复：禁用valid_counts的取回，避免XLA异步执行冲突
-            # valid_counts仅用于调试，不影响训练逻辑
-            # valid_counts_np = [int(tf.identity(vc).numpy()) if hasattr(vc, 'numpy') else int(vc) for vc in valid_counts_tf]
-            valid_counts_np = [batch_size] * self.n_agents  # 假装都是有效的，避免触发警告
-            
+            valid_counts_np = [batch_size] * self.n_agents
             self._last_valid_counts = valid_counts_np
-            # 移除后续的检查逻辑以节省开销
         except Exception:
-            # 如果转换失败，忽略（可能在 tf.function 内部）
             pass
-        # 将张量转为 Python 标量列表，兼容上层日志统计
-        # 🔧 关键优化：合并Tensor取回，减少同步点，避免XLA异步执行冲突
-        try:
-            # 确保critic_vec和actor_vec是1D张量
-            c_vec_flat = tf.reshape(critic_vec, [-1])
-            a_vec_flat = tf.reshape(actor_vec, [-1])
-            
-            # 拼接成一个大Tensor
-            combined_tensor = tf.concat([c_vec_flat, a_vec_flat], axis=0)
-            
-            # 一次性取回
-            combined_np = tf.identity(combined_tensor).numpy()
-            
-            # 分割
-            n_c = c_vec_flat.shape[0]
-            c_np = combined_np[:n_c]
-            a_np = combined_np[n_c:]
-            
-        except Exception:
-            # 回退方案
-            try:
-                c_np = tf.identity(critic_vec).numpy()
-            except:
-                c_np = [0.0] * self.n_agents
-            try:
-                a_np = tf.identity(actor_vec).numpy()
-            except:
-                a_np = [0.0] * self.n_agents
-        
-        # 🔧 核心修复：确保c_np和a_np是1D数组形式
-        # 注意：np已在文件顶部导入，不需要重新导入
-        # 转换为numpy数组并展平（处理多维数组的情况）
-        c_np = np.asarray(c_np).flatten()
-        a_np = np.asarray(a_np).flatten()
-        
-        # 确保是1D数组
-        if c_np.ndim == 0:
-            c_np = np.array([float(c_np)])
-        if a_np.ndim == 0:
-            a_np = np.array([float(a_np)])
-        
-        # 构造每智能体的loss词典（actor可能为NaN表示本次未更新）
+
         losses = []
         for i in range(self.n_agents):
-            # 安全地获取索引，如果只有一个值就重复使用
-            # 🔧 修复：使用.item()确保从numpy数组中提取标量值
-            if i < len(c_np):
-                ci = float(c_np[i].item() if hasattr(c_np[i], 'item') else c_np[i])
+            if i < tf.shape(critic_vec)[0]:
+                critic_loss_tensor = critic_vec[i]
             else:
-                ci = float(c_np[0].item() if hasattr(c_np[0], 'item') else c_np[0])
-            
-            if i < len(a_np):
-                ai = float(a_np[i].item() if hasattr(a_np[i], 'item') else a_np[i])
+                critic_loss_tensor = critic_vec[0] if tf.shape(critic_vec)[0] > 0 else tf.constant(0.0, dtype=tf.float32)
+
+            if i < tf.shape(actor_vec)[0]:
+                actor_loss_tensor = actor_vec[i]
             else:
-                ai = float(a_np[0].item() if hasattr(a_np[0], 'item') else a_np[0])
-            
-            losses.append({'critic_loss': ci, 'actor_loss': ai})
-        
-        # 软更新目标网络已移至图内执行（_multi_agent_update_step），此处不再调用
-        # self._soft_update_targets()
+                actor_loss_tensor = actor_vec[0] if tf.shape(actor_vec)[0] > 0 else tf.constant(0.0, dtype=tf.float32)
+
+            losses.append({
+                'critic_loss_tensor': critic_loss_tensor,
+                'actor_loss_tensor': actor_loss_tensor
+            })
+
+        cached_loss_values = getattr(self, '_last_synced_loss_values', None)
+        sync_losses_now = (
+            cached_loss_values is None
+            or (self.training_stats.get('train_steps', 0) % loss_sync_interval == 0)
+        )
+        if sync_losses_now:
+            try:
+                c_vec_flat = tf.reshape(critic_vec, [-1])
+                a_vec_flat = tf.reshape(actor_vec, [-1])
+                combined_tensor = tf.concat([c_vec_flat, a_vec_flat], axis=0)
+                combined_np = _safe_tensor_to_numpy(tf.identity(combined_tensor))
+                n_c_val = self.n_agents
+                c_np = combined_np[:n_c_val]
+                a_np = combined_np[n_c_val:]
+            except Exception:
+                try:
+                    c_np = _safe_tensor_to_numpy(tf.identity(critic_vec))
+                    a_np = _safe_tensor_to_numpy(tf.identity(actor_vec))
+                except Exception:
+                    c_np = np.array([0.0] * self.n_agents)
+                    a_np = np.array([0.0] * self.n_agents)
+
+            c_np = np.asarray(c_np).flatten()
+            a_np = np.asarray(a_np).flatten()
+            if c_np.ndim == 0:
+                c_np = np.array([float(c_np)])
+            if a_np.ndim == 0:
+                a_np = np.array([float(a_np)])
+            self._last_synced_loss_values = {
+                'critic': c_np.copy(),
+                'actor': a_np.copy(),
+            }
+
+            for i in range(self.n_agents):
+                if i < len(c_np):
+                    ci = float(c_np[i].item() if hasattr(c_np[i], 'item') else c_np[i])
+                else:
+                    ci = float(c_np[0].item() if hasattr(c_np[0], 'item') else c_np[0])
+                if i < len(a_np):
+                    ai = float(a_np[i].item() if hasattr(a_np[i], 'item') else a_np[i])
+                else:
+                    ai = float(a_np[0].item() if hasattr(a_np[0], 'item') else a_np[0])
+                losses[i]['critic_loss'] = ci
+                losses[i]['actor_loss'] = ai
+        elif cached_loss_values is not None:
+            c_np = np.asarray(cached_loss_values.get('critic', []), dtype=np.float32).flatten()
+            a_np = np.asarray(cached_loss_values.get('actor', []), dtype=np.float32).flatten()
+            for i in range(self.n_agents):
+                if c_np.size > 0:
+                    ci = float(c_np[i] if i < c_np.size else c_np[0])
+                    losses[i]['critic_loss'] = ci
+                if a_np.size > 0:
+                    ai = float(a_np[i] if i < a_np.size else a_np[0])
+                    losses[i]['actor_loss'] = ai
+        if detail_enabled:
+            update_timing['upd_train'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
         
         # total_it只在update级别递增一次
         self.total_it += 1
         
         # 更新训练步数统计
         self.training_stats['train_steps'] += 1
+        if detail_enabled:
+            update_timing['upd_post'] += _upd_perf_counter() - _t_upd_phase
+            _t_upd_phase = _upd_perf_counter()
         
         # 可选：PER优先级更新（与MADDPG一致的逻辑，使用Twin Critic的min(Q1,Q2)）
         if getattr(self.args, 'per_enabled', False):
             try:
-                gamma = self.c_gamma  # 🔧 XLA修复：使用缓存的常量
-                td_errors_list = []
-                # 使用与训练一致的目标动作（已构建的global_smoothed_actions）
-                for i in range(self.n_agents):
-                    agent = self.agents[i]
-                    # 🚨 标准MATD3：目标Q（从两个独立的目标Critic网络获取，并取min）
-                    if getattr(self.args, 'use_fr_feature', False):
-                        target_q1_1, target_q2_1 = agent['target_critic1']([global_next_state, global_smoothed_actions, fr_batch_column], training=False)
-                        target_q1_2, target_q2_2 = agent['target_critic2']([global_next_state, global_smoothed_actions, fr_batch_column], training=False)
-                    else:
-                        target_q1_1, target_q2_1 = agent['target_critic1']([global_next_state, global_smoothed_actions], training=False)
-                        target_q1_2, target_q2_2 = agent['target_critic2']([global_next_state, global_smoothed_actions], training=False)
-                    target_q1_1 = tf.cast(target_q1_1, tf.float32)
-                    target_q2_1 = tf.cast(target_q2_1, tf.float32)
-                    target_q1_2 = tf.cast(target_q1_2, tf.float32)
-                    target_q2_2 = tf.cast(target_q2_2, tf.float32)
-                    # 在两个独立Critic网络的Q值之间取min（Twin Critic）
-                    target_q1_combined = tf.minimum(target_q1_1, target_q1_2)
-                    target_q2_combined = tf.minimum(target_q2_1, target_q2_2)
-                    # 🔧 使用FR加权平均替代min操作：Q1评估前3维动作，Q2评估后4维PF参数
-                    fr_weight = tf.cast(fr_batch_column, tf.float32)  # (batch_size, 1)
-                    q1_weight = 1.0 - fr_weight
-                    q2_weight = fr_weight
-                    target_q_min = q1_weight * target_q1_combined + q2_weight * target_q2_combined
+                if td_err_vec is not None:
+                    # ✅ 快路径：复用训练中已计算的TD误差，避免PER额外前向
+                    if not hasattr(self, '_per_update_buffer'):
+                        self._per_update_buffer = []
+                    self._per_update_buffer.append((indices, td_err_vec))
                     
-                    # 🚨 标准MATD3：当前Q（从两个独立的Critic网络获取，并取min）
-                    if getattr(self.args, 'use_fr_feature', False):
-                        current_q1_1, current_q2_1 = agent['critic1']([global_state, global_actions, fr_batch_column], training=False)
-                        current_q1_2, current_q2_2 = agent['critic2']([global_state, global_actions, fr_batch_column], training=False)
-                    else:
-                        current_q1_1, current_q2_1 = agent['critic1']([global_state, global_actions], training=False)
-                        current_q1_2, current_q2_2 = agent['critic2']([global_state, global_actions], training=False)
-                    current_q1_1 = tf.cast(current_q1_1, tf.float32)
-                    current_q2_1 = tf.cast(current_q2_1, tf.float32)
-                    current_q1_2 = tf.cast(current_q1_2, tf.float32)
-                    current_q2_2 = tf.cast(current_q2_2, tf.float32)
-                    # 在两个独立Critic网络的Q值之间取min（Twin Critic）
-                    current_q1_combined = tf.minimum(current_q1_1, current_q1_2)
-                    current_q2_combined = tf.minimum(current_q2_1, current_q2_2)
-                    current_q_min = tf.minimum(current_q1_combined, current_q2_combined)
-                    # TD: r + gamma*(1-d)*Q' - Q
-                    r_i = tf.cast(rew_n[:, i], tf.float32)
-                    d_i = tf.cast(done_n[:, i], tf.float32)
-                    td_i = r_i + gamma * (1.0 - d_i) * tf.squeeze(target_q_min, axis=1) - tf.squeeze(current_q_min, axis=1)
-                    td_errors_list.append(tf.abs(td_i))
-                # 按智能体平均，得到每个样本一条TD误差
-                td_err = tf.reduce_mean(tf.stack(td_errors_list, axis=0), axis=0)
-                
-                # 🚀 GPU优化：批量累积PER更新（MATD3版本）
-                if not hasattr(self, '_per_update_buffer'):
-                    self._per_update_buffer = []
-                self._per_update_buffer.append((indices, td_err))
-                
-                # 每20次更新时才批量同步
-                if len(self._per_update_buffer) >= 20:
-                    # 🔧 XLA修复：批量同步所有优先级更新，避免在XLA编译时访问内存
-                    batch_updates = []
-                    for idx, pri in self._per_update_buffer:
-                        # 使用安全的tensor转换
-                        try:
-                            pri_np = _safe_tensor_to_numpy(tf.identity(pri))
-                            batch_updates.append((idx, pri_np))
-                        except Exception as e:
-                            # 如果转换失败，跳过这个更新
-                            if not getattr(self, '_per_update_warned', False):
-                                print(f"[警告] PER优先级更新失败，跳过: {e}")
-                                self._per_update_warned = True
-                            continue
-                    # 批量更新
-                    for idx, pri_np in batch_updates:
-                        try:
-                            replay_buffer.update_priorities(idx, pri_np)
-                        except Exception:
-                            pass
-                    self._per_update_buffer.clear()
+                    # 每20次更新时才批量同步
+                    if len(self._per_update_buffer) >= 20:
+                        self.flush_pending_per_updates(replay_buffer)
+                else:
+                    # 🚨 严格模式：无法复用TD误差时直接报错，不提供兜底路径
+                    raise RuntimeError(
+                        f"PER更新失败：无法复用TD误差。td_err_vec为None。"
+                        f"请确保_multi_agent_update_step或train_step_optimized正确返回td_err。"
+                    )
             except Exception:
                 pass
         
-        # 🚀 GPU优化：MATD3回合结束前，清空PER更新缓冲区
-        try:
-            if hasattr(self, '_per_update_buffer') and len(self._per_update_buffer) > 0:
-                # 🔧 XLA修复：批量同步所有优先级更新，避免在XLA编译时访问内存
-                batch_updates = []
-                for idx, pri in self._per_update_buffer:
-                    # 使用安全的tensor转换
-                    try:
-                        pri_np = _safe_tensor_to_numpy(tf.identity(pri))
-                        batch_updates.append((idx, pri_np))
-                    except Exception as e:
-                        # 如果转换失败，跳过这个更新
-                        continue
-                # 批量更新
-                for idx, pri_np in batch_updates:
-                    try:
-                        replay_buffer.update_priorities(idx, pri_np)
-                    except Exception:
-                        pass
-                self._per_update_buffer.clear()
-        except Exception:
-            pass
+        if detail_enabled:
+            update_timing['upd_per'] += _upd_perf_counter() - _t_upd_phase
+            self._last_update_timing = update_timing
         
         return losses
     
@@ -9351,11 +10704,12 @@ class OptimizedMATD3:
                    fr_batch, pf_batch, mix_beta, imitation_mu, should_update_actor):
         """MATD3单步训练（原始版本：包含重复计算，性能较低）"""
         # ⚠️ 注意：此方法包含重复计算，性能较低，建议使用train_step_optimized
-        # 🔧 修复：移除奖励裁剪，保留真实奖励信号
-        # 奖励裁剪会导致训练信号失真，应该通过Q值裁剪和梯度裁剪来控制稳定性
-        # reward_batch = tf.clip_by_value(reward_batch, tf.cast(self.c_reward_clip, reward_batch.dtype), tf.cast(1e10, reward_batch.dtype))
-        # 🔧 XLA友好：使用裁剪替代 is_finite
-        reward_batch = tf.clip_by_value(reward_batch, -1e6, 1e6)
+        # 统一 reward 裁剪口径（与分离梯度路径一致），避免消融路径引入额外变量
+        reward_batch = tf.clip_by_value(
+            reward_batch,
+            tf.cast(self.c_reward_clip, reward_batch.dtype),
+            tf.cast(1e6, reward_batch.dtype)
+        )
         fr_batch = tf.convert_to_tensor(fr_batch, dtype=tf.float32)
         fr_batch = tf.reshape(fr_batch, [-1, 1])
         pf_batch = tf.convert_to_tensor(pf_batch, dtype=tf.float32)
@@ -9366,8 +10720,12 @@ class OptimizedMATD3:
         dones = tf.cast(done_batch[:, agent_idx], tf.float32)
         
         agent = self.agents[agent_idx]
-        
+
         # 禁用计算层NaN→0保护
+        def _q_total(q_output):
+            if isinstance(q_output, (list, tuple)):
+                return tf.add_n([tf.cast(q, tf.float32) for q in q_output])
+            return tf.cast(q_output, tf.float32)
         
         # 训练Twin Critic
         with tf.GradientTape(persistent=True) as tape:
@@ -9934,19 +11292,28 @@ class OptimizedMATD3:
     @tf.function(reduce_retracing=True)
     def train_step_optimized(self, agent_idx, obs_batch, next_obs_batch, action_batch, reward_batch, done_batch,
                             global_state, global_next_state, global_actions, global_smoothed_actions, sample_weights,
-                            fr_batch, mix_beta, imitation_mu, should_update_actor):
-        """MATD3单步训练（优化版本：使用预计算的目标策略平滑）"""
-        # 🔧 修复：移除奖励裁剪，保留真实奖励信号
-        # 奖励裁剪会导致训练信号失真，应该通过Q值裁剪和梯度裁剪来控制稳定性
-        # reward_batch = tf.clip_by_value(reward_batch, tf.cast(self.c_reward_clip, reward_batch.dtype), tf.cast(1e10, reward_batch.dtype))
-        # 🔧 XLA友好：使用裁剪替代 is_finite
-        reward_batch = tf.clip_by_value(reward_batch, -1e6, 1e6)
+                            fr_batch, mix_beta, imitation_mu, should_update_actor,
+                            current_pf_batch_flat_precomputed=None, next_pf_batch_flat_precomputed=None):
+        """MATD3单步训练（优化版本：复用 current/next PF 特征缓存）。"""
+        # 统一 reward 裁剪口径（与优化路径/分离梯度路径一致）
+        reward_batch = tf.clip_by_value(
+            reward_batch,
+            tf.cast(self.c_reward_clip, reward_batch.dtype),
+            tf.cast(1e6, reward_batch.dtype)
+        )
         fr_batch = tf.convert_to_tensor(fr_batch, dtype=tf.float32)
         fr_batch = tf.reshape(fr_batch, [-1, 1])
         
         # 🔧 XLA修复：使用 tf.gather 进行索引，避免在 tf.function 中使用 Python 整数索引导致的内存对齐问题
         # 将 agent_idx 转换为 TensorFlow 标量
         agent_idx_tf = tf.cast(agent_idx, tf.int32)
+        if self.fairness_reweight_enabled:
+            fairness_weights = tf.cast(self.agent_fairness_weights_var, tf.float32)
+            fairness_weights = tf.reshape(fairness_weights, [-1])
+            agent_fairness_weight = tf.gather(fairness_weights, agent_idx_tf)
+            agent_fairness_weight = tf.clip_by_value(agent_fairness_weight, 0.1, 10.0)
+        else:
+            agent_fairness_weight = tf.constant(1.0, dtype=tf.float32)
         # 使用 tf.gather 进行索引，确保 XLA 兼容
         # obs_batch 形状: (batch_size, n_agents, obs_dim)
         # 需要提取第 agent_idx 个智能体的观察: (batch_size, obs_dim)
@@ -9959,35 +11326,62 @@ class OptimizedMATD3:
         # 临时解决方案：将 agent_idx 作为 Python 参数，但索引操作使用 TensorFlow
         agent = self.agents[agent_idx]  # 这个需要在 Python 层面完成
 
-        # 禁用计算层NaN→0保护
+        batch_size = tf.shape(global_state)[0]
+        pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
+        if self.use_pf_feature_flag:
+            if current_pf_batch_flat_precomputed is not None:
+                current_pf_batch_flat = tf.cast(current_pf_batch_flat_precomputed, tf.float32)
+            else:
+                current_pf_tensor = self._compute_base_pf_forces_batch_tf(obs_batch, fr_batch)
+                current_pf_batch_flat = _flatten_pf_feature_batch_tf(current_pf_tensor, self.n_agents, pf_feat_dim)
+            if next_pf_batch_flat_precomputed is not None:
+                next_pf_batch_flat = tf.cast(next_pf_batch_flat_precomputed, tf.float32)
+            else:
+                next_pf_tensor = self._compute_base_pf_forces_batch_tf(next_obs_batch, fr_batch)
+                next_pf_batch_flat = _flatten_pf_feature_batch_tf(next_pf_tensor, self.n_agents, pf_feat_dim)
+        else:
+            current_pf_batch_flat = tf.zeros([batch_size, self.n_agents * pf_feat_dim], dtype=tf.float32)
+            next_pf_batch_flat = tf.zeros([batch_size, self.n_agents * pf_feat_dim], dtype=tf.float32)
+        
+        def _q_total(q_output):
+            if isinstance(q_output, (list, tuple)):
+                return tf.add_n([tf.cast(q, tf.float32) for q in q_output])
+            return tf.cast(q_output, tf.float32)
         
         # 🚨 标准MATD3：训练两个独立的Twin Critic网络
         with tf.GradientTape(persistent=True) as tape:
             # ✅ 优化：直接使用预计算的全局平滑动作，不再重复计算
-            # 从target_critic1获取Q值（每个Critic都输出双Q值：q1评估前3维，q2评估后4维）
-            if self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志
-                target_q1_1, target_q2_1 = agent['target_critic1'](
+            if self.use_pf_feature_flag:
+                target_q_out_1 = agent['target_critic1'](
+                    [global_next_state, global_smoothed_actions, fr_batch, next_pf_batch_flat],
+                    training=False
+                )
+                target_q_out_2 = agent['target_critic2'](
+                    [global_next_state, global_smoothed_actions, fr_batch, next_pf_batch_flat],
+                    training=False
+                )
+            elif self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志
+                # Critic 期望 3 个输入：[state, action, fr]
+                target_q_out_1 = agent['target_critic1'](
                     [global_next_state, global_smoothed_actions, fr_batch],
                     training=False
                 )
-                target_q1_2, target_q2_2 = agent['target_critic2'](
+                target_q_out_2 = agent['target_critic2'](
                     [global_next_state, global_smoothed_actions, fr_batch],
                     training=False
                 )
             else:
-                target_q1_1, target_q2_1 = agent['target_critic1']([global_next_state, global_smoothed_actions], training=False)
-                target_q1_2, target_q2_2 = agent['target_critic2']([global_next_state, global_smoothed_actions], training=False)
-            
-            target_q1_1 = tf.cast(target_q1_1, tf.float32)
-            target_q2_1 = tf.cast(target_q2_1, tf.float32)
-            target_q1_2 = tf.cast(target_q1_2, tf.float32)
-            target_q2_2 = tf.cast(target_q2_2, tf.float32)
-            
-            # 🔧 XLA友好：使用裁剪替代 is_finite
-            target_q1_1 = tf.clip_by_value(target_q1_1, -1e6, 1e6)
-            target_q2_1 = tf.clip_by_value(target_q2_1, -1e6, 1e6)
-            target_q1_2 = tf.clip_by_value(target_q1_2, -1e6, 1e6)
-            target_q2_2 = tf.clip_by_value(target_q2_2, -1e6, 1e6)
+                # Critic 期望 2 个输入：[state, action]
+                target_q_out_1 = agent['target_critic1']([global_next_state, global_smoothed_actions], training=False)
+                target_q_out_2 = agent['target_critic2']([global_next_state, global_smoothed_actions], training=False)
+
+            target_qtot_1 = _q_total(target_q_out_1)
+            target_qtot_2 = _q_total(target_q_out_2)
+            # 🔧 NaN/Inf 防护：clip_by_value 对 nan 无效，先替换非有限值再裁剪
+            target_qtot_1 = tf.where(tf.math.is_finite(target_qtot_1), target_qtot_1, tf.zeros_like(target_qtot_1))
+            target_qtot_2 = tf.where(tf.math.is_finite(target_qtot_2), target_qtot_2, tf.zeros_like(target_qtot_2))
+            target_qtot_1 = tf.clip_by_value(target_qtot_1, -1e6, 1e6)
+            target_qtot_2 = tf.clip_by_value(target_qtot_2, -1e6, 1e6)
             
             # 🔧 优化：计算有效裁剪范围，确保Bellman更新后不超出原始q_clip
             q_clip = tf.cast(self.q_clip_value_cached, tf.float32)  # 🔧 XLA修复：使用缓存的常量
@@ -9997,15 +11391,8 @@ class OptimizedMATD3:
             factor = tf.constant(0.1, dtype=tf.float32)
             q_clip_effective = q_clip * (tf.constant(1.0, dtype=tf.float32) - gamma_val * factor)
             # 🔧 优化：只进行一次裁剪，使用更小的范围，确保Bellman更新后不超出原始q_clip
-            target_q1_1 = tf.clip_by_value(target_q1_1, -q_clip_effective, q_clip_effective)
-            target_q2_1 = tf.clip_by_value(target_q2_1, -q_clip_effective, q_clip_effective)
-            target_q1_2 = tf.clip_by_value(target_q1_2, -q_clip_effective, q_clip_effective)
-            target_q2_2 = tf.clip_by_value(target_q2_2, -q_clip_effective, q_clip_effective)
-            
-            # ✅ 修正MATD3：先计算每个Critic的总Q，再对总Q取twin-min
-            # Q_total = Q_head + Q_tail （两个部分价值之和 = 总价值）
-            target_qtot_1 = target_q1_1 + target_q2_1  # critic1的总Q
-            target_qtot_2 = target_q1_2 + target_q2_2  # critic2的总Q
+            target_qtot_1 = tf.clip_by_value(target_qtot_1, -q_clip_effective, q_clip_effective)
+            target_qtot_2 = tf.clip_by_value(target_qtot_2, -q_clip_effective, q_clip_effective)
             # Twin Critic: 对两个Critic的总Q取minimum (TD3的核心特性)
             target_q_next = tf.minimum(target_qtot_1, target_qtot_2)
             
@@ -10017,39 +11404,42 @@ class OptimizedMATD3:
             
             # Bellman更新：done=True时，target_q = rewards；done=False时，target_q = rewards + gamma * target_q_next
             # 🔧 关键修复：应用REWARD_SCALE归一化，防止Q值爆炸（回合奖励~130k → 缩放到~59）
-            scaled_rewards = rewards[:, tf.newaxis] * self.c_reward_scale
+            rewards_safe = tf.where(tf.math.is_finite(rewards), rewards, tf.zeros_like(rewards))
+            rewards_safe = tf.clip_by_value(rewards_safe, -1e6, 1e6)
+            scaled_rewards = rewards_safe[:, tf.newaxis] * self.c_reward_scale
             target_q = scaled_rewards + gamma_val * target_q_next
             # 🔧 保留第二次裁剪作为保护（使用原始q_clip），防止数值误差或极端rewards导致超出范围
             target_q = tf.clip_by_value(target_q, -q_clip, q_clip)
+            target_q = tf.where(tf.math.is_finite(target_q), target_q, tf.zeros_like(target_q))
             
-            # ✅ 修正MATD3：从两个独立的Critic网络获取当前Q值
-            # 每个Critic输出两个head：Q_head (前3维动作) 和 Q_tail (后4维PF参数)
-            if getattr(self.args, 'use_fr_feature', False):
-                current_q_head_1, current_q_tail_1 = agent['critic1']([global_state, global_actions, fr_batch], training=True)
-                current_q_head_2, current_q_tail_2 = agent['critic2']([global_state, global_actions, fr_batch], training=True)
+            if self.use_pf_feature_flag:
+                current_q_out_1 = agent['critic1']([global_state, global_actions, fr_batch, current_pf_batch_flat], training=True)
+                current_q_out_2 = agent['critic2']([global_state, global_actions, fr_batch, current_pf_batch_flat], training=True)
+            elif getattr(self.args, 'use_fr_feature', False):
+                # Critic 期望 3 个输入：[state, action, fr]
+                current_q_out_1 = agent['critic1']([global_state, global_actions, fr_batch], training=True)
+                current_q_out_2 = agent['critic2']([global_state, global_actions, fr_batch], training=True)
             else:
-                current_q_head_1, current_q_tail_1 = agent['critic1']([global_state, global_actions], training=True)
-                current_q_head_2, current_q_tail_2 = agent['critic2']([global_state, global_actions], training=True)
-            
-            current_q_head_1 = tf.cast(current_q_head_1, tf.float32)
-            current_q_tail_1 = tf.cast(current_q_tail_1, tf.float32)
-            current_q_head_2 = tf.cast(current_q_head_2, tf.float32)
-            current_q_tail_2 = tf.cast(current_q_tail_2, tf.float32)
-            
-            # ✅ 正确逻辑：先计算每个Critic的总Q
-            # Q_total = Q_head + Q_tail （两个部分价值之和 = 总价值）
-            current_qtot_1 = current_q_head_1 + current_q_tail_1  # critic1的总Q
-            current_qtot_2 = current_q_head_2 + current_q_tail_2  # critic2的总Q
-            
-            # 🔧 优化：使用q_clip_effective保持一致性（current_q不需要Bellman更新，但为了一致性使用相同范围）
+                # Critic 期望 2 个输入：[state, action]
+                current_q_out_1 = agent['critic1']([global_state, global_actions], training=True)
+                current_q_out_2 = agent['critic2']([global_state, global_actions], training=True)
+
+            current_qtot_1 = _q_total(current_q_out_1)
+            current_qtot_2 = _q_total(current_q_out_2)
+            # 🔧 NaN/Inf 防护：Critic 输出异常时避免 TD 与 loss 变为 nan
+            current_qtot_1 = tf.where(tf.math.is_finite(current_qtot_1), current_qtot_1, tf.zeros_like(current_qtot_1))
+            current_qtot_2 = tf.where(tf.math.is_finite(current_qtot_2), current_qtot_2, tf.zeros_like(current_qtot_2))
             current_qtot_1 = tf.clip_by_value(current_qtot_1, -q_clip_effective, q_clip_effective)
             current_qtot_2 = tf.clip_by_value(current_qtot_2, -q_clip_effective, q_clip_effective)
-            # 🔧 XLA友好：已经通过裁剪处理，不需要 is_finite
             
             # ✅ Twin Critic损失：对每个Critic的总Q分别计算TD误差
             # 不再对单个head使用统一的target（错误），而是对总Q使用统一的target（正确）
             td_1 = tf.squeeze(target_q - current_qtot_1, axis=1)  # critic1的TD误差
             td_2 = tf.squeeze(target_q - current_qtot_2, axis=1)  # critic2的TD误差
+            # PER复用：记录每样本TD误差（不回传梯度）
+            td_err_vec = 0.5 * (tf.abs(td_1) + tf.abs(td_2))
+            td_err_vec = tf.where(tf.math.is_finite(td_err_vec), td_err_vec, tf.zeros_like(td_err_vec))
+            td_err_vec = tf.stop_gradient(td_err_vec)
             
             delta = self.c_huber_delta  # 🔧 XLA修复：使用缓存的常量
             
@@ -10080,26 +11470,26 @@ class OptimizedMATD3:
             per_sample_loss_1 = tf.clip_by_value(per_sample_loss_1, -1e6, 1e6)
             per_sample_loss_2 = tf.clip_by_value(per_sample_loss_2, -1e6, 1e6)
             
-            # Critic1的损失
+            # Critic1的损失（nan*0=nan，求和前将非有限样本置零，避免 sum 为 nan）
             _valid1 = tf.math.is_finite(per_sample_loss_1)
+            per_sample_loss_1_safe = tf.where(_valid1, per_sample_loss_1, tf.zeros_like(per_sample_loss_1))
             v1 = tf.cast(_valid1, tf.float32)
-            num_1 = tf.reduce_sum(per_sample_loss_1 * v1)
+            num_1 = tf.reduce_sum(per_sample_loss_1_safe)
             den1 = tf.reduce_sum(v1)
             den1 = tf.maximum(den1, tf.cast(1.0, tf.float32))
-            # 🔧 修复NaN传播：在除法前确保 num_1 是有限值
             num_1 = tf.where(tf.math.is_finite(num_1), num_1, tf.cast(0.0, num_1.dtype))
             critic1_loss = num_1 / den1
             # 🔧 修复：再次裁剪最终损失，防止NaN/Inf
             critic1_loss = tf.clip_by_value(critic1_loss, -1e4, 1e4)
             critic1_loss = tf.where(tf.math.is_finite(critic1_loss), critic1_loss, tf.cast(0.0, critic1_loss.dtype))
             
-            # Critic2的损失
+            # Critic2的损失（同上，置零非有限样本再求和）
             _valid2 = tf.math.is_finite(per_sample_loss_2)
+            per_sample_loss_2_safe = tf.where(_valid2, per_sample_loss_2, tf.zeros_like(per_sample_loss_2))
             v2 = tf.cast(_valid2, tf.float32)
-            num_2 = tf.reduce_sum(per_sample_loss_2 * v2)
+            num_2 = tf.reduce_sum(per_sample_loss_2_safe)
             den2 = tf.reduce_sum(v2)
             den2 = tf.maximum(den2, tf.cast(1.0, tf.float32))
-            # 🔧 修复NaN传播：在除法前确保 num_2 是有限值
             num_2 = tf.where(tf.math.is_finite(num_2), num_2, tf.cast(0.0, num_2.dtype))
             critic2_loss = num_2 / den2
             # 🔧 修复：再次裁剪最终损失，防止NaN/Inf
@@ -10127,6 +11517,10 @@ class OptimizedMATD3:
                 qtot_2_cnt = tf.reduce_sum(tf.cast(mask2, tf.float32))
                 reg_qtot_2 = qtot_2_sum / tf.maximum(qtot_2_cnt, 1.0)
                 critic2_loss += q_reg_w * reg_qtot_2
+
+            # 训练公平权重：低成功率agent放大loss，提升其训练梯度
+            critic1_loss = critic1_loss * agent_fairness_weight
+            critic2_loss = critic2_loss * agent_fairness_weight
         
         # 🚨 标准MATD3：分别计算和更新两个Critic网络的梯度
         # 更新Critic1
@@ -10167,11 +11561,19 @@ class OptimizedMATD3:
         if should_update_actor:
             # 训练Actor
             with tf.GradientTape() as tape:
+                # 🚨 方案A：使用base PF参数重新计算PF力，确保训练/执行一致性
                 # 当前智能体生成新动作
-                if getattr(self.args, 'use_fr_feature', False):
-                    new_action = agent['actor']([obs, fr_batch], training=True)
+                actor_inputs = [obs]
+                if self.use_fr_feature_flag:
+                    actor_inputs.append(fr_batch)
+                if self.use_pf_feature_flag:
+                    pf_start = agent_idx * pf_feat_dim
+                    actor_inputs.append(current_pf_batch_flat[:, pf_start:pf_start + pf_feat_dim])
+                
+                if len(actor_inputs) == 1:
+                    new_action = agent['actor'](actor_inputs[0], training=True)
                 else:
-                    new_action = agent['actor'](obs, training=True)
+                    new_action = agent['actor'](actor_inputs, training=True)
                 new_action = tf.cast(new_action, tf.float32)
                 
                 # 应用势场修正
@@ -10185,22 +11587,10 @@ class OptimizedMATD3:
                 else:
                     corrected_action_head = new_action[:, :3]
                 
-                # 环境映射
-                arx = tf.cast(getattr(self.args, 'action_range_x', 1.0), tf.float32)
-                ary = tf.cast(getattr(self.args, 'action_range_y', 1.0), tf.float32)
-                arz = tf.cast(getattr(self.args, 'action_range_z', 1.0), tf.float32)
-                gz = tf.cast(getattr(self.args, 'control_accel_gain', 1.0), tf.float32)
-                
-                na_x = corrected_action_head[:, 0:1] * arx
-                na_y = corrected_action_head[:, 1:2] * ary
-                z_bias = tf.cast(self.z_action_bias, tf.float32)
-                na_z = (corrected_action_head[:, 2:3] + z_bias) * arz * gz
-                na_head = tf.concat([na_x, na_y, na_z], axis=1)
-                
-                # 🔧 终极修复：移除基于动态形状的if/else，彻底消除tf.cond
-                # 无论动作维度如何，都安全地拼接头部和尾部
-                na_tail = new_action[:, 3:]
-                new_action_real = tf.concat([na_head, na_tail], axis=1)
+                # Critic/Replay 使用归一化动作空间，Actor更新也必须保持同一动作口径
+                corrected_head_norm = tf.clip_by_value(corrected_action_head, -1.0, 1.0)
+                na_tail = tf.clip_by_value(new_action[:, 3:], -1.0, 1.0)
+                new_action_for_critic = tf.concat([corrected_head_norm, na_tail], axis=1)
                 
                 # 构建完整的动作输入
                 act_input = []
@@ -10208,7 +11598,7 @@ class OptimizedMATD3:
                 for j in range(self.n_agents):
                     j_act_dim = self.action_dims[j]
                     if j == agent_idx:
-                        act_input.append(new_action_real)
+                        act_input.append(new_action_for_critic)
                     else:
                         j_acts = global_actions[:, start:start + j_act_dim]
                         act_input.append(tf.cast(j_acts, tf.float32))
@@ -10216,26 +11606,25 @@ class OptimizedMATD3:
                 
                 global_actions_actor = tf.concat(act_input, axis=1)
                 
-                # ✅ 修正MATD3：Actor损失使用Twin Critic的min(Q_total)
-                # 从两个独立的Critic网络获取Q值，先计算总Q，然后取min以减少过估计偏差
-                if self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志
-                    actor_q_head_1, actor_q_tail_1 = agent['critic1']([global_state, global_actions_actor, fr_batch], training=False)
-                    actor_q_head_2, actor_q_tail_2 = agent['critic2']([global_state, global_actions_actor, fr_batch], training=False)
+                if self.use_pf_feature_flag:
+                    actor_q_out_1 = agent['critic1']([global_state, global_actions_actor, fr_batch, current_pf_batch_flat], training=False)
+                    actor_q_out_2 = agent['critic2']([global_state, global_actions_actor, fr_batch, current_pf_batch_flat], training=False)
+                elif self.use_fr_feature_flag:  # 🔧 XLA修复：使用缓存的标志
+                    # Critic 期望 3 个输入：[state, action, fr]
+                    actor_q_out_1 = agent['critic1']([global_state, global_actions_actor, fr_batch], training=False)
+                    actor_q_out_2 = agent['critic2']([global_state, global_actions_actor, fr_batch], training=False)
                 else:
-                    actor_q_head_1, actor_q_tail_1 = agent['critic1']([global_state, global_actions_actor], training=False)
-                    actor_q_head_2, actor_q_tail_2 = agent['critic2']([global_state, global_actions_actor], training=False)
-                actor_q_head_1 = tf.cast(actor_q_head_1, tf.float32)
-                actor_q_tail_1 = tf.cast(actor_q_tail_1, tf.float32)
-                actor_q_head_2 = tf.cast(actor_q_head_2, tf.float32)
-                actor_q_tail_2 = tf.cast(actor_q_tail_2, tf.float32)
-                # ✅ Q_total = Q_head + Q_tail
-                actor_qtot_1 = actor_q_head_1 + actor_q_tail_1
-                actor_qtot_2 = actor_q_head_2 + actor_q_tail_2
-                # Twin Critic: 对总Q取minimum
+                    # Critic 期望 2 个输入：[state, action]
+                    actor_q_out_1 = agent['critic1']([global_state, global_actions_actor], training=False)
+                    actor_q_out_2 = agent['critic2']([global_state, global_actions_actor], training=False)
+                actor_qtot_1 = _q_total(actor_q_out_1)
+                actor_qtot_2 = _q_total(actor_q_out_2)
+                actor_qtot_1 = tf.where(tf.math.is_finite(actor_qtot_1), actor_qtot_1, tf.zeros_like(actor_qtot_1))
+                actor_qtot_2 = tf.where(tf.math.is_finite(actor_qtot_2), actor_qtot_2, tf.zeros_like(actor_qtot_2))
                 actor_q_min = tf.minimum(actor_qtot_1, actor_qtot_2)
-                # 🔧 XLA友好：直接裁剪Q值到合理范围
                 q_clip = tf.cast(self.q_clip_value_cached, tf.float32)
                 actor_q_min = tf.clip_by_value(actor_q_min, -q_clip, q_clip)
+                actor_q_min = tf.where(tf.math.is_finite(actor_q_min), actor_q_min, tf.zeros_like(actor_q_min))
                 actor_loss_pg = -tf.reduce_mean(actor_q_min)
                 
                 # 动作正则化（危险区暂降正则强度）
@@ -10252,13 +11641,11 @@ class OptimizedMATD3:
                     arc_eff2 = _arc2 * (tf.cast(1.0, tf.float32) - tf.cast(0.7, tf.float32) * tf.reduce_mean(danger))
                 except Exception:
                     arc_eff2 = _arc2
-                # 🔧 修复边界饱和：使用边界惩罚而非简单的L2正则（MATD3）
                 action_head = new_action[:, :3]
                 action_tail = new_action[:, 3:]
                 
-                # 🚨 彻底修复：用Smooth L1替代exp，避免梯度爆炸
                 head_abs = tf.abs(action_head)
-                threshold = tf.cast(0.85, head_abs.dtype)
+                threshold = tf.cast(0.95, head_abs.dtype)
                 boundary_excess = tf.maximum(head_abs - threshold, tf.cast(0.0, head_abs.dtype))
                 smooth_l1_penalty = tf.where(
                     boundary_excess < tf.cast(0.1, boundary_excess.dtype),
@@ -10267,16 +11654,15 @@ class OptimizedMATD3:
                 )
                 head_boundary_penalty = tf.reduce_mean(smooth_l1_penalty)
                 head_l2 = tf.reduce_mean(tf.square(action_head))
-
-                # 🔧 新增：对持续向下（负向）Z轴加速度添加额外正则，防止策略整体被推向Z负半轴（MATD3单步版本）
-                neg_z_coef = tf.cast(getattr(self, 'neg_z_reg_coef_cached', 0.0), head_l2.dtype)
-                z_comp = action_head[:, 2:3]
-                neg_z = tf.nn.relu(-z_comp)
-                neg_z_penalty = tf.reduce_mean(tf.square(neg_z))
-
-                # 🔧 降低前三维度正则化强度：边界惩罚系数从5.0降低到3.0
-                head_reg = head_l2 + tf.cast(3.0, head_l2.dtype) * head_boundary_penalty
-                head_reg = head_reg + neg_z_coef * neg_z_penalty
+                
+                neg_action_mask = action_head < tf.cast(0.0, action_head.dtype)
+                neg_action_penalty = tf.reduce_mean(tf.where(
+                    neg_action_mask,
+                    tf.square(action_head) * tf.cast(0.3, action_head.dtype),
+                    tf.zeros_like(action_head)
+                ))
+                
+                head_reg = head_l2 + tf.cast(0.5, head_l2.dtype) * head_boundary_penalty + neg_action_penalty
                 
                 # 🔧 修复势场参数饱和：使用更温和的边界惩罚，避免参数被推到边界（MATD3版本）
                 # 问题：之前的边界惩罚太强（exp(5.0 * (|x| - 0.7))），导致参数被推到边界
@@ -10302,12 +11688,19 @@ class OptimizedMATD3:
                 # 解决方案：降低到0.1，让Q值梯度能够主导学习方向
                 pf_params_penalty = tf.reduce_mean(tf.abs(action_tail)) * tf.cast(0.1, action_tail.dtype)
                 
-                # 🔧 修复：大幅降低尾部正则化权重，避免压制Q值梯度
-                tail_reg = tf.cast(0.3, tail_mean.dtype) * tail_mean + tf.cast(0.5, tail_mean.dtype) * tail_boundary_penalty + pf_params_penalty
-                action_reg = (head_reg + tail_reg) * tf.cast(arc_eff2, new_action.dtype)
+                tail_reg = tf.cast(0.4, tail_mean.dtype) * tail_mean + tf.cast(0.6, tail_mean.dtype) * tail_boundary_penalty + pf_params_penalty
+                
+                q_gradient_strength = tf.abs(actor_loss_pg)
+                reg_scale = tf.where(
+                    q_gradient_strength < tf.cast(0.1, q_gradient_strength.dtype),
+                    tf.cast(0.5, q_gradient_strength.dtype),
+                    tf.cast(1.0, q_gradient_strength.dtype)
+                )
+                action_reg = (head_reg + tail_reg) * tf.cast(arc_eff2, new_action.dtype) * tf.cast(1.2, arc_eff2.dtype) * reg_scale
+                action_reg = tf.clip_by_value(action_reg, -1e6, 1e6)
                 actor_loss = actor_loss_pg + tf.cast(action_reg, tf.float32)
-                # 🚨 关键修复：确保 actor_loss 是有限值，防止NaN进入梯度计算（MATD3 train_step_optimized）
-                actor_loss = tf.where(tf.math.is_finite(actor_loss), actor_loss, tf.cast(0.0, actor_loss.dtype))
+                actor_loss = actor_loss * agent_fairness_weight
+                actor_loss = tf.clip_by_value(actor_loss, -1e6, 1e6)
             
             # 计算Actor梯度
             if hasattr(agent['actor_optimizer'], 'get_scaled_loss'):
@@ -10317,35 +11710,98 @@ class OptimizedMATD3:
             else:
                 actor_grads = tape.gradient(actor_loss, agent['actor'].trainable_variables)
             
-            # 🚨 修复Actor梯度不稳定：使用单一全局梯度裁剪，避免双重裁剪导致梯度不稳定
-            # 🔧 关键修复：移除逐层裁剪，只保留全局裁剪，避免梯度被过度裁剪
-            actor_grads, _ = tf.clip_by_global_norm(actor_grads, self.c_grad_clip_norm)
-            
-            # 数值守护：若存在非有限梯度，跳过本次Actor更新
-            grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in actor_grads if g is not None]
-            if grads_finite and tf.reduce_all(tf.stack(grads_finite)):
-                agent['actor_optimizer'].apply_gradients(zip(actor_grads, agent['actor'].trainable_variables))
+            actor_grads_pairs = [(g, v) for g, v in zip(actor_grads, agent['actor'].trainable_variables) if g is not None]
+            if actor_grads_pairs:
+                grads_only = [g for g, v in actor_grads_pairs]
+                vars_only = [v for g, v in actor_grads_pairs]
+                grads_only = [tf.clip_by_norm(g, 1.0) for g in grads_only]
+                grads_only, _ = tf.clip_by_global_norm(grads_only, tf.cast(self.c_grad_clip_norm, tf.float32))
+                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in grads_only]
+                if tf.reduce_all(tf.stack(grads_finite)):
+                    agent['actor_optimizer'].apply_gradients(zip(grads_only, vars_only))
         
         # 若本步未更新Actor，则将actor_loss标记为NaN，便于上层使用nanmean聚合
         actor_loss_out = tf.where(should_update_actor,
                                   actor_loss,
                                   tf.cast(tf.constant(float('nan')), actor_loss.dtype))
+        # 🔧 返回前确保 critic 总损失为有限值，避免 NaN 写入日志/历史
+        critic_loss_sum = critic1_loss + critic2_loss
+        critic_loss_out = tf.where(tf.math.is_finite(critic_loss_sum), critic_loss_sum, tf.constant(0.0, dtype=tf.float32))
         # 🚨 标准MATD3：返回两个Critic网络的总损失
         return {
-            'critic_loss': critic1_loss + critic2_loss,  # 总损失用于统计
+            'critic_loss': critic_loss_out,
             'actor_loss': actor_loss_out,
             'actor_updated': should_update_actor,
             'critic1_loss': critic1_loss,  # Critic1的损失
-            'critic2_loss': critic2_loss   # Critic2的损失
+            'critic2_loss': critic2_loss,  # Critic2的损失
+            'td_err': td_err_vec           # PER复用：每样本TD误差
         }
+
+    def _forward_twin_critic_pair(self, critic, inputs_a, inputs_b, training):
+        """单次前向同时评估两组输入，减少重复的 critic kernel launch。"""
+        merged_inputs = [tf.concat([tf.cast(a, tf.float32), tf.cast(b, tf.float32)], axis=0)
+                         for a, b in zip(inputs_a, inputs_b)]
+        q1_all, q2_all = critic(merged_inputs, training=training)
+        q1_all = tf.cast(q1_all, tf.float32)
+        q2_all = tf.cast(q2_all, tf.float32)
+        q1_a, q1_b = tf.split(q1_all, 2, axis=0)
+        q2_a, q2_b = tf.split(q2_all, 2, axis=0)
+        return q1_a, q2_a, q1_b, q2_b
+
+    def _merge_action_head_tail_static(self, head, tail, action_dim):
+        """使用静态 padding 合并 head/tail，减少梯度图中的动态 concat。"""
+        action_dim = int(action_dim)
+        if action_dim <= 0:
+            return head[:, :0]
+        head_dim = min(3, action_dim)
+        head_part = head[:, :head_dim]
+        if action_dim <= 3:
+            try:
+                return tf.ensure_shape(head_part, [None, action_dim])
+            except Exception:
+                return head_part
+        tail_dim = action_dim - 3
+        tail_part = tail[:, :tail_dim]
+        merged = tf.pad(head_part, [[0, 0], [0, tail_dim]]) + tf.pad(tail_part, [[0, 0], [3, 0]])
+        try:
+            merged = tf.ensure_shape(merged, [None, action_dim])
+        except Exception:
+            pass
+        return merged
+
+    def _replace_agent_action_slice_static(self, base_actions, agent_action, agent_idx):
+        """用静态 pad/mask 替换全局动作中的某个 agent slice，避免动态图 concat。"""
+        if self.total_action_dim is None or agent_idx >= len(self._agent_action_spans):
+            start = 0
+            pieces = []
+            for j, dim in enumerate(self.action_dims):
+                dim = int(dim)
+                if j == agent_idx:
+                    pieces.append(agent_action[:, :dim])
+                else:
+                    pieces.append(base_actions[:, start:start + dim])
+                start += dim
+            return tf.concat(pieces, axis=1)
+
+        start, dim, pad_right = self._agent_action_spans[agent_idx]
+        dim = int(dim)
+        padded_agent_action = tf.pad(agent_action[:, :dim], [[0, 0], [start, pad_right]])
+        mask = tf.cast(self._agent_action_masks[agent_idx], base_actions.dtype)
+        merged = base_actions * (1.0 - mask) + tf.cast(padded_agent_action, base_actions.dtype)
+        try:
+            merged = tf.ensure_shape(merged, [None, self.total_action_dim])
+        except Exception:
+            pass
+        return merged
 
     @tf.function(reduce_retracing=True)
     def _multi_agent_update_step(self,
                                  obs_n, next_obs_n, act_n, rew_n, done_n,
-                                 global_state, global_next_state, global_actions, global_smoothed_actions,
-                                 sample_weights, mix_beta, imitation_mu, fr_batch, should_update_actor,
-                                 global_actions_raw_all=None, global_actions_mixed_all=None,
-                                 global_a_next_smooth=None, global_a_next_corr=None):
+                                 global_state, global_next_state, global_actions,
+                                 sample_weights, fr_batch, should_update_actor,
+                                 global_actions_raw_all=None, global_actions_corrected_all=None,
+                                 global_a_next_smooth=None, global_a_next_corr=None,
+                                 current_pf_batch_flat_precomputed=None, next_pf_batch_flat_precomputed=None):
         # 说明：为了减少 Python→Graph 往返开销，将逐智能体的训练合并到一次 tf.function 执行
         # 注意：这里不返回 Python 字典，直接在图内应用梯度更新
         # 统一张量类型与形状，避免 retracing
@@ -10358,66 +11814,84 @@ class OptimizedMATD3:
         global_state = tf.convert_to_tensor(global_state)
         global_next_state = tf.convert_to_tensor(global_next_state)
         global_actions = tf.convert_to_tensor(global_actions)
-        global_smoothed_actions = tf.convert_to_tensor(global_smoothed_actions)
         if sample_weights is not None:
             sample_weights = tf.ensure_shape(tf.cast(tf.convert_to_tensor(sample_weights), tf.float32), [None])
-        mix_beta = tf.convert_to_tensor(mix_beta, dtype=tf.float32)
-        imitation_mu = tf.convert_to_tensor(imitation_mu, dtype=tf.float32)
+        if self.fairness_reweight_enabled:
+            fairness_weights = tf.cast(self.agent_fairness_weights_var, tf.float32)
+            fairness_weights = tf.reshape(fairness_weights, [self.n_agents])
+            fairness_weights = tf.clip_by_value(fairness_weights, 0.1, 10.0)
+        else:
+            fairness_weights = tf.ones([self.n_agents], dtype=tf.float32)
         fr_batch = tf.convert_to_tensor(fr_batch, dtype=tf.float32)
-        should_update_actor = tf.convert_to_tensor(should_update_actor, dtype=tf.bool)
         
-        # 核心稳定措施：对奖励进行裁剪，防止极端负奖励导致target_q爆炸，进而引发NaN
-        rew_n = tf.clip_by_value(rew_n, tf.cast(self.c_reward_clip, rew_n.dtype), tf.cast(1e10, rew_n.dtype))
+        # 与统一梯度路径保持一致的 reward 裁剪口径，避免消融路径引入额外变量
+        rew_n = tf.clip_by_value(rew_n, tf.cast(self.c_reward_clip, rew_n.dtype), tf.cast(1e6, rew_n.dtype))
         
         # 🔧 关键修复：使用历史存储的FR值，确保训练-执行一致性
         # 原因：如果FR值随时间变化（schedule），使用当前FR值会导致训练目标与实际执行不一致
         # 修复：优先使用传入的历史FR值（fr_batch参数），如果没有则使用当前FR值（向后兼容）
         batch_size = tf.shape(global_state)[0]
-        # 确保fr_batch形状正确：(batch_size, 1)
-        fr_batch_reshaped = tf.reshape(fr_batch, [-1, 1])
-        # 如果fr_batch长度小于batch_size，用当前FR值填充；否则直接使用
         current_fr_value = tf.cast(self.action_force_ratio_cached, tf.float32)
-        fr_batch_len = tf.shape(fr_batch_reshaped)[0]
-        # 如果fr_batch长度足够，直接使用；否则用当前FR值填充
-        fr_batch_padded = tf.cond(
-            tf.greater_equal(fr_batch_len, batch_size),
-            lambda: fr_batch_reshaped[:batch_size, :],
-            lambda: tf.concat([
-                fr_batch_reshaped,
-                tf.fill([batch_size - fr_batch_len, 1], current_fr_value)
-            ], axis=0)
-        )
-        fr_batch_safe = fr_batch_padded
+        fr_batch_safe = _broadcast_force_ratio(fr_batch, batch_size)
+        dual_q_mode = bool(self.use_dual_q)
+        separated_actor_mode = bool(dual_q_mode and self.use_separated_gradient)
         
-        # 🔧 方案A：重新计算PF力（基于当前状态），供Critic和Actor使用
-        # 只在启用PF特征时才计算PF力，避免不必要的计算
-        # 🔧 XLA友好：self.use_pf_feature_flag是编译时常量（在__init__时设置，之后不变）
-        # TensorFlow会在编译时进行常量折叠，将Python条件分支在编译时解析，不会导致retracing
+        pf_forces_recomputed = None
+        next_pf_forces_recomputed = None
+        pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
         if self.use_pf_feature_flag:
-            # 为每个智能体重新计算PF力
-            pf_forces_recomputed = []
-            for i in range(self.n_agents):
-                agent_obs = obs_n[:, i, :self.obs_shapes[i]]  # (batch, obs_dim)
-                agent_action = act_n[:, i, :self.action_dims[i]]  # (batch, act_dim)
-                
-                # 重新计算PF力（基于当前状态和原始动作）
-                if self.use_tf_potential_field_cached and current_fr_value > 0.0:
-                    # 使用势场修正函数计算PF力（它会返回修正后的动作和PF力矢量）
-                    _, pf_force_vector = self._apply_potential_field_correction(
-                        agent_action, agent_obs, current_fr_value
-                    )  # pf_force_vector: (batch, 3)
-                else:
-                    # 如果不使用势场修正，PF力为零
-                    pf_force_vector = tf.zeros([batch_size, 3], dtype=tf.float32)
-                
-                pf_forces_recomputed.append(pf_force_vector)
-            
-            # 拼接所有智能体的PF力并展平: (batch, n_agents*3)
-            pf_forces_batch_tf = tf.stack(pf_forces_recomputed, axis=1)  # (batch, n_agents, 3)
-            pf_batch_flat = tf.reshape(pf_forces_batch_tf, [batch_size, self.n_agents * 3])
+            if current_pf_batch_flat_precomputed is not None:
+                current_pf_batch_flat = tf.cast(current_pf_batch_flat_precomputed, tf.float32)
+                current_pf_batch_flat = tf.reshape(current_pf_batch_flat, [batch_size, -1])
+            else:
+                pf_forces_recomputed = []
+                for i in range(self.n_agents):
+                    agent_obs = obs_n[:, i, :self.obs_shapes[i]]  # (batch, obs_dim)
+                    should_compute_pf = tf.logical_and(
+                        self.use_tf_potential_field_cached,
+                        tf.greater(fr_batch_safe[:, 0], 0.0)
+                    )
+                    dummy_action = tf.zeros([batch_size, self.action_dims[i]], dtype=tf.float32)
+                    _, pf_force_vector = self._compute_pf_force_from_context_tf(
+                        dummy_action,
+                        *self._extract_pf_obs_context_compiled_tf(agent_obs)
+                    )
+                    pf_force_vector = tf.where(
+                        tf.broadcast_to(tf.reshape(should_compute_pf, [-1, 1]), [batch_size, 3]),
+                        pf_force_vector,
+                        tf.zeros([batch_size, 3], dtype=tf.float32)
+                    )
+                    pf_forces_recomputed.append(pf_force_vector)
+                pf_forces_batch_tf = tf.stack(pf_forces_recomputed, axis=1)  # (batch, n_agents, 3)
+                current_pf_batch_flat = _flatten_pf_feature_batch_tf(pf_forces_batch_tf, self.n_agents, pf_feat_dim)
+            if next_pf_batch_flat_precomputed is not None:
+                next_pf_batch_flat = tf.cast(next_pf_batch_flat_precomputed, tf.float32)
+                next_pf_batch_flat = tf.reshape(next_pf_batch_flat, [batch_size, -1])
+            else:
+                next_pf_forces_recomputed = []
+                for i in range(self.n_agents):
+                    agent_next_obs = next_obs_n[:, i, :self.obs_shapes[i]]
+                    should_compute_pf = tf.logical_and(
+                        self.use_tf_potential_field_cached,
+                        tf.greater(fr_batch_safe[:, 0], 0.0)
+                    )
+                    dummy_action = tf.zeros([batch_size, self.action_dims[i]], dtype=tf.float32)
+                    _, pf_force_vector = self._compute_pf_force_from_context_tf(
+                        dummy_action,
+                        *self._extract_pf_obs_context_compiled_tf(agent_next_obs)
+                    )
+                    pf_force_vector = tf.where(
+                        tf.broadcast_to(tf.reshape(should_compute_pf, [-1, 1]), [batch_size, 3]),
+                        pf_force_vector,
+                        tf.zeros([batch_size, 3], dtype=tf.float32)
+                    )
+                    next_pf_forces_recomputed.append(pf_force_vector)
+                next_pf_forces_batch_tf = tf.stack(next_pf_forces_recomputed, axis=1)
+                next_pf_batch_flat = _flatten_pf_feature_batch_tf(next_pf_forces_batch_tf, self.n_agents, pf_feat_dim)
         else:
-            # 如果未启用PF特征，创建零向量占位符（虽然不会被使用）
-            pf_batch_flat = tf.zeros([batch_size, self.n_agents * 3], dtype=tf.float32)
+            current_pf_batch_flat = tf.zeros([batch_size, self.n_agents * pf_feat_dim], dtype=tf.float32)
+            next_pf_batch_flat = tf.zeros([batch_size, self.n_agents * pf_feat_dim], dtype=tf.float32)
+            pf_forces_recomputed = None
         
         # 🚨 标准MATD3：分别训练两个独立的Critic网络（使用persistent tape）
         with tf.GradientTape(persistent=True) as tape_c:
@@ -10437,108 +11911,148 @@ class OptimizedMATD3:
             factor = tf.constant(0.1, dtype=tf.float32)
             q_clip_effective = q_clip * (tf.constant(1.0, dtype=tf.float32) - gamma * factor)
             sw = tf.cast(sample_weights, tf.float32) if sample_weights is not None else None
+            # PER复用：累计每样本TD误差（跨智能体求均值）
+            td_err_sum = tf.zeros([batch_size], dtype=tf.float32)
+            td_err_cnt = tf.zeros([batch_size], dtype=tf.float32)
             for i in range(self.n_agents):
+                agent_fairness_weight = tf.gather(fairness_weights, i)
                 rewards = tf.cast(rew_n[:, i], tf.float32)
                 dones = tf.cast(done_n[:, i], tf.float32)
                 agent = self.agents[i]
                 
-                # 🚨 关键修复：分别使用不同的动作评估target_q1_head和target_q2_tail
-                # target_q1_head应该使用global_a_next_smooth（原始动作）来评估
-                # target_q2_tail应该使用global_a_next_corr（修正后动作）来评估
-                # 这样才能正确反映两个head分别评估不同动作部分的Q值
-                
-                # 评估target_q1_head：使用原始动作（global_a_next_smooth）
-                target_inputs_head = [global_next_state, global_a_next_smooth]
-                if self.use_fr_feature_flag:
-                    target_inputs_head.append(fr_batch_safe)
-                if self.use_pf_feature_flag:
-                    target_inputs_head.append(pf_batch_flat)
-                target_q1_1, _ = agent['target_critic1'](target_inputs_head, training=False)
-                target_q1_2, _ = agent['target_critic2'](target_inputs_head, training=False)
-                
-                # 评估target_q2_tail：使用修正后动作（global_a_next_corr）
-                target_inputs_tail = [global_next_state, global_a_next_corr]
-                if self.use_fr_feature_flag:
-                    target_inputs_tail.append(fr_batch_safe)
-                if self.use_pf_feature_flag:
-                    target_inputs_tail.append(pf_batch_flat)
-                _, target_q2_1 = agent['target_critic1'](target_inputs_tail, training=False)
-                _, target_q2_2 = agent['target_critic2'](target_inputs_tail, training=False)
-                target_q1_1 = tf.cast(target_q1_1, tf.float32)
-                target_q2_1 = tf.cast(target_q2_1, tf.float32)
-                target_q1_2 = tf.cast(target_q1_2, tf.float32)
-                target_q2_2 = tf.cast(target_q2_2, tf.float32)
-                
-                # ✅ 方案C：先计算每个critic的total，然后在total之间取min
-                # 正确逻辑：双头是"组成件"，监督的是"合成后的总Q"
-                # 1. 先计算每个critic的总Q值
-                target_qtot_1 = target_q1_1 + target_q2_1  # Critic1的总Q值（head + tail）
-                target_qtot_2 = target_q1_2 + target_q2_2  # Critic2的总Q值（head + tail）
-                
-                # 🔧 优化：只进行一次裁剪，使用更小的范围，确保Bellman更新后不超出原始q_clip
+                critic1_reg_add = tf.cast(0.0, tf.float32)
+                critic2_reg_add = tf.cast(0.0, tf.float32)
+                if dual_q_mode:
+                    # 主线 dual-Q 语义：Q_tot = Q_head(a_raw) + Q_tail(a_corrected)
+                    target_inputs_head = [global_next_state, global_a_next_smooth]
+                    if self.use_fr_feature_flag:
+                        target_inputs_head.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        target_inputs_head.append(next_pf_batch_flat)
+
+                    target_inputs_tail = [global_next_state, global_a_next_corr]
+                    if self.use_fr_feature_flag:
+                        target_inputs_tail.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        target_inputs_tail.append(next_pf_batch_flat)
+
+                    target_q1_head_1, _, _, target_q1_tail_1 = self._forward_twin_critic_pair(
+                        agent['target_critic1'], target_inputs_head, target_inputs_tail, training=False
+                    )
+                    target_q1_head_2, _, _, target_q1_tail_2 = self._forward_twin_critic_pair(
+                        agent['target_critic2'], target_inputs_head, target_inputs_tail, training=False
+                    )
+                    target_qtot_1 = target_q1_head_1 + target_q1_tail_1
+                    target_qtot_2 = target_q1_head_2 + target_q1_tail_2
+
+                    current_inputs_head = [global_state, global_actions_raw_all]
+                    if self.use_fr_feature_flag:
+                        current_inputs_head.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        current_inputs_head.append(current_pf_batch_flat)
+
+                    current_inputs_tail = [global_state, global_actions]
+                    if self.use_fr_feature_flag:
+                        current_inputs_tail.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        current_inputs_tail.append(current_pf_batch_flat)
+
+                    current_q1_head_1, _, _, current_q1_tail_1 = self._forward_twin_critic_pair(
+                        agent['critic1'], current_inputs_head, current_inputs_tail, training=True
+                    )
+                    current_q1_head_2, _, _, current_q1_tail_2 = self._forward_twin_critic_pair(
+                        agent['critic2'], current_inputs_head, current_inputs_tail, training=True
+                    )
+                    current_qtot_1 = current_q1_head_1 + current_q1_tail_1
+                    current_qtot_2 = current_q1_head_2 + current_q1_tail_2
+
+                    q_reg_w = self.c_critic_q_reg
+                    if q_reg_w > 0:
+                        q1_head_1_sq = tf.clip_by_value(tf.square(current_q1_head_1), 0.0, 1e7)
+                        q1_tail_1_sq = tf.clip_by_value(tf.square(current_q1_tail_1), 0.0, 1e7)
+                        q1_head_2_sq = tf.clip_by_value(tf.square(current_q1_head_2), 0.0, 1e7)
+                        q1_tail_2_sq = tf.clip_by_value(tf.square(current_q1_tail_2), 0.0, 1e7)
+
+                        mask1_head_1 = tf.math.is_finite(q1_head_1_sq)
+                        mask1_tail_1 = tf.math.is_finite(q1_tail_1_sq)
+                        mask1_head_2 = tf.math.is_finite(q1_head_2_sq)
+                        mask1_tail_2 = tf.math.is_finite(q1_tail_2_sq)
+
+                        reg_q1_head_1 = tf.reduce_sum(tf.where(mask1_head_1, q1_head_1_sq, tf.zeros_like(q1_head_1_sq))) / tf.maximum(tf.reduce_sum(tf.cast(mask1_head_1, tf.float32)), 1.0)
+                        reg_q1_tail_1 = tf.reduce_sum(tf.where(mask1_tail_1, q1_tail_1_sq, tf.zeros_like(q1_tail_1_sq))) / tf.maximum(tf.reduce_sum(tf.cast(mask1_tail_1, tf.float32)), 1.0)
+                        reg_q1_head_2 = tf.reduce_sum(tf.where(mask1_head_2, q1_head_2_sq, tf.zeros_like(q1_head_2_sq))) / tf.maximum(tf.reduce_sum(tf.cast(mask1_head_2, tf.float32)), 1.0)
+                        reg_q1_tail_2 = tf.reduce_sum(tf.where(mask1_tail_2, q1_tail_2_sq, tf.zeros_like(q1_tail_2_sq))) / tf.maximum(tf.reduce_sum(tf.cast(mask1_tail_2, tf.float32)), 1.0)
+
+                        critic1_reg_add = q_reg_w * (reg_q1_head_1 + reg_q1_tail_1)
+                        critic2_reg_add = q_reg_w * (reg_q1_head_2 + reg_q1_tail_2)
+                else:
+                    # single-Q 消融：保持同一 update skeleton，只去掉 dual-Q head 结构。
+                    target_inputs = [global_next_state, global_a_next_corr]
+                    if self.use_fr_feature_flag:
+                        target_inputs.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        target_inputs.append(next_pf_batch_flat)
+                    target_qtot_1 = tf.cast(agent['target_critic1'](target_inputs, training=False), tf.float32)
+                    target_qtot_2 = tf.cast(agent['target_critic2'](target_inputs, training=False), tf.float32)
+
+                    current_inputs = [global_state, global_actions]
+                    if self.use_fr_feature_flag:
+                        current_inputs.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        current_inputs.append(current_pf_batch_flat)
+                    current_qtot_1 = tf.cast(agent['critic1'](current_inputs, training=True), tf.float32)
+                    current_qtot_2 = tf.cast(agent['critic2'](current_inputs, training=True), tf.float32)
+
+                    q_reg_w = self.c_critic_q_reg
+                    if q_reg_w > 0:
+                        q1_sq = tf.clip_by_value(tf.square(current_qtot_1), 0.0, 1e7)
+                        q2_sq = tf.clip_by_value(tf.square(current_qtot_2), 0.0, 1e7)
+                        mask_q1 = tf.math.is_finite(q1_sq)
+                        mask_q2 = tf.math.is_finite(q2_sq)
+                        reg_q1 = tf.reduce_sum(tf.where(mask_q1, q1_sq, tf.zeros_like(q1_sq))) / tf.maximum(tf.reduce_sum(tf.cast(mask_q1, tf.float32)), 1.0)
+                        reg_q2 = tf.reduce_sum(tf.where(mask_q2, q2_sq, tf.zeros_like(q2_sq))) / tf.maximum(tf.reduce_sum(tf.cast(mask_q2, tf.float32)), 1.0)
+                        critic1_reg_add = q_reg_w * reg_q1
+                        critic2_reg_add = q_reg_w * reg_q2
+
+                target_qtot_1 = tf.where(tf.math.is_finite(target_qtot_1), target_qtot_1, tf.zeros_like(target_qtot_1))
+                target_qtot_2 = tf.where(tf.math.is_finite(target_qtot_2), target_qtot_2, tf.zeros_like(target_qtot_2))
                 target_qtot_1 = tf.clip_by_value(target_qtot_1, -q_clip_effective, q_clip_effective)
                 target_qtot_2 = tf.clip_by_value(target_qtot_2, -q_clip_effective, q_clip_effective)
-                # 🔧 XLA友好：使用裁剪替代 is_finite
                 target_qtot_1 = tf.clip_by_value(target_qtot_1, -1e6, 1e6)
                 target_qtot_2 = tf.clip_by_value(target_qtot_2, -1e6, 1e6)
-                
-                # ✅ 正确做法：在total之间取min（TD3的核心特性）
                 target_q_next = tf.minimum(target_qtot_1, target_qtot_2)
-                
-                # 🔧 关键修复：done=True时，目标Q值应该直接等于rewards，不需要计算next_state的Q值
-                done_mask = tf.cast(dones[:, tf.newaxis], tf.float32)  # [batch, 1]
-                not_done_mask = 1.0 - done_mask  # [batch, 1]
-                
-                # 🔧 关键修复：应用REWARD_SCALE归一化，防止Q值爆炸（回合奖励~130k → 缩放到~59）
+
+                done_mask = tf.cast(dones[:, tf.newaxis], tf.float32)
+                not_done_mask = 1.0 - done_mask
                 scaled_rewards = rewards[:, tf.newaxis] * self.c_reward_scale
-                # 🔧 修复NaN传播：确保 scaled_rewards 是有限值（防止奖励中的NaN传播到Q值）
                 scaled_rewards = tf.where(tf.math.is_finite(scaled_rewards), scaled_rewards, tf.cast(0.0, scaled_rewards.dtype))
-                
-                # ✅ 正确做法：只计算一个y_tot，不再分别计算y_head和y_tail
-                # 关键点：head/tail只是total的可微分"分量"，只需要让它们的和满足Bellman即可
-                # 不需要为head/tail分别计算y，只需要计算一个统一的y_tot来监督total Q
                 target_q_next = target_q_next * not_done_mask
                 target_q_next = tf.where(tf.math.is_finite(target_q_next), target_q_next, tf.cast(0.0, target_q_next.dtype))
                 y_tot = scaled_rewards + gamma * target_q_next
                 y_tot = tf.clip_by_value(y_tot, -q_clip, q_clip)
                 y_tot = tf.where(tf.math.is_finite(y_tot), y_tot, tf.cast(0.0, y_tot.dtype))
-                # 🚨 关键修复：使用stop_gradient隔离target Q值，符合Bellman更新原则
                 y_tot = tf.stop_gradient(y_tot)
-                
-                # 🔧 XLA友好：裁剪后已经安全，掩码用于统计而非数值替换
-                mask_t = tf.math.is_finite(y_tot)  # 统一的掩码
-                # current Q
-                current_inputs = [global_state, global_actions]
-                if self.use_fr_feature_flag:
-                    current_inputs.append(fr_batch_safe)
-                if self.use_pf_feature_flag:
-                    current_inputs.append(pf_batch_flat)
-                # 🚨 标准MATD3：从两个独立的Critic网络获取当前Q值
-                current_q1_1, current_q2_1 = agent['critic1'](current_inputs, training=True)
-                current_q1_2, current_q2_2 = agent['critic2'](current_inputs, training=True)
-                current_q1_1 = tf.cast(current_q1_1, tf.float32)
-                current_q2_1 = tf.cast(current_q2_1, tf.float32)
-                current_q1_2 = tf.cast(current_q1_2, tf.float32)
-                current_q2_2 = tf.cast(current_q2_2, tf.float32)
-                
-                # ✅ 正确做法：先计算每个Critic的总Q
-                # Q_total = Q_head + Q_tail （两个部分价值之和 = 总价值）
-                current_qtot_1 = current_q1_1 + current_q2_1  # Critic1的总Q
-                current_qtot_2 = current_q1_2 + current_q2_2  # Critic2的总Q
-                
-                # 🔧 优化：使用q_clip_effective保持一致性（current_q不需要Bellman更新，但为了一致性使用相同范围）
+
+                current_qtot_1 = tf.where(tf.math.is_finite(current_qtot_1), current_qtot_1, tf.zeros_like(current_qtot_1))
+                current_qtot_2 = tf.where(tf.math.is_finite(current_qtot_2), current_qtot_2, tf.zeros_like(current_qtot_2))
                 current_qtot_1 = tf.clip_by_value(current_qtot_1, -q_clip_effective, q_clip_effective)
                 current_qtot_2 = tf.clip_by_value(current_qtot_2, -q_clip_effective, q_clip_effective)
-                # 🔧 XLA友好：裁剪后已经安全，掩码用于统计
+
+                mask_t = tf.math.is_finite(y_tot)
                 mask_c1 = tf.math.is_finite(current_qtot_1)
                 mask_c2 = tf.math.is_finite(current_qtot_2)
-                # 组合掩码（batch维度）：所有Q值都需有限
-                _mask_all = tf.squeeze(tf.logical_and(tf.logical_and(mask_t, mask_c1), mask_c2), axis=1)  # [B]
+                _mask_all = tf.squeeze(tf.logical_and(tf.logical_and(mask_t, mask_c1), mask_c2), axis=1)
                 
                 # ✅ 正确做法：只计算一个TD误差（对total Q）
                 # 不再对单个head使用统一的target（错误），而是对总Q使用统一的target（正确）
                 td1_full = tf.squeeze(y_tot - current_qtot_1, axis=1)  # Critic1的TD误差
                 td2_full = tf.squeeze(y_tot - current_qtot_2, axis=1)  # Critic2的TD误差
+                
+                # PER复用：累计每样本TD误差（仅统计有效样本）
+                td_abs = 0.5 * (tf.abs(td1_full) + tf.abs(td2_full))
+                td_abs = tf.where(_mask_all, td_abs, tf.zeros_like(td_abs))
+                td_err_sum += td_abs
+                td_err_cnt += tf.cast(_mask_all, tf.float32)
                 
                 # 🚨 标准MATD3：分别计算两个Critic网络的Huber损失
                 # Critic1的损失：Huber(y_tot - current_qtot_1)
@@ -10589,38 +12103,12 @@ class OptimizedMATD3:
                 valid_count = tf.reduce_sum(tf.cast(_mask_all, tf.int32))
                 valid_counts.append(valid_count)
                 
-                # Q 正则（与单步实现一致）
-                q_reg_w = self.c_critic_q_reg
-                if q_reg_w > 0:
-                    # Critic1的Q正则
-                    q1_1_sq = tf.square(current_q1_1)
-                    q2_1_sq = tf.square(current_q2_1)
-                    q1_1_sq = tf.clip_by_value(q1_1_sq, 0.0, 1e7)
-                    q2_1_sq = tf.clip_by_value(q2_1_sq, 0.0, 1e7)
-                    mask1_1 = tf.math.is_finite(q1_1_sq)
-                    mask2_1 = tf.math.is_finite(q2_1_sq)
-                    q1_1_sum = tf.reduce_sum(tf.where(mask1_1, q1_1_sq, tf.zeros_like(q1_1_sq)))
-                    q2_1_sum = tf.reduce_sum(tf.where(mask2_1, q2_1_sq, tf.zeros_like(q2_1_sq)))
-                    q1_1_cnt = tf.reduce_sum(tf.cast(mask1_1, tf.float32))
-                    q2_1_cnt = tf.reduce_sum(tf.cast(mask2_1, tf.float32))
-                    reg_q1_1 = q1_1_sum / tf.maximum(q1_1_cnt, 1.0)
-                    reg_q2_1 = q2_1_sum / tf.maximum(q2_1_cnt, 1.0)
-                    critic1_loss += q_reg_w * (reg_q1_1 + reg_q2_1)
-                    
-                    # Critic2的Q正则
-                    q1_2_sq = tf.square(current_q1_2)
-                    q2_2_sq = tf.square(current_q2_2)
-                    q1_2_sq = tf.clip_by_value(q1_2_sq, 0.0, 1e7)
-                    q2_2_sq = tf.clip_by_value(q2_2_sq, 0.0, 1e7)
-                    mask1_2 = tf.math.is_finite(q1_2_sq)
-                    mask2_2 = tf.math.is_finite(q2_2_sq)
-                    q1_2_sum = tf.reduce_sum(tf.where(mask1_2, q1_2_sq, tf.zeros_like(q1_2_sq)))
-                    q2_2_sum = tf.reduce_sum(tf.where(mask2_2, q2_2_sq, tf.zeros_like(q2_2_sq)))
-                    q1_2_cnt = tf.reduce_sum(tf.cast(mask1_2, tf.float32))
-                    q2_2_cnt = tf.reduce_sum(tf.cast(mask2_2, tf.float32))
-                    reg_q1_2 = q1_2_sum / tf.maximum(q1_2_cnt, 1.0)
-                    reg_q2_2 = q2_2_sum / tf.maximum(q2_2_cnt, 1.0)
-                    critic2_loss += q_reg_w * (reg_q1_2 + reg_q2_2)
+                critic1_loss += critic1_reg_add
+                critic2_loss += critic2_reg_add
+
+                # 训练公平权重：低成功率agent放大loss，提升其训练梯度
+                critic1_loss = critic1_loss * agent_fairness_weight
+                critic2_loss = critic2_loss * agent_fairness_weight
                 
                 # 🚨 标准MATD3：分别累积两个Critic网络的损失
                 critic_losses.append(critic1_loss + critic2_loss)  # 总损失用于统计
@@ -10698,420 +12186,337 @@ class OptimizedMATD3:
                         self.agents[i]['critic2_optimizer'].apply_gradients(pairs)
         del tape_c
 
-        # === 统一训练所有 Actor（一个 Tape 覆盖全部 Actor）===
-        # 去除条件分支，始终计算 Actor 损失与梯度；在应用梯度时用标量开关置零，避免 tf.cond 生成 Variant Optional
-        with tf.GradientTape(persistent=True) as tape_a:
-            total_actor_loss = tf.constant(0.0, dtype=tf.float32)
-            actor_losses = []
-            for i in range(self.n_agents):
-                # 🔧 修复：根据 obs_shapes 切片，去除 padding
-                obs = tf.cast(obs_n[:, i, :self.obs_shapes[i]], tf.float32)
-                agent = self.agents[i]
-                
-                # 🚨 新增：支持PF特征作为独立输入
-                # 🔧 XLA友好：使用编译时常量（use_fr_feature_flag和use_pf_feature_flag在__init__时设置，之后不变）
-                # TensorFlow会在编译时进行常量折叠，不会导致retracing
-                actor_inputs = [obs]
-                if self.use_fr_feature_flag:  # 🔧 编译时常量，XLA友好（常量折叠）
-                    actor_inputs.append(fr_batch_safe)
-                if self.use_pf_feature_flag:  # 🔧 编译时常量，XLA友好（常量折叠）
-                    # 🔧 方案A：使用重新计算的PF力（基于当前状态），而不是零向量占位符
-                    # 从重新计算的PF力中提取当前智能体的PF力
-                    agent_pf_force = pf_forces_recomputed[i]  # (batch, 3)
-                    # 如果pf_feature_dim是3，直接使用；否则需要调整
-                    if self.pf_feature_dim == 3:
-                        actor_inputs.append(agent_pf_force)
-                    else:
-                        # 如果pf_feature_dim不是3，需要调整维度
-                        pf_batch = tf.pad(agent_pf_force, [[0, 0], [0, self.pf_feature_dim - 3]]) if self.pf_feature_dim > 3 else agent_pf_force[:, :self.pf_feature_dim]
-                        actor_inputs.append(pf_batch)
-                
-                # 调用Actor网络
-                if len(actor_inputs) == 1:
-                    new_action = agent['actor'](actor_inputs[0], training=True)
-                else:
-                    new_action = agent['actor'](actor_inputs, training=True)
-                new_action = tf.cast(new_action, tf.float32)
-                
-                # 🚨🚨🚨 梯度分离策略（融合方案1+2）：
-                # 
-                # 核心思想：
-                #   - 前3维（xyz加速度）：学习"修正后的动作是好的"
-                #     → 梯度来自修正后的动作评估 Q(s, xyz_corrected)
-                #     → 使用stop_gradient阻止梯度回传到后4维
-                #   
-                #   - 后4维（势场参数）：学习"如何优化势场来辅助决策"
-                #     → 梯度来自修正后的动作评估 Q(s, xyz_corrected)
-                #     → 使用stop_gradient阻止梯度回传到前3维
-                # 
-                # 优势：
-                #   1. 前3维和后4维都学习修正后的动作（目标与执行匹配）
-                #   2. 通过stop_gradient实现梯度隔离，两个学习目标独立
-                #   3. 训练目标与实际执行完全一致
-                
-                # 🔧 XLA友好：使用裁剪替代 is_finite
-                new_action_safe = tf.clip_by_value(new_action, -10.0, 10.0)
-                
-                # ========== 梯度分离策略（原始方案）：前3维使用原始动作，后4维使用修正后动作 ==========
-                na_tail = new_action[:, 3:]
-                na_tail_safe = tf.clip_by_value(na_tail, -10.0, 10.0)
-                
-                # 🔧 传统APF模式：为路径2准备带stop_gradient的na_tail
-                na_tail_stopped = tf.stop_gradient(na_tail_safe)  # 传统APF：阻止梯度
-                pf_mask = tf.reshape(self.c_pf_params_fixed, [1, 1])  # [1, 1] for broadcasting
-                na_tail_for_corrected = pf_mask * na_tail_stopped + (1.0 - pf_mask) * na_tail_safe
-                
-                # ========== 路径1：前3维学习原始动作（不经过势场修正） ==========
-                # 🚨 关键：前3维学习原始动作，不依赖势场修正，让Actor学会直接输出安全动作
-                # 🔧 关键修复：对后4维使用stop_gradient，确保只有前3维收到梯度
-                na_tail_for_head = tf.stop_gradient(na_tail_safe)  # 后4维阻止梯度回传
-                
-                # 训练与回放统一使用归一化动作[-1,1]
-                raw_na_head = new_action_safe[:, :3]
-                raw_action_mapped = tf.concat([raw_na_head, na_tail_for_head], axis=1)
-                
-                # 构建全局动作（原始动作，用于前3维学习）
-                # 🚨 关键修复：使用 global_actions_raw_all（原始动作），而不是 global_actions（修正后动作）
-                pieces_raw = []
-                start = 0
-                for j, dim in enumerate(self.action_dims):
-                    if j == i:
-                        pieces_raw.append(raw_action_mapped)
-                    else:
-                        # 🚨 关键修复：如果传入了原始动作的全局动作，使用它；否则回退到修正后动作
-                        if global_actions_raw_all is not None:
-                            pieces_raw.append(tf.cast(global_actions_raw_all[:, start:start+dim], tf.float32))
-                        else:
-                            pieces_raw.append(tf.cast(global_actions[:, start:start+dim], tf.float32))
-                    start += dim
-                global_actions_raw = tf.concat(pieces_raw, axis=1)
-                
-                # 评估原始动作的Q值（前3维的学习目标）
-                # 🔧 新架构：使用Q1（评估前3维动作的Q值）
-                actor_inputs_raw = [global_state, global_actions_raw]
-                if self.use_fr_feature_flag:
-                    actor_inputs_raw.append(fr_batch_safe)
-                if self.use_pf_feature_flag:
-                    actor_inputs_raw.append(pf_batch_flat)
-                # 🚨 标准MATD3：Actor损失使用Twin Critic的min(Q1)（评估前3维原始动作，用于梯度分离）
-                # 从两个独立的Critic网络获取Q1值，然后取min以减少过估计偏差
-                actor_q_output_raw_1 = agent['critic1'](actor_inputs_raw, training=False)
-                actor_q_output_raw_2 = agent['critic2'](actor_inputs_raw, training=False)
-                if isinstance(actor_q_output_raw_1, (list, tuple)) and isinstance(actor_q_output_raw_2, (list, tuple)):
-                    actor_q1_raw_1, _ = actor_q_output_raw_1
-                    actor_q1_raw_2, _ = actor_q_output_raw_2
-                    actor_q1_raw_1 = tf.cast(actor_q1_raw_1, tf.float32)
-                    actor_q1_raw_2 = tf.cast(actor_q1_raw_2, tf.float32)
-                    actor_q_raw = tf.minimum(actor_q1_raw_1, actor_q1_raw_2)  # Twin Critic的min(Q1)
-                elif isinstance(actor_q_output_raw_1, (list, tuple)):
-                    actor_q1_raw_1, _ = actor_q_output_raw_1
-                    actor_q_raw = tf.cast(actor_q1_raw_1, tf.float32)
-                elif isinstance(actor_q_output_raw_2, (list, tuple)):
-                    actor_q1_raw_2, _ = actor_q_output_raw_2
-                    actor_q_raw = tf.cast(actor_q1_raw_2, tf.float32)
-                else:
-                    actor_q_raw = tf.minimum(
-                        tf.cast(actor_q_output_raw_1, tf.float32),
-                        tf.cast(actor_q_output_raw_2, tf.float32)
+        # === 统一训练所有 Actor（仅在延迟更新步进入）===
+        # 原先这里为避免图内 tf.cond/Optional 问题，选择“每步都算完，再把梯度乘 0”。
+        # 这在分离梯度路径里成本过高，因为 Actor 分支本身还会触发额外的 Critic 评估。
+        # 正确修复是：在 Python 侧使用 should_update_actor_bool，让 tf.function 只保留两张稳定图
+        # （更新 Actor / 不更新 Actor），从而彻底跳过非延迟步的 Actor 分支，而不重新引入图内条件控制流。
+        if should_update_actor:
+            with tf.GradientTape(persistent=True) as tape_a:
+                total_actor_loss = tf.constant(0.0, dtype=tf.float32)
+                actor_losses = []
+                current_force_ratio_actor = fr_batch_safe
+                actor_use_pf = self.use_tf_potential_field_cached and tf.reduce_any(
+                    tf.greater(current_force_ratio_actor, 0.0)
+                )
+                actor_has_shared_pf_context = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
+                actor_uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1 and self.action_dims[0] >= 3
+                actor_pf_context_by_agent = None
+                actor_pf_context_flat = ()
+                actor_pf_geometry_context_flat = ()
+                if actor_has_shared_pf_context:
+                    correct_obs_dim_actor = self.obs_shapes[0]
+                    actor_obs_agent_major = tf.transpose(
+                        obs_n[:, :, :correct_obs_dim_actor],
+                        perm=[1, 0, 2],
                     )
-                
-                # ========== 路径2：后4维学习修正后的动作（对前3维使用stop_gradient） ==========
-                # 🔧 关键：对前3维使用stop_gradient，只让后4维的梯度经过势场修正
-                # 🔧 关键修复：使用历史FR值（fr_batch_safe），确保训练-执行一致性
-                # 原因：如果FR值随时间变化（schedule），使用当前FR值会导致训练目标与实际执行不一致
-                current_force_ratio = fr_batch_safe  # 使用历史FR值（逐样本），而不是当前FR值
-                # 检查是否有正FR值（用于判断是否需要应用势场修正）
-                fr_positive_check = tf.reduce_any(tf.greater(current_force_ratio, 0.0))
-                use_pf = self.use_tf_potential_field_cached and fr_positive_check
-                
-                xyz_for_tail = tf.stop_gradient(new_action_safe[:, :3])  # 前3维阻止梯度回传
-                # 🔧 传统APF模式修复：如果势场参数固定（pf_params_fixed=1.0），则对后4维也使用stop_gradient
-                # 因为传统APF模式下，势场参数是固定的（delta=0），无法学习，所以梯度应该被阻止
-                pf_params_for_tail = na_tail_for_corrected  # 传统APF模式下会使用stop_gradient，可学习模式下使用可导版本
-                action_for_tail = tf.concat([xyz_for_tail, pf_params_for_tail], axis=1)
-                
-                if use_pf:
-                    # 势场修正（梯度只能从corrected_head回传到pf_params，不能到xyz）
-                    corrected_head_flat_tail, _ = self._apply_potential_field_correction(
-                        action_for_tail,  # [batch_size, 7]
-                        obs,  # [batch_size, obs_dim]
-                        current_force_ratio
+                    flat_actor_obs = tf.ensure_shape(
+                        tf.reshape(actor_obs_agent_major, [-1, correct_obs_dim_actor]),
+                        [None, correct_obs_dim_actor],
                     )
-                    corrected_head_for_tail = corrected_head_flat_tail  # 已经是[batch_size, 3]
-                else:
-                    corrected_head_for_tail = xyz_for_tail  # 不修正时，仍然使用stop_gradient的版本
-                
-                # 训练与回放统一使用归一化动作[-1,1]
-                corrected_head_norm_tail = corrected_head_for_tail
-                # 🔧 路径2：使用可导的pf_params_for_tail，让后4维能够学习
-                # 注意：这里必须使用pf_params_for_tail（可导），而不是na_tail_for_corrected（可能被stop_gradient）
-                corrected_action_mapped_tail = tf.concat([corrected_head_norm_tail, pf_params_for_tail], axis=1)
-                
-                # 构建全局动作（修正后，用于后4维学习）
-                # 🔧 关键修复：Path2构建global_actions_mixed时，其他智能体永远取global_actions_mixed_all
-                # 禁止global_actions_raw_all is None时fallback到mixed
-                pieces_corrected_tail = []
-                start = 0
-                for j, dim in enumerate(self.action_dims):
-                    if j == i:
-                        pieces_corrected_tail.append(corrected_action_mapped_tail)
-                    else:
-                        # 🚨 关键修复：如果传入了修正后动作的全局动作缓存，使用它；否则报错（禁止fallback）
-                        if global_actions_mixed_all is not None:
-                            pieces_corrected_tail.append(tf.cast(global_actions_mixed_all[:, start:start+dim], tf.float32))
-                        else:
-                            # 禁止fallback，必须提供global_actions_mixed_all
-                            raise ValueError("Path2构建global_actions_mixed时，必须提供global_actions_mixed_all，禁止fallback到mixed")
-                    start += dim
-                global_actions_corrected_tail = tf.concat(pieces_corrected_tail, axis=1)
-                
-                # 评估修正后动作的Q值（后4维的学习目标）
-                # 🔧 新架构：使用Q2（评估后4维PF参数的Q值）
-                actor_inputs_corrected = [global_state, global_actions_corrected_tail]
-                if self.use_fr_feature_flag:
-                    actor_inputs_corrected.append(fr_batch_safe)
-                if self.use_pf_feature_flag:
-                    actor_inputs_corrected.append(pf_batch_flat)
-                # 🚨 标准MATD3：使用Twin Critic的min(Q2)（评估后4维修正后动作，用于梯度分离）
-                # 从两个独立的Critic网络获取Q2值，然后取min以减少过估计偏差
-                actor_q_output_corrected_1 = agent['critic1'](actor_inputs_corrected, training=False)
-                actor_q_output_corrected_2 = agent['critic2'](actor_inputs_corrected, training=False)
-                if isinstance(actor_q_output_corrected_1, (list, tuple)) and isinstance(actor_q_output_corrected_2, (list, tuple)):
-                    _, actor_q2_corrected_1 = actor_q_output_corrected_1
-                    _, actor_q2_corrected_2 = actor_q_output_corrected_2
-                    actor_q2_corrected_1 = tf.cast(actor_q2_corrected_1, tf.float32)
-                    actor_q2_corrected_2 = tf.cast(actor_q2_corrected_2, tf.float32)
-                    actor_q_corrected_tail = tf.minimum(actor_q2_corrected_1, actor_q2_corrected_2)  # Twin Critic的min(Q2)
-                elif isinstance(actor_q_output_corrected_1, (list, tuple)):
-                    _, actor_q2_corrected_1 = actor_q_output_corrected_1
-                    actor_q_corrected_tail = tf.cast(actor_q2_corrected_1, tf.float32)
-                elif isinstance(actor_q_output_corrected_2, (list, tuple)):
-                    _, actor_q2_corrected_2 = actor_q_output_corrected_2
-                    actor_q_corrected_tail = tf.cast(actor_q2_corrected_2, tf.float32)
-                else:
-                    actor_q_corrected_tail = tf.minimum(
-                        tf.cast(actor_q_output_corrected_1, tf.float32),
-                        tf.cast(actor_q_output_corrected_2, tf.float32)
+                    actor_pf_context_flat = self._extract_pf_obs_context_compiled_tf(flat_actor_obs)
+                    actor_pf_geometry_context_flat = self._extract_pf_geometry_context_compiled_tf(
+                        actor_pf_context_flat[1],
+                        actor_pf_context_flat[2],
+                        actor_pf_context_flat[4],
+                        actor_pf_context_flat[5],
+                        actor_pf_context_flat[6],
                     )
-                
-                # ========== 梯度分离策略（原始方案）：前3维使用原始Q值，后4维使用修正后Q值 ==========
-                # 🚨 关键：两个路径使用不同的Q值，通过stop_gradient实现梯度隔离
-                # 
-                # 路径1（前3维）：
-                #   - 使用 actor_q_raw（原始动作的Q值）
-                #   - 学习目标：让Actor学会直接输出安全动作，不依赖势场修正
-                # 
-                # 路径2（后4维）：
-                #   - 使用 actor_q_corrected_tail（修正后动作的Q值）
-                #   - 前3维使用stop_gradient，梯度只影响后4维
-                #   - 学习目标：优化势场参数，使其能更好地辅助决策
-                # 
-                # 优势：
-                #   1. 前3维学习安全动作（不依赖势场）
-                #   2. 后4维学习最优势场（利用可导性）
-                #   3. 两个学习目标独立，互不干扰
-                
-                q_clip = self.c_q_clip
-                
-                # 前3维的loss（使用原始动作的Q值）
-                actor_q_raw_clipped = tf.clip_by_value(actor_q_raw, -q_clip, q_clip)
-                _sum_q_raw = tf.reduce_sum(actor_q_raw_clipped)
-                _cnt_q_raw = tf.cast(tf.size(actor_q_raw_clipped), tf.float32)
-                loss_head = -(_sum_q_raw / tf.maximum(_cnt_q_raw, 1.0))
-                
-                # 后4维的loss（使用修正后的Q值，但梯度只影响后4维）
-                actor_q_corrected_tail_clipped = tf.clip_by_value(actor_q_corrected_tail, -q_clip, q_clip)
-                _sum_q_corrected_tail = tf.reduce_sum(actor_q_corrected_tail_clipped)
-                _cnt_q_corrected_tail = tf.cast(tf.size(actor_q_corrected_tail_clipped), tf.float32)
-                loss_tail = -(_sum_q_corrected_tail / tf.maximum(_cnt_q_corrected_tail, 1.0))
-                
-                # 🔧 关键：梯度分离机制
-                # 路径1（loss_head）：
-                #   - 使用原始动作 [raw_xyz, stop_gradient(na_tail)]
-                #   - 梯度流向：loss_head → Q_raw → raw_xyz → Actor前3维输出 ✅
-                #   - 梯度不会回传到后4维（因为na_tail_for_head使用了stop_gradient）✅
-                # 
-                # 路径2（loss_tail）：
-                #   - 使用修正后动作 [stop_gradient(xyz), pf_params]
-                #   - 梯度流向：loss_tail → Q_corrected → corrected_xyz → pf_params → Actor后4维输出 ✅
-                #   - 梯度不会回传到前3维（因为xyz_for_tail使用了stop_gradient）✅
-                # 
-                # 所以我们可以安全地组合两个loss，梯度会自动分离
-                # 
-                # 🚨 关键修复：根据Force Ratio动态调整loss权重，使学习目标与实际执行匹配
-                # 问题：如果FR很高（0.95），实际执行的动作主要是势场动作（95%），网络动作只有5%
-                # 但前3维的loss权重是1.0，后4维只有0.1，导致前3维的学习是浪费的
-                # 解决方案：根据FR动态调整权重，使学习目标与实际执行比例匹配
-                # 
-                # 公式：
-                #   - head_weight = 1.0 - FR  （网络动作的实际使用比例）
-                #   - tail_weight = FR        （势场动作的实际使用比例）
-                # 
-                # 例如：
-                #   - FR=0.95 → head_weight=0.05, tail_weight=0.95（匹配实际执行：5%网络+95%势场）
-                #   - FR=0.50 → head_weight=0.50, tail_weight=0.50（匹配实际执行：50%网络+50%势场）
-                #   - FR=0.20 → head_weight=0.80, tail_weight=0.20（匹配实际执行：80%网络+20%势场）
-                # 
-                # 这样，学习目标与实际执行完全匹配，避免前3维在FR高时浪费学习资源
-                # 🔧 添加最小权重（0.1）确保两个loss都有一定影响，避免完全忽略某一维
-                head_weight_base = 1.0 - current_force_ratio  # 网络动作的实际使用比例
-                tail_weight_base = current_force_ratio       # 势场动作的实际使用比例
-                
-                # 🚨 传统APF模式特殊处理：如果势场参数固定（pf_params_fixed=1.0），则调整权重
-                # 在传统APF模式下，后4维参数固定无法学习，所以应该让前3维有更大的学习权重
-                # 即使前3维在实际执行时被忽略（FR=1.0），也应该让网络学习，作为"建议"或"参考"
-                pf_params_fixed = self.c_pf_params_fixed  # 1.0表示传统APF模式，0.0表示可学习模式
-                # 如果传统APF模式且FR=1.0，则增加前3维的学习权重（从0.1增加到0.5）
-                traditional_apf_adjustment = pf_params_fixed * tf.cast(0.4, tf.float32)  # 额外增加0.4的权重
-                head_weight_base = head_weight_base + traditional_apf_adjustment
-                
-                # 归一化到总和为1.0，并添加最小权重
+                actor_agent_fairness_weights = []
+                actor_agents_list = []
+                actor_action_dims = []
+                actor_obs_list = []
+                actor_new_action_safe_list = []
+                actor_inputs_raw_list = []
+                actor_xyz_for_tail_list = []
+                actor_pf_params_for_tail_list = []
+                actor_action_for_tail_list = []
+                actor_arc_eff_list = []
+                pf_mask = tf.reshape(self.c_pf_params_fixed, [1, 1])
+                base_actions_raw_f32 = (
+                    tf.cast(global_actions_raw_all, tf.float32)
+                    if global_actions_raw_all is not None else tf.cast(global_actions, tf.float32)
+                )
+                if global_actions_corrected_all is None:
+                    raise ValueError("Path2构建时，必须提供global_actions_corrected_all")
+                base_actions_corrected_f32 = tf.cast(global_actions_corrected_all, tf.float32)
+                pf_params_fixed = self.c_pf_params_fixed
+                traditional_apf_adjustment = pf_params_fixed * tf.cast(0.4, tf.float32)
+                head_weight_base = (tf.cast(1.0, tf.float32) - current_force_ratio_actor) + traditional_apf_adjustment
+                tail_weight_base = current_force_ratio_actor
                 min_weight = tf.cast(0.1, tf.float32)
                 head_weight = tf.maximum(head_weight_base, min_weight)
                 tail_weight = tf.maximum(tail_weight_base, min_weight)
-                # 归一化
                 weight_sum = head_weight + tail_weight
                 head_weight = head_weight / weight_sum
                 tail_weight = tail_weight / weight_sum
-                
-                actor_loss_pg = head_weight * loss_head + tail_weight * loss_tail
-                
-                # 🚨 关键修复：确保Q值梯度能够主导学习方向
-                # 问题：如果正则化太强，会压制Q值梯度，导致陷入边界饱和的智能体无法跳出局部最优
-                # 解决方案：对正则化进行动态调整，当Q值梯度很弱时，降低正则化强度
-                # 计算Q值梯度的相对强度（通过loss_head的绝对值来估计）
-                q_gradient_strength = tf.abs(loss_head)
-                # 如果Q值梯度很弱（loss_head接近0），降低正则化强度
-                reg_scale = tf.where(
-                    q_gradient_strength < tf.cast(0.1, q_gradient_strength.dtype),
-                    tf.cast(0.5, q_gradient_strength.dtype),  # Q值梯度弱时，正则化减半
-                    tf.cast(1.0, q_gradient_strength.dtype)   # Q值梯度正常时，使用正常正则化
-                )
-                
-                # 危险区暂降正则
-                _arc = tf.cast(self.action_reg_coef_cached, tf.float32)  # 🔧 XLA修复：使用缓存的常量
-                # 🔧 移除 try-except（在tf.function中会生成tf.cond），改用纯TensorFlow操作
-                # 计算动态正则系数（基于智能体离地高度的危险程度）
-                norm_pos = tf.cast(obs[:, :3], tf.float32)
-                map_half_tf = tf.cast(self.c_map_size * 0.5, tf.float32)
-                pos_for_clear = (norm_pos + tf.cast(1.0, norm_pos.dtype)) * map_half_tf
                 terrain_start_idx = 9
-                # 🔧 修复：地形信息索引1是当前地形高度（索引0是相对高度）
-                current_height = tf.cast(obs[:, terrain_start_idx + 1:terrain_start_idx + 2], tf.float32) * 100.0
-                r_min = pos_for_clear[:, 2:3] - current_height
-                # 🔧 XLA友好：使用裁剪确保数值稳定
-                r_min_safe = tf.clip_by_value(r_min, -100.0, 100.0)
-                danger = tf.clip_by_value((tf.cast(3.0, tf.float32) - r_min_safe) / tf.cast(3.0, tf.float32), 0.0, 1.0)
-                arc_eff = _arc * (tf.cast(1.0, tf.float32) - tf.cast(0.7, tf.float32) * tf.reduce_mean(danger))
-                # 🔧 XLA友好：裁剪 arc_eff 到合理范围
-                arc_eff = tf.clip_by_value(arc_eff, 0.01, 10.0)
-                # 🔧 修复边界饱和：使用边界惩罚而非简单的L2正则
-                new_action_safe = tf.clip_by_value(new_action, -10.0, 10.0)
-                action_head = new_action_safe[:, :3]
-                action_tail = new_action_safe[:, 3:]
-                
-                # 🚨 彻底修复：用Smooth L1替代exp，避免梯度爆炸
-                # 🔧 放宽前三维正则化：提高阈值，降低惩罚强度，允许更大的动作范围
-                head_abs = tf.abs(action_head)
-                threshold = tf.cast(0.95, head_abs.dtype)  # 🔧 放宽：从0.85提高到0.95，允许更大的动作值
-                boundary_excess = tf.maximum(head_abs - threshold, tf.cast(0.0, head_abs.dtype))
-                smooth_l1_penalty = tf.where(
-                    boundary_excess < tf.cast(0.1, boundary_excess.dtype),
-                    tf.cast(0.5, boundary_excess.dtype) * tf.square(boundary_excess),
-                    tf.cast(0.1, boundary_excess.dtype) * boundary_excess - tf.cast(0.005, boundary_excess.dtype)
-                )
-                head_boundary_penalty = tf.reduce_mean(smooth_l1_penalty)
-                head_l2 = tf.reduce_mean(tf.square(action_head))
-                
-                # 🚨 关键修复：添加对所有负值动作的惩罚，防止动作负向拉满
-                # 问题：某些智能体的ax、ay、az输出一直保持在-1.0，导致智能体无法正常导航
-                # 解决方案：对所有负值动作进行额外惩罚，鼓励输出正值或接近0
-                # 但惩罚要适度，不能完全压制Q值梯度
-                # 🔧 放宽：降低负值惩罚强度，允许更大的负值动作范围
-                neg_action_mask = action_head < tf.cast(0.0, action_head.dtype)  # 所有负值的掩码
-                neg_action_penalty = tf.reduce_mean(tf.where(
-                    neg_action_mask,
-                    tf.square(action_head) * tf.cast(0.3, action_head.dtype),  # 🔧 放宽：从0.8降低到0.3，允许更大的负值动作
-                    tf.zeros_like(action_head)
-                ))
-                
-                # 🔧 放宽前三维度正则化强度：边界惩罚系数从2.0降低到0.5，并降低负值惩罚
-                # 关键：不能完全压制Q值梯度，需要让Q值梯度能够主导学习方向，允许更大的动作范围
-                head_reg = head_l2 + tf.cast(0.5, head_l2.dtype) * head_boundary_penalty + neg_action_penalty
-                
-                # 🔧 修复势场参数饱和：使用更温和的边界惩罚，避免参数被推到边界（MADDPG train_step_optimized版本）
-                # 问题：之前的边界惩罚太强（exp(5.0 * (|x| - 0.7))），导致参数被推到边界
-                # 解决方案：使用更温和的惩罚，并添加对边界值的额外惩罚
-                tail_abs = tf.abs(action_tail)
-                # 🔧 修复：降低边界惩罚强度，使用更温和的sigmoid惩罚
-                # 当|action|接近1.0时，惩罚会平滑增加，但不会像exp那样爆炸
-                boundary_distance = tf.cast(1.0, tail_abs.dtype) - tail_abs  # 距离边界的距离（0到1之间）
-                # 使用sigmoid惩罚：当|action| > 0.8时开始显著惩罚，接近1.0时惩罚最大
-                boundary_penalty_smooth = tf.sigmoid((tail_abs - tf.cast(0.8, tail_abs.dtype)) * tf.cast(10.0, tail_abs.dtype))  # 范围[0, 1]
-                # 🔧 添加对边界值的额外惩罚：当|action| > 0.95时，额外惩罚
-                extreme_boundary_mask = tail_abs > tf.cast(0.95, tail_abs.dtype)
-                extreme_penalty = tf.where(extreme_boundary_mask, tf.cast(5.0, tail_abs.dtype) * (tail_abs - tf.cast(0.95, tail_abs.dtype)), tf.cast(0.0, tail_abs.dtype))
-                tail_boundary_penalty = tf.reduce_mean(boundary_penalty_smooth + extreme_penalty)
-                
-                tail_sq = tf.square(action_tail)
-                tail_sum = tf.reduce_sum(tail_sq)
-                tail_count = tf.cast(tf.size(tail_sq), tail_sq.dtype)
-                tail_mean = tf.where(tail_count > 0.0, tail_sum / tf.maximum(tail_count, 1.0), tf.cast(0.0, tail_sq.dtype))
-                
-                # 🚨 关键修复：大幅降低PF参数的L1惩罚权重
-                # 问题：之前权重2.0太高，当delta范围小时，L1惩罚主导了梯度方向
-                # 解决方案：降低到0.1，让Q值梯度能够主导学习方向
-                pf_params_penalty = tf.reduce_mean(tf.abs(action_tail)) * tf.cast(0.1, action_tail.dtype)
-                
-                # 🔧 修复：适度增大尾部正则化权重，防止势场参数饱和
-                # 之前：tail_reg = 0.3 * L2 + 0.5 * boundary + L1  ≈ 适度的正则化
-                # 现在：tail_reg = 0.4 * L2 + 0.6 * boundary + L1  ≈ 适度增强的正则化（降低强度）
-                tail_reg = tf.cast(0.4, tail_mean.dtype) * tail_mean + tf.cast(0.6, tail_mean.dtype) * tail_boundary_penalty + pf_params_penalty
-                
-                # 🔧 适度增大整体正则化系数：从1.0倍提高到1.2倍（降低强度）
-                # 关键：正则化不能完全压制Q值梯度，需要让Q值梯度能够主导学习方向
-                # 对于已经陷入边界饱和的智能体，需要Q值梯度来帮助它跳出局部最优
-                # 应用动态正则化缩放：当Q值梯度弱时，降低正则化强度
-                action_reg = (head_reg + tail_reg) * tf.cast(arc_eff, new_action_safe.dtype) * tf.cast(1.2, arc_eff.dtype) * reg_scale
-                # 🔧 XLA友好：使用裁剪替代 is_finite
-                action_reg = tf.clip_by_value(action_reg, -1e6, 1e6)
-                actor_loss = actor_loss_pg + tf.cast(action_reg, tf.float32)
-                # 🔧 XLA友好：使用裁剪替代 is_finite
-                actor_loss = tf.clip_by_value(actor_loss, -1e6, 1e6)
-                actor_losses.append(actor_loss)
-                total_actor_loss += tf.cast(actor_loss, tf.float32)
-        # 计算并应用所有 Actor 梯度（用 should_update_actor 将梯度置零以避免条件分支）
-        should_update_actor_f = tf.cast(should_update_actor, tf.float32)
-        all_actor_vars = []
-        per_agent_actor_slices = []
-        start = 0
-        for i in range(self.n_agents):
-            v = self.agents[i]['actor'].trainable_variables
-            all_actor_vars.extend(v)
-            per_agent_actor_slices.append((start, start + len(v)))
-            start += len(v)
-        actor_grads = tape_a.gradient(total_actor_loss, all_actor_vars)
-        for i in range(self.n_agents):
-            s, e = per_agent_actor_slices[i]
-            agent_vars = self.agents[i]['actor'].trainable_variables
-            agent_grads = [g for g in actor_grads[s:e] if g is not None]
-            # 确保梯度数量与变量数量匹配（过滤掉None梯度）
-            if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
-                # 🚨 修复Critic发散：增强梯度裁剪（两级裁剪策略）
-                # 级别1：逐层梯度裁剪（per-layer clipping）
-                grads_i = [tf.clip_by_norm(g, 1.0) for g in agent_grads]
-                # 级别2：全局梯度裁剪（global norm clipping）
-                gi, _ = tf.clip_by_global_norm(grads_i, tf.cast(self.c_grad_clip_norm, tf.float32))
-                gi = [g * should_update_actor_f for g in gi]
-                # 检查梯度有限性并应用
-                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in gi]
-                if tf.reduce_all(tf.stack(grads_finite)):
-                    # 🔧 XLA修复：使用pairs列表形式，与预热优化器保持一致
-                    # 在XLA模式下，优化器无法识别从zip得到的变量对象，需要使用pairs列表
-                    pairs = [(g, v) for g, v in zip(gi, agent_vars) if g is not None]
-                    if pairs:
-                        self.agents[i]['actor_optimizer'].apply_gradients(pairs)
-        del tape_a
+                map_half_tf = tf.cast(self.c_map_size * 0.5, tf.float32)
+                _arc = tf.cast(self.action_reg_coef_cached, tf.float32)
+                for i in range(self.n_agents):
+                    agent_fairness_weight = tf.gather(fairness_weights, i)
+                    obs = tf.cast(obs_n[:, i, :self.obs_shapes[i]], tf.float32)
+                    agent = self.agents[i]
+                    agent_action_dim = int(self.action_dims[i])
+
+                    actor_inputs = [obs]
+                    if self.use_fr_feature_flag:
+                        actor_inputs.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        if pf_forces_recomputed is not None:
+                            agent_pf_force = pf_forces_recomputed[i]
+                        else:
+                            pf_start = i * pf_feat_dim
+                            agent_pf_force = current_pf_batch_flat[:, pf_start:pf_start + pf_feat_dim]
+                        actor_inputs.append(agent_pf_force)
+
+                    if len(actor_inputs) == 1:
+                        new_action = agent['actor'](actor_inputs[0], training=True)
+                    else:
+                        new_action = agent['actor'](actor_inputs, training=True)
+                    new_action = tf.cast(new_action, tf.float32)
+                    new_action_safe = tf.clip_by_value(new_action, -10.0, 10.0)
+                    try:
+                        new_action_safe = tf.ensure_shape(new_action_safe, [None, agent_action_dim])
+                    except Exception:
+                        pass
+
+                    na_tail = new_action_safe[:, 3:agent_action_dim]
+                    na_tail_safe = tf.clip_by_value(na_tail, -10.0, 10.0)
+                    na_tail_stopped = tf.stop_gradient(na_tail_safe)
+                    na_tail_for_corrected = pf_mask * na_tail_stopped + (1.0 - pf_mask) * na_tail_safe
+                    na_tail_for_head = tf.stop_gradient(na_tail_safe)
+
+                    raw_na_head = new_action_safe[:, :3]
+                    raw_action_mapped = self._merge_action_head_tail_static(raw_na_head, na_tail_for_head, agent_action_dim)
+                    global_actions_raw = self._replace_agent_action_slice_static(base_actions_raw_f32, raw_action_mapped, i)
+
+                    actor_inputs_raw = [global_state, global_actions_raw]
+                    if self.use_fr_feature_flag:
+                        actor_inputs_raw.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        actor_inputs_raw.append(current_pf_batch_flat)
+
+                    xyz_for_tail = tf.stop_gradient(new_action_safe[:, :3])
+                    pf_params_for_tail = na_tail_for_corrected
+                    action_for_tail = self._merge_action_head_tail_static(xyz_for_tail, pf_params_for_tail, agent_action_dim)
+                    norm_pos = tf.cast(obs[:, :3], tf.float32)
+                    pos_for_clear = (norm_pos + tf.cast(1.0, norm_pos.dtype)) * map_half_tf
+                    current_height = tf.cast(obs[:, terrain_start_idx + 1:terrain_start_idx + 2], tf.float32) * 100.0
+                    r_min = pos_for_clear[:, 2:3] - current_height
+                    r_min_safe = tf.clip_by_value(r_min, -100.0, 100.0)
+                    danger = tf.clip_by_value((tf.cast(3.0, tf.float32) - r_min_safe) / tf.cast(3.0, tf.float32), 0.0, 1.0)
+                    arc_eff = _arc * (tf.cast(1.0, tf.float32) - tf.cast(0.7, tf.float32) * tf.reduce_mean(danger))
+                    arc_eff = tf.clip_by_value(arc_eff, 0.01, 10.0)
+
+                    actor_agent_fairness_weights.append(agent_fairness_weight)
+                    actor_agents_list.append(agent)
+                    actor_action_dims.append(agent_action_dim)
+                    actor_obs_list.append(obs)
+                    actor_new_action_safe_list.append(new_action_safe)
+                    actor_inputs_raw_list.append(actor_inputs_raw)
+                    actor_xyz_for_tail_list.append(xyz_for_tail)
+                    actor_pf_params_for_tail_list.append(pf_params_for_tail)
+                    actor_action_for_tail_list.append(action_for_tail)
+                    actor_arc_eff_list.append(arc_eff)
+
+                actor_corrected_head_batch = None
+                if actor_has_shared_pf_context and actor_uniform_action_dims and len(actor_action_for_tail_list) == self.n_agents:
+                    shared_act_dim = int(self.action_dims[0])
+                    flat_actor_actions_for_tail = tf.reshape(
+                        tf.stack(actor_action_for_tail_list, axis=0),
+                        [-1, shared_act_dim],
+                    )
+                    flat_actor_force_ratio = tf.tile(current_force_ratio_actor, [self.n_agents, 1])
+                    corrected_head_flat_batch, _ = self._apply_potential_field_correction_from_geometry_context_tf(
+                        flat_actor_actions_for_tail,
+                        flat_actor_force_ratio,
+                        actor_pf_context_flat[3],
+                        actor_pf_geometry_context_flat,
+                    )
+                    actor_corrected_head_batch = tf.reshape(corrected_head_flat_batch, [self.n_agents, -1, 3])
+                elif actor_has_shared_pf_context:
+                    correct_obs_dim_actor = self.obs_shapes[0]
+                    actor_pf_context_by_agent = (
+                        tf.reshape(actor_pf_context_flat[0], [self.n_agents, -1, correct_obs_dim_actor]),
+                        tf.reshape(actor_pf_context_flat[1], [self.n_agents, -1, 3]),
+                        tf.reshape(actor_pf_context_flat[2], [self.n_agents, -1, 3]),
+                        actor_pf_context_flat[3],
+                        tf.reshape(actor_pf_context_flat[4], [self.n_agents, -1, 32]),
+                        tf.reshape(actor_pf_context_flat[5], [self.n_agents, -1, 15]),
+                        tf.reshape(actor_pf_context_flat[6], [self.n_agents, -1, 12]),
+                    )
+
+                for i in range(self.n_agents):
+                    agent_fairness_weight = actor_agent_fairness_weights[i]
+                    obs = actor_obs_list[i]
+                    agent = actor_agents_list[i]
+                    agent_action_dim = actor_action_dims[i]
+                    new_action_safe = actor_new_action_safe_list[i]
+                    actor_inputs_raw = actor_inputs_raw_list[i]
+                    xyz_for_tail = actor_xyz_for_tail_list[i]
+                    pf_params_for_tail = actor_pf_params_for_tail_list[i]
+                    action_for_tail = actor_action_for_tail_list[i]
+
+                    if actor_corrected_head_batch is not None:
+                        corrected_head_for_tail = tf.where(
+                            tf.broadcast_to(actor_use_pf, tf.shape(actor_corrected_head_batch[i])),
+                            actor_corrected_head_batch[i],
+                            xyz_for_tail,
+                        )
+                    else:
+                        if actor_use_pf:
+                            if actor_has_shared_pf_context:
+                                pf_actor_obs_context = (
+                                    actor_pf_context_by_agent[0][i],
+                                    actor_pf_context_by_agent[1][i],
+                                    actor_pf_context_by_agent[2][i],
+                                    actor_pf_context_by_agent[3],
+                                    actor_pf_context_by_agent[4][i],
+                                    actor_pf_context_by_agent[5][i],
+                                    actor_pf_context_by_agent[6][i],
+                                )
+                            else:
+                                pf_actor_obs_context = self._extract_pf_obs_context_compiled_tf(obs)
+                            corrected_head_flat_tail, _ = self._apply_potential_field_correction_from_context_tf(
+                                action_for_tail,
+                                current_force_ratio_actor,
+                                *pf_actor_obs_context
+                            )
+                            corrected_head_for_tail = corrected_head_flat_tail
+                        else:
+                            corrected_head_for_tail = xyz_for_tail
+
+                    corrected_head_norm_tail = corrected_head_for_tail
+                    corrected_action_mapped_tail = self._merge_action_head_tail_static(corrected_head_norm_tail, pf_params_for_tail, agent_action_dim)
+                    global_actions_corrected_tail = self._replace_agent_action_slice_static(base_actions_corrected_f32, corrected_action_mapped_tail, i)
+
+                    actor_inputs_corrected = [global_state, global_actions_corrected_tail]
+                    if self.use_fr_feature_flag:
+                        actor_inputs_corrected.append(fr_batch_safe)
+                    if self.use_pf_feature_flag:
+                        actor_inputs_corrected.append(current_pf_batch_flat)
+                    q_clip = self.c_q_clip
+                    if dual_q_mode:
+                        actor_q1_raw_1, _, _, actor_q2_corrected_1 = self._forward_twin_critic_pair(
+                            agent['critic1'], actor_inputs_raw, actor_inputs_corrected, training=False
+                        )
+                        actor_q1_raw_2, _, _, actor_q2_corrected_2 = self._forward_twin_critic_pair(
+                            agent['critic2'], actor_inputs_raw, actor_inputs_corrected, training=False
+                        )
+                        if separated_actor_mode:
+                            actor_q_raw = tf.minimum(actor_q1_raw_1, actor_q1_raw_2)
+                            actor_q_corrected_tail = tf.minimum(actor_q2_corrected_1, actor_q2_corrected_2)
+
+                            actor_q_raw_clipped = tf.clip_by_value(actor_q_raw, -q_clip, q_clip)
+                            _sum_q_raw = tf.reduce_sum(actor_q_raw_clipped)
+                            _cnt_q_raw = tf.cast(tf.size(actor_q_raw_clipped), tf.float32)
+                            loss_head = -(_sum_q_raw / tf.maximum(_cnt_q_raw, 1.0))
+
+                            actor_q_corrected_tail_clipped = tf.clip_by_value(actor_q_corrected_tail, -q_clip, q_clip)
+                            _sum_q_corrected_tail = tf.reduce_sum(actor_q_corrected_tail_clipped)
+                            _cnt_q_corrected_tail = tf.cast(tf.size(actor_q_corrected_tail_clipped), tf.float32)
+                            loss_tail = -(_sum_q_corrected_tail / tf.maximum(_cnt_q_corrected_tail, 1.0))
+
+                            actor_loss_pg = head_weight * loss_head + tail_weight * loss_tail
+                            q_gradient_strength = tf.abs(loss_head)
+                        else:
+                            actor_qtot_1 = actor_q1_raw_1 + actor_q2_corrected_1
+                            actor_qtot_2 = actor_q1_raw_2 + actor_q2_corrected_2
+                            actor_qtot_1 = tf.where(tf.math.is_finite(actor_qtot_1), actor_qtot_1, tf.zeros_like(actor_qtot_1))
+                            actor_qtot_2 = tf.where(tf.math.is_finite(actor_qtot_2), actor_qtot_2, tf.zeros_like(actor_qtot_2))
+                            actor_q_min = tf.minimum(actor_qtot_1, actor_qtot_2)
+                            actor_q_min = tf.clip_by_value(actor_q_min, -q_clip, q_clip)
+                            actor_q_min = tf.where(tf.math.is_finite(actor_q_min), actor_q_min, tf.zeros_like(actor_q_min))
+                            actor_loss_pg = -tf.reduce_mean(actor_q_min)
+                            q_gradient_strength = tf.abs(actor_loss_pg)
+                    else:
+                        actor_q_out_1 = tf.cast(agent['critic1'](actor_inputs_corrected, training=False), tf.float32)
+                        actor_q_out_2 = tf.cast(agent['critic2'](actor_inputs_corrected, training=False), tf.float32)
+                        actor_q_out_1 = tf.where(tf.math.is_finite(actor_q_out_1), actor_q_out_1, tf.zeros_like(actor_q_out_1))
+                        actor_q_out_2 = tf.where(tf.math.is_finite(actor_q_out_2), actor_q_out_2, tf.zeros_like(actor_q_out_2))
+                        actor_q_min = tf.minimum(actor_q_out_1, actor_q_out_2)
+                        actor_q_min = tf.clip_by_value(actor_q_min, -q_clip, q_clip)
+                        actor_q_min = tf.where(tf.math.is_finite(actor_q_min), actor_q_min, tf.zeros_like(actor_q_min))
+                        actor_loss_pg = -tf.reduce_mean(actor_q_min)
+                        q_gradient_strength = tf.abs(actor_loss_pg)
+
+                    reg_scale = tf.where(
+                        q_gradient_strength < tf.cast(0.1, q_gradient_strength.dtype),
+                        tf.cast(0.5, q_gradient_strength.dtype),
+                        tf.cast(1.0, q_gradient_strength.dtype)
+                    )
+                    arc_eff = actor_arc_eff_list[i]
+
+                    action_head = new_action_safe[:, :3]
+                    action_tail = new_action_safe[:, 3:]
+                    head_abs = tf.abs(action_head)
+                    threshold = tf.cast(0.95, head_abs.dtype)
+                    boundary_excess = tf.maximum(head_abs - threshold, tf.cast(0.0, head_abs.dtype))
+                    smooth_l1_penalty = tf.where(
+                        boundary_excess < tf.cast(0.1, boundary_excess.dtype),
+                        tf.cast(0.5, boundary_excess.dtype) * tf.square(boundary_excess),
+                        tf.cast(0.1, boundary_excess.dtype) * boundary_excess - tf.cast(0.005, boundary_excess.dtype)
+                    )
+                    head_boundary_penalty = tf.reduce_mean(smooth_l1_penalty)
+                    head_l2 = tf.reduce_mean(tf.square(action_head))
+                    neg_action_mask = action_head < tf.cast(0.0, action_head.dtype)
+                    neg_action_penalty = tf.reduce_mean(tf.where(
+                        neg_action_mask,
+                        tf.square(action_head) * tf.cast(0.3, action_head.dtype),
+                        tf.zeros_like(action_head)
+                    ))
+                    head_reg = head_l2 + tf.cast(0.5, head_l2.dtype) * head_boundary_penalty + neg_action_penalty
+
+                    tail_abs = tf.abs(action_tail)
+                    boundary_penalty_smooth = tf.sigmoid((tail_abs - tf.cast(0.8, tail_abs.dtype)) * tf.cast(10.0, tail_abs.dtype))
+                    extreme_boundary_mask = tail_abs > tf.cast(0.95, tail_abs.dtype)
+                    extreme_penalty = tf.where(
+                        extreme_boundary_mask,
+                        tf.cast(5.0, tail_abs.dtype) * (tail_abs - tf.cast(0.95, tail_abs.dtype)),
+                        tf.cast(0.0, tail_abs.dtype)
+                    )
+                    tail_boundary_penalty = tf.reduce_mean(boundary_penalty_smooth + extreme_penalty)
+                    tail_sq = tf.square(action_tail)
+                    tail_sum = tf.reduce_sum(tail_sq)
+                    tail_count = tf.cast(tf.size(tail_sq), tail_sq.dtype)
+                    tail_mean = tf.where(tail_count > 0.0, tail_sum / tf.maximum(tail_count, 1.0), tf.cast(0.0, tail_sq.dtype))
+                    pf_params_penalty = tf.reduce_mean(tf.abs(action_tail)) * tf.cast(0.1, action_tail.dtype)
+                    tail_reg = tf.cast(0.4, tail_mean.dtype) * tail_mean + tf.cast(0.6, tail_mean.dtype) * tail_boundary_penalty + pf_params_penalty
+
+                    action_reg = (head_reg + tail_reg) * tf.cast(arc_eff, new_action_safe.dtype) * tf.cast(1.2, arc_eff.dtype) * reg_scale
+                    action_reg = tf.clip_by_value(action_reg, -1e6, 1e6)
+                    actor_loss = actor_loss_pg + tf.cast(action_reg, tf.float32)
+                    actor_loss = actor_loss * agent_fairness_weight
+                    actor_loss = tf.clip_by_value(actor_loss, -1e6, 1e6)
+                    actor_losses.append(actor_loss)
+                    total_actor_loss += tf.cast(actor_loss, tf.float32)
+
+            all_actor_vars = []
+            per_agent_actor_slices = []
+            start = 0
+            for i in range(self.n_agents):
+                v = self.agents[i]['actor'].trainable_variables
+                all_actor_vars.extend(v)
+                per_agent_actor_slices.append((start, start + len(v)))
+                start += len(v)
+            actor_grads = tape_a.gradient(total_actor_loss, all_actor_vars)
+            for i in range(self.n_agents):
+                s, e = per_agent_actor_slices[i]
+                agent_vars = self.agents[i]['actor'].trainable_variables
+                agent_grads = [g for g in actor_grads[s:e] if g is not None]
+                if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
+                    grads_i = [tf.clip_by_norm(g, 1.0) for g in agent_grads]
+                    gi, _ = tf.clip_by_global_norm(grads_i, tf.cast(self.c_grad_clip_norm, tf.float32))
+                    grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in gi]
+                    if tf.reduce_all(tf.stack(grads_finite)):
+                        pairs = [(g, v) for g, v in zip(gi, agent_vars) if g is not None]
+                        if pairs:
+                            self.agents[i]['actor_optimizer'].apply_gradients(pairs)
+            del tape_a
+            actor_losses_vec = tf.stack(actor_losses) if len(actor_losses) > 0 else tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
+        else:
+            actor_losses_vec = tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
 
         # === 图内软更新目标网络（彻底解决XLA兼容性问题）===
         # 说明：在Graph内直接执行Soft Update，避免Python端循环和assign操作导致的XLA碎片化
@@ -11123,26 +12528,25 @@ class OptimizedMATD3:
             # 更新 Critic 目标网络 (Critic1 & Critic2)
             # 使用 zip 同时遍历变量
             for main_v, target_v in zip(agent['critic1'].variables, agent['target_critic1'].variables):
-                target_v.assign(tau * main_v + (1.0 - tau) * target_v)
+                target_v.assign_add(tau * (main_v - target_v))
             for main_v, target_v in zip(agent['critic2'].variables, agent['target_critic2'].variables):
-                target_v.assign(tau * main_v + (1.0 - tau) * target_v)
+                target_v.assign_add(tau * (main_v - target_v))
                 
             # 更新 Actor 目标网络
             # 🔧 逻辑保持一致：Soft Update频率应与Actor Update频率一致
             # 如果配置了延迟更新，Actor只在特定步数更新，此时也才更新Target Actor
             if should_update_actor:
                 for main_v, target_v in zip(agent['actor'].variables, agent['target_actor'].variables):
-                    target_v.assign(tau * main_v + (1.0 - tau) * target_v)
-
-        actor_losses_vec = tf.stack(actor_losses) if len(actor_losses) > 0 else tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
-        # 🚨 关键修复：未更新时输出NaN而不是0.0，让nanmean正确忽略这些值
-        # 问题：之前输出0.0导致日志显示actor_loss=0.0000（被0拉低）
-        # 解决方案：输出NaN，让nanmean自动忽略非更新步，显示真实的actor_loss
-        actor_losses_vec = tf.where(should_update_actor, actor_losses_vec, tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32)))
+                    target_v.assign_add(tau * (main_v - target_v))
 
         critic_losses_vec = tf.stack(critic_losses) if len(critic_losses) > 0 else tf.fill([self.n_agents], tf.cast(0.0, tf.float32))
-        # 返回 loss 向量和有效样本计数（用于异常检测）
-        return critic_losses_vec, actor_losses_vec, valid_counts
+        # PER复用：归一化每样本TD误差并停止梯度
+        td_err_cnt_safe = tf.maximum(td_err_cnt, tf.ones_like(td_err_cnt))
+        td_err_vec = td_err_sum / td_err_cnt_safe
+        td_err_vec = tf.where(tf.math.is_finite(td_err_vec), td_err_vec, tf.zeros_like(td_err_vec))
+        td_err_vec = tf.stop_gradient(td_err_vec)
+        # 返回 loss 向量、有效样本计数与TD误差
+        return critic_losses_vec, actor_losses_vec, valid_counts, td_err_vec
     
     def _soft_update_targets(self):
         """🚨 标准MATD3：软更新目标网络（包括两个独立的Twin Critic）"""
@@ -11151,15 +12555,15 @@ class OptimizedMATD3:
         for agent in self.agents:
             # 更新目标Actor
             for main_var, target_var in zip(agent['actor'].trainable_variables, agent['target_actor'].trainable_variables):
-                target_var.assign(tau * main_var + (1 - tau) * target_var)
+                target_var.assign_add(tau * (main_var - target_var))
             
             # 🚨 标准MATD3：更新两个独立的目标Critic网络
             # 更新target_critic1
             for main_var, target_var in zip(agent['critic1'].trainable_variables, agent['target_critic1'].trainable_variables):
-                target_var.assign(tau * main_var + (1 - tau) * target_var)
+                target_var.assign_add(tau * (main_var - target_var))
             # 更新target_critic2
             for main_var, target_var in zip(agent['critic2'].trainable_variables, agent['target_critic2'].trainable_variables):
-                target_var.assign(tau * main_var + (1 - tau) * target_var)
+                target_var.assign_add(tau * (main_var - target_var))
     
     # === 势场修正辅助函数（复制自MADDPG，确保MATD3和MADDPG使用相同的势场实现） ===
     
@@ -11205,11 +12609,21 @@ class OptimizedMATD3:
         radius = base_radius + tf.cast(pf_u[:, 3:4], dtype) * delta_radius
         k_att = tf.maximum(k_att, tf.cast(0.1, dtype))
         lambda_1 = tf.maximum(lambda_1, tf.cast(2.0, dtype))
-        k_rep = tf.maximum(k_rep, tf.cast(0.1, dtype))
-        # 🔧 修复：提高radius的最小值限制（从1.0提高到10.0），确保检测范围足够大（MATD3版本）
-        # 问题：当pf_u = -1.0时，radius可能被限制到1.0米，太小无法检测地形
-        # 解决方案：提高最小值到10.0米，确保即使参数在边界，检测范围也足够
-        radius = tf.maximum(radius, tf.cast(10.0, dtype))
+        # 🚨 关键修复：大幅提高k_rep的最小值限制（MATD3版本），确保即使Actor输出负值，斥力也足够强
+        # 问题：从训练图像看，Actor学习到的k_rep参数持续为负，导致斥力不足，智能体持续碰撞
+        # 解决方案：提高最小值到base_k_rep的50%，确保即使pf_u=-1.0，k_rep也有足够大的值
+        # 🚨 紧急修复：大幅提高k_rep最小值限制（MATD3版本），解决训练不收敛问题
+        # 问题：从训练图像看，Actor学习到的k_rep参数持续为负（pf_u=-1.0），导致排斥力不足
+        # 原因：碰撞惩罚过高，网络学习到"降低排斥力以减少动作幅度"的策略
+        # 修复：提高最小值到base_k_rep的50%，确保即使pf_u=-1.0，k_rep也有足够大的值
+        k_rep_min = tf.maximum(base_k_rep * tf.cast(0.5, dtype), tf.cast(500.0, dtype))  # 🚨 提高最小值限制（20%→50%），确保足够排斥力
+        k_rep = tf.maximum(k_rep, k_rep_min)
+        # 🚨 紧急修复：大幅提高radius最小值限制（MATD3版本），解决训练不收敛问题
+        # 问题：从训练图像看，Actor学习到的radius参数持续为负（pf_u=-1.0），导致检测范围过小
+        # 原因：碰撞惩罚过高，网络学习到"降低检测范围以减少计算"的策略
+        # 修复：提高最小值到base_radius的50%，确保即使pf_u=-1.0，radius也有足够大的值
+        radius_min = tf.maximum(base_radius * tf.cast(0.5, dtype), tf.cast(50.0, dtype))  # 🚨 提高最小值限制（30%→50%），确保足够检测范围
+        radius = tf.maximum(radius, radius_min)
         return tf.concat([k_att, lambda_1, k_rep, radius], axis=1)
     
     def _calculate_terrain_forces_sphere_tf(self, agent_pos, goal_pos, k_rep, radius, obs):
@@ -11229,25 +12643,37 @@ class OptimizedMATD3:
         current_height = terrain_info[:, 1:2] * tf.cast(100.0, dtype)  # 🔧 修复：索引1是当前地形高度 (归一化还原：×100.0)
         terrain_gradients = terrain_info[:, 2:6] * tf.cast(10.0, dtype)  # 🔧 修复：索引2-5是地形梯度 (归一化还原：×10.0)
         
-        # 🔧 改进地形距离计算：区分穿透和未穿透情况
+        # 🔧 优化方案3：使用前方最小净空代替当前点净空，提前检测前方地形碰撞（MATD3版本）
         agent_height = agent_pos[:, 2:3]  # 智能体Z坐标
-        height_diff = agent_height - current_height  # 高度差（可能为负，表示穿透）
+        
+        # 当前点净空
+        clear_0 = agent_height - current_height  # (batch, 1) - 高度差（可能为负，表示穿透）
+        
+        # 🚨 关键优化：计算前方8个点的净空，选择最小值（最危险的点）
+        # 从观测中提取前方地形高度
+        forward_terrain_heights = terrain_info[:, 6:14] * tf.cast(100.0, dtype)  # 前方8个点的绝对地形高度
+        forward_terrain_heights_reshaped = tf.reshape(forward_terrain_heights, [-1, 8])  # (batch, 8)
+        clear_f = agent_height - forward_terrain_heights_reshaped  # (batch, 8) - 前方8个点的净空
+        min_clearance_forward = tf.reduce_min(clear_f, axis=1, keepdims=True)  # (batch, 1) - 前方最小净空
+        
+        # 使用当前点和前方最小净空中的较小值（最危险的点）
+        r_min_candidate = tf.minimum(clear_0, min_clearance_forward)  # (batch, 1)
         
         # 区分穿透和未穿透情况
-        penetration_mask = height_diff < tf.cast(0.0, dtype)  # 穿透掩码
+        penetration_mask = r_min_candidate < tf.cast(0.0, dtype)  # 穿透掩码
         safe_mask = tf.logical_not(penetration_mask)  # 安全掩码
         
         # 未穿透情况：使用正常距离计算（最小值为0.1米，防止倒数过大）
-        safe_r_min = tf.maximum(height_diff, tf.cast(0.1, dtype))
+        safe_r_min = tf.maximum(r_min_candidate, tf.cast(0.1, dtype))
         
-        # 🔧 修复：穿透时使用固定的较小r_min值，避免穿透很深时r_min过大导致斥力失效
-        # 问题：当穿透很深时（比如-1000米），penetration_r_min = max(1000*0.1, 0.05) = 100米
-        # 这会导致inv_r_min = 1/100 = 0.01，非常小，地形斥力几乎失效
-        # 解决方案：穿透时始终使用固定的较小r_min值（0.05米），产生最大斥力
+        # 🔧 修复：穿透时使用固定的较小r_min值，产生最大斥力
         penetration_r_min = tf.cast(0.05, dtype)  # 固定为0.05米，产生最大斥力
         
         # 根据掩码选择对应的r_min值
         r_min = tf.where(penetration_mask, penetration_r_min, safe_r_min)
+        
+        # 🔧 修复：保留height_diff用于后续的penetration_sigmoid计算
+        height_diff = r_min_candidate  # 使用最小净空作为高度差
         
         # 计算地形法向量 (基于梯度信息)
         # 🔧 修复：梯度应该是 (h(x+1) - h(x-1))/2 = (dx1 - dx2)/2
@@ -11295,19 +12721,20 @@ class OptimizedMATD3:
             terrain_normal
         )
         
-        # 🚨 关键改进：调整目标距离影响因子κ，让地形斥力在远距离时也保持足够强度（MATD3版本）
-        # 原设计：kappa = exp(-goal_dist / 50.0)，当距离目标很远时（200米），kappa ≈ 0.018，导致地形斥力被大幅削弱
-        # 改进：使用平方根衰减，让远距离时地形斥力更强
-        #   公式：kappa = 1.0 / (1.0 + goal_dist / 50.0)
-        #   距离100米：kappa = 1.0 / (1.0 + 100/50) = 1.0/3.0 ≈ 0.33（比exp衰减的0.135强144%）
-        #   距离200米：kappa = 1.0 / (1.0 + 200/50) = 1.0/5.0 = 0.20（比exp衰减的0.018强11倍）
+        # 🔧 优化方案1B：大幅削弱κ因子的衰减（MATD3版本）
+        # 核心思想：地形碰撞的危险性与距离目标无关！
+        # 
+        # 原设计：kappa = 1.0 / (1.0 + goal_dist / 50.0)
+        #   距离200米：κ = 1.0/5.0 = 0.2（地形斥力被削弱80%）❌
+        # 
+        # 优化后：kappa = 1.0 / (1.0 + goal_dist / 500.0)  # 从50改为500
+        #   距离100米：κ = 1.0/1.2 = 0.83（仅削弱17%）✅
+        #   距离200米：κ = 1.0/1.4 = 0.71（仅削弱29%）✅
         goal_dist = tf.norm(goal_pos - agent_pos, axis=1, keepdims=True)
-        # 使用平方根衰减：1.0 / (1.0 + goal_dist / 50.0)
-        # 这样在远距离时，地形斥力仍然保持足够强度，能够有效阻止贴地飞行
-        kappa_denom = tf.cast(1.0, dtype) + goal_dist / tf.cast(50.0, dtype)
-        kappa = tf.cast(1.0, dtype) / (kappa_denom + tf.cast(1e-6, dtype))  # 防止除以零
-        # 确保kappa在合理范围内[0.1, 1.0]
-        kappa = tf.clip_by_value(kappa, tf.cast(0.1, dtype), tf.cast(1.0, dtype))
+        kappa_denom = tf.cast(1.0, dtype) + goal_dist / tf.cast(500.0, dtype)  # 🔧 从50.0改为500.0
+        kappa = tf.cast(1.0, dtype) / (kappa_denom + tf.cast(1e-6, dtype))
+        # 确保kappa在合理范围内[0.3, 1.0]（下限从0.1提高到0.3）
+        kappa = tf.clip_by_value(kappa, tf.cast(0.3, dtype), tf.cast(1.0, dtype))  # 🔧 下限从0.1提高到0.3
         R_safe = radius
         n = tf.cast(2.0, dtype)
         eps = tf.cast(1e-3, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
@@ -11354,11 +12781,20 @@ class OptimizedMATD3:
         
         repulsion_strength = base_repulsion * penetration_penalty_factor
         
-        # 🔧 修复：使用平滑过渡函数替代硬截断，实现平滑的上限过渡（MATD3版本）
-        # 上限从10.0平滑过渡到50.0：max_repulsion = 10 + 40 * (1 - sigmoid)
-        max_repulsion_base = tf.cast(10.0, dtype)
-        max_repulsion_extra = tf.cast(40.0, dtype)
+        # 🔧 优化方案2：大幅提升穿透时的排斥力上限（MATD3版本）
+        # 原设计：穿透时上限300.0，目标吸引力32.4，比值9.26
+        # 新优化：穿透时上限500.0，目标吸引力32.4，比值15.4 ✅✅✅
+        # 
+        # 上限从100.0平滑过渡到500.0：max_repulsion = 100 + 400 * (1 - sigmoid)
+        max_repulsion_base = tf.cast(100.0, dtype)  # 🔧 未穿透时上限（从40.0提升到100.0，充分利用大k_rep值）
+        max_repulsion_extra = tf.cast(400.0, dtype)  # 🔧 穿透时额外上限（调整为400.0，保持总上限500.0）
         max_repulsion = max_repulsion_base + max_repulsion_extra * (tf.cast(1.0, dtype) - penetration_sigmoid)
+        # 穿透时：max_repulsion ≈ 500.0（压倒性地强于目标吸引力32.4，比值15.4）
+        # 未穿透时：max_repulsion ≈ 100.0（提升2.5倍，充分利用大k_rep值，避免近距离斥力被过度限制）
+        # 
+        # 📊 为什么需要这么大的上限？
+        # 当智能体目标在地形内部时（由于目标Z坐标设置错误），目标吸引力会持续将智能体拖入地形。
+        # 此时需要极强的排斥力（15倍目标吸引力）才能将智能体强制推出地形。
         repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), max_repulsion)
         
         terrain_force = terrain_normal * repulsion_strength
@@ -11387,141 +12823,19 @@ class OptimizedMATD3:
         agent_pos = tf.reshape(agent_pos, [batch_size_dyn, 3])  # 确保 (batch, 3)
         radius = tf.reshape(radius, [batch_size_dyn, 1])  # 确保 (batch, 1)
         
-        # 🚨 修复：obs实际结构（与场景一致）: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境6] = 81维
-        obstacle_start_idx = 9 + 32  # 41：跳过状态9 + 地形32（原来38）
+        # obs结构: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境6] = 81维
+        obstacle_start_idx = 9 + 32  # 41
         obstacle_info = obs[:, obstacle_start_idx:obstacle_start_idx + 15]
-        obstacle_info = tf.reshape(obstacle_info, [batch_size_dyn, 15])  # 确保 (batch, 15)
+        obstacle_info = tf.reshape(obstacle_info, [batch_size_dyn, 15])
         
-        # 🔧 扇区/雷达式编码结构（15维）：
-        # 0-7: 8个水平方向扇区的最近距离（相对于前进方向）
-        # 8-10: 3个垂直层的最近距离（上、中、下）
-        # 11-13: 最近障碍物的方向向量
-        # 14: 最近障碍物的归一化距离
+        # Top-3最近障碍物编码（15维）：3个障碍物 × 5维(相对位置3 + 表面距离1 + 半径1)
+        # 槽位k (k=0,1,2): [k*5:k*5+3]=归一化相对位置, [k*5+3]=归一化表面距离, [k*5+4]=归一化半径
+        # 无障碍物sentinel: (0,0,0,1.0,0) → surface_dist=1.0表示无障碍物
         
-        # 🔧 关键修复：从观测中提取速度信息，计算前进方向（用于重建扇区角度）
-        # 状态信息：位置(0-2) + 速度(3-5) + 加速度(6-8)
-        agent_velocity = obs[:, 3:6]  # (batch, 3) 速度信息（已归一化，需要反归一化）
-        agent_velocity_unnorm = agent_velocity * tf.cast(22.5, dtype)  # 反归一化：max_speed=22.5
-        vel_norm = tf.norm(agent_velocity_unnorm, axis=1, keepdims=True)  # (batch, 1)
-        # 计算前进方向（在XY平面）
-        vel_xy = agent_velocity_unnorm[:, :2]  # (batch, 2) XY平面速度
-        vel_xy_norm = tf.norm(vel_xy, axis=1, keepdims=True)  # (batch, 1)
-        # 前进方向角度（在XY平面）
-        forward_angle_xy = tf.atan2(vel_xy[:, 1:2], vel_xy[:, 0:1])  # (batch, 1)
-        # 如果速度很小，使用目标方向或默认方向
-        vel_threshold = tf.cast(1e-6, dtype)
-        # 从目标信息中提取目标方向（索引56-58是目标方向向量：9+32+15=56）
-        goal_dir = obs[:, 56:59]  # (batch, 3) 目标方向向量
-        goal_dir_xy = goal_dir[:, :2]  # (batch, 2)
-        goal_angle_xy = tf.atan2(goal_dir_xy[:, 1:2], goal_dir_xy[:, 0:1])  # (batch, 1)
-        # 如果速度很小，使用目标方向；如果目标方向也很小，使用默认方向[1,0,0]（0度）
-        default_angle = tf.cast(0.0, dtype)
-        forward_angle_xy = tf.where(
-            vel_xy_norm > vel_threshold,
-            forward_angle_xy,
-            tf.where(
-                tf.norm(goal_dir_xy, axis=1, keepdims=True) > vel_threshold,
-                goal_angle_xy,
-                tf.fill(tf.shape(forward_angle_xy), default_angle)
-            )
-        )  # (batch, 1)
+        no_obstacle_threshold = tf.cast(0.99, dtype)
+        default_dist_center = radius + tf.cast(10.0, dtype)
         
-        # 从扇区编码重建障碍物位置用于势场力计算
-        # 策略：使用最近障碍物信息（11-14维）重建1个障碍物，从8个扇区中选择最近的2个扇区重建另外2个障碍物
-        
-        # 🔧 优化：统一 reshape 障碍物信息（已在开始处确保 obstacle_info 形状正确）
-        # 获取最近障碍物信息（维度11-14）
-        nearest_dir = obstacle_info[:, 11:14]  # 方向向量 (batch, 3)
-        nearest_dir = tf.reshape(nearest_dir, [batch_size_dyn, 3])  # 确保 (batch, 3)
-        nearest_dist_norm = obstacle_info[:, 14:15]  # 归一化距离 (batch, 1)
-        nearest_dist_norm = tf.reshape(nearest_dist_norm, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        nearest_dist_surface = nearest_dist_norm * self.c_map_size  # 反归一化到表面距离
-        # 假设最近障碍物半径为5米（中等大小）
-        nearest_radius = tf.cast(5.0, dtype)
-        nearest_dist_center = nearest_dist_surface + nearest_radius  # (batch, 1)
-        # 直接广播乘法，XLA 可以优化此操作
-        obstacle_1_pos = nearest_dir * nearest_dist_center  # (batch, 3) * (batch, 1) -> (batch, 3)
-        
-        # 从8个扇区中选择最近的2个扇区（维度0-7）
-        sector_distances = obstacle_info[:, 0:8]  # (batch, 8)
-        # 🔧 修复：将距离为1.0的扇区（无障碍物）设置为很大的值，避免被选中
-        # 1.0表示归一化后的最大距离（无障碍物），应该被排除
-        max_dist_threshold = tf.cast(0.99, dtype)  # 接近1.0的阈值
-        sector_distances_filtered = tf.where(
-            sector_distances > max_dist_threshold,
-            tf.cast(1e6, dtype),  # 无障碍物的扇区设置为很大的值
-            sector_distances
-        )
-        # 找到距离最小的2个扇区索引
-        # 使用top_k找到最小的2个值及其索引
-        k = 2
-        sector_distances_sorted, sector_indices = tf.nn.top_k(-sector_distances_filtered, k=k)  # 负号因为要找最小值
-        sector_distances_sorted = -sector_distances_sorted  # 恢复正值
-        # 🔧 修复：如果选中的扇区距离很大（无障碍物），使用默认值
-        sector_distances_sorted = tf.where(
-            sector_distances_sorted > tf.cast(0.99 * self.c_map_size, dtype),
-            tf.cast(self.c_map_size, dtype),  # 使用地图尺寸作为默认距离
-            sector_distances_sorted
-        )
-        
-        # 扇区角度（相对于前进方向）：0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
-        sector_angles_deg = tf.constant([0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0], dtype=dtype)
-        pi_over_180 = tf.cast(3.141592653589793 / 180.0, dtype)  # π/180
-        sector_angles_rad = sector_angles_deg * pi_over_180  # (8,)
-        
-        # 🔧 优化：统一 reshape 扇区相关计算（forward_angle_xy 已在开始处确保形状）
-        # 重建第2个障碍物（从第一个最近扇区）
-        sector_idx_1 = sector_indices[:, 0:1]  # (batch, 1)
-        sector_idx_1 = tf.reshape(sector_idx_1, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_relative_1 = tf.gather(sector_angles_rad, sector_idx_1)  # (batch, 1) 相对角度
-        sector_angle_relative_1 = tf.reshape(sector_angle_relative_1, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_absolute_1 = sector_angle_relative_1 + forward_angle_xy  # (batch, 1) 绝对角度
-        sector_dist_1 = sector_distances_sorted[:, 0:1] * self.c_map_size  # 反归一化
-        sector_dist_1 = tf.reshape(sector_dist_1, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        # 假设障碍物在扇区中心方向，半径为5米
-        obstacle_2_radius = tf.cast(5.0, dtype)
-        dist_center_1 = sector_dist_1 + obstacle_2_radius  # (batch, 1)
-        # 构建方向向量（在XY平面）
-        obstacle_2_dir_xy = tf.stack([
-            tf.cos(sector_angle_absolute_1[:, 0]),
-            tf.sin(sector_angle_absolute_1[:, 0]),
-            tf.zeros_like(sector_angle_absolute_1[:, 0])
-        ], axis=1)  # (batch, 3)
-        obstacle_2_dir_xy = tf.reshape(obstacle_2_dir_xy, [batch_size_dyn, 3])  # 确保 (batch, 3)
-        obstacle_2_pos = obstacle_2_dir_xy * dist_center_1  # (batch, 3) * (batch, 1) -> (batch, 3)
-        
-        # 🔧 优化：统一 reshape 第3个障碍物相关计算
-        # 重建第3个障碍物（从第二个最近扇区）
-        sector_idx_2 = sector_indices[:, 1:2]  # (batch, 1)
-        sector_idx_2 = tf.reshape(sector_idx_2, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_relative_2 = tf.gather(sector_angles_rad, sector_idx_2)  # (batch, 1) 相对角度
-        sector_angle_relative_2 = tf.reshape(sector_angle_relative_2, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        sector_angle_absolute_2 = sector_angle_relative_2 + forward_angle_xy  # (batch, 1) 绝对角度
-        sector_dist_2 = sector_distances_sorted[:, 1:2] * self.c_map_size  # 反归一化
-        sector_dist_2 = tf.reshape(sector_dist_2, [batch_size_dyn, 1])  # 确保 (batch, 1)
-        obstacle_3_radius = tf.cast(5.0, dtype)
-        dist_center_2 = sector_dist_2 + obstacle_3_radius  # (batch, 1)
-        obstacle_3_dir_xy = tf.stack([
-            tf.cos(sector_angle_absolute_2[:, 0]),
-            tf.sin(sector_angle_absolute_2[:, 0]),
-            tf.zeros_like(sector_angle_absolute_2[:, 0])
-        ], axis=1)  # (batch, 3)
-        obstacle_3_dir_xy = tf.reshape(obstacle_3_dir_xy, [batch_size_dyn, 3])  # 确保 (batch, 3)
-        obstacle_3_pos = obstacle_3_dir_xy * dist_center_2  # (batch, 3) * (batch, 1) -> (batch, 3)
-        obstacle_1_abs_pos = agent_pos + obstacle_1_pos
-        obstacle_2_abs_pos = agent_pos + obstacle_2_pos
-        obstacle_3_abs_pos = agent_pos + obstacle_3_pos
-        
-        # 🔧 修复：保存半径信息，用于计算到表面的距离
-        obstacle_radii_list = [
-            tf.expand_dims(nearest_radius, axis=0),
-            tf.expand_dims(obstacle_2_radius, axis=0),
-            tf.expand_dims(obstacle_3_radius, axis=0)
-        ]
-        # 🔧 关键修复：确保 total_repulsion 的初始形状是 (batch, 3)
-        # batch_size_dyn 已在前面定义，这里直接使用
-        total_repulsion = tf.zeros([batch_size_dyn, 3], dtype=dtype)
-        # 🔧 XLA修复：使用预缓存的常量，避免在tf.function中使用tf.cast创建常量导致context错误
+        # XLA友好：预缓存常量
         c_0_0_dtype = tf.cast(self.c_0_0, dtype)
         c_0_5_dtype = tf.cast(self.c_0_5, dtype)
         c_1_0_dtype = tf.cast(self.c_1_0, dtype)
@@ -11530,41 +12844,68 @@ class OptimizedMATD3:
         c_10_0_dtype = tf.cast(self.c_10_0, dtype)
         c_1e_6_dtype = tf.cast(self.c_1e_6, dtype)
         
-        for obstacle_idx, obstacle_pos in enumerate([obstacle_1_abs_pos, obstacle_2_abs_pos, obstacle_3_abs_pos]):
-            # 🔧 关键修复：确保 obstacle_pos 的形状是 (batch, 3)
-            obstacle_pos = tf.reshape(obstacle_pos, [batch_size_dyn, 3])
-            dist_to_center = tf.norm(obstacle_pos - agent_pos, axis=1, keepdims=True)  # (batch, 1)
-            # 🔧 关键修复：计算到表面的距离（减去半径）
-            obstacle_radius = obstacle_radii_list[obstacle_idx]  # (1,)
-            # 🔧 关键修复：确保 obstacle_radius 的形状与 dist_to_center 兼容
-            obstacle_radius = tf.reshape(obstacle_radius, [1, 1])  # (1, 1) 以便广播
-            dist_to_surface = tf.maximum(dist_to_center - obstacle_radius, c_0_5_dtype)  # (batch, 1)
-            dist = dist_to_surface  # 使用到表面的距离计算斥力
-            # 方向仍基于到中心的向量
-            repulsion_dir = (agent_pos - obstacle_pos) / (dist_to_center + c_1e_6_dtype)  # (batch, 3)
-            # 🔧 关键修复：确保 repulsion_dir 的形状是 (batch, 3)
-            repulsion_dir = tf.reshape(repulsion_dir, [batch_size_dyn, 3])
-            R_detection = radius  # (batch, 1)
-            # 🔧 先计算1/dist并裁剪，防止后续平方溢出
-            inv_dist = c_1_0_dtype / (dist + c_1e_6_dtype)  # (batch, 1)
-            inv_dist = tf.clip_by_value(inv_dist, c_0_0_dtype, c_10_0_dtype)
-            inv_R = c_1_0_dtype / (R_detection + c_1e_6_dtype)  # (batch, 1)
-            strength_core = (inv_dist - inv_R) * tf.pow(inv_dist, c_2_0_dtype)  # (batch, 1)
+        total_repulsion = tf.zeros([batch_size_dyn, 3], dtype=dtype)
+        
+        for k in range(3):
+            offset = k * 5
+            rel_pos_norm = obstacle_info[:, offset:offset+3]
+            surface_dist_norm = obstacle_info[:, offset+3:offset+4]
+            radius_norm = obstacle_info[:, offset+4:offset+5]
             
-            # 🔧 修复：使用平滑过渡函数替代硬截断，避免在检测半径边界处突变（MATD3版本）
-            # 使用sigmoid函数实现平滑过渡
-            transition_width = tf.cast(2.0, dtype)  # 过渡宽度（米）
-            dist_to_boundary = R_detection - dist  # (batch, 1) 距离边界的距离（正值表示在检测半径内）
-            smooth_factor = c_1_0_dtype / (c_1_0_dtype + tf.exp(-dist_to_boundary / transition_width))  # (batch, 1)
-            repulsion_strength = strength_core * smooth_factor  # (batch, 1)
-            repulsion_strength = tf.clip_by_value(repulsion_strength, c_0_0_dtype, c_3_0_dtype)  # (batch, 1)
-            # 🔧 关键修复：确保 repulsion_dir 是 (batch, 3)，repulsion_strength 是 (batch, 1)
-            # 相乘后应该是 (batch, 3)
-            repulsion_force = repulsion_dir * repulsion_strength  # (batch, 3)
-            # 🔧 关键修复：确保 repulsion_force 的形状是 (batch, 3)，如果不是则 reshape
+            rel_pos_norm = tf.reshape(rel_pos_norm, [batch_size_dyn, 3])
+            surface_dist_norm = tf.reshape(surface_dist_norm, [batch_size_dyn, 1])
+            radius_norm = tf.reshape(radius_norm, [batch_size_dyn, 1])
+            
+            has_obstacle = surface_dist_norm < no_obstacle_threshold  # (batch, 1)
+            
+            rel_pos = rel_pos_norm * self.c_map_size
+            obs_radius = tf.maximum(radius_norm * self.c_map_size, c_1_0_dtype)
+            
+            abs_pos = agent_pos + rel_pos
+            
+            default_dir = tf.constant([1.0, 0.0, 0.0], dtype=dtype)
+            default_pos = agent_pos + tf.tile(
+                tf.reshape(default_dir, [1, 3]), [batch_size_dyn, 1]
+            ) * default_dist_center
+            
+            obstacle_pos = tf.where(
+                tf.tile(has_obstacle, [1, 3]),
+                abs_pos,
+                default_pos
+            )
+            obstacle_pos = tf.reshape(obstacle_pos, [batch_size_dyn, 3])
+            
+            obstacle_radius = tf.where(has_obstacle, obs_radius, c_1_0_dtype)
+            obstacle_radius = tf.reshape(obstacle_radius, [batch_size_dyn, 1])
+            
+            dist_to_center = tf.norm(obstacle_pos - agent_pos, axis=1, keepdims=True)
+            dist_to_surface = tf.maximum(dist_to_center - obstacle_radius, c_0_5_dtype)
+            dist = dist_to_surface
+            
+            repulsion_dir = (agent_pos - obstacle_pos) / (dist_to_center + c_1e_6_dtype)
+            repulsion_dir = tf.reshape(repulsion_dir, [batch_size_dyn, 3])
+            
+            R_detection = radius  # (batch, 1)
+            inv_dist = c_1_0_dtype / (dist + c_1e_6_dtype)
+            inv_dist = tf.clip_by_value(inv_dist, c_0_0_dtype, c_10_0_dtype)
+            inv_R = c_1_0_dtype / (R_detection + c_1e_6_dtype)
+            strength_core = (inv_dist - inv_R) * tf.pow(inv_dist, c_2_0_dtype)
+            
+            transition_width = tf.cast(2.0, dtype)
+            dist_to_boundary = R_detection - dist
+            smooth_factor = c_1_0_dtype / (c_1_0_dtype + tf.exp(-dist_to_boundary / transition_width))
+            
+            repulsion_strength = strength_core * smooth_factor
+            # 球障斥力上限与地形一致：未穿透 100，穿透 500（原 c_3_0=3.0 过弱，易剩球障碰撞）
+            raw_dist_to_surface = dist_to_center - obstacle_radius
+            penetration_mask = raw_dist_to_surface < tf.cast(0.0, dtype)
+            max_repulsion_obstacle = tf.where(penetration_mask, tf.cast(500.0, dtype), tf.cast(100.0, dtype))
+            repulsion_strength = tf.clip_by_value(repulsion_strength, c_0_0_dtype, max_repulsion_obstacle)
+            
+            repulsion_force = repulsion_dir * repulsion_strength
             repulsion_force = tf.reshape(repulsion_force, [batch_size_dyn, 3])
             total_repulsion += repulsion_force
-        # 🔧 关键修复：确保返回值的形状是 (batch, 3)
+        
         total_repulsion = tf.reshape(total_repulsion, [batch_size_dyn, 3])
         return total_repulsion
     
@@ -11623,85 +12964,218 @@ class OptimizedMATD3:
 
         total_repulsion = tf.reduce_sum(repulsion_dir * repulsion_strength, axis=1)  # (batch, 3)
         return total_repulsion
-    
-    # 🔧 XLA修复：添加@tf.function装饰器，与OptimizedMADDPG保持一致，避免autograph转换错误
-    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
-    def _apply_potential_field_correction_tf(self, action, obs, force_ratio):
-        """
-        应用势场修正（TensorFlow稳定可微版本）
-        与OptimizedMADDPG共用实现（复用计算逻辑）
-        """
-        orig_dtype = action.dtype
-        action = tf.cast(action, tf.float32) if action.dtype != tf.float32 else action
-        obs = tf.cast(obs, tf.float32) if obs.dtype != tf.float32 else obs
-        batch_size = tf.shape(action)[0]
-        act_dim = tf.shape(action)[1]
-        obs_dim = tf.shape(obs)[1]
 
-        force_ratio = _broadcast_force_ratio(force_ratio, batch_size)
-        # 🔧 XLA修复：确保padding值显式转换为tf.int32，避免内存对齐问题
-        action_pad = tf.maximum(7 - act_dim, 0)
-        action_pad = tf.cast(action_pad, tf.int32)  # 确保是int32类型
-        action = tf.pad(action, [[0, 0], [0, action_pad]])
-        action_head = action[:, :3]
+    def _calculate_terrain_forces_from_terrain_info_tf(self, agent_pos, goal_pos, k_rep, radius, terrain_info):
+        """基于已切片的 terrain_info 计算地形斥力，避免重复切片/类型转换。"""
+        dtype = agent_pos.dtype
+        terrain_info = tf.cast(terrain_info, dtype)
+        k_rep = tf.cast(k_rep, dtype)
+        radius = tf.cast(radius, dtype)
+        goal_pos = tf.cast(goal_pos, dtype)
 
-        # 🔧 XLA修复：确保padding值显式转换为tf.int32，避免内存对齐问题
-        obs_pad = tf.maximum(81 - obs_dim, 0)
-        obs_pad = tf.cast(obs_pad, tf.int32)  # 确保是int32类型
-        obs = tf.pad(obs, [[0, 0], [0, obs_pad]])  # 🚨 修复：从75改为81维（MATD3版本，地形29→32 + 目标信息7维）
-        padded_obs_dim = tf.shape(obs)[1]
-        has_valid_inputs = tf.logical_and(
-            tf.greater_equal(padded_obs_dim, 49),
-            tf.greater_equal(act_dim + action_pad, 7)
+        current_height = terrain_info[:, 1:2] * tf.cast(100.0, dtype)
+        terrain_gradients = terrain_info[:, 2:6] * tf.cast(10.0, dtype)
+        agent_height = agent_pos[:, 2:3]
+        clear_0 = agent_height - current_height
+        forward_terrain_heights = terrain_info[:, 6:14] * tf.cast(100.0, dtype)
+        clear_f = agent_height - tf.reshape(forward_terrain_heights, [-1, 8])
+        min_clearance_forward = tf.reduce_min(clear_f, axis=1, keepdims=True)
+        r_min_candidate = tf.minimum(clear_0, min_clearance_forward)
+        penetration_mask = r_min_candidate < tf.cast(0.0, dtype)
+        safe_r_min = tf.maximum(r_min_candidate, tf.cast(0.1, dtype))
+        penetration_r_min = tf.cast(0.05, dtype)
+        r_min = tf.where(penetration_mask, penetration_r_min, safe_r_min)
+        height_diff = r_min_candidate
+
+        grad_x = (terrain_gradients[:, 0:1] - terrain_gradients[:, 2:3]) / tf.cast(2.0, dtype)
+        grad_y = (terrain_gradients[:, 1:2] - terrain_gradients[:, 3:4]) / tf.cast(2.0, dtype)
+        terrain_normal_base = tf.concat([-grad_x, -grad_y, tf.ones_like(grad_x)], axis=1)
+        terrain_normal_base = terrain_normal_base / (tf.norm(terrain_normal_base, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+        terrain_normal_z_safe = tf.maximum(terrain_normal_base[:, 2:3], tf.cast(0.1, dtype))
+        terrain_normal_safe = tf.concat([terrain_normal_base[:, 0:2], terrain_normal_z_safe], axis=1)
+        terrain_normal_safe = terrain_normal_safe / (tf.norm(terrain_normal_safe, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+        upward_normal = tf.concat([tf.zeros_like(grad_x), tf.zeros_like(grad_y), tf.ones_like(grad_x)], axis=1)
+        terrain_normal = tf.where(tf.tile(penetration_mask, [1, 3]), upward_normal, terrain_normal_safe)
+        terrain_normal = tf.where(
+            tf.tile(terrain_normal[:, 2:3] < tf.cast(0.0, dtype), [1, 3]),
+            upward_normal,
+            terrain_normal
         )
-        force_ratio = force_ratio * tf.cast(has_valid_inputs, tf.float32)
-        
-        # 自适应恢复到物理坐标（米）
+
+        goal_dist = tf.norm(goal_pos - agent_pos, axis=1, keepdims=True)
+        kappa_denom = tf.cast(1.0, dtype) + goal_dist / tf.cast(500.0, dtype)
+        kappa = tf.cast(1.0, dtype) / (kappa_denom + tf.cast(1e-6, dtype))
+        kappa = tf.clip_by_value(kappa, tf.cast(0.3, dtype), tf.cast(1.0, dtype))
+        eps = tf.cast(1e-3, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
+        inv_r_min = tf.cast(1.0, dtype) / (r_min + eps)
+        inv_R_safe = tf.cast(1.0, dtype) / (radius + eps)
+        inv_r_min = tf.clip_by_value(inv_r_min, tf.cast(0.0, dtype), tf.cast(20.0, dtype))
+        base_repulsion = k_rep * (inv_r_min - inv_R_safe) * tf.square(inv_r_min) * kappa
+        base_repulsion = tf.clip_by_value(base_repulsion, tf.cast(0.0, dtype), tf.cast(10000.0, dtype))
+
+        transition_width = tf.cast(0.5, dtype)
+        exp_arg_penetration = tf.clip_by_value(-height_diff / transition_width, tf.cast(-50.0, dtype), tf.cast(50.0, dtype))
+        penetration_sigmoid = tf.cast(1.0, dtype) / (tf.cast(1.0, dtype) + tf.exp(exp_arg_penetration))
+        penetration_penalty_factor = tf.cast(1.0, dtype) + tf.cast(4.0, dtype) * (tf.cast(1.0, dtype) - penetration_sigmoid)
+        deep_penetration_mask = height_diff < tf.cast(-10.0, dtype)
+        exp_arg_deep = tf.clip_by_value(
+            -(height_diff + tf.cast(10.0, dtype)) / tf.cast(5.0, dtype),
+            tf.cast(-50.0, dtype),
+            tf.cast(50.0, dtype)
+        )
+        deep_penetration_sigmoid = tf.cast(1.0, dtype) / (tf.cast(1.0, dtype) + tf.exp(exp_arg_deep))
+        deep_penetration_bonus = tf.cast(5.0, dtype) * (tf.cast(1.0, dtype) - deep_penetration_sigmoid)
+        penetration_penalty_factor = tf.where(
+            tf.tile(deep_penetration_mask, [1, 1]),
+            penetration_penalty_factor + deep_penetration_bonus,
+            penetration_penalty_factor
+        )
+
+        repulsion_strength = base_repulsion * penetration_penalty_factor
+        max_repulsion = tf.cast(100.0, dtype) + tf.cast(400.0, dtype) * (tf.cast(1.0, dtype) - penetration_sigmoid)
+        repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), max_repulsion)
+        terrain_force = terrain_normal * repulsion_strength
+        terrain_force_z_safe = tf.maximum(terrain_force[:, 2:3], tf.cast(0.0, dtype))
+        terrain_force = tf.concat([terrain_force[:, 0:2], terrain_force_z_safe], axis=1)
+        return tf.clip_by_value(terrain_force, -1e6, 1e6)
+
+    def _calculate_obstacle_repulsion_from_info_tf(self, agent_pos, obstacle_info, radius):
+        """基于已切片的 obstacle_info 计算障碍物斥力。"""
+        dtype = agent_pos.dtype
+        batch_size_dyn = tf.shape(agent_pos)[0]
+        radius = tf.cast(radius, dtype)
+        agent_pos = tf.reshape(agent_pos, [batch_size_dyn, 3])
+        radius = tf.reshape(radius, [batch_size_dyn, 1, 1])
+        obstacle_info = tf.reshape(tf.cast(obstacle_info, dtype), [batch_size_dyn, 3, 5])
+
+        no_obstacle_threshold = tf.cast(0.99, dtype)
+        c_0_0_dtype = tf.cast(self.c_0_0, dtype)
+        c_0_5_dtype = tf.cast(self.c_0_5, dtype)
+        c_1_0_dtype = tf.cast(self.c_1_0, dtype)
+        c_10_0_dtype = tf.cast(self.c_10_0, dtype)
+        c_1e_6_dtype = tf.cast(self.c_1e_6, dtype)
+
+        rel_pos_norm = obstacle_info[:, :, 0:3]
+        surface_dist_norm = obstacle_info[:, :, 3:4]
+        radius_norm = obstacle_info[:, :, 4:5]
+        has_obstacle = surface_dist_norm < no_obstacle_threshold
+
+        rel_pos = rel_pos_norm * self.c_map_size
+        obs_radius = tf.maximum(radius_norm * self.c_map_size, c_1_0_dtype)
+
+        agent_pos_expanded = tf.expand_dims(agent_pos, axis=1)
+        abs_pos = agent_pos_expanded + rel_pos
+        default_dir = tf.reshape(tf.constant([1.0, 0.0, 0.0], dtype=dtype), [1, 1, 3])
+        default_dist_center = radius + tf.cast(10.0, dtype)
+        default_pos = agent_pos_expanded + default_dir * default_dist_center
+
+        obstacle_pos = tf.where(
+            tf.tile(has_obstacle, [1, 1, 3]),
+            abs_pos,
+            default_pos
+        )
+        obstacle_radius = tf.where(has_obstacle, obs_radius, c_1_0_dtype)
+
+        diff = obstacle_pos - agent_pos_expanded
+        dist_to_center = tf.norm(diff, axis=2, keepdims=True)
+        dist = tf.maximum(dist_to_center - obstacle_radius, c_0_5_dtype)
+        repulsion_dir = -diff / (dist_to_center + c_1e_6_dtype)
+
+        inv_dist = c_1_0_dtype / (dist + c_1e_6_dtype)
+        inv_dist = tf.clip_by_value(inv_dist, c_0_0_dtype, c_10_0_dtype)
+        inv_R = c_1_0_dtype / (radius + c_1e_6_dtype)
+        strength_core = (inv_dist - inv_R) * tf.square(inv_dist)
+
+        transition_width = tf.cast(2.0, dtype)
+        dist_to_boundary = radius - dist
+        smooth_factor = c_1_0_dtype / (c_1_0_dtype + tf.exp(-dist_to_boundary / transition_width))
+        repulsion_strength = strength_core * smooth_factor
+
+        raw_dist_to_surface = dist_to_center - obstacle_radius
+        penetration_mask = raw_dist_to_surface < tf.cast(0.0, dtype)
+        max_repulsion_obstacle = tf.where(
+            penetration_mask,
+            tf.cast(500.0, dtype),
+            tf.cast(100.0, dtype)
+        )
+        repulsion_strength = tf.clip_by_value(repulsion_strength, c_0_0_dtype, max_repulsion_obstacle)
+
+        total_repulsion = tf.reduce_sum(repulsion_dir * repulsion_strength, axis=1)
+        return tf.reshape(total_repulsion, [batch_size_dyn, 3])
+
+    def _calculate_agent_repulsion_from_info_tf(self, agent_pos, other_agents_info, radius):
+        """基于已切片的 other_agents_info 计算智能体间斥力。"""
+        dtype = agent_pos.dtype
+        radius = tf.cast(radius, dtype)
+        other_agents_info = tf.cast(other_agents_info, dtype)
+        other_agent_1_pos = other_agents_info[:, 0:3] * tf.cast(100.0, dtype)
+        other_agent_2_pos = other_agents_info[:, 6:9] * tf.cast(100.0, dtype)
+        other_agent_1_abs_pos = agent_pos + other_agent_1_pos
+        other_agent_2_abs_pos = agent_pos + other_agent_2_pos
+        others_abs = tf.stack([other_agent_1_abs_pos, other_agent_2_abs_pos], axis=1)
+        diff = others_abs - tf.expand_dims(agent_pos, axis=1)
+        dist = tf.norm(diff, axis=2, keepdims=True)
+        dist = tf.maximum(dist, tf.cast(0.5, dtype))
+        repulsion_dir = -diff / (dist + tf.cast(1e-6, dtype))
+        r_detection = tf.expand_dims(radius, axis=1)
+        inv_dist = tf.cast(1.0, dtype) / (dist + tf.cast(1e-6, dtype))
+        inv_dist = tf.clip_by_value(inv_dist, tf.cast(0.0, dtype), tf.cast(10.0, dtype))
+        inv_R = tf.cast(1.0, dtype) / (r_detection + tf.cast(1e-6, dtype))
+        strength_core = (inv_dist - inv_R) * tf.square(inv_dist)
+        transition_width = tf.cast(2.0, dtype)
+        dist_to_boundary = r_detection - dist
+        smooth_factor = tf.cast(1.0, dtype) / (tf.cast(1.0, dtype) + tf.exp(-dist_to_boundary / transition_width))
+        repulsion_strength = strength_core * smooth_factor
+        repulsion_strength = tf.clip_by_value(repulsion_strength, tf.cast(0.0, dtype), tf.cast(15.0, dtype))
+        repulsion_strength = repulsion_strength * tf.cast(3.0, dtype)
+        return tf.reduce_sum(repulsion_dir * repulsion_strength, axis=1)
+
+    def _extract_pf_obs_context_tf(self, obs):
+        """提取与 action 无关的 PF 观测上下文，供同一步多次修正复用。"""
+        obs = tf.cast(obs, tf.float32) if obs.dtype != tf.float32 else obs
+        batch_size_dyn = tf.shape(obs)[0]
+        static_obs_dim = obs.shape[1]
+        if static_obs_dim is not None and static_obs_dim >= 81:
+            obs_valid_inputs = tf.ones([batch_size_dyn, 1], dtype=tf.bool)
+        else:
+            obs_dim = tf.shape(obs)[1]
+            obs_pad = tf.maximum(81 - obs_dim, 0)
+            obs_pad = tf.cast(obs_pad, tf.int32)
+            obs = tf.pad(obs, [[0, 0], [0, obs_pad]])
+            padded_obs_dim = tf.shape(obs)[1]
+            obs_valid_scalar = tf.greater_equal(padded_obs_dim, 49)
+            obs_valid_inputs = tf.fill([batch_size_dyn, 1], obs_valid_scalar)
+
         norm_pos = obs[:, :3]
         map_half_tf = self.c_map_size * 0.5
-        # 🔧 直接按归一化公式还原真实坐标，保留完整高度信息
         pos = (norm_pos + tf.cast(1.0, norm_pos.dtype)) * map_half_tf
-        obs_shape = tf.shape(obs)
-        obs_dim = obs_shape[1]
-        
-        # === 提取目标信息 ===
-        # 🚨 修复：观察数据实际顺序: [状态9, 地形32, 障碍物15, 目标7, 其他智能体12, 环境/标记6] = 81维（MATD3版本，地形从29→32）
-        _goal_offset = 9 + 32 + 15  # 56（原来53，地形+3维）
-        goal_dir_norm = obs[:, _goal_offset:_goal_offset+3] / 1.0  # 方向向量（3维）
-        goal_dist_norm = obs[:, _goal_offset+3:_goal_offset+4] * self.c_map_size  # 距离（1维）
-        goal_abs_pos_norm = obs[:, _goal_offset+4:_goal_offset+7]  # 🚨 新增：目标绝对位置（归一化，3维）
-        
-        # 🔧 添加验证：确保方向向量有效（不是零向量）
+        terrain_info = obs[:, 9:41]
+        obstacle_info = obs[:, 41:56]
+        other_agents_info = obs[:, 63:75]
+
+        _goal_offset = 9 + 32 + 15
+        goal_dir_norm = obs[:, _goal_offset:_goal_offset + 3]
+        goal_dist_norm = obs[:, _goal_offset + 3:_goal_offset + 4] * self.c_map_size
+        goal_abs_pos_norm = obs[:, _goal_offset + 4:_goal_offset + 7]
+
         dir_magnitude = tf.norm(goal_dir_norm, axis=1, keepdims=True) + 1e-6
-        valid_goal_mask = dir_magnitude > 0.1  # 确保方向向量有效（阈值0.1，避免数值误差）
-        invalid_goal_mask = tf.logical_not(valid_goal_mask)
-        # 🔧 XLA修复：移除@tf.function中的计数器更新，避免设备不匹配错误（CPU变量 vs GPU函数）
-        # 注意：在@tf.function中访问CPU上的tf.Variable会导致设备不匹配，因此注释掉调试计数器
-        # invalid_count = tf.reduce_sum(tf.cast(invalid_goal_mask, tf.int32))
-        # invalid_increment = invalid_count * tf.cast(invalid_count > 0, tf.int32)
-        # self._pf_invalid_goal_counter.assign_add(invalid_increment)
+        valid_goal_mask = dir_magnitude > 0.1
         goal_dir = tf.where(
             tf.tile(valid_goal_mask, [1, 3]),
             goal_dir_norm / dir_magnitude,
-            tf.zeros_like(goal_dir_norm)  # 如果无效，使用零向量
+            tf.zeros_like(goal_dir_norm)
         )
-        
-        # 🚨 关键修复：优先使用绝对位置，相对位置作为备用（MATD3版本）
-        # 还原绝对位置：goal_abs_pos = (goal_abs_pos_norm + 1.0) * map_half
+
         goal_pos_from_abs = (goal_abs_pos_norm + tf.cast(1.0, goal_abs_pos_norm.dtype)) * map_half_tf
-        
-        # 相对位置重建（备用）
         goal_pos_from_rel = pos + goal_dir * goal_dist_norm
-        
-        # 🔧 优先使用绝对位置，如果绝对位置无效（全零），则使用相对位置
         abs_pos_valid = tf.reduce_sum(tf.abs(goal_abs_pos_norm), axis=1, keepdims=True) > 0.01
         goal_pos = tf.where(
             tf.tile(abs_pos_valid, [1, 3]),
-            goal_pos_from_abs,  # 优先使用绝对位置
+            goal_pos_from_abs,
             tf.where(
                 tf.tile(valid_goal_mask, [1, 3]),
-                goal_pos_from_rel,  # 备用：使用相对位置
-                pos  # 最终备用：使用智能体位置
+                goal_pos_from_rel,
+                pos
             )
         )
 
@@ -11710,9 +13184,6 @@ class OptimizedMATD3:
         max_xy = self.c_map_size - tf.cast(1.0, dtype_goal)
         gx = tf.clip_by_value(goal_pos[:, 0:1], min_xy, max_xy)
         gy = tf.clip_by_value(goal_pos[:, 1:2], min_xy, max_xy)
-
-        # 🔧 XLA修复：直接使用缓存的tensor，避免在@tf.function中调用方法导致autograph转换错误
-        # 注意：不能在@tf.function装饰的函数中调用未装饰的方法，会导致autograph转换错误
         height_map = self._terrain_height_tensor
         ix, iy = self._world_to_map_transform_tf(gx, gy)
         terrain_height = self._bilinear_sample_height_tf(height_map, ix, iy)
@@ -11723,115 +13194,571 @@ class OptimizedMATD3:
             tf.cast(self.c_map_size, dtype_goal)
         )
         goal_pos = tf.concat([gx, gy, gz], axis=1)
-        
-        # === 提取Actor输出的势场参数 ===
-        pf_params_raw = action[:, 3:7]
-        
-        # === 参数映射（安全范围）===
-        # 注意：通过调整delta参数来控制Actor对PF的影响范围（MATD3版本）
+
+        return obs, pos, goal_pos, obs_valid_inputs, terrain_info, obstacle_info, other_agents_info
+
+    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
+    def _extract_pf_obs_context_compiled_tf(self, obs):
+        """共享 PF 观测解析时保持 PF_JIT，避免 terrain/goal 预处理落回 eager。"""
+        return self._extract_pf_obs_context_tf(obs)
+
+    def _prepare_pf_action_inputs_tf(self, action, obs_valid_inputs):
+        """准备 PF 计算所需的动作头部和势场参数。"""
+        static_act_dim = action.shape[1]
+        if static_act_dim is not None and static_act_dim >= 7:
+            action_head = action[:, :3]
+            pf_params_raw = action[:, 3:7]
+            has_valid_inputs = obs_valid_inputs
+        else:
+            act_dim = tf.shape(action)[1]
+            action_pad = tf.maximum(7 - act_dim, 0)
+            action_pad = tf.cast(action_pad, tf.int32)
+            action = tf.pad(action, [[0, 0], [0, action_pad]])
+            action_head = action[:, :3]
+            pf_params_raw = action[:, 3:7]
+            has_valid_inputs = tf.logical_and(
+                obs_valid_inputs,
+                tf.greater_equal(act_dim + action_pad, 7)
+            )
+
         pf_params = self._map_actor_pf_params_tf(pf_params_raw)
-        k_att, lambda_1, k_rep, radius = (
-            pf_params[:, 0:1], pf_params[:, 1:2],
-            pf_params[:, 2:3], pf_params[:, 3:4],
-        )
+        radius = pf_params[:, 3:4]
         params_finite = tf.reduce_all(tf.math.is_finite(pf_params), axis=1, keepdims=True)
         radius_valid = radius > tf.cast(1e-6, radius.dtype)
         pf_params_valid = tf.logical_and(params_finite, radius_valid)
-        
-        # === 计算势场力 ===
-        goal_force = self._calculate_goal_attraction_force_tf(pos, goal_pos, k_att, lambda_1)
-        terrain_force = self._calculate_terrain_forces_sphere_tf(pos, goal_pos, k_rep, radius, obs)
-        agent_force = self._calculate_agent_repulsion_forces_tf(pos, obs, radius)
-        obstacle_force = self._calculate_obstacle_repulsion_forces_tf(pos, obs, radius)
-        # 🔧 关键修复：确保 obstacle_force 的形状是 (batch, 3)（MATD3版本）
+        return action_head, pf_params, pf_params_valid, has_valid_inputs
+
+    def _extract_pf_geometry_context_tf(self, pos, goal_pos, terrain_info, obstacle_info, other_agents_info):
+        """提取与 PF 参数无关的几何上下文，供同一步多次 PF 计算复用。"""
+        dtype = pos.dtype
+
+        vec_to_goal = tf.cast(goal_pos, dtype) - tf.cast(pos, dtype)
+        goal_dist = tf.norm(vec_to_goal, axis=1, keepdims=True)
+        goal_eps = tf.cast(1e-3, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
+        goal_dist = tf.maximum(goal_dist, goal_eps)
+        goal_dir = vec_to_goal / goal_dist
+
+        terrain_info = tf.cast(terrain_info, dtype)
+        current_height = terrain_info[:, 1:2] * tf.cast(100.0, dtype)
+        terrain_gradients = terrain_info[:, 2:6] * tf.cast(10.0, dtype)
+        agent_height = pos[:, 2:3]
+        clear_0 = agent_height - current_height
+        forward_terrain_heights = terrain_info[:, 6:14] * tf.cast(100.0, dtype)
+        clear_f = agent_height - tf.reshape(forward_terrain_heights, [-1, 8])
+        min_clearance_forward = tf.reduce_min(clear_f, axis=1, keepdims=True)
+        r_min_candidate = tf.minimum(clear_0, min_clearance_forward)
+        penetration_mask = r_min_candidate < tf.cast(0.0, dtype)
+        safe_r_min = tf.maximum(r_min_candidate, tf.cast(0.1, dtype))
+        r_min = tf.where(penetration_mask, tf.cast(0.05, dtype), safe_r_min)
+        height_diff = r_min_candidate
+
+        grad_x = (terrain_gradients[:, 0:1] - terrain_gradients[:, 2:3]) / tf.cast(2.0, dtype)
+        grad_y = (terrain_gradients[:, 1:2] - terrain_gradients[:, 3:4]) / tf.cast(2.0, dtype)
+        terrain_normal_base = tf.concat([-grad_x, -grad_y, tf.ones_like(grad_x)], axis=1)
+        terrain_normal_base = terrain_normal_base / (tf.norm(terrain_normal_base, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+        terrain_normal_z_safe = tf.maximum(terrain_normal_base[:, 2:3], tf.cast(0.1, dtype))
+        terrain_normal_safe = tf.concat([terrain_normal_base[:, 0:2], terrain_normal_z_safe], axis=1)
+        terrain_normal_safe = terrain_normal_safe / (tf.norm(terrain_normal_safe, axis=1, keepdims=True) + tf.cast(1e-6, dtype))
+        upward_normal = tf.concat([tf.zeros_like(grad_x), tf.zeros_like(grad_y), tf.ones_like(grad_x)], axis=1)
+        terrain_normal = tf.where(tf.tile(penetration_mask, [1, 3]), upward_normal, terrain_normal_safe)
+        terrain_normal = tf.where(
+            tf.tile(terrain_normal[:, 2:3] < tf.cast(0.0, dtype), [1, 3]),
+            upward_normal,
+            terrain_normal
+        )
+
+        goal_dist_for_kappa = tf.norm(goal_pos - pos, axis=1, keepdims=True)
+        kappa_denom = tf.cast(1.0, dtype) + goal_dist_for_kappa / tf.cast(500.0, dtype)
+        kappa = tf.cast(1.0, dtype) / (kappa_denom + tf.cast(1e-6, dtype))
+        kappa = tf.clip_by_value(kappa, tf.cast(0.3, dtype), tf.cast(1.0, dtype))
+        terrain_eps = tf.cast(1e-3, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
+        terrain_inv_r_min = tf.cast(1.0, dtype) / (r_min + terrain_eps)
+        terrain_inv_r_min = tf.clip_by_value(terrain_inv_r_min, tf.cast(0.0, dtype), tf.cast(20.0, dtype))
+        transition_width = tf.cast(0.5, dtype)
+        exp_arg_penetration = tf.clip_by_value(-height_diff / transition_width, tf.cast(-50.0, dtype), tf.cast(50.0, dtype))
+        penetration_sigmoid = tf.cast(1.0, dtype) / (tf.cast(1.0, dtype) + tf.exp(exp_arg_penetration))
+        penetration_penalty_factor = tf.cast(1.0, dtype) + tf.cast(4.0, dtype) * (tf.cast(1.0, dtype) - penetration_sigmoid)
+        deep_penetration_mask = height_diff < tf.cast(-10.0, dtype)
+        exp_arg_deep = tf.clip_by_value(
+            -(height_diff + tf.cast(10.0, dtype)) / tf.cast(5.0, dtype),
+            tf.cast(-50.0, dtype),
+            tf.cast(50.0, dtype)
+        )
+        deep_penetration_sigmoid = tf.cast(1.0, dtype) / (tf.cast(1.0, dtype) + tf.exp(exp_arg_deep))
+        deep_penetration_bonus = tf.cast(5.0, dtype) * (tf.cast(1.0, dtype) - deep_penetration_sigmoid)
+        terrain_penalty_factor = tf.where(
+            tf.tile(deep_penetration_mask, [1, 1]),
+            penetration_penalty_factor + deep_penetration_bonus,
+            penetration_penalty_factor
+        )
+        terrain_max_repulsion = tf.cast(100.0, dtype) + tf.cast(400.0, dtype) * (tf.cast(1.0, dtype) - penetration_sigmoid)
+
         batch_size_dyn = tf.shape(pos)[0]
-        obstacle_force = tf.reshape(obstacle_force, [batch_size_dyn, 3])  # 确保形状是 (batch, 3)
-        
-        # 🔧 平滑地形斥力增强：使用sigmoid而不是hard threshold，减少突变
+        obstacle_info = tf.reshape(tf.cast(obstacle_info, dtype), [batch_size_dyn, 3, 5])
+        no_obstacle_threshold = tf.cast(0.99, dtype)
+        rel_pos_norm = obstacle_info[:, :, 0:3]
+        surface_dist_norm = obstacle_info[:, :, 3:4]
+        radius_norm = obstacle_info[:, :, 4:5]
+        obstacle_has = surface_dist_norm < no_obstacle_threshold
+        obstacle_rel_pos = rel_pos_norm * self.c_map_size
+        obstacle_radius = tf.maximum(radius_norm * self.c_map_size, tf.cast(1.0, dtype))
+        obstacle_dist_to_center = tf.norm(obstacle_rel_pos, axis=2, keepdims=True)
+        obstacle_repulsion_dir = tf.where(
+            tf.tile(obstacle_has, [1, 1, 3]),
+            -obstacle_rel_pos / (obstacle_dist_to_center + tf.cast(1e-6, dtype)),
+            tf.zeros_like(obstacle_rel_pos)
+        )
+        obstacle_raw_dist_surface = obstacle_dist_to_center - obstacle_radius
+        obstacle_dist_surface = tf.maximum(obstacle_raw_dist_surface, tf.cast(0.5, dtype))
+        obstacle_max_repulsion = tf.where(
+            obstacle_raw_dist_surface < tf.cast(0.0, dtype),
+            tf.cast(500.0, dtype),
+            tf.cast(100.0, dtype)
+        )
+
+        other_agents_info = tf.cast(other_agents_info, dtype)
+        other_agent_1_pos = other_agents_info[:, 0:3] * tf.cast(100.0, dtype)
+        other_agent_2_pos = other_agents_info[:, 6:9] * tf.cast(100.0, dtype)
+        other_agent_1_abs_pos = pos + other_agent_1_pos
+        other_agent_2_abs_pos = pos + other_agent_2_pos
+        others_abs = tf.stack([other_agent_1_abs_pos, other_agent_2_abs_pos], axis=1)
+        agent_rel_diff = others_abs - tf.expand_dims(pos, axis=1)
+        agent_rel_dist = tf.norm(agent_rel_diff, axis=2, keepdims=True)
+        agent_rel_dist = tf.maximum(agent_rel_dist, tf.cast(0.5, dtype))
+        agent_repulsion_dir = -agent_rel_diff / (agent_rel_dist + tf.cast(1e-6, dtype))
+
+        return (
+            goal_dir,
+            goal_dist,
+            terrain_normal,
+            terrain_inv_r_min,
+            kappa,
+            terrain_penalty_factor,
+            terrain_max_repulsion,
+            obstacle_has,
+            obstacle_repulsion_dir,
+            obstacle_dist_surface,
+            obstacle_max_repulsion,
+            agent_repulsion_dir,
+            agent_rel_dist,
+        )
+
+    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
+    def _extract_pf_geometry_context_compiled_tf(self, pos, goal_pos, terrain_info, obstacle_info, other_agents_info):
+        """共享 geometry_context 时仍保持 PF_JIT 热路径，避免退回 eager 计算。"""
+        return self._extract_pf_geometry_context_tf(
+            pos,
+            goal_pos,
+            terrain_info,
+            obstacle_info,
+            other_agents_info,
+        )
+
+    def _pack_pf_geometry_cache_from_shared_context_tf(self, obs_valid_inputs, geometry_ctx, batch_size_dyn):
+        """将共享 geometry_context 打包为 (batch, n_agents, 38) 的压缩缓存。"""
+        flat_items = batch_size_dyn * self.n_agents
+        obs_valid_inputs = tf.cast(obs_valid_inputs, tf.float32)
+        obs_valid_inputs = tf.reshape(obs_valid_inputs, [-1, 1])
+        obs_valid_len = tf.shape(obs_valid_inputs)[0]
+        obs_valid_inputs = tf.cond(
+            tf.equal(obs_valid_len, flat_items),
+            lambda: obs_valid_inputs,
+            lambda: tf.broadcast_to(obs_valid_inputs[:1], [flat_items, 1]),
+        )
+        (
+            goal_dir,
+            goal_dist,
+            terrain_normal,
+            terrain_inv_r_min,
+            kappa,
+            terrain_penalty_factor,
+            terrain_max_repulsion,
+            obstacle_has,
+            obstacle_repulsion_dir,
+            obstacle_dist_surface,
+            obstacle_max_repulsion,
+            agent_repulsion_dir,
+            agent_rel_dist,
+        ) = geometry_ctx
+        packed_parts = [
+            tf.reshape(obs_valid_inputs, [batch_size_dyn, self.n_agents, 1]),
+            tf.reshape(goal_dir, [batch_size_dyn, self.n_agents, 3]),
+            tf.reshape(goal_dist, [batch_size_dyn, self.n_agents, 1]),
+            tf.reshape(terrain_normal, [batch_size_dyn, self.n_agents, 3]),
+            tf.reshape(terrain_inv_r_min, [batch_size_dyn, self.n_agents, 1]),
+            tf.reshape(kappa, [batch_size_dyn, self.n_agents, 1]),
+            tf.reshape(terrain_penalty_factor, [batch_size_dyn, self.n_agents, 1]),
+            tf.reshape(terrain_max_repulsion, [batch_size_dyn, self.n_agents, 1]),
+            tf.reshape(tf.cast(obstacle_has, tf.float32), [batch_size_dyn, self.n_agents, 3]),
+            tf.reshape(obstacle_repulsion_dir, [batch_size_dyn, self.n_agents, 9]),
+            tf.reshape(obstacle_dist_surface, [batch_size_dyn, self.n_agents, 3]),
+            tf.reshape(obstacle_max_repulsion, [batch_size_dyn, self.n_agents, 3]),
+            tf.reshape(agent_repulsion_dir, [batch_size_dyn, self.n_agents, 6]),
+            tf.reshape(agent_rel_dist, [batch_size_dyn, self.n_agents, 2]),
+        ]
+        return tf.concat(packed_parts, axis=2)
+
+    def _unpack_pf_geometry_cache_tf(self, packed_cache):
+        """将 (batch, n_agents, 38) 的压缩缓存还原为共享 geometry_context。"""
+        packed_cache = tf.convert_to_tensor(packed_cache, dtype=tf.float32)
+        packed_cache = tf.ensure_shape(packed_cache, [None, self.n_agents, 38])
+        flat_cache = tf.reshape(packed_cache, [-1, 38])
+
+        offset = 0
+        obs_valid_inputs = flat_cache[:, offset:offset + 1] > 0.5
+        offset += 1
+        goal_dir = flat_cache[:, offset:offset + 3]
+        offset += 3
+        goal_dist = flat_cache[:, offset:offset + 1]
+        offset += 1
+        terrain_normal = flat_cache[:, offset:offset + 3]
+        offset += 3
+        terrain_inv_r_min = flat_cache[:, offset:offset + 1]
+        offset += 1
+        kappa = flat_cache[:, offset:offset + 1]
+        offset += 1
+        terrain_penalty_factor = flat_cache[:, offset:offset + 1]
+        offset += 1
+        terrain_max_repulsion = flat_cache[:, offset:offset + 1]
+        offset += 1
+        obstacle_has = tf.reshape(flat_cache[:, offset:offset + 3] > 0.5, [-1, 3, 1])
+        offset += 3
+        obstacle_repulsion_dir = tf.reshape(flat_cache[:, offset:offset + 9], [-1, 3, 3])
+        offset += 9
+        obstacle_dist_surface = tf.reshape(flat_cache[:, offset:offset + 3], [-1, 3, 1])
+        offset += 3
+        obstacle_max_repulsion = tf.reshape(flat_cache[:, offset:offset + 3], [-1, 3, 1])
+        offset += 3
+        agent_repulsion_dir = tf.reshape(flat_cache[:, offset:offset + 6], [-1, 2, 3])
+        offset += 6
+        agent_rel_dist = tf.reshape(flat_cache[:, offset:offset + 2], [-1, 2, 1])
+        geometry_ctx = (
+            goal_dir,
+            goal_dist,
+            terrain_normal,
+            terrain_inv_r_min,
+            kappa,
+            terrain_penalty_factor,
+            terrain_max_repulsion,
+            obstacle_has,
+            obstacle_repulsion_dir,
+            obstacle_dist_surface,
+            obstacle_max_repulsion,
+            agent_repulsion_dir,
+            agent_rel_dist,
+        )
+        return obs_valid_inputs, geometry_ctx
+
+    def compute_pf_geometry_cache_batch_numpy(self, obs_batch):
+        """NumPy 包装：批量生成压缩 PF 几何上下文缓存。"""
+        try:
+            batch_size = int(obs_batch.shape[0]) if hasattr(obs_batch, 'shape') else len(obs_batch)
+        except Exception:
+            batch_size = 0
+        if batch_size <= 0:
+            return np.zeros((0, self.n_agents, 38), dtype=np.float32)
+        obs_batch = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
+        correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else tf.shape(obs_batch)[2]
+        flat_obs = tf.reshape(obs_batch[:, :, :correct_obs_dim], [-1, correct_obs_dim])
+        obs_ctx = self._extract_pf_obs_context_compiled_tf(flat_obs)
+        geometry_ctx = self._extract_pf_geometry_context_compiled_tf(
+            obs_ctx[1],
+            obs_ctx[2],
+            obs_ctx[4],
+            obs_ctx[5],
+            obs_ctx[6],
+        )
+        packed_cache = self._pack_pf_geometry_cache_from_shared_context_tf(obs_ctx[3], geometry_ctx, tf.shape(obs_batch)[0])
+        return np.ascontiguousarray(_safe_tensor_to_numpy(tf.identity(packed_cache)), dtype=np.float32)
+
+    def _compose_pf_force_from_geometry_context_tf(self, action_head, pf_params, pf_params_valid, geometry_ctx):
+        """在共享 geometry_context 上合成 PF 力。"""
+        dtype = action_head.dtype
+        (
+            goal_dir,
+            goal_dist,
+            terrain_normal,
+            terrain_inv_r_min,
+            kappa,
+            terrain_penalty_factor,
+            terrain_max_repulsion,
+            obstacle_has,
+            obstacle_repulsion_dir,
+            obstacle_dist_surface,
+            obstacle_max_repulsion,
+            agent_repulsion_dir,
+            agent_rel_dist,
+        ) = geometry_ctx
+
+        k_att = pf_params[:, 0:1]
+        lambda_1 = pf_params[:, 1:2]
+        k_rep = pf_params[:, 2:3]
+        radius = pf_params[:, 3:4]
+
+        d0 = tf.clip_by_value(lambda_1, tf.cast(3.0, dtype), tf.cast(15.0, dtype))
+        dist_diff = goal_dist - d0
+        switch_factor = tf.sigmoid(tf.cast(5.0, dtype) * dist_diff)
+        close_attraction = k_att * d0
+        far_attraction = tf.cast(1.2, dtype) * k_att * goal_dist
+        goal_force = goal_dir * (close_attraction * (tf.cast(1.0, dtype) - switch_factor) + far_attraction * switch_factor)
+
+        eps = tf.cast(1e-3, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
+        inv_R_safe = tf.cast(1.0, dtype) / (radius + eps)
+        base_repulsion = k_rep * (terrain_inv_r_min - inv_R_safe) * tf.square(terrain_inv_r_min) * kappa
+        base_repulsion = tf.clip_by_value(base_repulsion, tf.cast(0.0, dtype), tf.cast(10000.0, dtype))
+        terrain_strength = base_repulsion * terrain_penalty_factor
+        terrain_strength = tf.clip_by_value(terrain_strength, tf.cast(0.0, dtype), terrain_max_repulsion)
+        terrain_force = terrain_normal * terrain_strength
+        terrain_force_z_safe = tf.maximum(terrain_force[:, 2:3], tf.cast(0.0, dtype))
+        terrain_force = tf.concat([terrain_force[:, 0:2], terrain_force_z_safe], axis=1)
+
+        obstacle_inv_dist = tf.cast(1.0, dtype) / (obstacle_dist_surface + eps)
+        obstacle_inv_dist = tf.clip_by_value(obstacle_inv_dist, tf.cast(0.0, dtype), tf.cast(10.0, dtype))
+        obstacle_inv_R = tf.cast(1.0, dtype) / (tf.reshape(radius, [-1, 1, 1]) + eps)
+        obstacle_strength_core = (obstacle_inv_dist - obstacle_inv_R) * tf.square(obstacle_inv_dist)
+        obstacle_smooth_factor = tf.cast(1.0, dtype) / (
+            tf.cast(1.0, dtype) + tf.exp(-(tf.reshape(radius, [-1, 1, 1]) - obstacle_dist_surface) / tf.cast(2.0, dtype))
+        )
+        obstacle_strength = obstacle_strength_core * obstacle_smooth_factor
+        obstacle_strength = tf.clip_by_value(obstacle_strength, tf.cast(0.0, dtype), obstacle_max_repulsion)
+        obstacle_strength = tf.where(obstacle_has, obstacle_strength, tf.zeros_like(obstacle_strength))
+        obstacle_force = tf.reduce_sum(obstacle_repulsion_dir * obstacle_strength, axis=1)
+
+        agent_inv_dist = tf.cast(1.0, dtype) / (agent_rel_dist + eps)
+        agent_inv_dist = tf.clip_by_value(agent_inv_dist, tf.cast(0.0, dtype), tf.cast(10.0, dtype))
+        agent_inv_R = tf.cast(1.0, dtype) / (tf.expand_dims(radius, axis=1) + eps)
+        agent_strength_core = (agent_inv_dist - agent_inv_R) * tf.square(agent_inv_dist)
+        agent_smooth_factor = tf.cast(1.0, dtype) / (
+            tf.cast(1.0, dtype) + tf.exp(-(tf.expand_dims(radius, axis=1) - agent_rel_dist) / tf.cast(2.0, dtype))
+        )
+        agent_strength = agent_strength_core * agent_smooth_factor
+        agent_strength = tf.clip_by_value(agent_strength, tf.cast(0.0, dtype), tf.cast(15.0, dtype))
+        agent_strength = agent_strength * tf.cast(3.0, dtype)
+        agent_force = tf.reduce_sum(agent_repulsion_dir * agent_strength, axis=1)
+
+        d_goal = goal_dist
+        kappa_goal = tf.exp(-d_goal / tf.cast(50.0, dtype))
+        terrain_force = terrain_force * kappa_goal
+        obstacle_force = obstacle_force * kappa_goal
+
         terrain_force_z = terrain_force[:, 2:3]
-        # sigmoid((|Fz| - 0.5) * 4)，在|Fz|=0.5附近平滑过渡
         force_z_abs = tf.abs(terrain_force_z)
-        enhancement_factor = 1.0 + 1.5 * tf.sigmoid((force_z_abs - 0.5) * 4.0)  # 范围[1.0, 2.5]
+        enhancement_factor = 1.0 + 1.5 * tf.sigmoid((force_z_abs - 0.5) * 4.0)
         terrain_force_enhanced = terrain_force * tf.cast(enhancement_factor, terrain_force.dtype)
-        
-        total_force = goal_force + terrain_force_enhanced + agent_force + obstacle_force
-        
-        # 🔧 修复：势场力归一化问题
-        # 问题：目标吸引力在远距离时可达 2 * k_att * dist，当k_att=5.0、dist=200时可达2000
-        # 原归一化使用max_force*1.5=13.2，导致势场力被过度压缩（2000/13.2≈151，被clip到1.0）
-        # 解决方案：先分别限制各分量的幅值，再组合，避免地形斥力被目标吸引力削弱
-        dtype_action = action_head.dtype
-        
-        # 🔧 改进：分别限制各分量的幅值，确保地形斥力不被目标吸引力削弱
-        # 1. 限制目标吸引力的幅值（防止过度主导）
-        # 🔧 修复：适当降低目标吸引力上限（从5.0倍降低到3.0倍），避免压倒地形斥力（MATD3版本）
-        # 问题：当前吸引力太强，导致智能体总是穿透地形过去
-        # 解决方案：降低上限到 max_force * 3.0（默认32.4），在保持远距离有效性的同时，避免压倒地形斥力
-        max_goal_force_norm = tf.cast(self.c_max_force * 3.0, dtype_action)  # 🔧 修复：从5.0倍降低到3.0倍
+
+        max_goal_force_norm = tf.cast(self.c_max_force * 3.0, dtype)
         goal_force_limited = tf.clip_by_norm(goal_force, max_goal_force_norm)
-        
-        # 2. 地形斥力不限制（或使用更大的上限），确保其有效性
-        max_terrain_force_norm = tf.cast(self.c_max_force * 5.0, dtype_action)  # 地形斥力上限（更大）
+        max_terrain_force_norm = tf.cast(self.c_max_force * 5.0, dtype)
         terrain_force_limited = tf.clip_by_norm(terrain_force_enhanced, max_terrain_force_norm)
-        
-        # 3. 限制其他力
-        max_other_force_norm = tf.cast(self.c_max_force * 2.0, dtype_action)
+        max_other_force_norm = tf.cast(self.c_max_force * 2.0, dtype)
         agent_force_limited = tf.clip_by_norm(agent_force, max_other_force_norm)
         obstacle_force_limited = tf.clip_by_norm(obstacle_force, max_other_force_norm)
-        
-        # 4. 重新组合限制后的力
         total_force_limited = goal_force_limited + terrain_force_limited + agent_force_limited + obstacle_force_limited
-        
-        # 🔧 修复：改进归一化方式，保留相对强度信息，避免远距离时吸引力被过度削弱（MATD3版本）
-        # 问题：使用total_force的幅值作为归一化基准，会导致远距离时虽然力更大，但归一化后和近距离时一样都是1.0
-        # 解决方案：使用各分量上限之和作为归一化基准，保留相对强度信息
+
         force_magnitude = tf.norm(total_force_limited, axis=1, keepdims=True)
-        eps = tf.cast(1e-6, dtype_action)
-        
-        # 归一化基准 = 各分量上限的平方和开方（L2范数的理论上限）
-        max_goal_norm = tf.cast(self.c_max_force * 3.0, dtype_action)  # 🔧 修复：目标吸引力上限（从5.0降低到3.0）
-        max_terrain_norm = tf.cast(self.c_max_force * 5.0, dtype_action)  # 地形斥力上限（MATD3版本）
-        max_other_norm = tf.cast(self.c_max_force * 2.0, dtype_action)  # 其他力上限
-        # 归一化基准 = 各分量上限的平方和开方（L2范数的理论上限）
-        # 🚨 关键修复：防止sqrt输入为负数导致NaN（MATD3版本）
-        sum_squares = max_goal_norm * max_goal_norm + max_terrain_norm * max_terrain_norm + max_other_norm * max_other_norm * tf.cast(2.0, dtype_action)
-        # 确保输入为正数（理论上应该总是正数，但防止数值误差）
-        eps_matd3 = tf.cast(1e-3, dtype_action) if dtype_action in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype_action)
-        sum_squares = tf.maximum(sum_squares, eps_matd3 * eps_matd3)
+        max_goal_norm = tf.cast(self.c_max_force * 3.0, dtype)
+        max_terrain_norm = tf.cast(self.c_max_force * 5.0, dtype)
+        max_other_norm = tf.cast(self.c_max_force * 2.0, dtype)
+        sum_squares = (
+            max_goal_norm * max_goal_norm
+            + max_terrain_norm * max_terrain_norm
+            + max_other_norm * max_other_norm * tf.cast(2.0, dtype)
+        )
+        norm_eps = tf.cast(1e-3, dtype) if dtype in (tf.float16, tf.bfloat16) else tf.cast(1e-6, dtype)
+        sum_squares = tf.maximum(sum_squares, norm_eps * norm_eps)
         norm_base_theoretical = tf.sqrt(sum_squares)
-        # 🚨 关键修复：确保norm_base_theoretical是有限值
-        norm_base_theoretical = tf.where(tf.math.is_finite(norm_base_theoretical), norm_base_theoretical, tf.ones_like(norm_base_theoretical) * eps_matd3)
-        # 使用理论上限和实际幅值的较小值，避免过度放大
+        norm_base_theoretical = tf.where(
+            tf.math.is_finite(norm_base_theoretical),
+            norm_base_theoretical,
+            tf.ones_like(norm_base_theoretical) * norm_eps
+        )
         norm_base = tf.minimum(force_magnitude, norm_base_theoretical)
-        # 🚨 关键修复：降低归一化基准最小值，避免PF力被过度压缩（MATD3版本）
-        # 原因：如果norm_base最小值太大（c_max_force * 1.0 = 8.0），实际PF力（2-5）归一化后只有0.25-0.625
-        # 修复：使用c_max_force * 0.1 = 0.8作为最小值，保留更多PF力强度信息
-        norm_base = tf.maximum(norm_base, tf.cast(self.c_max_force * 0.1, dtype_action))  # 从1.0降低到0.1
-        
-        # 归一化到[-1,1]范围，保留相对强度信息
-        # 🚨 关键修复：确保norm_base是有限值，防止除以NaN/Inf（MATD3版本）
-        norm_base = tf.where(tf.math.is_finite(norm_base), norm_base, tf.ones_like(norm_base) * eps_matd3)
-        a_pf_raw = total_force_limited / (norm_base + eps_matd3)
-        # 🚨 关键修复：确保a_pf_raw是有限值
+        norm_base = tf.maximum(norm_base, tf.cast(self.c_max_force * 0.1, dtype))
+        norm_base = tf.where(tf.math.is_finite(norm_base), norm_base, tf.ones_like(norm_base) * norm_eps)
+        a_pf_raw = total_force_limited / (norm_base + norm_eps)
         a_pf_raw = tf.where(tf.math.is_finite(a_pf_raw), a_pf_raw, tf.zeros_like(a_pf_raw))
-        a_pf_clipped = tf.clip_by_value(a_pf_raw, tf.cast(-1.0, dtype_action), tf.cast(1.0, dtype_action))
-        # 🚨 关键修复：确保a_pf_clipped是有限值
+        a_pf_clipped = tf.clip_by_value(a_pf_raw, tf.cast(-1.0, dtype), tf.cast(1.0, dtype))
         a_pf_clipped = tf.where(tf.math.is_finite(a_pf_clipped), a_pf_clipped, tf.zeros_like(a_pf_clipped))
-        
-        # 验证有效性
+
         force_finite = tf.reduce_all(tf.math.is_finite(a_pf_clipped), axis=1, keepdims=True)
         pf_use_mask = tf.logical_and(pf_params_valid, force_finite)
-        a_pf = tf.where(pf_use_mask, a_pf_clipped, action_head)
-        
-        # 混合网络动作和势场动作
-        r = tf.cast(tf.clip_by_value(force_ratio, 0.0, 1.0), dtype_action)
-        corrected = action_head + r * (a_pf - action_head)
-        
-        # 🔧 新增：返回势场力矢量（归一化后的3维向量，范围[-1,1]）
-        # 将势场力矢量归一化到[-1,1]范围，作为额外的观测特征
-        pf_force_vector = tf.cast(a_pf, orig_dtype)  # (batch, 3) 归一化后的势场力矢量
-        
-        return tf.cast(corrected, orig_dtype), pf_force_vector
+        return tf.where(pf_use_mask, a_pf_clipped, action_head)
+
+    def _compute_pf_force_from_geometry_context_tf(self, action, obs_valid_inputs, geometry_ctx):
+        """基于共享 geometry_context 计算 PF 力。"""
+        orig_dtype = action.dtype
+        action = tf.cast(action, tf.float32) if action.dtype != tf.float32 else action
+        action_head, pf_params, pf_params_valid, _ = self._prepare_pf_action_inputs_tf(action, obs_valid_inputs)
+        pf_force = self._compose_pf_force_from_geometry_context_tf(action_head, pf_params, pf_params_valid, geometry_ctx)
+        return tf.cast(action_head, orig_dtype), tf.cast(pf_force, orig_dtype)
+
+    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
+    def _compute_pf_force_from_geometry_context_compiled_tf(self, action, obs_valid_inputs, geometry_ctx):
+        """共享 geometry_context 时复用 PF_JIT，避免动作/target 预计算落回非编译路径。"""
+        return self._compute_pf_force_from_geometry_context_tf(action, obs_valid_inputs, geometry_ctx)
+
+    def _compute_base_pf_forces_from_shared_context_tf(self, obs_valid_inputs, geometry_ctx, force_ratio, batch_size_dyn, act_dim):
+        """在已提取共享 geometry_context 的前提下计算 base PF 特征。"""
+        dummy_action = tf.zeros([batch_size_dyn * self.n_agents, act_dim], dtype=tf.float32)
+        _, pf_force_flat = self._compute_pf_force_from_geometry_context_compiled_tf(
+            dummy_action,
+            obs_valid_inputs,
+            geometry_ctx,
+        )
+        pf_tensor = tf.reshape(pf_force_flat, [batch_size_dyn, self.n_agents, 3])
+        fr_batch = _broadcast_force_ratio(force_ratio, batch_size_dyn)
+        fr_positive_mask = tf.reshape(tf.greater(fr_batch[:, 0], 0.0), [-1, 1, 1])
+        return tf.where(
+            tf.broadcast_to(fr_positive_mask, tf.shape(pf_tensor)),
+            pf_tensor,
+            tf.zeros_like(pf_tensor),
+        )
+
+    def _compute_base_pf_forces_batch_tf(self, obs_batch, force_ratio):
+        """基于 obs 批量计算 base PF 特征，并按历史 FR 门控。"""
+        obs_batch = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
+        batch_size_dyn = tf.shape(obs_batch)[0]
+        if not self.use_pf_feature_flag or not self.use_tf_potential_field_cached:
+            return tf.zeros([batch_size_dyn, self.n_agents, 3], dtype=tf.float32)
+
+        fr_batch = _broadcast_force_ratio(force_ratio, batch_size_dyn)
+        fr_positive_mask = tf.reshape(tf.greater(fr_batch[:, 0], 0.0), [-1, 1, 1])
+        uniform_obs_dims = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
+        uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1
+
+        if uniform_obs_dims and uniform_action_dims:
+            correct_obs_dim = self.obs_shapes[0]
+            act_dim = self.action_dims[0]
+            flat_obs = tf.ensure_shape(
+                tf.reshape(obs_batch[:, :, :correct_obs_dim], [-1, correct_obs_dim]),
+                [None, correct_obs_dim],
+            )
+            obs_ctx = self._extract_pf_obs_context_compiled_tf(flat_obs)
+            geometry_ctx = self._extract_pf_geometry_context_compiled_tf(
+                obs_ctx[1],
+                obs_ctx[2],
+                obs_ctx[4],
+                obs_ctx[5],
+                obs_ctx[6],
+            )
+            pf_tensor = self._compute_base_pf_forces_from_shared_context_tf(
+                obs_ctx[3],
+                geometry_ctx,
+                force_ratio,
+                batch_size_dyn,
+                act_dim,
+            )
+        else:
+            pf_forces_per_agent = []
+            default_act_dim = self.action_dims[0] if len(self.action_dims) > 0 else 7
+            for idx_i in range(self.n_agents):
+                obs_dim_i = self.obs_shapes[idx_i] if idx_i < len(self.obs_shapes) else tf.shape(obs_batch)[2]
+                act_dim_i = self.action_dims[idx_i] if idx_i < len(self.action_dims) else default_act_dim
+                agent_obs = obs_batch[:, idx_i, :obs_dim_i]
+                dummy_action = tf.zeros([batch_size_dyn, act_dim_i], dtype=tf.float32)
+                obs_ctx = self._extract_pf_obs_context_compiled_tf(agent_obs)
+                _, pf_force_vec = self._compute_pf_force_from_context_tf(dummy_action, *obs_ctx)
+                pf_forces_per_agent.append(pf_force_vec)
+            pf_tensor = tf.stack(pf_forces_per_agent, axis=1)
+
+        return tf.where(
+            tf.broadcast_to(fr_positive_mask, tf.shape(pf_tensor)),
+            pf_tensor,
+            tf.zeros_like(pf_tensor),
+        )
+
+    def compute_base_pf_forces_batch_numpy(self, obs_batch, force_ratio):
+        """NumPy 包装：供交互阶段缓存 next_pf_forces 使用。"""
+        try:
+            batch_size = int(obs_batch.shape[0]) if hasattr(obs_batch, 'shape') else len(obs_batch)
+        except Exception:
+            batch_size = 0
+        if batch_size <= 0:
+            return np.zeros((0, self.n_agents, 3), dtype=np.float32)
+        if not self.use_pf_feature_flag or not self.use_tf_potential_field_cached:
+            return np.zeros((batch_size, self.n_agents, 3), dtype=np.float32)
+        pf_tensor = self._compute_base_pf_forces_batch_tf(obs_batch, force_ratio)
+        return np.ascontiguousarray(_safe_tensor_to_numpy(tf.identity(pf_tensor)), dtype=np.float32)
+
+    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
+    def _compute_pf_force_from_context_tf(
+        self,
+        action,
+        obs,
+        pos,
+        goal_pos,
+        obs_valid_inputs,
+        terrain_info,
+        obstacle_info,
+        other_agents_info,
+    ):
+        """基于已提取的 PF 观测上下文计算 PF 力，不做 force-ratio 混合。"""
+        geometry_context = self._extract_pf_geometry_context_tf(
+            pos,
+            goal_pos,
+            terrain_info,
+            obstacle_info,
+            other_agents_info,
+        )
+        return self._compute_pf_force_from_geometry_context_tf(action, obs_valid_inputs, geometry_context)
+
+    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
+    def _apply_potential_field_correction_from_geometry_context_tf(
+        self,
+        action,
+        force_ratio,
+        obs_valid_inputs,
+        geometry_context,
+    ):
+        """基于共享 geometry_context 执行 PF 修正。"""
+        batch_size = tf.shape(action)[0]
+        action_head, pf_force_vector = self._compute_pf_force_from_geometry_context_tf(
+            action,
+            obs_valid_inputs,
+            geometry_context,
+        )
+        corrected_dtype = action_head.dtype
+        force_ratio = _broadcast_force_ratio(force_ratio, batch_size)
+        force_ratio = force_ratio * tf.cast(obs_valid_inputs, tf.float32)
+        r = tf.cast(tf.clip_by_value(force_ratio, 0.0, 1.0), corrected_dtype)
+        corrected = action_head + r * (pf_force_vector - action_head)
+        return tf.cast(corrected, corrected_dtype), pf_force_vector
+
+    @tf.function(jit_compile=bool(os.getenv('PF_JIT','0').lower() in ('1','true','yes','on')), reduce_retracing=True)
+    def _apply_potential_field_correction_from_context_tf(
+        self,
+        action,
+        force_ratio,
+        obs,
+        pos,
+        goal_pos,
+        obs_valid_inputs,
+        terrain_info,
+        obstacle_info,
+        other_agents_info,
+    ):
+        """基于已提取的 PF 观测上下文执行修正，避免重复解析同一份 obs。"""
+        geometry_context = self._extract_pf_geometry_context_tf(
+            pos,
+            goal_pos,
+            terrain_info,
+            obstacle_info,
+            other_agents_info,
+        )
+        return self._apply_potential_field_correction_from_geometry_context_tf(
+            action,
+            force_ratio,
+            obs_valid_inputs,
+            geometry_context,
+        )
+    
+    def _apply_potential_field_correction_tf(self, action, obs, force_ratio):
+        """
+        应用势场修正（TensorFlow稳定可微版本）
+        MATD3 包装入口：真正的 jit_compile 应落在 from_context 热内核上。
+        """
+        obs_ctx = self._extract_pf_obs_context_compiled_tf(obs)
+        return self._apply_potential_field_correction_from_context_tf(action, force_ratio, *obs_ctx)
 
     def _apply_potential_field_correction(self, action, obs, force_ratio):
         # 根据自适应状态动态选择：挂起期间走 Eager 版本，平时走 JIT 版本
@@ -11896,7 +13823,7 @@ class OptimizedMATD3:
         except Exception as e:
             # 出错时保持默认 zeros tensor
             pass
-    
+
     def _world_to_map_transform_tf(self, x, y):
         """
         世界坐标到地图索引的转换
@@ -11908,7 +13835,7 @@ class OptimizedMATD3:
         ix = tf.clip_by_value(x, tf.cast(0.0, dtype), map_size - tf.cast(1.0, dtype))
         iy = tf.clip_by_value(y, tf.cast(0.0, dtype), map_size - tf.cast(1.0, dtype))
         return ix, iy
-    
+
     def _bilinear_sample_height_tf(self, height_map, ix, iy):
         """
         双线性插值采样高度图
@@ -11916,76 +13843,57 @@ class OptimizedMATD3:
         ix, iy: [B,1] 地图索引
         返回: [B,1] 高度值
         """
-        # 🔧 XLA修复：使用 tf.shape 获取维度，确保类型一致
         H = tf.cast(tf.shape(height_map)[0], tf.int32)
         W = tf.cast(tf.shape(height_map)[1], tf.int32)
-        
-        # 确保索引在有效范围内
+
         dtype = ix.dtype
-        # 🔧 XLA修复：确保 W 和 H 至少为 1，避免除零或负索引
         W_safe = tf.maximum(W, 1)
         H_safe = tf.maximum(H, 1)
-        ix = tf.clip_by_value(ix, tf.cast(0.0, dtype), tf.cast(W_safe-1, dtype))
-        iy = tf.clip_by_value(iy, tf.cast(0.0, dtype), tf.cast(H_safe-1, dtype))
-        
-        # 🔧 XLA修复：计算四个角点，确保ceil不会超出范围
+        ix = tf.clip_by_value(ix, tf.cast(0.0, dtype), tf.cast(W_safe - 1, dtype))
+        iy = tf.clip_by_value(iy, tf.cast(0.0, dtype), tf.cast(H_safe - 1, dtype))
+
         x0 = tf.math.floor(ix)
-        x1 = tf.minimum(tf.math.ceil(ix), tf.cast(W_safe-1, dtype))  # 确保不超出W_safe-1
+        x1 = tf.minimum(tf.math.ceil(ix), tf.cast(W_safe - 1, dtype))
         y0 = tf.math.floor(iy)
-        y1 = tf.minimum(tf.math.ceil(iy), tf.cast(H_safe-1, dtype))  # 确保不超出H_safe-1
-        
-        # 🔧 XLA修复：转换为整数索引时再次clip，双重保护防止越界
-        x0i = tf.clip_by_value(tf.cast(x0, tf.int32), 0, W_safe-1)
-        x1i = tf.clip_by_value(tf.cast(x1, tf.int32), 0, W_safe-1)
-        y0i = tf.clip_by_value(tf.cast(y0, tf.int32), 0, H_safe-1)
-        y1i = tf.clip_by_value(tf.cast(y1, tf.int32), 0, H_safe-1)
-        
-        # 采样四个角点的高度值
-        # 🔧 XLA修复：使用 tf.gather 代替 tf.gather_nd，避免内存对齐问题
-        # 将 2D height_map 展平为 1D，使用线性索引访问
-        # 🔧 XLA修复：预先展平 height_map，避免在循环中重复 reshape
+        y1 = tf.minimum(tf.math.ceil(iy), tf.cast(H_safe - 1, dtype))
+
+        x0i = tf.clip_by_value(tf.cast(x0, tf.int32), 0, W_safe - 1)
+        x1i = tf.clip_by_value(tf.cast(x1, tf.int32), 0, W_safe - 1)
+        y0i = tf.clip_by_value(tf.cast(y0, tf.int32), 0, H_safe - 1)
+        y1i = tf.clip_by_value(tf.cast(y1, tf.int32), 0, H_safe - 1)
+
         height_map_flat = tf.reshape(height_map, [-1])
         map_size = tf.shape(height_map_flat)[0]
-        
+
         def gather_height(xi, yi):
             batch_size = tf.shape(xi)[0]
-            # 将索引展平并确保在有效范围内
             xi_flat = tf.reshape(xi, [-1])
             yi_flat = tf.reshape(yi, [-1])
-            # 🔧 XLA修复：使用 tf.maximum 确保 W 和 H 至少为 1，避免除零或负索引
-            W_safe = tf.maximum(W, 1)
-            H_safe = tf.maximum(H, 1)
-            # 确保索引在 [0, W_safe-1] 和 [0, H_safe-1] 范围内
-            xi_safe = tf.clip_by_value(xi_flat, 0, W_safe - 1)
-            yi_safe = tf.clip_by_value(yi_flat, 0, H_safe - 1)
-            # 🔧 XLA修复：使用线性索引代替 gather_nd，避免内存对齐问题
-            # 线性索引 = y * W + x，确保使用 int32 类型避免类型转换问题
+            W_safe_local = tf.maximum(W, 1)
+            H_safe_local = tf.maximum(H, 1)
+            xi_safe = tf.clip_by_value(xi_flat, 0, W_safe_local - 1)
+            yi_safe = tf.clip_by_value(yi_flat, 0, H_safe_local - 1)
             xi_safe_int = tf.cast(xi_safe, tf.int32)
             yi_safe_int = tf.cast(yi_safe, tf.int32)
-            W_safe_int = tf.cast(W_safe, tf.int32)
+            W_safe_int = tf.cast(W_safe_local, tf.int32)
             linear_indices = yi_safe_int * W_safe_int + xi_safe_int
-            # 🔧 XLA修复：确保线性索引在有效范围内 [0, map_size-1]
             linear_indices = tf.clip_by_value(linear_indices, 0, tf.maximum(0, map_size - 1))
-            # 使用 tf.gather 访问，比 gather_nd 更安全
             gathered = tf.gather(height_map_flat, linear_indices)
             return tf.reshape(gathered, [batch_size, 1])
-        
-        Ia = gather_height(x0i, y0i)  # 左下
-        Ib = gather_height(x1i, y0i)  # 右下
-        Ic = gather_height(x0i, y1i)  # 左上
-        Id = gather_height(x1i, y1i)  # 右上
-        
-        # 计算权重
+
+        Ia = gather_height(x0i, y0i)
+        Ib = gather_height(x1i, y0i)
+        Ic = gather_height(x0i, y1i)
+        Id = gather_height(x1i, y1i)
+
         wx = ix - x0
         wy = iy - y0
         wa = (1 - wx) * (1 - wy)
         wb = wx * (1 - wy)
         wc = (1 - wx) * wy
         wd = wx * wy
-        
-        # 双线性插值
-        h = wa * Ia + wb * Ib + wc * Ic + wd * Id
-        return h
+
+        return wa * Ia + wb * Ib + wc * Ic + wd * Id
     
     def save_models(self, path):
         """🚨 标准MATD3：保存模型（包括两个独立的Twin Critic网络）"""
@@ -12123,37 +14031,263 @@ def train(args):
     else:
         reward_debugger = None
 
-    # 初始化动态地图切换状态
-    # 如果用户显式启用了 --random-terrain，则直接解锁随机地形，绕过课程学习
-    user_explicit_random = getattr(args, 'random_terrain', False)
-    map_change_unlocked = user_explicit_random  # 显式设置时直接解锁
-    consecutive_success_count = 0
-    episodes_since_best_for_unlock = 0  # 用于解锁逻辑的独立计数器
-    total_success_count = 0  # 累计成功次数（不要求连续），用于解锁信息显示
+    def _env_flag_bool(name, default=False):
+        try:
+            return os.getenv(name, '1' if default else '0').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            return bool(default)
 
-    # 如果启用了动态切换，默认从固定地图开始；是否从固定位置启动需尊重用户的动态首次/显式设置
-    # 但如果用户显式设置了 --random-terrain，则尊重用户意图，不强制禁用
-    if args.unlock_env_on_success > 0 and args.unlock_env_on_plateau > 0:
-        if not user_explicit_random:
-            args.random_terrain = False
-        dynamic_first = bool(getattr(args, 'dynamic_first_time', False))
-        # 仅在未启用动态首次，且用户未显式将 use_fixed_positions 设为 False 时，才从固定位置启动
-        if not dynamic_first and (not hasattr(args, 'use_fixed_positions') or args.use_fixed_positions is not False):
-            args.use_fixed_positions = True
+    def _parse_stage_series(env_name, fallback_values, cast_fn=int):
+        raw = str(os.getenv(env_name, '')).strip()
+        values = []
+        if raw:
+            for token in raw.split(','):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    values.append(cast_fn(float(token)) if cast_fn is int else cast_fn(token))
+                except Exception:
+                    pass
+        if not values:
+            values = list(fallback_values)
+        if not values:
+            values = [0]
+        while len(values) < 4:
+            values.append(values[-1])
+        return values[:4]
+
+    def _set_bool_env(name, value):
+        os.environ[name] = '1' if bool(value) else '0'
+
+    def _parse_multi_seed_list(base_seed_value):
+        seeds_raw = str(os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '')).strip()
+        seeds = []
+        if seeds_raw:
+            for token in seeds_raw.split(','):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    seeds.append(int(token))
+                except Exception:
+                    pass
+        if not seeds:
+            base = int(base_seed_value)
+            seeds = [base, base + 17, base + 37, base + 71]
+        return seeds
+
+    def _apply_curriculum_stage_env(stage_cfg):
+        setattr(args, 'use_fixed_positions', bool(stage_cfg['use_fixed_positions']))
+        setattr(args, 'dynamic_first_time', bool(stage_cfg['dynamic_first_time']))
+        setattr(args, 'random_terrain', bool(stage_cfg.get('random_terrain', False)))
+        setattr(args, 'terrain_seed', int(stage_cfg['terrain_seed']))
+        setattr(args, 'per_episode_terrain', bool(stage_cfg.get('per_episode_terrain', False)))
+        setattr(args, 'per_env_terrain', bool(stage_cfg.get('per_env_terrain', True)))
+
+        _set_bool_env('USE_DYNAMIC_OBSTACLES', stage_cfg['use_dynamic_obstacles'])
+        _set_bool_env('USE_FIXED_POSITIONS', stage_cfg['use_fixed_positions'])
+        _set_bool_env('DYNAMIC_FIRST_TIME', stage_cfg['dynamic_first_time'])
+        _set_bool_env('RANDOM_TERRAIN', stage_cfg.get('random_terrain', False))
+        _set_bool_env('SEMI_RANDOM_TERRAIN', stage_cfg.get('semi_random_terrain', False))
+        _set_bool_env('PER_EPISODE_TERRAIN', stage_cfg.get('per_episode_terrain', False))
+        _set_bool_env('PER_ENV_TERRAIN', stage_cfg.get('per_env_terrain', True))
+        _set_bool_env('CURRICULUM_MULTI_TERRAIN_MODE', stage_cfg.get('multi_terrain_mode', False))
+        os.environ['SCENARIO_SEED'] = str(int(stage_cfg['terrain_seed']))
+        os.environ['TERRAIN_BASE_SEED'] = str(int(stage_cfg.get('terrain_base_seed', stage_cfg['terrain_seed'])))
+        os.environ['PEAK_JITTER_RANGE'] = str(float(stage_cfg.get('peak_jitter_range', os.getenv('PEAK_JITTER_RANGE', '15.0'))))
+        os.environ['CURRICULUM_MULTI_TERRAIN_SEEDS'] = ','.join(str(int(seed)) for seed in stage_cfg.get('multi_terrain_seeds', []))
+        os.environ['CURRICULUM_STAGE_ID'] = str(int(stage_cfg.get('stage_id', 0)))
+        os.environ['CURRICULUM_REWARD_PROFILE'] = str(stage_cfg.get('reward_profile', 'fixed_route'))
+
+    # 初始化课程学习状态：实现 5 阶段训练路径
+    user_explicit_random = bool(getattr(args, 'random_terrain', False))
+    curriculum_enabled = bool(args.unlock_env_on_success > 0 and args.unlock_env_on_plateau > 0)
+    if curriculum_enabled and user_explicit_random:
         if not quiet_output:
-            if user_explicit_random:
-                print(f"🗺️ 用户显式启用随机地形模式，将在每个回合使用不同的随机地形（绕过课程学习）。")
-            else:
-                print(f"动态环境切换已启用: 连续成功 {args.unlock_env_on_success} 次且奖励停滞 {args.unlock_env_on_plateau} 回合后解锁。")
-                if getattr(args, 'use_fixed_positions', False):
-                    print("训练将从固定地图和固定位置开始。")
-                    if not os.path.exists(args.positions_file):
-                        print(f"  [警告] 固定位置文件未找到: {args.positions_file}. 场景将回退到默认复位逻辑。")
-                else:
-                    if dynamic_first:
-                        print("训练将从固定地图开始，首次动态生成位置，后续固定。")
-                    else:
-                        print("训练将从固定地图但动态位置开始。")
+            print("🧭 已启用五阶段课程学习，训练将按课程阶段控制地图随机化，覆盖显式 --random-terrain 设置。")
+        user_explicit_random = False
+        args.random_terrain = False
+
+    curriculum_lr_reduced = False
+    consecutive_success_count = 0          # 阶段内连续成功计数
+    episodes_since_best_for_unlock = 0     # 阶段内奖励停滞计数
+    total_success_count = 0                # 全局累计团队成功次数（用于日志和统计）
+    curriculum_stage_success_count = 0     # 当前阶段累计团队成功次数
+    curriculum_stage_start_episode = 0
+    curriculum_stage_best_reward = -np.inf
+
+    try:
+        base_terrain_seed = int(getattr(args, 'terrain_seed', None) if getattr(args, 'terrain_seed', None) is not None else os.getenv('SCENARIO_SEED', os.getenv('TERRAIN_BASE_SEED', '67')))
+    except Exception:
+        base_terrain_seed = 67
+    try:
+        stage4_base_seed = int(os.getenv('TERRAIN_BASE_SEED', str(base_terrain_seed)))
+    except Exception:
+        stage4_base_seed = base_terrain_seed
+    try:
+        stage4_peak_jitter = float(os.getenv('PEAK_JITTER_RANGE', '15.0'))
+    except Exception:
+        stage4_peak_jitter = 15.0
+    multi_terrain_seeds = _parse_multi_seed_list(stage4_base_seed)
+    stage_success_targets = _parse_stage_series(
+        'CURRICULUM_STAGE_SUCCESS_TARGETS',
+        [max(1, int(args.unlock_env_on_success))] * 4,
+        cast_fn=int
+    )
+    stage_plateau_targets = _parse_stage_series(
+        'CURRICULUM_STAGE_PLATEAU_TARGETS',
+        [max(1, int(args.unlock_env_on_plateau))] * 4,
+        cast_fn=int
+    )
+    stage_min_episodes = _parse_stage_series(
+        'CURRICULUM_STAGE_MIN_EPISODES',
+        [20, 20, 30, 40],
+        cast_fn=int
+    )
+    try:
+        curriculum_total_success_multiplier = max(1.0, float(os.getenv('CURRICULUM_TOTAL_SUCCESS_MULTIPLIER', '3.0')))
+    except Exception:
+        curriculum_total_success_multiplier = 3.0
+
+    curriculum_stages = [
+        {
+            'stage_id': 1,
+            'label': '阶段1 固定地形+固定位置+固定障碍物',
+            'reward_profile': 'fixed_route',
+            'use_dynamic_obstacles': False,
+            'use_fixed_positions': True,
+            'dynamic_first_time': bool(getattr(args, 'dynamic_first_time', False)),
+            'random_terrain': False,
+            'semi_random_terrain': False,
+            'per_episode_terrain': False,
+            'per_env_terrain': True,
+            'terrain_seed': base_terrain_seed,
+            'terrain_base_seed': stage4_base_seed,
+            'peak_jitter_range': stage4_peak_jitter,
+            'multi_terrain_mode': False,
+            'multi_terrain_seeds': [],
+        },
+        {
+            'stage_id': 2,
+            'label': '阶段2 固定地形+固定位置+随机障碍物',
+            'reward_profile': 'obstacle_route',
+            'use_dynamic_obstacles': True,
+            'use_fixed_positions': True,
+            'dynamic_first_time': bool(getattr(args, 'dynamic_first_time', False)),
+            'random_terrain': False,
+            'semi_random_terrain': False,
+            'per_episode_terrain': False,
+            'per_env_terrain': True,
+            'terrain_seed': base_terrain_seed,
+            'terrain_base_seed': stage4_base_seed,
+            'peak_jitter_range': stage4_peak_jitter,
+            'multi_terrain_mode': False,
+            'multi_terrain_seeds': [],
+        },
+        {
+            'stage_id': 3,
+            'label': '阶段3 固定地形+随机位置+随机障碍物',
+            'reward_profile': 'obstacle_route',
+            'use_dynamic_obstacles': True,
+            'use_fixed_positions': False,
+            'dynamic_first_time': False,
+            'random_terrain': False,
+            'semi_random_terrain': False,
+            'per_episode_terrain': False,
+            'per_env_terrain': True,
+            'terrain_seed': base_terrain_seed,
+            'terrain_base_seed': stage4_base_seed,
+            'peak_jitter_range': stage4_peak_jitter,
+            'multi_terrain_mode': False,
+            'multi_terrain_seeds': [],
+        },
+        {
+            'stage_id': 4,
+            'label': '阶段4 半随机地形+随机位置+随机障碍物',
+            'reward_profile': 'obstacle_route',
+            'use_dynamic_obstacles': True,
+            'use_fixed_positions': False,
+            'dynamic_first_time': False,
+            'random_terrain': False,
+            'semi_random_terrain': True,
+            'per_episode_terrain': True,
+            'per_env_terrain': True,
+            'terrain_seed': stage4_base_seed,
+            'terrain_base_seed': stage4_base_seed,
+            'peak_jitter_range': stage4_peak_jitter,
+            'multi_terrain_mode': False,
+            'multi_terrain_seeds': [],
+        },
+        {
+            'stage_id': 5,
+            'label': '阶段5 多 terrain seed+随机位置+随机障碍物',
+            'reward_profile': 'obstacle_route',
+            'use_dynamic_obstacles': True,
+            'use_fixed_positions': False,
+            'dynamic_first_time': False,
+            'random_terrain': False,
+            'semi_random_terrain': False,
+            'per_episode_terrain': True,
+            'per_env_terrain': True,
+            'terrain_seed': int(multi_terrain_seeds[0]),
+            'terrain_base_seed': int(multi_terrain_seeds[0]),
+            'peak_jitter_range': stage4_peak_jitter,
+            'multi_terrain_mode': True,
+            'multi_terrain_seeds': multi_terrain_seeds,
+        },
+    ]
+
+    def _format_curriculum_stage_desc(stage_cfg, stage_index=None):
+        if not isinstance(stage_cfg, dict):
+            return "当前模式=非课程固定环境"
+        try:
+            stage_id = int(stage_cfg.get('stage_id', (stage_index + 1) if stage_index is not None else 0))
+        except Exception:
+            stage_id = (stage_index + 1) if stage_index is not None else 0
+        total_stages = len(curriculum_stages)
+        raw_label = str(stage_cfg.get('label', f'阶段{stage_id}')).strip()
+        stage_prefix = f"阶段{stage_id}"
+        if raw_label.startswith(stage_prefix):
+            stage_body = raw_label[len(stage_prefix):].strip()
+        else:
+            stage_body = raw_label
+        if stage_body:
+            return f"当前课程=第{stage_id}/{total_stages}阶段 {stage_body}"
+        return f"当前课程=第{stage_id}/{total_stages}阶段"
+
+    def _format_unlock_mode_desc():
+        if curriculum_enabled:
+            current_stage_cfg = curriculum_stages[curriculum_stage_index]
+            return _format_curriculum_stage_desc(current_stage_cfg, curriculum_stage_index)
+        if user_explicit_random:
+            try:
+                lvl = int(getattr(args, 'terrain_complexity_level', 1))
+            except Exception:
+                lvl = getattr(args, 'terrain_complexity_level', 'unknown')
+            return f"当前模式=显式随机地形(复杂度等级 {lvl})"
+        return "当前模式=非课程固定环境"
+
+    curriculum_stage_index = 0
+    map_change_unlocked = user_explicit_random
+    obstacle_change_unlocked = False
+    if curriculum_enabled:
+        _apply_curriculum_stage_env(curriculum_stages[curriculum_stage_index])
+        obstacle_change_unlocked = curriculum_stages[curriculum_stage_index]['use_dynamic_obstacles']
+        if not quiet_output:
+            print("🚀 五阶段课程学习已启用:")
+            for idx, stage_cfg in enumerate(curriculum_stages, start=1):
+                print(f"   {idx}. {stage_cfg['label']}")
+            print(f"   当前阶段: {curriculum_stages[curriculum_stage_index]['label']}")
+            print(f"   阶段解锁目标(连续成功): {stage_success_targets}")
+            print(f"   阶段解锁目标(奖励停滞): {stage_plateau_targets}")
+            print(f"   阶段最短训练回合: {stage_min_episodes}")
+            print(f"   多 terrain seed 池: {multi_terrain_seeds}")
+    elif user_explicit_random and not quiet_output:
+        print("🗺️ 用户显式启用随机地形模式，将在每个回合使用不同的随机地形（绕过课程学习）。")
+    if not curriculum_enabled:
+        os.environ['CURRICULUM_STAGE_ID'] = '0'
+        os.environ['CURRICULUM_REWARD_PROFILE'] = 'fixed_route'
 
     # 运行目录：为每次训练创建独立的时间戳目录，避免与历史运行混淆
     try:
@@ -12446,6 +14580,203 @@ def train(args):
             obs_dims=obs_shapes,
             act_dims=action_dims
         )
+
+    if not use_lite or not isinstance(replay_buffer, LiteReplayBuffer):
+        raise RuntimeError("当前训练主线固定使用 LiteReplayBuffer")
+    if not hasattr(maddpg, 'batch_select_actions_vectorized'):
+        raise RuntimeError("当前训练主线要求算法实例提供 batch_select_actions_vectorized()")
+
+    def _sync_global_scenario_snapshot():
+        nonlocal global_scenario, global_world
+        try:
+            global_scenario = load_scenario_module(args.scenario, args)
+            global_world = global_scenario.make_world() if global_scenario else None
+            if global_scenario is not None:
+                try:
+                    maddpg.scenario = global_scenario
+                    maddpg.update_terrain_cache(global_scenario)
+                except Exception:
+                    pass
+        except Exception:
+            global_scenario = None
+            global_world = None
+
+    def _rebuild_env_after_curriculum_change():
+        nonlocal env, obs_n
+        if hasattr(env, 'close'):
+            env.close()
+        if args.num_envs > 1:
+            env_fns = [functools.partial(make_env_init, i, vars(args)) for i in range(args.num_envs)]
+            env = ParallelEnv(env_fns)
+        else:
+            env = SingleEnvWrapper(make_env_init(0, vars(args)))
+        obs_n = env.reset()
+        maddpg.reset_hidden_states(batch_size=args.num_envs)
+        _sync_global_scenario_snapshot()
+
+    def _clear_replay_buffer_for_curriculum():
+        try:
+            buffer_size_before = replay_buffer.size()
+            keep_recent_n = int(os.getenv('CURRICULUM_RB_KEEP_RECENT', '1000'))
+            keep_recent_n = max(0, min(keep_recent_n, buffer_size_before))
+            if keep_recent_n > 0 and buffer_size_before > keep_recent_n:
+                replay_buffer.clear(keep_recent_n=keep_recent_n)
+            else:
+                replay_buffer.clear()
+            if not quiet_output:
+                tqdm.write(
+                    f"🧹 经验回放缓冲区已清理: {buffer_size_before} → {replay_buffer.size()} 条经验",
+                    file=tqdm_file
+                )
+        except Exception as e:
+            if not quiet_output:
+                tqdm.write(f"⚠️ 清理经验回放缓冲区失败: {e}", file=tqdm_file)
+
+    def _reset_target_networks_for_curriculum():
+        reset_count = 0
+        for agent in maddpg.agents:
+            try:
+                if 'target_actor' in agent and 'actor' in agent:
+                    agent['target_actor'].set_weights(agent['actor'].get_weights())
+                    reset_count += 1
+                if 'target_critic' in agent and 'critic' in agent:
+                    agent['target_critic'].set_weights(agent['critic'].get_weights())
+                    reset_count += 1
+                elif 'target_critic1' in agent and 'critic1' in agent:
+                    agent['target_critic1'].set_weights(agent['critic1'].get_weights())
+                    agent['target_critic2'].set_weights(agent['critic2'].get_weights())
+                    reset_count += 2
+            except Exception:
+                pass
+        if (not quiet_output) and reset_count > 0:
+            tqdm.write(f"🔄 目标网络已重置: {reset_count} 个目标网络已从主网络复制", file=tqdm_file)
+
+    def _reduce_learning_rate_once_for_curriculum():
+        nonlocal curriculum_lr_reduced
+        if curriculum_lr_reduced:
+            return
+        try:
+            curriculum_lr_factor = float(os.getenv('CURRICULUM_LR_FACTOR', '0.5'))
+            curriculum_lr_factor = max(0.1, min(1.0, curriculum_lr_factor))
+
+            def _safe_set_lr(opt, lr_var, new_lr):
+                base_opt = getattr(opt, 'inner_optimizer', getattr(opt, '_optimizer', opt))
+                try:
+                    lr_attr = getattr(base_opt, 'learning_rate', None)
+                    if hasattr(lr_attr, 'assign'):
+                        lr_attr.assign(tf.cast(new_lr, tf.float32))
+                    else:
+                        setattr(base_opt, 'learning_rate', float(new_lr))
+                except Exception:
+                    try:
+                        setattr(base_opt, 'lr', float(new_lr))
+                    except Exception:
+                        pass
+
+            def _get_current_lr_safe(lr_var, lr_schedule):
+                if lr_var is not None:
+                    try:
+                        current_lr = float(_safe_tensor_to_numpy(lr_var))
+                        if current_lr > 0 and np.isfinite(current_lr):
+                            return current_lr
+                    except Exception:
+                        pass
+                if lr_schedule is not None and hasattr(lr_schedule, 'initial_learning_rate'):
+                    try:
+                        init_lr = getattr(lr_schedule, 'initial_learning_rate')
+                        return float(_safe_tensor_to_numpy(init_lr)) if hasattr(init_lr, 'numpy') else float(init_lr)
+                    except Exception:
+                        pass
+                return None
+
+            for agent in maddpg.agents:
+                actor_lr_schedule = agent.get('actor_lr_schedule', None)
+                critic_lr_schedule = agent.get('critic_lr_schedule', None)
+                actor_lr_var = agent.get('actor_lr_var', None)
+                critic_lr_var = agent.get('critic_lr_var', None)
+                old_actor_lr = _get_current_lr_safe(actor_lr_var, actor_lr_schedule)
+                old_critic_lr = _get_current_lr_safe(critic_lr_var, critic_lr_schedule)
+                if old_actor_lr is not None and old_actor_lr > 0:
+                    new_actor_lr = old_actor_lr * curriculum_lr_factor
+                    if actor_lr_schedule is not None and hasattr(actor_lr_schedule, 'initial_learning_rate'):
+                        try:
+                            if hasattr(actor_lr_schedule.initial_learning_rate, 'assign'):
+                                actor_lr_schedule.initial_learning_rate.assign(tf.cast(new_actor_lr, tf.float32))
+                        except Exception:
+                            pass
+                    if actor_lr_var is not None:
+                        try:
+                            actor_lr_var.assign(tf.cast(new_actor_lr, tf.float32))
+                        except Exception:
+                            pass
+                    _safe_set_lr(agent['actor_optimizer'], actor_lr_var, new_actor_lr)
+                if old_critic_lr is not None and old_critic_lr > 0:
+                    new_critic_lr = old_critic_lr * curriculum_lr_factor
+                    if critic_lr_schedule is not None and hasattr(critic_lr_schedule, 'initial_learning_rate'):
+                        try:
+                            if hasattr(critic_lr_schedule.initial_learning_rate, 'assign'):
+                                critic_lr_schedule.initial_learning_rate.assign(tf.cast(new_critic_lr, tf.float32))
+                        except Exception:
+                            pass
+                    if critic_lr_var is not None:
+                        try:
+                            critic_lr_var.assign(tf.cast(new_critic_lr, tf.float32))
+                        except Exception:
+                            pass
+                    _safe_set_lr(agent['critic_optimizer'], critic_lr_var, new_critic_lr)
+            curriculum_lr_reduced = True
+            if not quiet_output:
+                tqdm.write(f"📉 学习率已降低到原来的 {curriculum_lr_factor*100:.0f}%（仅首次课程切换执行）", file=tqdm_file)
+        except Exception as e:
+            if not quiet_output:
+                tqdm.write(f"⚠️ 降低学习率失败: {e}", file=tqdm_file)
+
+    def _reset_optimizer_state_for_curriculum():
+        try:
+            curriculum_reset_optimizer = os.getenv('CURRICULUM_RESET_OPTIMIZER', '1').lower() in ('1', 'true', 'yes', 'on')
+            if not curriculum_reset_optimizer:
+                return
+            for agent in maddpg.agents:
+                for opt_key in ('actor_optimizer', 'critic_optimizer'):
+                    optimizer = agent.get(opt_key, None)
+                    if optimizer is None:
+                        continue
+                    base_opt = getattr(optimizer, 'inner_optimizer', getattr(optimizer, '_optimizer', optimizer))
+                    if hasattr(base_opt, 'variables'):
+                        for var in base_opt.variables:
+                            if 'm' in var.name or 'v' in var.name or 'momentum' in var.name.lower():
+                                var.assign(tf.zeros_like(var))
+            if not quiet_output:
+                tqdm.write("🔄 优化器状态已重置: Adam momentum 已清零", file=tqdm_file)
+        except Exception as e:
+            if not quiet_output:
+                tqdm.write(f"⚠️ 重置优化器状态失败: {e}", file=tqdm_file)
+
+    def _transition_curriculum_stage(next_stage_index, unlock_reason, episode_idx):
+        nonlocal curriculum_stage_index
+        nonlocal consecutive_success_count, episodes_since_best_for_unlock
+        nonlocal curriculum_stage_success_count, curriculum_stage_start_episode, curriculum_stage_best_reward
+        nonlocal obstacle_change_unlocked
+        current_stage_label = curriculum_stages[curriculum_stage_index]['label']
+        next_stage = curriculum_stages[next_stage_index]
+        curriculum_stage_index = next_stage_index
+        obstacle_change_unlocked = bool(next_stage['use_dynamic_obstacles'])
+        _apply_curriculum_stage_env(next_stage)
+        if not quiet_output:
+            tqdm.write(
+                f"🎯 课程阶段切换: {current_stage_label} → {next_stage['label']} (原因: {unlock_reason})",
+                file=tqdm_file
+            )
+        _rebuild_env_after_curriculum_change()
+        _clear_replay_buffer_for_curriculum()
+        _reset_target_networks_for_curriculum()
+        _reduce_learning_rate_once_for_curriculum()
+        _reset_optimizer_state_for_curriculum()
+        consecutive_success_count = 0
+        episodes_since_best_for_unlock = 0
+        curriculum_stage_success_count = 0
+        curriculum_stage_start_episode = episode_idx + 1
+        curriculum_stage_best_reward = -np.inf
     
     
     # 已移除训练阶段轨迹可视化
@@ -12453,11 +14784,17 @@ def train(args):
     # 训练统计
     episode_rewards = []
     episode_force_ratios = []  # 🔧 新增：记录每个回合的FR值
+    # 🔧 新增：记录每个回合结束时的探索噪声强度（OU噪声标准差）
+    noise_scale_var_history = []
     actor_losses_history = []  # 添加actor loss历史
     critic_losses_history = []  # 添加critic loss历史
     best_reward = -np.inf
     best_episode = 0
     best_episode_force_ratio = 0.0  # 🔧 新增：记录最佳回合的FR值
+    best_team_success_rate = -1.0  # 按 SR_team 标准保存的最佳模型
+    best_team_sr_episode = -1
+    best_team_sr_force_ratio = 0.0
+    best_team_sr_reward = -np.inf
     best_trajectory_time_major = None  # [timestep][agent][xyz]
     best_vis_context = None            # 保存最佳回合的可视化上下文（地形/障碍/目标）
     last_trajectory_time_major = None  # 保存最后一次回合轨迹
@@ -12533,13 +14870,39 @@ def train(args):
                     best_reward = checkpoint_state.get('best_reward', -np.inf)
                     best_episode = checkpoint_state.get('best_episode', 0)
                     best_episode_force_ratio = checkpoint_state.get('best_episode_force_ratio', 0.0)
+                    best_team_success_rate = float(
+                        checkpoint_state.get('best_team_success_rate', -1.0)
+                    )
+                    best_team_sr_episode = int(checkpoint_state.get('best_team_sr_episode', -1))
+                    best_team_sr_force_ratio = float(
+                        checkpoint_state.get('best_team_sr_force_ratio', 0.0)
+                    )
+                    _loaded_best_team_sr_reward = checkpoint_state.get('best_team_sr_reward', -np.inf)
+                    best_team_sr_reward = (
+                        float(_loaded_best_team_sr_reward)
+                        if _loaded_best_team_sr_reward is not None
+                        else -np.inf
+                    )
+                    restored_success_flags = checkpoint_state.get('success_flags', []) or []
+                    restored_agent_success_flags = checkpoint_state.get('agent_success_flags', []) or []
+                    restored_team_success_flags = checkpoint_state.get('team_success_flags', []) or []
                     actor_losses_history = checkpoint_state.get('actor_losses_history', [])
                     critic_losses_history = checkpoint_state.get('critic_losses_history', [])
+                    noise_scale_var_history = checkpoint_state.get('noise_scale_var_history', [])
+                    maddpg._episode_success_flags = list(restored_success_flags)
+                    maddpg._episode_agent_success_flags = list(restored_agent_success_flags)
+                    maddpg._episode_team_success_flags = list(restored_team_success_flags)
+                    total_success_count = int(sum(restored_team_success_flags)) if restored_team_success_flags else 0
                     
                     print(f"✅ 成功加载检查点状态:")
                     print(f"   - 起始回合: {start_episode}")
                     print(f"   - 已完成回合数: {len(episode_rewards)}")
                     print(f"   - 最佳奖励: {best_reward:.2f} (第{best_episode+1}回合)")
+                    if best_team_sr_episode >= 0:
+                        print(
+                            f"   - 最佳Team SR: {best_team_success_rate:.3f} "
+                            f"(第{best_team_sr_episode+1}回合, FR={best_team_sr_force_ratio:.3f})"
+                        )
                     
                     # 调整训练回合数（如果从检查点恢复）
                     if start_episode > 0:
@@ -12589,8 +14952,18 @@ def train(args):
             'best_reward': float(best_reward),
             'best_episode': int(best_episode),
             'best_episode_force_ratio': float(best_episode_force_ratio),
+            'best_team_success_rate': float(best_team_success_rate),
+            'best_team_sr_episode': int(best_team_sr_episode),
+            'best_team_sr_force_ratio': float(best_team_sr_force_ratio),
+            'best_team_sr_reward': (
+                float(best_team_sr_reward) if np.isfinite(best_team_sr_reward) else None
+            ),
+            'success_flags': getattr(maddpg, '_episode_success_flags', []),
+            'agent_success_flags': getattr(maddpg, '_episode_agent_success_flags', []),
+            'team_success_flags': getattr(maddpg, '_episode_team_success_flags', []),
             'actor_losses_history': actor_losses_history,
             'critic_losses_history': critic_losses_history,
+            'noise_scale_var_history': noise_scale_var_history,
             'train_episodes': int(args.train_episodes),
             'exp_name': args.exp_name,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
@@ -12604,7 +14977,7 @@ def train(args):
                 print(f"💾 检查点已保存: {checkpoint_dir} (episode {episode+1})")
         except Exception as e:
             print(f"⚠️  保存检查点状态失败: {e}")
-    
+
     # 配置进度显示输出与行为（支持环境变量控制）
     try:
         tqdm_to_stdout = os.getenv("TQDM_TO_STDOUT", "1").lower() in ("1", "true", "yes", "on")
@@ -12740,6 +15113,215 @@ def train(args):
         postfix_interval = int(os.getenv('POSTFIX_INTERVAL', '50'))
     except Exception:
         postfix_interval = 50
+    # 计时汇总（默认启用；用 TIMING_SUMMARY=0 关闭）
+    try:
+        timing_enabled = os.getenv('TIMING_SUMMARY', '1').lower() in ('1','true','yes','on')
+    except Exception:
+        timing_enabled = True  # 默认启用
+    try:
+        timing_interval_steps = int(os.getenv('TIMING_INTERVAL_STEPS', '0')) if timing_enabled else 0
+        if timing_interval_steps < 0:
+            timing_interval_steps = 0
+    except Exception:
+        timing_interval_steps = 0
+    try:
+        timing_level = int(os.getenv('TIMING_LEVEL', '1')) if timing_enabled else 1
+    except Exception:
+        timing_level = 1
+    try:
+        timing_detail_enabled = timing_enabled and (
+            timing_level >= 2 or os.getenv('TIMING_DETAIL', '0').lower() in ('1', 'true', 'yes', 'on')
+        )
+    except Exception:
+        timing_detail_enabled = bool(timing_enabled and timing_level >= 2)
+    if timing_enabled:
+        _perf_counter = time.perf_counter
+        def _new_timing_bucket():
+            return {
+                'action': 0.0,
+                'sync': 0.0,
+                'env': 0.0,
+                'obs': 0.0,
+                'replay': 0.0,
+                'update': 0.0,
+                'total': 0.0,
+            }
+        def _emit_timing(label, timing, steps):
+            if steps <= 0:
+                return
+            total = float(timing.get('total', 0.0))
+            if total <= 0.0:
+                return
+            known = (
+                float(timing.get('action', 0.0)) +
+                float(timing.get('sync', 0.0)) +
+                float(timing.get('env', 0.0)) +
+                float(timing.get('obs', 0.0)) +
+                float(timing.get('replay', 0.0)) +
+                float(timing.get('update', 0.0))
+            )
+            other = max(total - known, 0.0)
+            def _fmt(name, val):
+                ms = (val * 1000.0) / float(steps)
+                pct = (val / total) * 100.0 if total > 0 else 0.0
+                return f"{name}={ms:.1f}ms {pct:.0f}%"
+            parts = [
+                _fmt("act", timing.get('action', 0.0)),
+                _fmt("sync", timing.get('sync', 0.0)),
+                _fmt("env", timing.get('env', 0.0)),
+                _fmt("obs", timing.get('obs', 0.0)),
+                _fmt("rb", timing.get('replay', 0.0)),
+                _fmt("upd", timing.get('update', 0.0)),
+                _fmt("other", other),
+            ]
+            total_ms = (total * 1000.0) / float(steps)
+            line = f"[TIMING] {label} | total={total_ms:.1f}ms/step | " + " | ".join(parts)
+            try:
+                tqdm.write(line, file=tqdm_file)
+            except Exception:
+                print(line)
+        if timing_detail_enabled:
+            _detail_env_keys = (
+                'env_set',
+                'env_world',
+                'env_pre',
+                'env_traj',
+                'env_obs',
+                'env_reward',
+                'env_done',
+                'env_info',
+                'env_post',
+                'env_outer',
+            )
+            _detail_rew_keys = (
+                'rew_cache',
+                'rew_state',
+                'rew_numeric',
+                'rew_explore',
+                'rew_motion',
+                'rew_success',
+                'rew_collision',
+                'rew_clearance',
+                'rew_lateral',
+                'rew_team',
+                'rew_reduce',
+            )
+            _detail_upd_keys = (
+                'upd_sample',
+                'upd_prepare',
+                'upd_target',
+                'upd_train',
+                'upd_per',
+                'upd_post',
+            )
+            _detail_labels = {
+                'env_set': 'set',
+                'env_world': 'world',
+                'env_pre': 'pre',
+                'env_traj': 'traj',
+                'env_obs': 'obs',
+                'env_reward': 'rew',
+                'env_done': 'done',
+                'env_info': 'info',
+                'env_post': 'post',
+                'env_outer': 'outer',
+                'rew_cache': 'cache',
+                'rew_state': 'state',
+                'rew_numeric': 'num',
+                'rew_explore': 'expl',
+                'rew_motion': 'motion',
+                'rew_success': 'succ',
+                'rew_collision': 'coll',
+                'rew_clearance': 'clear',
+                'rew_lateral': 'lat',
+                'rew_team': 'team',
+                'rew_reduce': 'reduce',
+                'upd_sample': 'sample',
+                'upd_prepare': 'prep',
+                'upd_target': 'target',
+                'upd_train': 'train',
+                'upd_per': 'per',
+                'upd_post': 'post',
+            }
+            _detail_all_keys = _detail_env_keys + _detail_rew_keys + _detail_upd_keys
+            def _new_timing_detail_bucket():
+                bucket = {}
+                for key in _detail_all_keys:
+                    bucket[key] = 0.0
+                return bucket
+            def _merge_timing_detail(dst, src):
+                if not isinstance(dst, dict) or not isinstance(src, dict):
+                    return
+                for key in dst.keys():
+                    if key in src:
+                        try:
+                            dst[key] += float(src[key])
+                        except Exception:
+                            pass
+            def _extract_env_timing_detail(info_payload):
+                if isinstance(info_payload, dict):
+                    info_entries = [info_payload]
+                elif isinstance(info_payload, list):
+                    info_entries = [entry for entry in info_payload if isinstance(entry, dict)]
+                else:
+                    info_entries = []
+                detail_entries = []
+                for entry in info_entries:
+                    detail = entry.get('_timing')
+                    if isinstance(detail, dict):
+                        detail_entries.append(detail)
+                if not detail_entries:
+                    return None
+                aggregated = {}
+                for key in _detail_all_keys:
+                    values = []
+                    for detail in detail_entries:
+                        if key in detail:
+                            try:
+                                values.append(float(detail[key]))
+                            except Exception:
+                                pass
+                    if values:
+                        aggregated[key] = max(values) if len(values) > 1 else values[0]
+                return aggregated if aggregated else None
+            def _fmt_detail_group(group_name, total, detail, keys, steps):
+                if total <= 0.0:
+                    return None
+                pieces = []
+                subtotal = 0.0
+                for key in keys:
+                    val = float(detail.get(key, 0.0))
+                    subtotal += val
+                    pieces.append(f"{_detail_labels[key]}={(val * 1000.0) / float(steps):.1f}")
+                other = max(total - subtotal, 0.0)
+                pieces.append(f"other={(other * 1000.0) / float(steps):.1f}")
+                return f"{group_name}(" + ", ".join(pieces) + ")"
+            def _emit_timing_detail(label, timing, detail, steps):
+                if steps <= 0:
+                    return
+                parts = []
+                env_part = _fmt_detail_group("env", float(timing.get('env', 0.0)), detail, _detail_env_keys, steps)
+                if env_part is not None:
+                    parts.append(env_part)
+                rew_part = _fmt_detail_group("rew", float(detail.get('env_reward', 0.0)), detail, _detail_rew_keys, steps)
+                if rew_part is not None:
+                    parts.append(rew_part)
+                upd_part = _fmt_detail_group("upd", float(timing.get('update', 0.0)), detail, _detail_upd_keys, steps)
+                if upd_part is not None:
+                    parts.append(upd_part)
+                if not parts:
+                    return
+                line = f"[TIMING2] {label} | " + " | ".join(parts) + " ms/step"
+                try:
+                    tqdm.write(line, file=tqdm_file)
+                except Exception:
+                    print(line)
+
+    # 🔧 同步阶段CPU拷贝策略（STRICT_CPU_COPY=1 强制深拷贝，默认仅保证C连续以减少拷贝）
+    try:
+        strict_cpu_copy = os.getenv('STRICT_CPU_COPY', '0').lower() in ('1','true','yes','on')
+    except Exception:
+        strict_cpu_copy = False
 
     # 心跳日志（用于长跑定位停滞/被杀时刻）
     try:
@@ -12873,480 +15455,7 @@ def train(args):
             print(f"\n【初始权重】记录Actor第一个权重值:")
             for i, w in enumerate(maddpg._initial_weights):
                 print(f"  智能体{i}: {w:.8f}")
-    # === 学习预热机制初始化 ===
-    warmup_enabled = os.getenv('LEARNING_WARMUP_ENABLED', '1').lower() in ('1','true','yes','on')
-    warmup_ratio = float(os.getenv('LEARNING_WARMUP_RATIO', '0.10'))
-    min_warmup_steps = int(os.getenv('LEARNING_WARMUP_MIN_STEPS', '5000'))
-    max_warmup_steps = int(os.getenv('LEARNING_WARMUP_MAX_STEPS', '20000'))
-    warmup_random_policy = os.getenv('WARMUP_RANDOM_POLICY', '0').lower() in ('1','true','yes','on')
-    warmup_random_scale = max(0.0, min(1.0, float(os.getenv('WARMUP_RANDOM_SCALE', '1.0'))))
-    warmup_force_ratio = float(os.getenv('WARMUP_FORCE_RATIO', '1.0'))
-    warmup_force_ratio = min(max(warmup_force_ratio, 0.0), 1.0)
-    try:
-        maddpg.random_warmup_policy_enabled = warmup_random_policy
-        maddpg.warmup_random_scale = warmup_random_scale
-        maddpg.warmup_force_ratio_override = warmup_force_ratio
-    except Exception:
-        pass
-    
-    warmup_completed = False
-    warmup_step_count = 0
-    # 🔧 新增：预热阶段虚拟样本计数（不向RB写入，但仍按容量比例计算“预热填充率”）
-    warmup_virtual_samples = 0
-
-    class PfMetaBayesOptimizer:
-        """轻量级贝叶斯优化器（基于固定核的高斯过程 + 随机采样EI）。"""
-        def __init__(self, param_bounds, init_random=5, acq_samples=64, noise=0.1, length_scale=0.5, xi=0.01, seed=None, maximize=True):
-            self.param_bounds = dict(param_bounds)
-            self.param_names = list(self.param_bounds.keys())
-            self.init_random = max(1, int(init_random))
-            self.acq_samples = max(1, int(acq_samples))
-            self.noise = max(1e-9, float(noise))
-            self.length_scale = max(1e-6, float(length_scale))
-            self.xi = max(1e-6, float(xi))
-            self.maximize = bool(maximize)
-            rng_seed = seed if seed is not None else (int(time.time()) & 0x7fffffff)
-            self.rng = np.random.RandomState(rng_seed)
-            self.X = []
-            self.y = []
-            self._gp_dirty = True
-            self._gp_cache = None
-
-        def _random_point(self):
-            return {
-                name: float(self.rng.uniform(low, high))
-                for name, (low, high) in self.param_bounds.items()
-            }
-
-        def _vectorize(self, params):
-            vec = []
-            for name in self.param_names:
-                low, high = self.param_bounds[name]
-                value = float(params.get(name, (low + high) * 0.5))
-                vec.append(np.clip(value, low, high))
-            return np.asarray(vec, dtype=np.float64)
-
-        def _kernel(self, xa, xb):
-            if xa.ndim == 1:
-                xa = xa[None, :]
-            if xb.ndim == 1:
-                xb = xb[None, :]
-            diff = (xa[:, None, :] - xb[None, :, :]) / self.length_scale
-            sqdist = np.sum(diff * diff, axis=2)
-            return np.exp(-0.5 * sqdist).astype(np.float64, copy=False)
-
-        def _ensure_gp(self):
-            if not self._gp_dirty:
-                return
-            if not self.X:
-                self._gp_cache = None
-                self._gp_dirty = False
-                return
-            X = np.asarray(self.X, dtype=np.float64)
-            K = self._kernel(X, X)
-            n = K.shape[0]
-            K.flat[::n + 1] += self.noise
-            try:
-                L = np.linalg.cholesky(K)
-                alpha = np.linalg.solve(L.T, np.linalg.solve(L, np.asarray(self.y, dtype=np.float64)))
-                self._gp_cache = {'X': X, 'L': L, 'alpha': alpha}
-            except np.linalg.LinAlgError:
-                self._gp_cache = None
-            self._gp_dirty = False
-
-        def _predict(self, x_vec):
-            self._ensure_gp()
-            cache = self._gp_cache
-            if cache is None:
-                return 0.0, 1.0
-            Kx = self._kernel(cache['X'], x_vec[None, :]).reshape(-1)
-            mean = float(np.dot(Kx, cache['alpha']))
-            v = np.linalg.solve(cache['L'], Kx)
-            var = max(1e-9, 1.0 - float(np.dot(v, v)))
-            return mean, var
-
-        @staticmethod
-        def _norm_cdf(z):
-            return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-
-        @staticmethod
-        def _norm_pdf(z):
-            return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * z * z)
-
-        def _expected_improvement(self, mean, var, best):
-            sigma = math.sqrt(max(var, 1e-9))
-            imp = best - mean - self.xi
-            if sigma < 1e-9:
-                return 0.0
-            z = imp / sigma
-            cdf = self._norm_cdf(z)
-            pdf = self._norm_pdf(z)
-            ei = imp * cdf + sigma * pdf
-            return max(0.0, ei)
-
-        def suggest(self):
-            if len(self.X) < self.init_random:
-                return self._random_point()
-            best_point = None
-            best_ei = -1.0
-            cache = self._gp_cache
-            if cache is None:
-                self._ensure_gp()
-            if self._gp_cache is None:
-                return self._random_point()
-            best_y = np.min(self.y)
-            for _ in range(self.acq_samples):
-                cand = self._random_point()
-                vec = self._vectorize(cand)
-                mean, var = self._predict(vec)
-                ei = self._expected_improvement(mean, var, best_y)
-                if ei > best_ei:
-                    best_ei = ei
-                    best_point = cand
-            return best_point if best_point is not None else self._random_point()
-
-        def observe(self, params, score):
-            if params is None or score is None:
-                return
-            if not np.isfinite(score):
-                return
-            vec = self._vectorize(params)
-            target = -float(score) if self.maximize else float(score)
-            self.X.append(vec)
-            self.y.append(target)
-            self._gp_dirty = True
-
-    # === 势场参数预热期元优化（仅在预热阶段生效，可选） ===
-    # 通过在几组轻量候选 base 参数之间轮换，记录各自的成功率与回合奖励，
-    # 在 warmup 结束时一次性覆盖 args 中的默认 base 值与 MADDPG/MATD3 内部缓存。
-    pf_meta_enabled = os.getenv('PF_META_WARMUP_ENABLED', '0').lower() in ('1', 'true', 'yes', 'on')
-    pf_meta_was_enabled = pf_meta_enabled
-    pf_meta_candidates = []
-    pf_meta_stats = []
-    pf_meta_current_idx = None
-    pf_meta_required_episodes = max(1, int(os.getenv('PF_META_MIN_EPISODES', '2')))
-    pf_meta_max_candidates = max(1, int(os.getenv('PF_META_MAX_CANDIDATES', '9')))
-    pf_meta_distance_weight = float(os.getenv('PF_META_DISTANCE_WEIGHT', '1.0'))
-    pf_meta_obstacle_weight = float(os.getenv('PF_META_OBSTACLE_WEIGHT', '0.7'))
-    pf_meta_penetration_weight = float(os.getenv('PF_META_PENETRATION_WEIGHT', '1.2'))
-    pf_meta_energy_weight = float(os.getenv('PF_META_ENERGY_WEIGHT', '0.3'))
-    pf_meta_episode_state = None
-    pf_meta_method = os.getenv('PF_META_METHOD', 'grid').strip().lower()
-    if pf_meta_method not in ('grid', 'bayes'):
-        pf_meta_method = 'grid'
-    pf_meta_bo_init_random = max(1, int(os.getenv('PF_META_BO_INIT_RANDOM', '5')))
-    pf_meta_bo_acq_samples = max(1, int(os.getenv('PF_META_BO_ACQ_SAMPLES', '64')))
-    pf_meta_bo_noise = float(os.getenv('PF_META_BO_NOISE', '0.1'))
-    pf_meta_bo_length_scale = float(os.getenv('PF_META_BO_LENGTH_SCALE', '0.5'))
-    pf_meta_bo_xi = float(os.getenv('PF_META_BO_XI', '0.01'))
-    pf_meta_baseline_file = os.getenv('PF_META_BASELINE_FILE', './logs/pf_meta_baseline.json')
-    pf_meta_bayes = None
-    pf_meta_bayes_pending = []
-    pf_meta_total_evals = 0
-
-    if pf_meta_enabled and not warmup_random_policy:
-        if not quiet_output:
-            print("[PF_META] 检测到预热期未启用随机势场策略，已禁用元优化以避免配置不一致")
-        pf_meta_enabled = False
-
-    def _apply_pf_candidate_to_maddpg(cand):
-        """将候选势场参数写回 args 与 maddpg 内部缓存，不改网络结构/XLA。"""
-        try:
-            args.goal_attraction = float(cand['goal_attraction'])
-            args.lambda_1_base = float(cand['lambda_1_base'])
-            args.terrain_repulsion = float(cand['terrain_repulsion'])
-            args.agent_influence_range = float(cand['agent_influence_range'])
-            args.delta_k_att = float(cand['delta_k_att'])
-            args.delta_lambda_1 = float(cand['delta_lambda_1'])
-            args.delta_k_rep = float(cand['delta_k_rep'])
-            args.delta_radius = float(cand['delta_radius'])
-        except Exception:
-            pass
-        # 更新 MADDPG/MATD3 内部缓存，供 TF 势场映射使用
-        try:
-            maddpg.goal_attraction_cached = float(getattr(args, 'goal_attraction', 1.0))
-            maddpg.lambda_1_base_cached = float(getattr(args, 'lambda_1_base', 5.0))
-            maddpg.terrain_repulsion_cached = float(getattr(args, 'terrain_repulsion', 80.0))
-            maddpg.agent_influence_range_cached = float(getattr(args, 'agent_influence_range', 10.0))
-            maddpg.delta_k_att_cached = float(getattr(args, 'delta_k_att', 0.5))
-            maddpg.delta_lambda_1_cached = float(getattr(args, 'delta_lambda_1', 2.5))
-            maddpg.delta_k_rep_cached = float(getattr(args, 'delta_k_rep', 40.0))
-            maddpg.delta_radius_cached = float(getattr(args, 'delta_radius', 5.0))
-        except Exception:
-            # 若某些类未定义上述缓存，忽略即可
-            pass
-
-    def _pf_meta_empty_stats():
-        return {
-            'episodes': 0,
-            'sum_reward': 0.0,
-            'success': 0,
-            'distance_total': 0.0,
-            'distance_samples': 0,
-            'obstacle_hits': 0,
-            'penetration_hits': 0,
-            'energy_total': 0.0,
-            'energy_samples': 0,
-            'score_total': 0.0
-        }
-
-    def _pf_meta_dump_baseline(file_path, candidate, stats):
-        try:
-            if not file_path:
-                return
-            dir_name = os.path.dirname(file_path)
-            if dir_name:
-                os.makedirs(dir_name, exist_ok=True)
-            payload = {
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'candidate': candidate,
-                'stats': stats
-            }
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"[PF_META] 写入基准文件失败: {e}")
-
-    def _pf_meta_measure_episode(env):
-        """统计单回合的距离/碰撞等指标，供PF元优化评分使用。"""
-        try:
-            sub_envs = []
-            if hasattr(env, 'envs') and isinstance(env.envs, (list, tuple)) and len(env.envs) > 0:
-                sub_envs = list(env.envs)
-            else:
-                sub_envs = [env]
-        except Exception:
-            sub_envs = [env]
-
-        distances = []
-        obstacle_hits = 0
-        penetration_hits = 0
-
-        for sub_env in sub_envs:
-            scenario = getattr(sub_env, 'scenario', None)
-            world = getattr(sub_env, 'world', None)
-            agents = []
-            if scenario is not None and hasattr(scenario, 'agents'):
-                agents = scenario.agents
-            elif world is not None and hasattr(world, 'agents'):
-                agents = world.agents
-
-            for agent in agents:
-                goal_pos = None
-                try:
-                    if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and getattr(agent.goal_a.state, 'p_pos', None) is not None:
-                        goal_pos = agent.goal_a.state.p_pos
-                    elif scenario is not None and getattr(scenario, 'goal_pos', None) is not None:
-                        goal_pos = scenario.goal_pos
-                except Exception:
-                    goal_pos = None
-
-                try:
-                    agent_pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
-                    if goal_pos is not None and agent_pos is not None:
-                        distances.append(float(np.linalg.norm(np.asarray(agent_pos) - np.asarray(goal_pos))))
-                except Exception:
-                    pass
-
-                if getattr(agent, '_had_obstacle_collision', False):
-                    obstacle_hits += 1
-                if getattr(agent, '_had_terrain_contact_or_penetration', False) or getattr(agent, '_had_penetration_or_collision', False):
-                    penetration_hits += 1
-
-                for attr in ('_had_obstacle_collision', '_had_terrain_contact_or_penetration', '_had_penetration_or_collision'):
-                    if hasattr(agent, attr):
-                        try:
-                            setattr(agent, attr, False)
-                        except Exception:
-                            pass
-
-        avg_distance = float(np.mean(distances)) if distances else float('inf')
-        return avg_distance, obstacle_hits, penetration_hits
-
-    # 🔧 性能优化：为预热阶段动作生成函数添加@tf.function装饰器，启用XLA加速
-    # 注意：由于需要调用maddpg的方法，我们将随机动作生成和势场修正分开处理
-    @tf.function(reduce_retracing=True)
-    def _generate_pf_random_actions_tf(obs_tensor, n_agents, act_dim, scale):
-        """预热阶段生成随机动作（TensorFlow函数，支持XLA加速）"""
-        num_envs = tf.shape(obs_tensor)[0]
-        # 生成随机动作前3维（力向量）
-        head = tf.random.uniform([num_envs, n_agents, 3], minval=-scale, maxval=scale, dtype=tf.float32)
-        head = tf.clip_by_value(head, -1.0, 1.0)
-        
-        # 🔧 XLA修复：完全避免tf.cond和嵌套函数，使用固定维度生成，避免XLA编译错误
-        # 策略：始终生成完整的动作维度（至少7维，覆盖常见的act_dim），然后裁剪到正确维度
-        # 这样可以避免条件分支，确保XLA编译成功
-        max_act_dim = tf.maximum(act_dim, 7)  # 至少7维（3维head + 4维tail），覆盖常见情况
-        tail_dim = tf.maximum(max_act_dim - 3, 0)
-        tail_shape = tf.stack([num_envs, n_agents, tail_dim])
-        tail = tf.random.uniform(tail_shape, minval=-1.0, maxval=1.0, dtype=tf.float32)
-        # 拼接head和tail
-        random_actions_full = tf.concat([head, tail], axis=2)
-        # 裁剪到正确的维度（act_dim）
-        random_actions = random_actions_full[:, :, :act_dim]
-        return random_actions
-    
-    def _generate_pf_random_actions(maddpg, obs_tensor, scale=1.0, force_ratio=1.0):
-        """预热阶段使用随机动作+势场修正生成可执行动作（优化版本，启用XLA加速）"""
-        # 🔧 性能优化：使用TensorFlow函数生成随机动作，然后应用势场修正
-        obs_tensor = tf.convert_to_tensor(obs_tensor, dtype=tf.float32)
-        n_agents = maddpg.n_agents
-        act_dim = int(maddpg.action_dims[0])
-        
-        # 步骤1：使用TensorFlow函数生成随机动作（XLA加速）
-        random_actions = _generate_pf_random_actions_tf(
-            obs_tensor,
-            tf.constant(n_agents, dtype=tf.int32),
-            tf.constant(act_dim, dtype=tf.int32),
-            tf.constant(scale, dtype=tf.float32)
-        )
-        
-        # 步骤2：应用势场修正（使用已编译的TensorFlow函数，支持XLA加速）
-        flat_actions = tf.reshape(random_actions, [-1, act_dim])
-        flat_obs = tf.reshape(obs_tensor, [-1, tf.shape(obs_tensor)[2]])
-        corrected_head_flat, pf_force_flat = maddpg._apply_potential_field_correction_tf(
-            flat_actions,
-            flat_obs,
-            tf.constant(force_ratio, dtype=tf.float32)
-        )
-        
-        # 步骤3：拼接修正后的前3维和原始后4维
-        # 🔧 XLA修复：使用TensorFlow操作替换Python if/else，避免XLA编译错误
-        num_envs = tf.shape(obs_tensor)[0]
-        corrected_head = tf.reshape(corrected_head_flat, [num_envs, n_agents, 3])
-        pf_force_vector = tf.reshape(pf_force_flat, [num_envs, n_agents, 3])
-        # 🔧 修复：使用tf.slice提取tail，如果act_dim <= 3，则tail为空（通过slice自动处理）
-        # 使用Python条件判断（因为此函数不是@tf.function装饰的），但确保tail维度正确
-        if act_dim > 3:
-            tail = random_actions[:, :, 3:act_dim]
-        else:
-            tail = tf.zeros([num_envs, n_agents, 0], dtype=random_actions.dtype)
-        actions = tf.concat([corrected_head, tail], axis=2)
-        return actions, pf_force_vector
-
-    def _linspace_with_fallback(vmin, vmax, samples):
-        if samples <= 1 or abs(vmax - vmin) < 1e-8:
-            return [float(vmin)]
-        return np.linspace(float(vmin), float(vmax), int(samples)).tolist()
-
-    pf_meta_param_bounds = {}
-    pf_meta_param_names = []
-    if pf_meta_enabled:
-        try:
-            base_ga = float(getattr(args, 'goal_attraction', 1.0))
-            base_l1 = float(getattr(args, 'lambda_1_base', 5.0))
-            base_tr = float(getattr(args, 'terrain_repulsion', 80.0))
-            base_air = float(getattr(args, 'agent_influence_range', 10.0))
-            base_dkatt = float(getattr(args, 'delta_k_att', 0.5))
-            base_dl1 = float(getattr(args, 'delta_lambda_1', 2.5))
-            base_dkrep = float(getattr(args, 'delta_k_rep', 40.0))
-            base_drad = float(getattr(args, 'delta_radius', 5.0))
-            pf_ga_min = float(os.getenv('PF_META_GA_MIN', str(base_ga * 0.7)))
-            pf_ga_max = float(os.getenv('PF_META_GA_MAX', str(base_ga * 1.4)))
-            pf_tr_min = float(os.getenv('PF_META_TR_MIN', str(base_tr * 0.65)))
-            pf_tr_max = float(os.getenv('PF_META_TR_MAX', str(base_tr * 1.35)))
-            pf_range_min = float(os.getenv('PF_META_RANGE_MIN', str(base_air * 0.6)))
-            pf_range_max = float(os.getenv('PF_META_RANGE_MAX', str(base_air * 1.4)))
-            pf_meta_param_bounds = {
-                'goal_attraction': (pf_ga_min, pf_ga_max),
-                'terrain_repulsion': (pf_tr_min, pf_tr_max),
-                'agent_influence_range': (pf_range_min, pf_range_max),
-            }
-            pf_meta_param_names = list(pf_meta_param_bounds.keys())
-
-            base_candidate = {
-                'goal_attraction': base_ga,
-                'lambda_1_base': base_l1,
-                'terrain_repulsion': base_tr,
-                'agent_influence_range': base_air,
-                'delta_k_att': base_dkatt,
-                'delta_lambda_1': base_dl1,
-                'delta_k_rep': base_dkrep,
-                'delta_radius': base_drad,
-            }
-
-            def _build_candidate_from_subset(subset):
-                cand = base_candidate.copy()
-                for name, (low, high) in pf_meta_param_bounds.items():
-                    if name in subset:
-                        cand[name] = float(np.clip(subset[name], low, high))
-                return cand
-
-            if pf_meta_method == 'bayes':
-                pf_meta_bayes = PfMetaBayesOptimizer(
-                    param_bounds=pf_meta_param_bounds,
-                    init_random=pf_meta_bo_init_random,
-                    acq_samples=pf_meta_bo_acq_samples,
-                    noise=pf_meta_bo_noise,
-                    length_scale=pf_meta_bo_length_scale,
-                    xi=pf_meta_bo_xi,
-                    maximize=True
-                )
-                pf_meta_candidates.append(base_candidate.copy())
-                pf_meta_stats.append(_pf_meta_empty_stats())
-                subset = {name: base_candidate[name] for name in pf_meta_param_names}
-                pf_meta_bayes_pending.append(subset)
-            else:
-                pf_ga_samples = max(1, int(os.getenv('PF_META_GA_SAMPLES', '3')))
-                pf_tr_samples = max(1, int(os.getenv('PF_META_TR_SAMPLES', '3')))
-                pf_range_samples = max(1, int(os.getenv('PF_META_RANGE_SAMPLES', '2')))
-                ga_values = _linspace_with_fallback(pf_ga_min, pf_ga_max, pf_ga_samples)
-                tr_values = _linspace_with_fallback(pf_tr_min, pf_tr_max, pf_tr_samples)
-                range_values = _linspace_with_fallback(pf_range_min, pf_range_max, pf_range_samples)
-
-                seen = set()
-
-                def _append_candidate(cand):
-                    key = (
-                        round(cand['goal_attraction'], 6),
-                        round(cand['terrain_repulsion'], 6),
-                        round(cand['agent_influence_range'], 6),
-                    )
-                    if key in seen or len(pf_meta_candidates) >= pf_meta_max_candidates:
-                        return
-                    seen.add(key)
-                    pf_meta_candidates.append(cand)
-                    pf_meta_stats.append(_pf_meta_empty_stats())
-
-                _append_candidate(base_candidate.copy())
-
-                for ga in ga_values:
-                    for tr in tr_values:
-                        for rng in range_values:
-                            cand = {
-                                'goal_attraction': float(ga),
-                                'lambda_1_base': base_l1,
-                                'terrain_repulsion': float(tr),
-                                'agent_influence_range': float(rng),
-                                'delta_k_att': base_dkatt,
-                                'delta_lambda_1': base_dl1,
-                                'delta_k_rep': base_dkrep,
-                                'delta_radius': base_drad,
-                            }
-                            _append_candidate(cand)
-                            if len(pf_meta_candidates) >= pf_meta_max_candidates:
-                                break
-                        if len(pf_meta_candidates) >= pf_meta_max_candidates:
-                            break
-                    if len(pf_meta_candidates) >= pf_meta_max_candidates:
-                        break
-
-                if not pf_meta_candidates:
-                    pf_meta_enabled = False
-        except Exception:
-            pf_meta_enabled = False
-    
-    if pf_meta_enabled and not quiet_output:
-        print(f"[PF_META] 候选数量: {len(pf_meta_candidates)} (上限 {pf_meta_max_candidates})，"
-              f"每个至少评估 {pf_meta_required_episodes} 回合")
-    if not quiet_output and warmup_enabled:
-        print(f"\n🔥 学习预热机制已启用:")
-        print(f"  预热比例: {warmup_ratio*100:.1f}%")
-        print(f"  最小预热步数: {min_warmup_steps}")
-        print(f"  最大预热步数: {max_warmup_steps}")
-        print(f"  缓冲区容量: {replay_buffer.capacity}")
-        print(f"  目标预热步数: {int(replay_buffer.capacity * warmup_ratio)}")
-        print("="*60)
+    # 当前训练主路径已移除学习预热与 PF 元优化，直接进入标准训练循环。
     
     # 初始化环境观察
     obs_n = env.reset()
@@ -13384,87 +15493,19 @@ def train(args):
         actor_losses_history.clear()
         critic_losses_history.clear()
         
-        # 🔧 预热阶段：删除固定位置文件，强制每次随机生成
-        warmup_random_init = bool(os.getenv('WARMUP_RANDOM_INIT', '1').lower() in ('1', 'true', 'yes', 'on'))
-        if warmup_enabled and (not warmup_completed) and warmup_random_init:
-            # 删除所有固定位置文件，强制环境每次重新生成位置
-            import glob
-            pattern = os.path.join(run_dir, '**/fixed_agent_positions.json')
-            for filepath in glob.glob(pattern, recursive=True):
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
+        current_curriculum_stage = curriculum_stages[curriculum_stage_index] if curriculum_enabled else None
+        random_terrain_mode_active = bool(user_explicit_random and not curriculum_enabled)
+        random_obstacle_mode_active = bool(current_curriculum_stage['use_dynamic_obstacles']) if current_curriculum_stage else obstacle_change_unlocked
+        random_mode_active = random_terrain_mode_active
 
-        # 预热阶段：在每个回合开始时选择一个势场候选配置并应用
-        if pf_meta_enabled and warmup_enabled and (not warmup_completed):
-            try:
-                if pf_meta_method == 'bayes':
-                    subset = None
-                    if pf_meta_bayes_pending:
-                        subset = pf_meta_bayes_pending.pop(0)
-                    elif pf_meta_bayes is not None and pf_meta_param_bounds:
-                        subset = pf_meta_bayes.suggest()
-                    if subset is not None and pf_meta_param_bounds:
-                        cand = _build_candidate_from_subset(subset)
-                        pf_meta_candidates.append(cand)
-                        pf_meta_stats.append(_pf_meta_empty_stats())
-                        pf_meta_current_idx = len(pf_meta_candidates) - 1
-                        pf_meta_episode_state = {
-                            'energy_sum': 0.0,
-                            'energy_samples': 0,
-                            'candidate_params': {name: cand.get(name) for name in pf_meta_param_names}
-                        }
-                        _apply_pf_candidate_to_maddpg(cand)
-                        if not quiet_output:
-                            print(
-                                "[PF_META][BO] "
-                                f"回合 {episode+1} 评估第{pf_meta_current_idx+1}个候选 "
-                                f"(ga={cand['goal_attraction']:.3f}, tr={cand['terrain_repulsion']:.1f}, "
-                                f"range={cand['agent_influence_range']:.1f})"
-                            )
-                    else:
-                        pf_meta_current_idx = None
-                        pf_meta_episode_state = None
-                else:
-                    if pf_meta_candidates:
-                        pf_meta_current_idx = int(episode % len(pf_meta_candidates))
-                        _apply_pf_candidate_to_maddpg(pf_meta_candidates[pf_meta_current_idx])
-                        pf_meta_episode_state = {'energy_sum': 0.0, 'energy_samples': 0}
-                        if not quiet_output:
-                            cand = pf_meta_candidates[pf_meta_current_idx]
-                            st = pf_meta_stats[pf_meta_current_idx]
-                            sampled = st['episodes']
-                            avg_r = (st['sum_reward'] / sampled) if sampled > 0 else None
-                            succ_rate = (st['success'] / sampled * 100.0) if sampled > 0 else 0.0
-                            avg_r_str = f"{avg_r:.1f}" if avg_r is not None else "N/A"
-                            print(
-                                "[PF_META] "
-                                f"回合 {episode+1} 使用候选 {pf_meta_current_idx+1}/{len(pf_meta_candidates)} | "
-                                f"ga={cand['goal_attraction']:.3f} tr={cand['terrain_repulsion']:.1f} "
-                                f"range={cand['agent_influence_range']:.1f} | "
-                                f"采样 {sampled} ep (目标≥{pf_meta_required_episodes}), "
-                                f"成功率 {succ_rate:.1f}%, 平均回合奖励 {avg_r_str}"
-                            )
-                    else:
-                        pf_meta_current_idx = None
-                        pf_meta_episode_state = None
-            except Exception:
-                pf_meta_current_idx = None
-                pf_meta_episode_state = None
-        else:
-            pf_meta_current_idx = None
-            pf_meta_episode_state = None
-
-        # 预热锁定：保证预热与训练阶段使用相同的复杂度和地图
-        curriculum_locked = warmup_enabled and (not warmup_completed)
-        random_mode_active = map_change_unlocked and (not curriculum_locked)
-
-        # 在每个回合开始时，如果已解锁随机地形（且不在预热锁定阶段），则设置新的随机种子
-        if random_mode_active:
+        # 在每个回合开始时，如果用户显式启用了随机地形，则设置新的随机种子
+        if random_terrain_mode_active:
             args.terrain_seed = np.random.randint(0, 100000)
             if not quiet_output:
                 tqdm.write(f"🗺️ 新随机地形种子: {args.terrain_seed}", file=tqdm_file)
+        
+        # 🚀 新增：随机障碍物模式已解锁（障碍物会在reset_world时自动重新生成，无需额外设置）
+        # 注意：障碍物生成由场景类的reset_world方法根据USE_DYNAMIC_OBSTACLES环境变量自动处理
         
         # 噪声重启机制：每N回合重启噪声，避免陷入局部解（N<=0 时关闭）
         noise_restart_interval = int(os.getenv('NOISE_RESTART_INTERVAL', '200'))
@@ -13494,7 +15535,7 @@ def train(args):
 
         # 在每个回合开始时（无论是否静默输出）都应用按百分比的 action_force_ratio 日程
         try:
-            # 记录初始混合比例，供预热完成后恢复
+            # 记录初始混合比例，供整个训练过程中的 schedule 使用
             if not hasattr(args, '_base_action_force_ratio'):
                 try:
                     args._base_action_force_ratio = float(getattr(args, 'action_force_ratio', 0.0))
@@ -13554,22 +15595,10 @@ def train(args):
                     # 🔧 修复：及时更新FR缓存，确保训练时使用的FR值与实际FR值一致
                     if hasattr(maddpg, 'action_force_ratio_cached'):
                         maddpg.action_force_ratio_cached = float(new_ratio)
-            else:
-                # 无日程时：若预热已完成，恢复到初始混合比例，避免被预热阶段的0覆写
-                if os.getenv('LEARNING_WARMUP_ENABLED', '1').lower() in ('1','true','yes','on'):
-                    try:
-                        if 'warmup_completed' in locals() and warmup_completed:
-                            args.action_force_ratio = float(getattr(args, '_base_action_force_ratio', getattr(args, 'action_force_ratio', 0.0)))
-                    except Exception:
-                        pass
         except Exception:
             pass
 
         current_action_force_ratio = float(getattr(args, 'action_force_ratio', 0.0))
-        if warmup_enabled and not warmup_completed and warmup_random_policy:
-            current_action_force_ratio = warmup_force_ratio
-            args.action_force_ratio = current_action_force_ratio
-
         maddpg.action_force_ratio_cached = current_action_force_ratio
 
         # 碰撞惩罚权重线性日程（训练初期降低，后期恢复）
@@ -13614,38 +15643,6 @@ def train(args):
             if not quiet_output and episode == 0:
                 tqdm.write(f"[WARN] 碰撞权重日程执行失败: {sched_err}", file=tqdm_file)
 
-        # 预热阶段势场总开关：WARMUP_FORCE_ENABLED（1=预热也应用势场修正，0=预热禁用势场修正）
-        try:
-            if warmup_enabled and not warmup_completed:
-                enabled = os.getenv('WARMUP_FORCE_ENABLED', '1').lower() in ('1','true','yes','on')
-                if not enabled:
-                    args.action_force_ratio = 0.0
-        except Exception:
-            pass
-
-        # 预热阶段禁止保存轨迹与交互HTML，避免I/O与绘图开销；预热完成后自动恢复原值
-        try:
-            # 记录原始保存开关（仅初始化一次）
-            if not hasattr(args, '_orig_save_flags'):
-                args._orig_save_flags = dict(
-                    SAVE_BEST_TRAJ=os.getenv('SAVE_BEST_TRAJ', '1'),
-                    SAVE_EPISODE_TRAJ=os.getenv('SAVE_EPISODE_TRAJ', '0'),
-                    SAVE_INTERACTIVE_TRAJ=os.getenv('SAVE_INTERACTIVE_TRAJ', '1'),
-                    SAVE_INTERACTIVE_TRAJ_INDEPENDENT=os.getenv('SAVE_INTERACTIVE_TRAJ_INDEPENDENT', '0'),
-                )
-            if warmup_enabled and not warmup_completed:
-                os.environ['SAVE_BEST_TRAJ'] = '0'
-                os.environ['SAVE_EPISODE_TRAJ'] = '0'
-                # 🔧 修复：允许在预热阶段生成交互HTML，不强制禁用
-                # os.environ['SAVE_INTERACTIVE_TRAJ'] = '0'
-                # os.environ['SAVE_INTERACTIVE_TRAJ_INDEPENDENT'] = '0'
-        except Exception:
-            pass
-        
-        # 更新total_steps统计（修复噪声衰减问题）
-        if hasattr(maddpg, 'training_stats'):
-            maddpg.training_stats['total_steps'] += args.episode_length
-        
         # 参数噪声路径已移除（仅保留OU噪声）。这里不再更新 actor_perturbed。
 
         # 先获取total_steps，避免在后续代码中出现未定义变量
@@ -13684,13 +15681,11 @@ def train(args):
         last_avg_actor_loss = None
         last_avg_critic_loss = None
 
-        # 注意：这里的 reset 返回的是 (num_envs, n_agents, obs_dim)
-        # 🔧 预热阶段强制每次reset，保证随机初始化
-        if ('obs_n' not in locals() or obs_n is None or 
-            (warmup_enabled and (not warmup_completed) and warmup_random_init)):
+        # 🔧 单环境模式：reset 返回的是 (1, n_agents, obs_dim) - 批次化格式保持API兼容
+        if 'obs_n' not in locals() or obs_n is None:
             obs_n = env.reset()
         
-        # episode_reward 现在是每个环境的奖励列表
+        # 🔧 单环境模式：episode_reward 是单环境奖励（保持数组格式以兼容API）
         episode_rewards_per_env = np.zeros(env.num_envs)
         per_env_cum_rewards = np.zeros(env.num_envs, dtype=np.float64)
         # 跟踪每个并行环境在本回合内是否已经早停（任一agent done 即视为该环境早停）
@@ -13698,16 +15693,27 @@ def train(args):
         
         # 本地只记录当前回合轨迹，回合结束若为最佳再保存为最佳轨迹
         episode_traj_tmp = [] if enable_best_traj else None
-        # 新增：收集Actor网络7维输出历史数据（默认开启，以便可视化时附带时序图）
-        # 说明：此前通过环境变量 ENABLE_ACTOR_OUTPUT_COLLECTION 控制，默认关闭。
-        #      现改为默认开启，避免漏掉用于诊断“网络死亡/饱和”的时序图。
-        episode_actor_outputs_tmp = []
+        # Actor 7维原始输出历史仅用于可视化诊断，由环境变量控制是否采样。
+        try:
+            enable_actor_output_collection = os.getenv('ENABLE_ACTOR_OUTPUT_COLLECTION', '0').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            enable_actor_output_collection = False
+        episode_actor_outputs_tmp = [] if enable_actor_output_collection else None
+        # 计时汇总：每回合初始化
+        if timing_enabled:
+            timing_ep = _new_timing_bucket()
+            timing_window = _new_timing_bucket()
+            timing_steps = 0
+            timing_window_steps = 0
+            if timing_detail_enabled:
+                timing_detail_ep = _new_timing_detail_bucket()
+                timing_detail_window = _new_timing_detail_bucket()
         
         # 重置环境计数器（用于检测变化）
         if hasattr(maddpg, '_last_running_envs'):
             maddpg._last_running_envs = env.num_envs
         
-        # 处理初始观察
+        # 🔧 单环境模式：处理初始观察（观察处理器已优化为单环境处理）
         if hasattr(maddpg.obs_processor, 'batch_process_observations_vectorized'):
             processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
         else:
@@ -13716,12 +15722,8 @@ def train(args):
         # 🔧 性能优化1：预先缓存方法判断，避免每步重复（提升2-3%）
         _use_vectorized_actions = hasattr(maddpg, 'batch_select_actions_vectorized')
         _use_vectorized_obs = hasattr(maddpg.obs_processor, 'batch_process_observations_vectorized')
-        
-        # 🔧 调试：检查为什么可能回退到非向量化路径
-        if not _use_vectorized_actions and not quiet_output and step < 5:
-            print(f"[警告] batch_select_actions_vectorized 方法不存在，将使用非向量化路径")
-            print(f"      maddpg类型: {type(maddpg).__name__}")
-            print(f"      可用方法: {[m for m in dir(maddpg) if 'batch_select' in m]}")
+        if not _use_vectorized_actions:
+            raise RuntimeError("当前训练主线仅允许 batch_select_actions_vectorized()")
         
         # 🔧 性能优化2：缓存TF Tensor，减少重复转换（提升8-12%）
         _obs_tensor_cached = tf.convert_to_tensor(processed_obs, dtype=tf.float32)
@@ -13730,11 +15732,7 @@ def train(args):
         _profiling_enabled = profiling
         _profile_interval = 100  # 每100步输出一次profile信息
         # 细分选择动作内部计时（不改变逻辑，仅额外测时与日志）
-        try:
-            import os as _os
-            _select_profile_enabled = _os.getenv('INTERNAL_SELECT_PROFILE', '0').lower() in ('1','true','yes','on')
-        except Exception:
-            _select_profile_enabled = False
+        _select_profile_enabled = False
         
         last_hb = time.time()
         # 采样Actor输出的步间隔（默认10，可通过环境变量覆盖以获得更连续的曲线）
@@ -13752,10 +15750,53 @@ def train(args):
         # 注意：这些变量是episode级别的，每个episode都会重新初始化
         _cached_env_structure = None
         _cached_agents_list = None  # 🔧 性能优化：缓存agents列表，避免每步重复访问
+        pending_single_transition = None
+
+        def _compute_single_next_pf_features(single_next_obs, fr_value):
+            if not (
+                getattr(maddpg, 'use_pf_feature_flag', False)
+                and getattr(maddpg, 'use_tf_potential_field_cached', getattr(args, 'use_tf_potential_field', True))
+                and float(fr_value) > 0.0
+            ):
+                return None
+            try:
+                next_obs_batch = np.expand_dims(np.asarray(single_next_obs, dtype=np.float32), axis=0)
+                next_pf_batch = maddpg.compute_base_pf_forces_batch_numpy(next_obs_batch, float(fr_value))
+                if isinstance(next_pf_batch, np.ndarray) and next_pf_batch.shape == (1, n_agents, 3):
+                    return np.ascontiguousarray(next_pf_batch[0], dtype=np.float32)
+            except Exception as e:
+                raise RuntimeError(f"单环境 next PF 特征计算失败: {e}") from e
+            return np.zeros((n_agents, 3), dtype=np.float32)
+
+        def _flush_pending_single_transition(next_pf_features_override=None):
+            nonlocal pending_single_transition
+            if pending_single_transition is None:
+                return
+            next_pf_features_single = next_pf_features_override
+            if next_pf_features_single is None and pending_single_transition.get('need_pf_features', False):
+                next_pf_features_single = _compute_single_next_pf_features(
+                    pending_single_transition['next_obs_n'],
+                    pending_single_transition['fr_value'],
+                )
+            replay_buffer.add_single_aligned(
+                obs_n=pending_single_transition['obs_n'],
+                next_obs_n=pending_single_transition['next_obs_n'],
+                act_n=pending_single_transition['act_n'],
+                rew_n=pending_single_transition['rew_n'],
+                done_n=pending_single_transition['done_n'],
+                fr_value=pending_single_transition['fr_value'],
+                pf_forces=pending_single_transition['pf_forces'],
+                act_corrected=pending_single_transition['act_corrected'],
+                next_act_corrected=None,
+                pf_features=pending_single_transition['pf_features'],
+                next_pf_features=next_pf_features_single,
+            )
+            pending_single_transition = None
         
         for step in range(args.episode_length):
-            use_pf_random_warmup = warmup_enabled and (not warmup_completed) and warmup_random_policy
             step_start = time.time() if _profiling_enabled else None
+            if timing_enabled:
+                _t_step0 = _perf_counter()
             
             # === 更新world的step计数器（用于奖励调试）===
             if enable_reward_debug:
@@ -13771,427 +15812,88 @@ def train(args):
                     pass
             
             # 批量选择动作（使用缓存的TF Tensor，避免重复转换）
+            if timing_enabled:
+                _t_action_start = _perf_counter()
             _t_act_start = time.time() if _profiling_enabled else None
-            # 🔧 性能优化：直接使用缓存的TF Tensor（之前每步都重复转换）
-            if _use_vectorized_actions and _select_profile_enabled and (step % _profile_interval == 0):
-                # 仅在采样步进行细分计时（严格保持原有逻辑顺序）
-                t_total0 = time.time()
-                # 1) Actor前向（并行所有智能体）
-                t0 = time.time()
-                actions_per_agent = []
-                for i in range(maddpg.n_agents):
-                    # 🔧 修复：确保观测维度正确（使用obs_shapes[i]而不是直接使用所有维度）
-                    obs_dim = maddpg.obs_shapes[i] if i < len(maddpg.obs_shapes) else _obs_tensor_cached.shape[2]
-                    agent_obs = _obs_tensor_cached[:, i, :obs_dim]  # 🔧 修复：使用正确的观测维度
-                    # 🔧 修复：检查use_pf_feature，确保输入数量与网络构建时一致
-                    actor_inputs = [agent_obs]
-                    if getattr(maddpg, 'use_fr_feature_flag', False) or getattr(maddpg.args, 'use_fr_feature', False):
-                        fr_b = tf.fill([tf.shape(agent_obs)[0], 1], tf.cast(getattr(maddpg.args, 'action_force_ratio', 0.0), tf.float32))
-                        actor_inputs.append(fr_b)
-                    if getattr(maddpg, 'use_pf_feature_flag', False) or getattr(maddpg.args, 'use_pf_feature', False):
-                        # 使用零向量作为PF输入的占位符
-                        pf_feature_dim = getattr(maddpg, 'pf_feature_dim', getattr(maddpg.args, 'pf_feature_dim', 3))
-                        pf_b = tf.zeros([tf.shape(agent_obs)[0], pf_feature_dim], dtype=tf.float32)
-                        actor_inputs.append(pf_b)
-                    # 🔧 修复：根据输入数量调用Actor网络
-                    if len(actor_inputs) == 1:
-                        agent_actions = maddpg.agents[i]['actor'](actor_inputs[0], training=False)
-                    else:
-                        agent_actions = maddpg.agents[i]['actor'](actor_inputs, training=False)
-                    # NaN 安全
-                    agent_actions = tf.where(tf.math.is_nan(agent_actions), tf.zeros_like(agent_actions), agent_actions)
-                    # 🔧 XLA修复：确保所有tensor形状一致，避免stack时的内存对齐问题
-                    expected_act_dim = maddpg.action_dims[i] if hasattr(maddpg, 'action_dims') and i < len(maddpg.action_dims) else 7
-                    agent_actions = tf.ensure_shape(agent_actions, [None, expected_act_dim])
-                    actions_per_agent.append(agent_actions)
-                # 🔧 XLA修复：确保stack和transpose操作的类型一致性
-                actions_stacked = tf.stack(actions_per_agent, axis=0)  # [n_agents, batch, act_dim]
-                actions = tf.transpose(actions_stacked, [1, 0, 2])  # [batch, n_agents, act_dim]
-                ms_actor = (time.time() - t0) * 1000.0
-
-                # 2) 维度对齐到8的倍数
-                orig_act_dim = tf.shape(actions)[2]
-                orig_act_dim = tf.cast(orig_act_dim, tf.int32)  # 🔧 XLA修复：确保是int32类型
-                # 🔧 XLA修复：确保mod操作的所有中间结果都是int32类型
-                mod_result = tf.math.mod(orig_act_dim, 8)
-                mod_result = tf.cast(mod_result, tf.int32)  # 确保是int32
-                remainder = tf.cast(8, tf.int32) - mod_result
-                pad = tf.math.mod(remainder, tf.cast(8, tf.int32))
-                pad = tf.cast(pad, tf.int32)  # 🔧 XLA修复：确保是int32类型
-                actions_work = tf.pad(actions, [[0, 0], [0, 0], [0, pad]])
-
-                # 3) OU噪声
-                t1 = time.time()
-                if getattr(maddpg, 'vectorized_ou_noise', None) is not None:
-                    ou_tensor = maddpg.vectorized_ou_noise.generate_noise()
-                    target_dim = tf.shape(actions_work)[2]
-                    ou_dim = tf.shape(ou_tensor)[2]
-                    pad_needed = tf.maximum(target_dim - ou_dim, 0)
-                    pad_needed = tf.cast(pad_needed, tf.int32)  # 🔧 XLA修复：确保是int32类型
-                    ou_tensor = tf.pad(ou_tensor, [[0, 0], [0, 0], [0, pad_needed]])
-                    ou_tensor = ou_tensor[:, :, :target_dim]
-                    actions_work = actions_work + tf.cast(ou_tensor, actions_work.dtype)
-                else:
-                    # 兼容旧路径
-                    num_envs_int = int(getattr(maddpg.args, 'num_envs', 1))
-                    ou_rows = []
-                    for env_idx in range(num_envs_int):
-                        per_env = []
-                        for agent_idx in range(maddpg.n_agents):
-                            current_std = max(float(maddpg.args.noise_scale), float(maddpg.args.noise_min))
-                            maddpg.ou_noises[env_idx][agent_idx].set_std_dev(current_std)
-                            per_env.append(maddpg.ou_noises[env_idx][agent_idx]())
-                        ou_rows.append(tf.stack(per_env, axis=0))
-                    ou_tensor = tf.stack(ou_rows, axis=0)
-                    target_dim = tf.shape(actions_work)[2]
-                    ou_dim = tf.shape(ou_tensor)[2]
-                    pad_needed = tf.maximum(target_dim - ou_dim, 0)
-                    pad_needed = tf.cast(pad_needed, tf.int32)  # 🔧 XLA修复：确保是int32类型
-                    ou_tensor = tf.pad(ou_tensor, [[0, 0], [0, 0], [0, pad_needed]])
-                    ou_tensor = ou_tensor[:, :, :target_dim]
-                    actions_work = actions_work + tf.cast(ou_tensor, actions_work.dtype)
-                dtype_aw = actions_work.dtype
-                actions_work = tf.clip_by_value(actions_work, tf.cast(-1.0, dtype_aw), tf.cast(1.0, dtype_aw))
-                ms_ou = (time.time() - t1) * 1000.0
-
-                # 4) epsilon-greedy 随机
-                t2 = time.time()
-                eps = tf.cast(getattr(maddpg, 'current_random_action_prob', 0.0), actions_work.dtype)
-                # 始终在 CPU 端生成随机数
-                with tf.device('/CPU:0'):
-                    rand_mask = tf.random.uniform(tf.shape(actions_work)[:2], dtype=actions_work.dtype) < eps
-                    rand_actions = tf.random.uniform(tf.shape(actions_work), minval=-1.0, maxval=1.0, dtype=actions_work.dtype)
-                mask3 = tf.expand_dims(rand_mask, axis=2)
-                actions_work = tf.where(mask3, rand_actions, actions_work)
-                ms_eps = (time.time() - t2) * 1000.0
-
-                # 5) 裁剪回原始维度
-                actions = tf.slice(actions_work, [0, 0, 0], [tf.shape(actions_work)[0], tf.shape(actions_work)[1], orig_act_dim])
-
-                # 6) 势场修正（向量化）
-                t3 = time.time()
-                # 使用Python标量进行开关判断，避免Tensor与0.0比较引起歧义
-                current_force_ratio = float(getattr(maddpg.args, 'action_force_ratio', 0.2))
-                use_tf_potential_field = getattr(maddpg.args, 'use_tf_potential_field', True)
-                # 🔧 新增：计算势场力矢量
-                pf_forces_tensor = None
-                if use_tf_potential_field and current_force_ratio > 0.0:
-                    num_envs_dyn = tf.shape(actions)[0]
-                    act_dim_dyn = tf.shape(actions)[2]
-                    obs_dim_dyn = tf.shape(_obs_tensor_cached)[2]
-                    flat_actions = tf.reshape(actions, [-1, act_dim_dyn])
-                    flat_obs = tf.reshape(_obs_tensor_cached, [-1, obs_dim_dyn])
-                    corrected_head_flat, pf_force_flat = maddpg._apply_potential_field_correction(flat_actions, flat_obs, current_force_ratio)
-                    corrected_head = tf.reshape(corrected_head_flat, [num_envs_dyn, maddpg.n_agents, 3])
-                    pf_forces_tensor = tf.reshape(pf_force_flat, [num_envs_dyn, maddpg.n_agents, 3])
-                    tail = actions[:, :, 3:]
-                    actions = tf.concat([corrected_head, tail], axis=2)
-                else:
-                    # 未使用势场修正时，势场力为零
-                    num_envs_dyn = tf.shape(actions)[0]
-                    pf_forces_tensor = tf.zeros([num_envs_dyn, maddpg.n_agents, 3], dtype=actions.dtype)
-                ms_pf = (time.time() - t3) * 1000.0
-
-                # 生成最终tensor（包含动作和势场力）
-                actions_tensor = (actions, pf_forces_tensor)
-                ms_total = (time.time() - t_total0) * 1000.0
+            # 🔧 性能优化：训练主线固定使用向量化多返回值接口
+            if _profiling_enabled:
+                with tf.profiler.experimental.Trace('action_select', step_num=step, _r=1):
+                    actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor, raw_actor_outputs_tensor, current_pf_features_tensor = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
             else:
-                # 主路径：正常动作选择（非性能分析步）
-                use_pf_random_warmup = warmup_enabled and (not warmup_completed) and warmup_random_policy
-                if use_pf_random_warmup:
-                    # 路径1：PF引导的随机预热（向量化实现）
-                    # 🔧 修复：统一返回值解包，避免_profiling_enabled时返回值未解包导致错误
-                    if _profiling_enabled:
-                        with tf.profiler.experimental.Trace('warmup_random', step_num=step, _r=1):
-                            actions_tensor, pf_forces_tensor = _generate_pf_random_actions(
-                                maddpg,
-                                _obs_tensor_cached,
-                                scale=warmup_random_scale,
-                                force_ratio=warmup_force_ratio
-                            )
-                    else:
-                        actions_tensor, pf_forces_tensor = _generate_pf_random_actions(
-                            maddpg,
-                            _obs_tensor_cached,
-                            scale=warmup_random_scale,
-                            force_ratio=warmup_force_ratio
-                        )
-                elif _use_vectorized_actions:
-                    # 路径2：向量化动作选择（优先使用）
-                    # 🚨🚨🚨 关键修改：现在返回三个值
-                    # 1. actions_for_storage: 存入回放区（原始+噪声，无势场修正）
-                    # 2. actions_for_execution: 交给环境（原始+噪声+势场修正）
-                    # 3. pf_forces: 势场力
-                    if _profiling_enabled:
-                        with tf.profiler.experimental.Trace('action_select', step_num=step, _r=1):
-                            actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
-                    else:
-                        actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
-                    
-                    # 🔧 打包成tuple，供后续解包处理
-                    actions_tensor = (actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor)
-                    
-                    # 🔧 新增：将势场力矢量追加到观测中
-                    # 注意：这里我们需要将势场力追加到当前观测，以便保存到ReplayBuffer
-                    # 但由于观测已经处理过，我们需要在保存经验时处理
-                    # 暂时先保存pf_forces_tensor，稍后在保存经验时追加到观测
-                else:
-                    # 路径3：回退到非向量化（仅在向量化方法不可用时使用）
-                    # 🔧 警告：这不应该发生，因为 MATD3/MADDPG 都有 batch_select_actions_vectorized 方法
-                    if not quiet_output and step < 10:
-                        print(f"[警告] 回退到非向量化动作选择路径（step={step}）")
-                        print(f"      _use_vectorized_actions={_use_vectorized_actions}, warmup={warmup_enabled}, completed={warmup_completed}")
-                    if _profiling_enabled:
-                        with tf.profiler.experimental.Trace('action_select', step_num=step, _r=1):
-                            actions_tensor, pf_forces_tensor = maddpg.batch_select_actions(_obs_tensor_cached, add_noise=True)
-                    else:
-                        actions_tensor, pf_forces_tensor = maddpg.batch_select_actions(_obs_tensor_cached, add_noise=True)
-                    
-                    # 🔧 新增：将势场力矢量追加到观测中（与vectorized版本一致）
-                    # 注意：这里我们需要将势场力追加到当前观测，以便保存到ReplayBuffer
-                    # 但由于观测已经处理过，我们需要在保存经验时处理
-                    # 暂时先保存pf_forces_tensor，稍后在保存经验时追加到观测
+                actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor, raw_actor_outputs_tensor, current_pf_features_tensor = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
+            if timing_enabled:
+                _dt_action = _perf_counter() - _t_action_start
+                timing_ep['action'] += _dt_action
+                timing_window['action'] += _dt_action
+                _t_sync_start = _perf_counter()
             # 🔧 修复：显式转换为float32并确保内存对齐（修复CUDA_ERROR_MISALIGNED_ADDRESS）
             t_host0 = time.time() if (_profiling_enabled and (step % _profile_interval == 0)) else None
             # 🔧 修改：处理新的返回值（存储动作、执行动作、势场力）
             # 🔧 关键修复：在异步执行模式下，先确保GPU操作完成再转换为NumPy
             # 避免在Tensor还在被使用时调用.numpy()导致CUDA_ERROR_MISALIGNED_ADDRESS
+            collect_actor_outputs_this_step = bool(
+                episode_actor_outputs_tmp is not None and
+                (step == 0 or step % actor_output_interval == 0)
+            )
+            raw_actor_outputs_np = None
             try:
-                # 🚨🚨🚨 新逻辑：处理三个返回值
-                if isinstance(actions_tensor, tuple) and len(actions_tensor) == 3:
-                    # 三个返回值：存储动作、执行动作、势场力
-                    actions_for_storage_tf, actions_for_execution_tf, pf_forces_tf = actions_tensor
-                    
-                    # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
-                    # 这样可以避免在异步执行模式下，tensor还在计算时调用.numpy()导致内存对齐错误
-                    # 注意：tf.identity不会打断XLA编译，只是确保tensor已经被计算
-                    # 🔧 增强修复：对每个tensor都使用tf.identity，确保计算完成
-                    actions_for_storage_tf = tf.identity(actions_for_storage_tf)
-                    actions_for_execution_tf = tf.identity(actions_for_execution_tf)
-                    pf_forces_tf = tf.identity(pf_forces_tf)
-                    
-                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
-                    # 直接使用ascontiguousarray确保内存对齐，_safe_tensor_to_numpy已返回numpy数组
-                    try:
-                        # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                        actions_storage_np = _safe_tensor_to_numpy(actions_for_storage_tf)
-                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
-                        actions_for_storage = np.ascontiguousarray(actions_storage_np, dtype=np.float32)
-                    except (AttributeError, RuntimeError):
-                        # 回退：如果.numpy()不可用，先转array再对齐
-                        actions_storage_temp = np.array(actions_for_storage_tf, dtype=np.float32)
-                        actions_for_storage = np.ascontiguousarray(actions_storage_temp, dtype=np.float32)
-                    
-                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
-                    try:
-                        # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                        actions_np = _safe_tensor_to_numpy(actions_for_execution_tf)
-                        # 🔧 关键修复：验证数组形状，确保每个智能体都有独立的动作
-                        if actions_np.ndim != 3:
-                            raise ValueError(f"actions_for_execution形状异常: {actions_np.shape}, 期望3维 [num_envs, n_agents, action_dim]")
-                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
-                        # _safe_tensor_to_numpy已返回numpy数组，ascontiguousarray足够确保内存对齐
-                        actions = np.ascontiguousarray(actions_np, dtype=np.float32)
-                    except (AttributeError, RuntimeError, ValueError) as e:
-                        # 回退：如果.numpy()不可用或形状异常，先转array再对齐
-                        if not quiet_output and step < 10:
-                            print(f"[警告] 执行动作转换异常: {e}, 使用回退方案")
-                        actions_temp = np.array(actions_for_execution_tf, dtype=np.float32)
-                        # 确保形状正确
-                        if actions_temp.ndim == 2:
-                            actions_temp = np.expand_dims(actions_temp, axis=0)
-                        actions = np.ascontiguousarray(actions_temp, dtype=np.float32)
-                    
-                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
-                    try:
-                        # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                        pf_forces_np_temp = _safe_tensor_to_numpy(pf_forces_tf)
-                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
-                        pf_forces_np = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
-                    except (AttributeError, RuntimeError):
-                        # 回退：如果.numpy()不可用，先转array再对齐
-                        pf_forces_temp = np.array(pf_forces_tf, dtype=np.float32)
-                        pf_forces_np = np.ascontiguousarray(pf_forces_temp, dtype=np.float32)
-                
-                elif isinstance(actions_tensor, tuple) and len(actions_tensor) == 2:
-                    # 兼容旧版本：两个返回值（动作、势场力）
-                    actions_tf, pf_forces_tf = actions_tensor
-                    
-                    # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
-                    actions_tf = tf.identity(actions_tf)
-                    pf_forces_tf = tf.identity(pf_forces_tf)
-                    
-                    # 🔧 优化：直接使用ascontiguousarray确保内存对齐
-                    # 转换动作
-                    try:
-                        # 🔧 XLA修复：使用安全的tensor转换，避免在XLA编译时访问内存
-                        actions_np = _safe_tensor_to_numpy(actions_tf)
-                        actions = np.ascontiguousarray(actions_np, dtype=np.float32)
-                    except (AttributeError, RuntimeError):
-                        actions = np.ascontiguousarray(
-                            np.array(actions_tf, dtype=np.float32),
-                            dtype=np.float32
-                        )
-                    
-                    # 🔧 性能优化：简化转换逻辑，移除不必要的tobytes()+frombuffer()+copy()操作
-                    try:
-                        # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                        pf_forces_np_temp = _safe_tensor_to_numpy(pf_forces_tf)
-                        # 🔧 性能优化：直接使用ascontiguousarray，移除不必要的tobytes()+frombuffer()+copy()
-                        pf_forces_np = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
-                    except (AttributeError, RuntimeError):
-                        pf_forces_temp = np.array(pf_forces_tf, dtype=np.float32)
-                        pf_forces_np = np.ascontiguousarray(pf_forces_temp, dtype=np.float32)
-                    
-                    # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
-                    # 旧版本：存储动作和执行动作相同
-                    actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
-                else:
-                    # 兼容旧版本（非向量化路径或未修改的函数）
-                    # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
-                    actions_tensor = tf.identity(actions_tensor)
-                    
-                    # 🔧 优化：直接使用ascontiguousarray确保内存对齐
-                    try:
-                        # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                        actions_np = _safe_tensor_to_numpy(actions_tensor)
-                        actions = np.ascontiguousarray(actions_np, dtype=np.float32)
-                    except (AttributeError, RuntimeError):
-                        actions = np.ascontiguousarray(
-                            np.array(actions_tensor, dtype=np.float32),
-                            dtype=np.float32
-                        )
-                    pf_forces_np = np.zeros((actions.shape[0], actions.shape[1], 3), dtype=np.float32)
-                    # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
-                    actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
-            except Exception as e:
-                # 🔧 错误处理：如果转换失败，尝试强制同步后重试
-                if not quiet_output:
-                    print(f"[警告] Tensor转NumPy失败，尝试强制同步后重试: {e}")
+                num_envs_sync = int(getattr(env, 'num_envs', 1))
+                n_agents_sync = int(getattr(maddpg, 'n_agents', 3))
+                action_dim_sync = int(actions_for_storage_tensor.shape[2]) if actions_for_storage_tensor.shape.ndims >= 3 else 7
+                raw_action_dim_sync = int(raw_actor_outputs_tensor.shape[2]) if raw_actor_outputs_tensor.shape.ndims >= 3 else action_dim_sync
+                size1 = num_envs_sync * n_agents_sync * action_dim_sync
+                size2 = size1
+                size3 = num_envs_sync * n_agents_sync * 3
+                size4 = num_envs_sync * n_agents_sync * 3
+                size5 = num_envs_sync * n_agents_sync * raw_action_dim_sync
+                concat_parts = [
+                    tf.reshape(actions_for_storage_tensor, [-1]),
+                    tf.reshape(actions_for_execution_tensor, [-1]),
+                    tf.reshape(pf_forces_tensor, [-1]),
+                    tf.reshape(current_pf_features_tensor, [-1]),
+                ]
+                if collect_actor_outputs_this_step:
+                    concat_parts.append(tf.reshape(raw_actor_outputs_tensor, [-1]))
                 try:
-                    # 强制等待所有操作完成（不使用已移除的sync_execution）
-                    # 使用 tf.constant 的副作用来强制同步
-                    _ = tf.constant(0)
-                    
-                    # 🔧 优化：异常处理中也使用ascontiguousarray确保内存对齐
-                    if isinstance(actions_tensor, tuple) and len(actions_tensor) == 3:
-                        actions_for_storage_tf, actions_for_execution_tf, pf_forces_tf = actions_tensor
-                        # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
-                        actions_for_storage_tf = tf.identity(actions_for_storage_tf)
-                        actions_for_execution_tf = tf.identity(actions_for_execution_tf)
-                        pf_forces_tf = tf.identity(pf_forces_tf)
-                        try:
-                            # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                            actions_for_storage_np = _safe_tensor_to_numpy(actions_for_storage_tf)
-                            actions_np = _safe_tensor_to_numpy(actions_for_execution_tf)
-                            pf_forces_np_temp = _safe_tensor_to_numpy(pf_forces_tf)
-                            actions_for_storage = np.ascontiguousarray(actions_for_storage_np, dtype=np.float32)
-                            actions = np.ascontiguousarray(actions_np, dtype=np.float32)
-                            pf_forces_np = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
-                        except (AttributeError, RuntimeError):
-                            actions_for_storage = np.ascontiguousarray(
-                                np.array(actions_for_storage_tf, dtype=np.float32), dtype=np.float32
-                            )
-                            actions = np.ascontiguousarray(
-                                np.array(actions_for_execution_tf, dtype=np.float32), dtype=np.float32
-                            )
-                            pf_forces_np = np.ascontiguousarray(
-                                np.array(pf_forces_tf, dtype=np.float32), dtype=np.float32
-                            )
-                    elif isinstance(actions_tensor, tuple) and len(actions_tensor) == 2:
-                        actions_tf, pf_forces_tf = actions_tensor
-                        # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
-                        actions_tf = tf.identity(actions_tf)
-                        pf_forces_tf = tf.identity(pf_forces_tf)
-                        try:
-                            # 🔧 关键修复：使用安全的tensor到numpy转换，避免XLA异步执行冲突
-                            actions_np = _safe_tensor_to_numpy(actions_tf)
-                            pf_forces_np_temp = _safe_tensor_to_numpy(pf_forces_tf)
-                            actions = np.ascontiguousarray(actions_np, dtype=np.float32)
-                            pf_forces_np = np.ascontiguousarray(pf_forces_np_temp, dtype=np.float32)
-                        except (AttributeError, RuntimeError):
-                            actions = np.ascontiguousarray(
-                                np.array(actions_tf, dtype=np.float32), dtype=np.float32
-                            )
-                            pf_forces_np = np.ascontiguousarray(
-                                np.array(pf_forces_tf, dtype=np.float32), dtype=np.float32
-                            )
-                        # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
-                        actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
-                    else:
-                        # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
-                        actions_tensor = tf.identity(actions_tensor)
-                        try:
-                            # 🔧 XLA修复：使用安全的tensor转换，避免在XLA编译时访问内存
-                            actions_np = _safe_tensor_to_numpy(actions_tensor)
-                            actions = np.ascontiguousarray(actions_np, dtype=np.float32)
-                        except (AttributeError, RuntimeError):
-                            actions = np.ascontiguousarray(
-                                np.array(actions_tensor, dtype=np.float32), dtype=np.float32
-                            )
-                        pf_forces_np = np.zeros((actions.shape[0], actions.shape[1], 3), dtype=np.float32)
-                        # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
-                        actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
-                except Exception as e2:
-                    # 如果仍然失败，使用零数组作为兜底
-                    if not quiet_output:
-                        print(f"[错误] Tensor转NumPy最终失败，使用零数组: {e2}")
-                    # 使用args中的环境数量
-                    _num_envs = int(getattr(args, 'num_envs', 1))
-                    _n_agents = n_agents if 'n_agents' in locals() else 3
-                    # 🔧 优化：零数组也使用ascontiguousarray确保内存对齐
-                    actions = np.ascontiguousarray(
-                        np.zeros((_num_envs, _n_agents, 7), dtype=np.float32), 
-                        dtype=np.float32
-                    )
-                    pf_forces_np = np.ascontiguousarray(
-                        np.zeros((_num_envs, _n_agents, 3), dtype=np.float32),
-                        dtype=np.float32
-                    )
-                    # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
-                    actions_for_storage = np.ascontiguousarray(actions, dtype=np.float32)
+                    combined_tf = tf.concat(concat_parts, axis=0)
+                    flat = np.ascontiguousarray(_safe_tensor_to_numpy(combined_tf), dtype=np.float32)
+                    actions_for_storage = flat[:size1].reshape(num_envs_sync, n_agents_sync, action_dim_sync)
+                    actions = flat[size1:size1 + size2].reshape(num_envs_sync, n_agents_sync, action_dim_sync)
+                    pf_start = size1 + size2
+                    pf_feat_start = pf_start + size3
+                    raw_start = pf_feat_start + size4
+                    pf_forces_np = flat[pf_start:pf_feat_start].reshape(num_envs_sync, n_agents_sync, 3)
+                    current_pf_features_np = flat[pf_feat_start:raw_start].reshape(num_envs_sync, n_agents_sync, 3)
+                    if collect_actor_outputs_this_step:
+                        raw_actor_outputs_np = flat[raw_start:raw_start + size5].reshape(num_envs_sync, n_agents_sync, raw_action_dim_sync)
+                except (AttributeError, RuntimeError, ValueError) as e:
+                    if episode == 0 and not quiet_output and step < 10:
+                        print(f"[警告] 动作合并同步失败，回退到分次转换: {e}")
+                    actions_for_storage = np.ascontiguousarray(_safe_tensor_to_numpy(actions_for_storage_tensor), dtype=np.float32)
+                    actions = np.ascontiguousarray(_safe_tensor_to_numpy(actions_for_execution_tensor), dtype=np.float32)
+                    pf_forces_np = np.ascontiguousarray(_safe_tensor_to_numpy(pf_forces_tensor), dtype=np.float32)
+                    current_pf_features_np = np.ascontiguousarray(_safe_tensor_to_numpy(current_pf_features_tensor), dtype=np.float32)
+                    if collect_actor_outputs_this_step:
+                        raw_actor_outputs_np = np.ascontiguousarray(_safe_tensor_to_numpy(raw_actor_outputs_tensor), dtype=np.float32)
+            except Exception as e:
+                raise RuntimeError(f"当前训练主线的动作同步失败: {e}") from e
             
-            # 🔧 优化：由于上面已经使用了ascontiguousarray，这里只需要验证
-            # 如果由于某种原因数组不是C-contiguous，则再次对齐（通常不会发生）
-            if not actions.flags['C_CONTIGUOUS']:
-                actions = np.ascontiguousarray(actions, dtype=np.float32)
+            # 🚀 XLA友好优化：移除冗余的C_CONTIGUOUS检查
+            # 上面的代码已经确保actions和pf_forces_np是C-contiguous的（通过ascontiguousarray）
+            # ascontiguousarray保证返回C-contiguous数组，所以这个检查是冗余的
+            # 移除后不影响XLA编译（这是Python层面的检查，不在计算图中）
             
-            # 🔧 对pf_forces_np也进行验证（如果存在）
-            if pf_forces_np is not None and not pf_forces_np.flags['C_CONTIGUOUS']:
-                pf_forces_np = np.ascontiguousarray(pf_forces_np, dtype=np.float32)
-                # 🔧 形状验证：确保pf_forces_np的形状正确
+            # 🔧 形状验证：确保pf_forces_np的形状正确（仅在需要时检查）
+            if pf_forces_np is not None:
                 expected_shape = (actions.shape[0], actions.shape[1], 3)
                 if pf_forces_np.shape != expected_shape:
-                    if not quiet_output and step < 10:
+                    # 🔧 性能优化：仅在第一个episode输出警告
+                    if episode == 0 and not quiet_output and step < 10:
                         print(f"[警告] pf_forces_np形状不匹配: 期望{expected_shape}, 实际{pf_forces_np.shape}, 已修正")
                     # 修正形状：如果形状不匹配，创建正确形状的零数组
                     pf_forces_np = np.zeros(expected_shape, dtype=np.float32)
 
-            if (pf_meta_enabled and use_pf_random_warmup and
-                    pf_meta_current_idx is not None and pf_meta_episode_state is not None):
-                try:
-                    head_actions_np = actions[..., :3]
-                    energy_sample = float(np.mean(np.linalg.norm(head_actions_np, axis=2)))
-                    if np.isfinite(energy_sample):
-                        pf_meta_episode_state['energy_sum'] += energy_sample
-                        pf_meta_episode_state['energy_samples'] += 1
-                except Exception:
-                    pass
-            
-            # 🔧 动作平滑：使用指数移动平均减少毛刺
-            # 🔧 修复：降低平滑强度，避免动作滞后导致智能体到处跑
-            # 问题：平滑系数0.3（新动作30%，历史70%）导致动作滞后，智能体无法及时响应环境变化
-            # 解决方案：提高新动作权重到0.7（新动作70%，历史30%），减少滞后
-            # 只在训练阶段且步数>100后启用，避免影响初期探索
-            if step > 100 and hasattr(maddpg, 'prev_actions'):
-                smooth_alpha = 0.7  # 🔧 修复：从0.3提高到0.7，新动作占70%，历史占30%，减少滞后
-                smoothed = smooth_alpha * actions + (1.0 - smooth_alpha) * maddpg.prev_actions
-                # 再次确保平滑后的动作也是对齐的
-                actions = np.ascontiguousarray(smoothed, dtype=np.float32)
-            
-            # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
-            # 保存当前动作供下次使用（也确保对齐）
-            maddpg.prev_actions = np.ascontiguousarray(actions, dtype=np.float32)
+            # 动作平滑当前禁用，避免 PF 修正产生执行滞后。
             
             if _profiling_enabled and _select_profile_enabled and (step % _profile_interval == 0):
                 ms_host = (time.time() - t_host0) * 1000.0 if t_host0 else 0.0
@@ -14210,39 +15912,15 @@ def train(args):
                 _t_act = (time.time() - _t_act_start) * 1000
                 print(f"[PROFILE] action_select: {_t_act:.1f}ms")
             
-            # 🔧 Actor输出采样（频率可配）：用于可视化分析动作与PF参数
-            # 🔧 关键修复：直接从Actor网络获取原始7维输出，绕过噪声和势场修正
-            # 🔧 优化：在预热阶段使用随机策略时跳过网络输出采样（因为网络输出不会被使用，没有意义）
-            use_pf_random_warmup = warmup_enabled and (not warmup_completed) and warmup_random_policy
-            if episode_actor_outputs_tmp is not None and (step == 0 or step % actor_output_interval == 0) and not use_pf_random_warmup:
+            # Actor 输出采样（频率可配）：直接复用本步动作选择阶段返回的原始输出。
+            if (
+                collect_actor_outputs_this_step and
+                raw_actor_outputs_np is not None
+            ):
                 try:
-                    # 🔧 性能优化：直接使用缓存的obs tensor，避免重复转换
-                    # 直接调用Actor网络，获取原始7维输出（3维动作+4维势场参数）
-                    # 🔧 关键修复：支持PF特征作为独立输入
-                    raw_actor_outputs = []
-                    for i in range(maddpg.n_agents):
-                        agent_obs = _obs_tensor_cached[:, i, :]  # (num_envs, obs_dim)
-                        # 🔧 使用缓存的标志，确保与Actor网络构建时的配置一致
-                        actor_inputs = [agent_obs]
-                        if getattr(maddpg, 'use_fr_feature_flag', False) or getattr(maddpg.args, 'use_fr_feature', False):
-                            fr_b = tf.fill([tf.shape(agent_obs)[0], 1], tf.cast(getattr(maddpg.args, 'action_force_ratio', 0.0), tf.float32))
-                            actor_inputs.append(fr_b)
-                        if getattr(maddpg, 'use_pf_feature_flag', False) or getattr(maddpg.args, 'use_pf_feature', False):
-                            # 使用零向量作为PF输入的占位符
-                            pf_feature_dim = getattr(maddpg, 'pf_feature_dim', getattr(maddpg.args, 'pf_feature_dim', 3))
-                            pf_b = tf.zeros([tf.shape(agent_obs)[0], pf_feature_dim], dtype=tf.float32)
-                            actor_inputs.append(pf_b)
-                        
-                        if len(actor_inputs) == 1:
-                            agent_raw_output = maddpg.agents[i]['actor'](actor_inputs[0], training=False)  # (num_envs, 7)
-                        else:
-                            agent_raw_output = maddpg.agents[i]['actor'](actor_inputs, training=False)  # (num_envs, 7)
-                        raw_actor_outputs.append(agent_raw_output)
-                    # 拼接为 (num_envs, n_agents, 7)
-                    raw_outputs_tensor = tf.stack(raw_actor_outputs, axis=1)
-                    # 🔧 性能优化：移除不必要的copy()，切片[0]已创建新数组
-                    # 取第0个环境的数据
-                    episode_actor_outputs_tmp.append(raw_outputs_tensor.numpy().astype(np.float32)[0])
+                    episode_actor_outputs_tmp.append(
+                        np.ascontiguousarray(raw_actor_outputs_np[0], dtype=np.float32)
+                    )
                 except Exception as e:
                     if not quiet_output:
                         print(f"[WARNING] Actor输出采样失败: {e}")
@@ -14363,7 +16041,7 @@ def train(args):
                                     w_max = np.max(np.abs(w))
                                     # 输出层：超过1.2倍阈值就约束（从1.5倍降低）
                                     if j == len(weights) - 2:  # 输出层权重
-                                        if w_max > max_weight_threshold * 1.2:
+                                        if w_max > max_weight_threshold:
                                             quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')
                                             if not quiet_output:
                                                 print(f"🔧 Actor {i}输出层权重约束: {w_max:.3f} → {max_weight_threshold:.3f}")
@@ -14379,7 +16057,7 @@ def train(args):
                                             if w_max > max_weight_value:
                                                 max_weight_value = w_max
                                                 max_layer_idx = j
-                                            w_scaled = w * (max_weight_threshold * 1.2 / w_max)  # 更激进的缩放
+                                            w_scaled = w * (max_weight_threshold / w_max)
                                             agent['actor'].set_weights([
                                                 weights[k] if k != j else w_scaled 
                                                 for k in range(len(weights))
@@ -14429,18 +16107,25 @@ def train(args):
             # 如果需要对比，请设置 USE_TF_POTENTIAL_FIELD=1
             pass
             
-            # 🔧 性能优化：移除不必要的copy()，ascontiguousarray已创建新数组
+            # 🔧 性能优化：减少同步阶段的重复 CPU contiguous 修正
             # 动作处理：训练与回放统一使用归一化动作[-1,1]
             # 物理映射在环境侧（apply_action_force）完成
-            actions_for_storage = np.ascontiguousarray(actions_for_storage, dtype=np.float32)
+            storage_already_ready = (
+                isinstance(actions_for_storage, np.ndarray)
+                and actions_for_storage.dtype == np.float32
+                and actions_for_storage.flags['C_CONTIGUOUS']
+            )
+            if not storage_already_ready:
+                actions_for_storage = _ensure_cpu_contig(actions_for_storage, dtype=np.float32, force_copy=False)
 
             # 🔧 关键修复：确保传递给环境的actions完全内存对齐
             # 问题：在并行环境（multiprocessing）中，actions会通过pickle序列化传递
             # 如果内存不对齐，反序列化后的数组可能触发CUDA_ERROR_MISALIGNED_ADDRESS
             # 解决：创建一个确保64字节对齐的副本
             # 🔧 关键修复：确保actions形状正确 [num_envs, n_agents, action_dim]
+            # 🔧 性能优化：仅在第一个episode的前5步输出警告
             if actions.ndim != 3:
-                if not quiet_output and step < 5:
+                if episode == 0 and not quiet_output and step < 5:
                     print(f"[警告] actions维度异常: {actions.ndim}维，期望3维，形状={actions.shape}")
                 # 尝试修复形状
                 if actions.ndim == 2:
@@ -14452,24 +16137,28 @@ def train(args):
                     _action_dim = actions.shape[0] // _n_agents
                     actions = actions.reshape(1, _n_agents, _action_dim)
             
-            # 🔧 关键修复：确保传递给多进程环境的actions是完全独立的CPU数组
-            # 问题：即使使用了ascontiguousarray，数组可能仍然包含对GPU tensor的内部引用
-            # 在pickle序列化时，这些引用可能导致CUDA_ERROR_ILLEGAL_ADDRESS
-            # 解决：使用更彻底的方法创建完全独立的副本
-            # 步骤1：先确保是C-contiguous
-            actions_contiguous = np.ascontiguousarray(actions, dtype=np.float32)
-            # 🔧 性能优化：简化内存复制逻辑，frombuffer已创建新数组，不需要额外的copy()
-            # 步骤2：使用tobytes()+frombuffer创建完全独立的内存副本（最彻底的方法）
-            # 这样可以确保完全脱离原始内存，不保留任何引用
-            actions_bytes = actions_contiguous.tobytes()
-            actions_for_env = np.frombuffer(actions_bytes, dtype=np.float32).reshape(actions_contiguous.shape)
-            # 🔧 性能优化：frombuffer已创建新数组，直接使用ascontiguousarray确保对齐
-            # 步骤3：再次确保是C-contiguous和正确的dtype
-            if not actions_for_env.flags['C_CONTIGUOUS'] or actions_for_env.dtype != np.float32:
-                actions_for_env = np.ascontiguousarray(actions_for_env, dtype=np.float32)
+            # 🔧 同步阶段：默认直接复用已经是 float32/C-contiguous/aligned 的结果；
+            # 只有在需要极致稳定拷贝或数组条件不满足时，才走 _ensure_cpu_contig。
+            actions_env_already_ready = (
+                isinstance(actions, np.ndarray)
+                and actions.dtype == np.float32
+                and actions.flags['C_CONTIGUOUS']
+                and actions.flags['ALIGNED']
+            )
+            if strict_cpu_copy:
+                actions_for_env = _ensure_cpu_contig(actions, dtype=np.float32, force_copy=True)
+            elif actions_env_already_ready:
+                actions_for_env = actions
+            else:
+                actions_for_env = _ensure_cpu_contig(actions, dtype=np.float32, force_copy=False)
+            if timing_enabled:
+                _dt_sync = _perf_counter() - _t_sync_start
+                timing_ep['sync'] += _dt_sync
+                timing_window['sync'] += _dt_sync
             
             # 验证对齐和形状（调试用，生产环境可删除）
-            if step < 5 and not quiet_output:
+            # 🔧 性能优化：仅在第一个episode的前5步输出，减少I/O开销
+            if episode == 0 and step < 5 and not quiet_output:
                 print(f"[DEBUG] actions检查: shape={actions_for_env.shape}, "
                       f"C-contiguous={actions_for_env.flags['C_CONTIGUOUS']}, "
                       f"aligned={actions_for_env.flags['ALIGNED']}, dtype={actions_for_env.dtype}")
@@ -14482,21 +16171,50 @@ def train(args):
             
             # 执行并行步骤（环境接收原始动作用于其内部的映射）
             _t_env_start = time.time() if _profiling_enabled else None
+            if timing_enabled:
+                _t_env0 = _perf_counter()
             if _profiling_enabled:
                 with tf.profiler.experimental.Trace('env_step', step_num=step, _r=1):
                     next_obs_n, rew_n, done_n, info_n = env.step(actions_for_env)
             else:
                 next_obs_n, rew_n, done_n, info_n = env.step(actions_for_env)
+            if timing_enabled:
+                _dt_env = _perf_counter() - _t_env0
+                timing_ep['env'] += _dt_env
+                timing_window['env'] += _dt_env
+                if timing_detail_enabled:
+                    env_detail_step = _extract_env_timing_detail(info_n)
+                    if env_detail_step is not None:
+                        _merge_timing_detail(timing_detail_ep, env_detail_step)
+                        _merge_timing_detail(timing_detail_window, env_detail_step)
 
-            # 🔧 修复：检测并处理 NaN/Inf 数据，防止XLA错误
-            # 1. 处理 Observations
-            if np.any(np.isnan(next_obs_n)) or np.any(np.isinf(next_obs_n)):
-                # 将异常观察值置零
-                next_obs_n = np.nan_to_num(next_obs_n, nan=0.0, posinf=100.0, neginf=-100.0)
+            # 🔧 性能优化：快速NaN/Inf检查，仅在检测到异常时才全面检查（XLA友好）
+            # 1. 处理 Observations（性能优化：快速检查）
+            if isinstance(next_obs_n, np.ndarray) and next_obs_n.size > 0:
+                # 快速检查：仅检查第一个元素，如果异常再全面检查
+                # 注意：这是numpy数组操作，不在XLA计算图中，完全安全
+                first_elem = next_obs_n.flat[0]
+                if not np.isfinite(first_elem):
+                    # 全面检查（仅在快速检查发现异常时）
+                    if np.any(np.isnan(next_obs_n)) or np.any(np.isinf(next_obs_n)):
+                        next_obs_n = np.nan_to_num(next_obs_n, nan=0.0, posinf=100.0, neginf=-100.0)
+            elif not isinstance(next_obs_n, np.ndarray):
+                # 非numpy数组，直接检查（向后兼容）
+                if np.any(np.isnan(next_obs_n)) or np.any(np.isinf(next_obs_n)):
+                    next_obs_n = np.nan_to_num(next_obs_n, nan=0.0, posinf=100.0, neginf=-100.0)
             
-            # 2. 处理 Rewards (前面已经修复过，但为了保险再次检查)
-            if np.any(np.isnan(rew_n)) or np.any(np.isinf(rew_n)):
-                 rew_n = np.nan_to_num(rew_n, nan=-100.0, posinf=100.0, neginf=-500.0)
+            # 2. 处理 Rewards（性能优化：快速检查）
+            if isinstance(rew_n, np.ndarray) and rew_n.size > 0:
+                # 快速检查：仅检查第一个元素，如果异常再全面检查
+                first_elem = rew_n.flat[0]
+                if not np.isfinite(first_elem):
+                    # 全面检查（仅在快速检查发现异常时）
+                    if np.any(np.isnan(rew_n)) or np.any(np.isinf(rew_n)):
+                        rew_n = np.nan_to_num(rew_n, nan=-100.0, posinf=100.0, neginf=-500.0)
+            elif not isinstance(rew_n, np.ndarray):
+                # 非numpy数组，直接检查（向后兼容）
+                if np.any(np.isnan(rew_n)) or np.any(np.isinf(rew_n)):
+                    rew_n = np.nan_to_num(rew_n, nan=-100.0, posinf=100.0, neginf=-500.0)
 
             if _profiling_enabled and _t_env_start and step % _profile_interval == 0:
                 _t_env = (time.time() - _t_env_start) * 1000
@@ -14600,8 +16318,10 @@ def train(args):
                         print(f"[WARNING] 轨迹收集失败: {e}")
                         traceback.print_exc()
             
-            # 处理下一个观察
+            # 🔧 单环境模式：处理下一个观察（观察处理器已优化为单环境处理）
             _t_obs_start = time.time() if _profiling_enabled else None
+            if timing_enabled:
+                _t_obs0 = _perf_counter()
             # 🔧 性能优化：使用缓存的判断结果，避免每步hasattr（提升2-3%）
             if _profiling_enabled:
                 with tf.profiler.experimental.Trace('obs_process', step_num=step, _r=1):
@@ -14614,6 +16334,10 @@ def train(args):
                     processed_next_obs = maddpg.obs_processor.batch_process_observations_vectorized(next_obs_n)
                 else:
                     processed_next_obs = maddpg.obs_processor.batch_process_observations_parallel(next_obs_n)
+            if timing_enabled:
+                _dt_obs = _perf_counter() - _t_obs0
+                timing_ep['obs'] += _dt_obs
+                timing_window['obs'] += _dt_obs
             if _profiling_enabled and _t_obs_start and step % _profile_interval == 0:
                 _t_obs = (time.time() - _t_obs_start) * 1000
                 print(f"[PROFILE] obs_process: {_t_obs:.1f}ms")
@@ -14622,7 +16346,7 @@ def train(args):
             try:
                 # 🔧 性能优化：使用缓存的环境变量，避免每步读取
                 def _reduce_done(_done):
-                    mode = EARLY_STOP_MODE  # 使用缓存值
+                    mode = EARLY_STOP_MODE
                     
                     # 禁用早停模式
                     if mode == 'never' or mode == 'disabled':
@@ -14676,172 +16400,171 @@ def train(args):
             except Exception:
                 all_done_now = False
 
-            if all_done_now:
-                # 截断Actor输出历史与本地临时轨迹到有效步（step+1）
-                try:
-                    if 'episode_actor_outputs_tmp' in locals() and episode_actor_outputs_tmp is not None:
-                        if len(episode_actor_outputs_tmp) > (step + 1):
-                            episode_actor_outputs_tmp = episode_actor_outputs_tmp[:step+1]
-                except Exception:
-                    pass
-                try:
-                    if 'episode_traj_tmp' in locals() and episode_traj_tmp is not None:
-                        if len(episode_traj_tmp) > (step + 1):
-                            episode_traj_tmp = episode_traj_tmp[:step+1]
-                except Exception:
-                    pass
-                # 更新掩码后结束本回合
-                try:
-                    if hasattr(env, 'num_envs') and isinstance(env_done_now, np.ndarray):
-                        episode_env_done = np.logical_or(episode_env_done, env_done_now)
-                except Exception:
-                    pass
-                break
+            # 不在这里提前结束：仍需写入当前 transition、累计奖励，并在单环境路径下补齐 next_pf_features。
 
             # 仅屏蔽"此前已早停"的环境；本步刚刚 early-stop 的环境仍然计入本步奖励与样本（done=True）
             already_done_mask = episode_env_done.copy()
 
             # 🔧 性能优化：批量存储经验，跳过此前已早停的环境
+            if timing_enabled:
+                _t_rb0 = _perf_counter()
             num_envs = env.num_envs  # 缓存避免重复访问
             already_done_mask_len = len(already_done_mask)  # 缓存避免重复计算
             
-            # 🔧 性能优化：批量收集有效环境的数据，减少循环开销
-            valid_env_indices = []
-            obs_list = []
-            next_obs_list = []
-            action_list = []
-            reward_list = []
-            done_list = []
-            fr_list = []
-            pf_forces_list = []
-            act_corrected_list = []
-            
-            # 🔧 关键修复：随机动作的FR应该为0.0，因为探索不应被APF约束
-            # 如果是warmup随机动作（use_pf_random_warmup=True），FR=0.0
-            # 否则使用全局FR值
-            if use_pf_random_warmup:
-                # Warmup随机动作：FR=0.0（探索动作，不应被APF约束）
-                current_fr_value = 0.0
+            current_fr_value = float(getattr(args, 'action_force_ratio', 0.0))
+            need_pf_feature_cache = bool(
+                getattr(maddpg, 'use_pf_feature_flag', False)
+                and getattr(maddpg, 'use_tf_potential_field_cached', getattr(args, 'use_tf_potential_field', True))
+                and current_fr_value > 0.0
+            )
+            if need_pf_feature_cache:
+                if current_pf_features_np is None or current_pf_features_np.shape[:2] != (num_envs, n_agents):
+                    try:
+                        current_pf_features_np = maddpg.compute_base_pf_forces_batch_numpy(processed_obs, current_fr_value)
+                    except Exception as e:
+                        raise RuntimeError(f"当前训练主线的 current PF 特征回退计算失败: {e}") from e
+                next_pf_features_np = None
             else:
-                # 正常网络动作：使用全局FR值
-                current_fr_value = float(getattr(args, 'action_force_ratio', 0.0))
+                current_pf_features_np = np.zeros((num_envs, n_agents, 3), dtype=np.float32)
+                next_pf_features_np = None
             
-            for i in range(num_envs):
-                if i < already_done_mask_len and already_done_mask[i]:
-                    continue
-                
-                # 数据格式验证
-                try:
-                    # 🔧 性能优化：直接使用i访问，避免重复的len检查和三元表达式
-                    obs_data = processed_obs[i]
-                    next_obs_data = processed_next_obs[i]
-                    # 🔧 性能优化：info解析默认禁用（可通过ENABLE_INFO_PARSING=1启用）
-                    # 训练与回放统一存储归一化动作，不覆盖为物理动作
-                    action_data = actions_for_storage[i]
-                    
-                    # 🔧 性能优化：直接访问，不需要边界检查（i已经在range内）
-                    reward_data = rew_n[i]
-                    done_data = done_n[i]
-                    
-                    # 🔧 性能优化：观测数据通常已经是numpy数组（从环境返回），避免不必要的转换
-                    # 统一使用Lite/NumPy回放缓冲区：转换为NumPy后写入
-                    # 注意：预热阶段的数据仅用于调参/势场元优化，不写入RB
-                    # 🔧 性能优化：只在确实是Tensor时才转换，避免不必要的GPU-CPU同步
-                    if isinstance(obs_data, tf.Tensor):
-                        obs_np = _safe_tensor_to_numpy(obs_data)
-                    else:
-                        obs_np = obs_data
-                    if isinstance(next_obs_data, tf.Tensor):
-                        next_obs_np = _safe_tensor_to_numpy(next_obs_data)
-                    else:
-                        next_obs_np = next_obs_data
-                    
-                    # 🚨 修改：不再将PF力追加到obs末尾，保持obs为81维
-                    # PF力现在作为独立输入传递给Actor（类似FR的处理方式）
-                    # 这里不再需要追加PF到obs，obs保持81维
-                    # 保持obs_np和next_obs_np不变（不追加势场力）
-                    
-                    # 🚨 新增：获取当前环境的势场力，用于存储到回放池
-                    current_pf_forces_for_storage = None
-                    if 'pf_forces_np' in locals() and pf_forces_np is not None:
-                        if len(pf_forces_np.shape) == 3 and pf_forces_np.shape[1] == n_agents and pf_forces_np.shape[2] == 3:
-                            if i < pf_forces_np.shape[0]:
-                                current_pf_forces_for_storage = pf_forces_np[i]  # (n_agents, 3)
-                    
-                    # 🔧 新增：获取修正后的动作（混合动作），用于存储到回放池
-                    # actions是归一化的执行动作（含PF修正）
-                    action_data_corrected = None
-                    if 'actions' in locals() and actions is not None:
-                        try:
-                            if len(actions.shape) == 3 and actions.shape[1] == n_agents:
-                                    if i < actions.shape[0]:
-                                        # 🔧 性能优化：移除不必要的copy()，直接使用切片（numpy切片返回视图，但ascontiguousarray会创建新数组）
-                                        action_data_corrected = np.ascontiguousarray(actions[i], dtype=np.float32)
-                        except Exception:
-                            pass  # 如果获取失败，使用None，让回放缓冲区自己计算
-                    
-                    # 收集数据用于批量存储
-                    valid_env_indices.append(i)
-                    obs_list.append(obs_np)
-                    next_obs_list.append(next_obs_np)
-                    action_list.append(action_data)
-                    reward_list.append(reward_data)
-                    done_list.append(done_data)
-                    fr_list.append(current_fr_value)
-                    pf_forces_list.append(current_pf_forces_for_storage)
-                    act_corrected_list.append(action_data_corrected)
-                except Exception as e:
-                    print(f"[错误] 收集环境{i}的数据时出错: {e}")
-                    continue
-            
-            # 🔧 性能优化：批量存储所有有效环境的经验
-            if len(valid_env_indices) > 0:
-                try:
-                    if warmup_enabled and not warmup_completed:
-                        # 仅统计"虚拟样本数"，用于按容量比例衡量预热填充进度
-                        warmup_virtual_samples += len(valid_env_indices)
-                        if use_pf_random_warmup:
-                            if isinstance(replay_buffer, LiteReplayBuffer):
-                                # 使用批量存储方法
-                                replay_buffer.add_batch(obs_list, next_obs_list, action_list, reward_list, done_list, 
-                                                       fr_list, pf_forces_list, act_corrected_list)
+            # 🔧 性能优化：在循环外预检查obs是否为Tensor，避免循环内重复检查（XLA友好）
+            # 如果所有obs都是numpy数组（通常情况），跳过循环内的类型检查
+            obs_is_tensor = (len(processed_obs) > 0 and isinstance(processed_obs[0], tf.Tensor))
+            next_obs_is_tensor = (len(processed_next_obs) > 0 and isinstance(processed_next_obs[0], tf.Tensor))
+            # 🔧 主训练默认是单环境；这里直接命中单环境快路径，避免每步构造 list 再批量 coercion。
+            if num_envs == 1:
+                if pending_single_transition is not None:
+                    try:
+                        next_pf_features_single = None
+                        if pending_single_transition.get('need_pf_features', False):
+                            if current_pf_features_np is not None and current_pf_features_np.shape == (1, n_agents, 3):
+                                next_pf_features_single = np.ascontiguousarray(current_pf_features_np[0], dtype=np.float32)
                             else:
-                                # 回退到逐个存储
-                                for idx in range(len(valid_env_indices)):
-                                    replay_buffer.add(obs_list[idx], next_obs_list[idx], action_list[idx], 
-                                                     reward_list[idx], done_list[idx])
-                    else:
-                        if isinstance(replay_buffer, LiteReplayBuffer):
-                            # 使用批量存储方法
-                            replay_buffer.add_batch(obs_list, next_obs_list, action_list, reward_list, done_list, 
-                                                   fr_list, pf_forces_list, act_corrected_list)
+                                next_pf_features_single = _compute_single_next_pf_features(
+                                    pending_single_transition['next_obs_n'],
+                                    pending_single_transition['fr_value'],
+                                )
+                        _flush_pending_single_transition(next_pf_features_override=next_pf_features_single)
+                    except Exception as e:
+                        raise RuntimeError(f"当前训练主线的单环境延迟回放写入失败: {e}") from e
+                if not (already_done_mask_len > 0 and already_done_mask[0]):
+                    try:
+                        obs_np = _safe_tensor_to_numpy(processed_obs[0]) if obs_is_tensor else processed_obs[0]
+                        next_obs_np = _safe_tensor_to_numpy(processed_next_obs[0]) if next_obs_is_tensor else processed_next_obs[0]
+                        pf_forces_single = None
+                        if pf_forces_np is not None and pf_forces_np.shape == (1, n_agents, 3):
+                            pf_forces_single = pf_forces_np[0]
+                        current_pf_features_single = None
+                        if current_pf_features_np is not None and current_pf_features_np.shape == (1, n_agents, 3):
+                            current_pf_features_single = current_pf_features_np[0]
+                        act_corrected_single = None
+                        if actions is not None and actions.shape[0] == 1 and actions.shape[1] == n_agents:
+                            act_corrected_single = np.ascontiguousarray(actions[0], dtype=np.float32)
+                        if all_done_now:
+                            terminal_next_pf_features = _compute_single_next_pf_features(next_obs_np, current_fr_value)
+                            replay_buffer.add_single_aligned(
+                                obs_n=obs_np,
+                                next_obs_n=next_obs_np,
+                                act_n=actions_for_storage[0],
+                                rew_n=rew_n[0],
+                                done_n=done_n[0],
+                                fr_value=current_fr_value,
+                                pf_forces=pf_forces_single,
+                                act_corrected=act_corrected_single,
+                                next_act_corrected=None,
+                                pf_features=current_pf_features_single,
+                                next_pf_features=terminal_next_pf_features,
+                            )
                         else:
-                            # 回退到逐个存储
-                            for idx in range(len(valid_env_indices)):
-                                replay_buffer.add(obs_list[idx], next_obs_list[idx], action_list[idx], 
-                                                 reward_list[idx], done_list[idx])
-                except Exception as e:
-                    print(f"[错误] 批量存储经验时出错: {e}")
-                    # 回退到逐个存储
-                    for idx, i in enumerate(valid_env_indices):
-                        try:
-                            if isinstance(replay_buffer, LiteReplayBuffer):
-                                replay_buffer.add(obs_list[idx], next_obs_list[idx], action_list[idx], 
-                                               reward_list[idx], done_list[idx], fr_list[idx], 
-                                               pf_forces_list[idx], act_corrected_list[idx])
-                            else:
-                                replay_buffer.add(obs_list[idx], next_obs_list[idx], action_list[idx], 
-                                               reward_list[idx], done_list[idx])
-                        except Exception as e2:
-                            print(f"[错误] 存储环境{i}的经验时出错: {e2}")
-                            continue
+                            pending_single_transition = {
+                                'obs_n': obs_np,
+                                'next_obs_n': next_obs_np,
+                                'act_n': actions_for_storage[0],
+                                'rew_n': rew_n[0],
+                                'done_n': done_n[0],
+                                'fr_value': current_fr_value,
+                                'pf_forces': pf_forces_single,
+                                'act_corrected': act_corrected_single,
+                                'pf_features': current_pf_features_single,
+                                'need_pf_features': bool(need_pf_feature_cache),
+                            }
+                    except Exception as e:
+                        raise RuntimeError(f"当前训练主线的单环境回放写入失败: {e}") from e
+            else:
+                obs_list = []
+                next_obs_list = []
+                action_list = []
+                reward_list = []
+                done_list = []
+                fr_list = []
+                pf_forces_list = []
+                pf_features_list = []
+                act_corrected_list = []
+
+                for i in range(num_envs):
+                    if i < already_done_mask_len and already_done_mask[i]:
+                        continue
+                    try:
+                        obs_np = _safe_tensor_to_numpy(processed_obs[i]) if obs_is_tensor else processed_obs[i]
+                        next_obs_np = _safe_tensor_to_numpy(processed_next_obs[i]) if next_obs_is_tensor else processed_next_obs[i]
+                        pf_forces_single = None
+                        if pf_forces_np is not None and pf_forces_np.shape[1:] == (n_agents, 3) and i < pf_forces_np.shape[0]:
+                            pf_forces_single = pf_forces_np[i]
+                        current_pf_features_single = None
+                        if current_pf_features_np is not None and current_pf_features_np.shape[1:] == (n_agents, 3) and i < current_pf_features_np.shape[0]:
+                            current_pf_features_single = current_pf_features_np[i]
+                        act_corrected_single = None
+                        if actions is not None and actions.shape[1] == n_agents and i < actions.shape[0]:
+                            act_corrected_single = np.ascontiguousarray(actions[i], dtype=np.float32)
+                        obs_list.append(obs_np)
+                        next_obs_list.append(next_obs_np)
+                        action_list.append(actions_for_storage[i])
+                        reward_list.append(rew_n[i])
+                        done_list.append(done_n[i])
+                        fr_list.append(current_fr_value)
+                        pf_forces_list.append(pf_forces_single)
+                        pf_features_list.append(current_pf_features_single)
+                        act_corrected_list.append(act_corrected_single)
+                    except Exception as e:
+                        raise RuntimeError(f"当前训练主线的批量回放收集失败，env={i}: {e}") from e
+
+                if obs_list:
+                    try:
+                        replay_buffer.add_batch(
+                            obs_batch=obs_list,
+                            next_obs_batch=next_obs_list,
+                            act_batch=action_list,
+                            rew_batch=reward_list,
+                            done_batch=done_list,
+                            fr_values=fr_list,
+                            pf_forces_batch=pf_forces_list,
+                            pf_features_batch=pf_features_list,
+                            act_corrected_batch=act_corrected_list,
+                            next_act_corrected_batch=None,
+                        )
+                    except Exception as e:
+                        raise RuntimeError(f"当前训练主线的批量回放写入失败: {e}") from e
+            if timing_enabled:
+                _dt_rb = _perf_counter() - _t_rb0
+                timing_ep['replay'] += _dt_rb
+                timing_window['replay'] += _dt_rb
             
             # 累计奖励：对"此前已早停"的环境屏蔽累计；本步新早停仍计入本步奖励
             try:
-                # 🔧 修复：检测并处理 NaN/Inf 奖励，防止污染统计和触发XLA错误
-                if np.any(np.isnan(rew_n)) or np.any(np.isinf(rew_n)):
-                    # 将异常值替换为一个非常小的负值，表示严重错误
-                    rew_n = np.where(np.isnan(rew_n) | np.isinf(rew_n), -1000.0, rew_n)
+                # 🔧 性能优化：快速NaN/Inf检查，仅在检测到异常时才全面检查（XLA友好）
+                # 注意：这是numpy数组操作，不在XLA计算图中，完全安全
+                if isinstance(rew_n, np.ndarray) and rew_n.size > 0:
+                    # 快速检查：仅检查第一个元素，如果异常再全面检查
+                    first_elem = rew_n.flat[0]
+                    if not np.isfinite(first_elem):
+                        # 全面检查（仅在快速检查发现异常时）
+                        if np.any(np.isnan(rew_n)) or np.any(np.isinf(rew_n)):
+                            rew_n = np.where(np.isnan(rew_n) | np.isinf(rew_n), -1000.0, rew_n)
+                elif not isinstance(rew_n, np.ndarray):
+                    # 非numpy数组，直接检查（向后兼容）
+                    if np.any(np.isnan(rew_n)) or np.any(np.isinf(rew_n)):
+                        rew_n = np.where(np.isnan(rew_n) | np.isinf(rew_n), -1000.0, rew_n)
 
                 # 🔧 性能优化：由于后续需要修改数组（already_done_mask会修改），必须复制
                 # 但如果已经是float32的numpy数组，直接copy()即可，避免类型转换
@@ -14853,7 +16576,13 @@ def train(args):
                 if rew_eff.ndim == 2 and len(already_done_mask) == rew_eff.shape[0]:
                     rew_eff[already_done_mask, :] = 0.0
                 
-                step_increment = np.sum(rew_eff, axis=1)
+                # 🚨 关键修复：回合累计奖励使用“每环境的平均每智能体奖励”，避免额外乘以智能体数量
+                # 原实现使用 np.sum(rew_eff, axis=1)，会把每个环境中所有智能体的奖励再求和，
+                # 与上方的 step_rewards（使用 np.mean(rew_n) 记录“平均单步奖励”）不一致，
+                # 也会导致回合奖励约为「平均单步奖励 × 步数 × 智能体数量」，出现上百万量级。
+                # 修复后：step_increment 表示“该环境在当前步的平均每智能体奖励”，
+                # 回合总奖励 ≈ 平均单步奖励 × 有效步数，更符合直觉和日志含义。
+                step_increment = np.mean(rew_eff, axis=1)
                 episode_rewards_per_env += step_increment
                 per_env_cum_rewards += step_increment
             except Exception as e:
@@ -14881,163 +16610,31 @@ def train(args):
             # 固定使用 --update-rate 作为实际采样/更新频率
             adaptive['current_update_rate'] = adaptive['base_update_rate']
 
-            # === 学习预热机制检查 ===
-            if warmup_enabled and not warmup_completed:
-                warmup_step_count += 1
-                # 预热阶段不向RB写入，但仍按“虚拟样本数 / 容量”计算填充比例，保持配置含义不变
-                try:
-                    cap = getattr(replay_buffer, 'capacity', None)
-                    if cap is None or cap <= 0:
-                        buffer_fill_ratio = 0.0
-                    else:
-                        buffer_fill_ratio = min(1.0, float(warmup_virtual_samples) / float(cap))
-                except Exception:
-                    buffer_fill_ratio = 0.0
-                
-                # 预热完成条件（满足任一即可）
-                warmup_by_ratio = (buffer_fill_ratio >= warmup_ratio and warmup_step_count >= min_warmup_steps)
-                warmup_by_max_steps = (warmup_step_count >= max_warmup_steps)
-                
-                pf_meta_ready = True
-                if pf_meta_enabled:
-                    if pf_meta_method == 'bayes':
-                        pf_meta_ready = (pf_meta_total_evals >= pf_meta_required_episodes)
-                    elif pf_meta_candidates:
-                        pf_meta_ready = all(st['episodes'] >= pf_meta_required_episodes for st in pf_meta_stats)
-
-                should_finish_warmup = warmup_by_ratio or warmup_by_max_steps
-                if should_finish_warmup and pf_meta_enabled and not pf_meta_ready and not warmup_by_max_steps:
-                    should_finish_warmup = False
-
-                if should_finish_warmup:
-                    warmup_completed = True
-                    if not quiet_output:
-                        print(f"\n🎯 学习预热完成！")
-                        print(f"  预热步数: {warmup_step_count}")
-                        print(f"  缓冲区填充: {buffer_fill_ratio*100:.1f}%")
-                        print(f"  完成条件: {'比例+最小步数' if warmup_by_ratio else '最大步数'}")
-                        print("="*60)
-                    
-                    # 预热结束后重置课程解锁计数，确保训练阶段从同一地图继续
-                    consecutive_success_count = 0
-                    total_success_count = 0
-                    episodes_since_best_for_unlock = 0
-                    random_success_counter = 0
-                    
-                    # 预热结束时，从候选中选出在预热期表现最佳的一组势场参数并固定下来
-                    if pf_meta_enabled and pf_meta_candidates:
-                        best_idx = 0
-                        best_score = -1e9
-                        valid_indices = [
-                            (idx, st) for idx, st in enumerate(pf_meta_stats)
-                            if st['episodes'] >= pf_meta_required_episodes
-                        ]
-                        candidate_iter = valid_indices if valid_indices else list(enumerate(pf_meta_stats))
-                        for idx, st in candidate_iter:
-                            if st['episodes'] <= 0:
-                                continue
-                            avg_score = st['score_total'] / float(st['episodes'])
-                            if avg_score > best_score:
-                                best_score = avg_score
-                                best_idx = idx
-                        if not any(st['episodes'] > 0 for st in pf_meta_stats):
-                            best_idx = 0
-                        chosen = pf_meta_candidates[best_idx]
-                        _apply_pf_candidate_to_maddpg(chosen)
-                        pf_meta_enabled = False  # 后续不再在回合间切换候选
-                        
-                        # 🔧 修复：best_stats需要在quiet_output条件外定义，否则保存时会出错
-                        best_stats = pf_meta_stats[best_idx]
-                        best_score = best_stats['score_total'] / max(best_stats['episodes'], 1)
-                        
-                        if not quiet_output:
-                            print("[PF_META] 预热结束候选统计：")
-                            for idx, st in enumerate(pf_meta_stats, start=1):
-                                ep_cnt = st['episodes']
-                                succ_rate = (st['success'] / ep_cnt * 100.0) if ep_cnt > 0 else 0.0
-                                avg_r = st['sum_reward'] / ep_cnt if ep_cnt > 0 else 0.0
-                                avg_dist = st['distance_total'] / max(st['distance_samples'], 1)
-                                avg_energy = st['energy_total'] / max(st['energy_samples'], 1)
-                                avg_score = st['score_total'] / max(ep_cnt, 1)
-                                print(
-                                    f"  - 候选{idx}: 采样{ep_cnt}ep, score={avg_score:.3f}, "
-                                    f"距离={avg_dist:.1f}m, 障碍碰撞={st['obstacle_hits']}, 穿透={st['penetration_hits']}, "
-                                    f"能量={avg_energy:.3f}, 成功率{succ_rate:.1f}%, 平均奖励{avg_r:.1f}"
-                                )
-                            print(f"[PF_META] 预热结束，选择候选 {best_idx+1}/{len(pf_meta_candidates)} 作为固定势场参数：")
-                            print(f"         goal_attraction={chosen['goal_attraction']:.4f}, "
-                                  f"lambda_1_base={chosen['lambda_1_base']:.4f}, "
-                                  f"terrain_repulsion={chosen['terrain_repulsion']:.4f}, "
-                                  f"agent_influence_range={chosen['agent_influence_range']:.4f}, "
-                                  f"score={best_score:.3f}")
-                        try:
-                            _pf_meta_dump_baseline(
-                                pf_meta_baseline_file,
-                                chosen,
-                                {
-                                    'episodes': best_stats['episodes'],
-                                    'avg_score': best_score,
-                                    'avg_reward': best_stats['sum_reward'] / max(best_stats['episodes'], 1),
-                                    'avg_distance': best_stats['distance_total'] / max(best_stats['distance_samples'], 1),
-                                    'obstacle_hits': best_stats['obstacle_hits'],
-                                    'penetration_hits': best_stats['penetration_hits'],
-                                    'avg_energy': best_stats['energy_total'] / max(best_stats['energy_samples'], 1)
-                                }
-                            )
-                            if not quiet_output:
-                                print(f"✅ 元优化基准参数已保存到: {pf_meta_baseline_file}")
-                        except Exception as e:
-                            print(f"⚠️ 保存元优化基准参数失败: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    
-                    # 🔧 切换到训练阶段的随机动作概率
-                    if hasattr(maddpg, 'is_warmup_phase'):
-                        maddpg.is_warmup_phase = False
-                    try:
-                        base_fr = float(getattr(args, '_base_action_force_ratio', getattr(args, 'action_force_ratio', current_action_force_ratio)))
-                        args.action_force_ratio = base_fr
-                        maddpg.action_force_ratio_cached = base_fr
-                        if not quiet_output:
-                            print(f"🔄 势场混合比例切换到训练阶段配置: {base_fr:.2f}")
-                    except Exception:
-                        pass
-                    # 预热完成：恢复原始保存开关，确保后续能保存首回合/最佳回合交互图
-                    try:
-                        if hasattr(args, '_orig_save_flags'):
-                            for k, v in args._orig_save_flags.items():
-                                if isinstance(v, str):
-                                    os.environ[k] = v
-                    except Exception:
-                        pass
-                    try:
-                        maddpg.current_random_action_prob = maddpg.random_action_prob_training
-                        if not quiet_output:
-                            print(f"🔄 随机动作概率从 {maddpg.random_action_prob_warmup:.2f} 切换到 {maddpg.random_action_prob_training:.2f}")
-                    except Exception:
-                        pass
-                
-                # 预热阶段显示进度
-                if warmup_step_count % 1000 == 0 and not quiet_output:
-                    print(f"🔥 预热进度: {warmup_step_count}/{max_warmup_steps} 步, "
-                          f"缓冲区: {buffer_fill_ratio*100:.1f}%, "
-                          f"目标: {warmup_ratio*100:.1f}%")
-
             # 训练更新条件
             should_update_by_schedule = (step % adaptive['current_update_rate'] == 0 or step == args.episode_length - 1)
             should_update_by_buffer = replay_buffer.size() >= args.batch_size
-            should_update_by_warmup = (not warmup_enabled or warmup_completed)
             # 🔧 关键优化：检测评估模式（传统APF等不需要网络训练的情况）
             skip_network_update = os.getenv('SKIP_NETWORK_UPDATE', '0') == '1'
             
-            if should_update_by_schedule and should_update_by_buffer and should_update_by_warmup and not skip_network_update:
+            if should_update_by_schedule and should_update_by_buffer and not skip_network_update:
                 upd_t0 = time.time() if _profiling_enabled else None
+                if timing_enabled:
+                    _t_upd0 = _perf_counter()
                 with _stack_watchdog(stack_dump_timeout, label=f"maddpg.update episode={episode+1} step={step}"):
                     if _profiling_enabled:
                         with tf.profiler.experimental.Trace('update', step_num=int(maddpg.training_stats.get('train_steps', 0)), _r=1):
                             losses = maddpg.update(replay_buffer, args.batch_size)
                     else:
                         losses = maddpg.update(replay_buffer, args.batch_size)
+                if timing_enabled:
+                    _dt_upd = _perf_counter() - _t_upd0
+                    timing_ep['update'] += _dt_upd
+                    timing_window['update'] += _dt_upd
+                    if timing_detail_enabled:
+                        update_detail = getattr(maddpg, '_last_update_timing', None)
+                        if isinstance(update_detail, dict):
+                            _merge_timing_detail(timing_detail_ep, update_detail)
+                            _merge_timing_detail(timing_detail_window, update_detail)
                 
         # 取消训练后期的 XLA Global 重新启用逻辑，统一由启动阶段控制
                 # 调试：检查losses是否为空
@@ -15072,7 +16669,55 @@ def train(args):
                     log_critic = avg_critic_loss if avg_critic_loss is not None else float('nan')
                     log_actor = avg_actor_loss if avg_actor_loss is not None else float('nan')
                     total_loss = log_critic + log_actor
+                    
+                    # 🚨 关键修复：检测NaN损失并记录状态（仅记录真 NaN，不记录占位/同步失败的假 NaN）
+                    has_nan = False
+                    nan_info = []
+                    if np.isnan(log_critic) or np.isinf(log_critic):
+                        has_nan = True
+                        nan_info.append(f"Critic损失异常: {log_critic}")
+                    if np.isnan(log_actor) or np.isinf(log_actor):
+                        has_nan = True
+                        nan_info.append(f"Actor损失异常: {log_actor}")
+                    if np.isnan(total_loss) or np.isinf(total_loss):
+                        has_nan = True
+                        nan_info.append(f"总损失异常: {total_loss}")
+                    # 假 NaN：本步未更新 Actor（占位 NaN），仅 Actor 为 nan 且 Critic 正常时不记录
+                    is_placeholder_nan = (
+                        avg_actor_loss is None
+                        and avg_critic_loss is not None
+                        and np.isfinite(avg_critic_loss)
+                    )
+                    should_record_nan = has_nan and not is_placeholder_nan
+                    
+                    if should_record_nan:
+                        # 记录NaN发生时的状态
+                        nan_state_file = os.path.join(run_dir, f"nan_state_step_{maddpg.training_stats['train_steps']}.txt")
+                        try:
+                            with open(nan_state_file, 'w', encoding='utf-8') as f:
+                                f.write(f"NaN损失检测 - 步骤: {maddpg.training_stats['train_steps']}\n")
+                                f.write(f"回合: {episode + 1}\n")
+                                f.write(f"异常信息: {', '.join(nan_info)}\n")
+                                f.write(f"Actor损失: {log_actor}\n")
+                                f.write(f"Critic损失: {log_critic}\n")
+                                f.write(f"总损失: {total_loss}\n")
+                                f.write(f"更新率: {adaptive['current_update_rate']}\n")
+                                f.write(f"批次大小: {args.batch_size}\n")
+                                f.write(f"经验回放缓冲区大小: {replay_buffer.size()}\n")
+                                f.write(f"课程学习状态: obstacle_change_unlocked={obstacle_change_unlocked}, curriculum_lr_reduced={curriculum_lr_reduced}\n")
+                                f.write(f"成功计数: consecutive={consecutive_success_count}, total={total_success_count}\n")
+                                if hasattr(maddpg, 'training_stats'):
+                                    f.write(f"训练统计: {maddpg.training_stats}\n")
+                        except Exception as e:
+                            if not quiet_output:
+                                tqdm.write(f"⚠️ 保存NaN状态失败: {e}", file=tqdm_file)
+                        if not quiet_output:
+                            tqdm.write(f"🚨 NaN损失检测！状态已保存到: {nan_state_file}", file=tqdm_file)
+                            tqdm.write(f"   异常信息: {', '.join(nan_info)}", file=tqdm_file)
+                    
                     msg = f"步骤 {maddpg.training_stats['train_steps']}: 更新率={adaptive['current_update_rate']}, 批次大小={args.batch_size}, actor损失={log_actor:.4f}, critic损失={log_critic:.4f}, 总损失={total_loss:.4f}"
+                    if should_record_nan:
+                        msg += " [NaN!]"
                     
                     # 🔥 添加学习率监控（如果使用了学习率调度器）
                     try:
@@ -15177,6 +16822,21 @@ def train(args):
             except Exception:
                 pass
 
+            if timing_enabled:
+                _dt_total = _perf_counter() - _t_step0
+                timing_ep['total'] += _dt_total
+                timing_window['total'] += _dt_total
+                timing_steps += 1
+                timing_window_steps += 1
+                if timing_interval_steps > 0 and timing_window_steps >= timing_interval_steps:
+                    _emit_timing(f"ep{episode+1} step{step+1}", timing_window, timing_window_steps)
+                    if timing_detail_enabled:
+                        _emit_timing_detail(f"ep{episode+1} step{step+1}", timing_window, timing_detail_window, timing_window_steps)
+                    timing_window = _new_timing_bucket()
+                    if timing_detail_enabled:
+                        timing_detail_window = _new_timing_detail_bucket()
+                    timing_window_steps = 0
+
             # 主进程早停：当所有并行环境均早停时，立即结束当前回合；部分早停则继续并打印状态
             try:
                 if hasattr(env, 'num_envs'):
@@ -15197,6 +16857,12 @@ def train(args):
             except Exception:
                 pass
         
+        if pending_single_transition is not None:
+            try:
+                _flush_pending_single_transition()
+            except Exception as e:
+                raise RuntimeError(f"当前训练主线的回合末单环境回放补写失败: {e}") from e
+
         # 打印奖励调试信息
         if not quiet_output:
             avg_step_reward = np.mean(step_rewards) if step_rewards else 0
@@ -15216,6 +16882,8 @@ def train(args):
         # 因为碰撞可能发生在任何环境中，只从best_env收集会导致统计不准确
         episode_collision_counts = []
         episode_min_distances = []
+        episode_terrain_total = 0   # 本回合地形碰撞次数汇总（仅显示）
+        episode_obstacle_total = 0  # 本回合球形障碍碰撞次数汇总（仅显示）
         try:
             # 🚨 关键修复：每次episode结束时重新检查环境结构，不使用训练循环中的缓存
             # 因为训练循环中的缓存可能指向第一个环境，而我们需要检查所有环境
@@ -15258,6 +16926,17 @@ def train(args):
                             # 🚨 关键修复：记录所有智能体的碰撞数（包括0），确保汇总正确
                             # 原因：用户要求记录每回合内三个智能体碰撞数汇总，即使某个智能体碰撞数为0也要记录
                             episode_collision_counts.append(penetration_count)
+                            # 收集地形/球形分项碰撞（仅显示用，无则视为0）
+                            if debug_info_is_dict:
+                                tcnt = agent.debug_info.get('terrain_penetration_count', 0)
+                                ocnt = agent.debug_info.get('obstacle_collision_count', 0)
+                                try:
+                                    tcnt = int(tcnt) if np.isfinite(tcnt) else 0
+                                    ocnt = int(ocnt) if np.isfinite(ocnt) else 0
+                                except (ValueError, TypeError, OverflowError):
+                                    tcnt = ocnt = 0
+                                episode_terrain_total += tcnt
+                                episode_obstacle_total += ocnt
                             
                             # 收集min_distance_to_obstacle
                             min_dist = None
@@ -15305,6 +16984,10 @@ def train(args):
         # 初始化统计列表（如果不存在）
         if not hasattr(maddpg, '_episode_collision_counts'):
             maddpg._episode_collision_counts = []
+        if not hasattr(maddpg, '_episode_terrain_collision_counts'):
+            maddpg._episode_terrain_collision_counts = []  # 每回合地形碰撞次数（用于分项曲线图）
+        if not hasattr(maddpg, '_episode_obstacle_collision_counts'):
+            maddpg._episode_obstacle_collision_counts = []  # 每回合球形障碍碰撞次数（用于分项曲线图）
         if not hasattr(maddpg, '_episode_agent_collision_counts'):
             maddpg._episode_agent_collision_counts = []  # 🚨 新增：每回合每个智能体的碰撞次数
         if not hasattr(maddpg, '_episode_min_distances'):
@@ -15340,127 +17023,86 @@ def train(args):
             # 如果记录失败，使用空列表
             maddpg._episode_agent_collision_counts.append([])
         
-        # 🚨 关键修复：如果回合成功（无碰撞），确保碰撞计数为0
-        # 问题：成功判定要求无碰撞，但碰撞计数可能不为0，导致不一致
-        # 修复：在记录碰撞计数前，先检查成功状态，如果成功则强制碰撞计数为0
-        try:
-            episode_success = _episode_success_without_collision(env, args)
-            if episode_success:
-                # 如果成功，说明没有碰撞，强制碰撞计数为0
-                # 这确保成功回合的碰撞计数始终为0，与成功判定保持一致
-                if total_collisions > 0:
-                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                        print(f"[警告] 回合{episode+1}：成功判定为True但碰撞计数={total_collisions}，强制设为0")
-                    total_collisions = 0
-        except Exception as e:
-            # 如果成功判定失败，不影响碰撞计数记录
-            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                print(f"[警告] 检查成功状态时出错: {e}")
-        
+        # 成功判定与 [成功记录] 统一由下方同一套逻辑计算，不再在此处用 _episode_success_without_collision 改写碰撞计数
         maddpg._episode_collision_counts.append(total_collisions)
+        maddpg._episode_terrain_collision_counts.append(episode_terrain_total)
+        maddpg._episode_obstacle_collision_counts.append(episode_obstacle_total)
         
-        # 🚨 新增：记录每个智能体的成功状态和团队成功状态（根据图片定义）
-        # 定义：Reach_i := ∃t ≤ T_max, ||p_t^i - g^i|| ≤ r_goal
-        #       Safe_i := ∀t ≤ T_max, no-collision for agent i
+        # 🚨 新增：记录每个智能体的成功状态和团队成功状态（统一终止帧语义）
+        # 定义：Reach_i := 终止帧 ||p_T^i - g^i|| <= r_goal
+        #       Safe_i := 整个回合期间无真实碰撞/真实穿透
         #       Succ_i := Reach_i ∧ Safe_i
         #       Succ_team := Λ_{i=1}^{M} Succ_i
+        # 🚨 权威来源：MultiAgentEnv 步末写入的 world._episode_*（policy_agents 与 scenario 阈值），
+        #    与 [成功]/[到达目标] 一致；严格模式下不可用则直接报错终止，不允许回退。
         try:
-            # 获取成功判定阈值
-            thr_success = float(getattr(args, 'success_distance_threshold', 4.0))
             agent_success_flags = []  # 每个智能体的成功标志
-            team_success_flag = 1  # 团队成功标志（初始为1，如果任何智能体失败则设为0）
+            agent_reach_flags = []    # 每个智能体的到达目标标志（用于详细打印）
+            agent_safe_flags = []     # 每个智能体的无碰撞标志（用于详细打印）
+            team_success_flag = 1  # 跨子环境聚合：任一智能体失败则 0
             
-            # 遍历所有环境，收集每个智能体的成功状态
             for env_idx, single_env in envs_to_check:
-                if hasattr(single_env, 'world') and hasattr(single_env.world, 'agents'):
-                    scn = getattr(single_env, 'scenario', None)
-                    if scn is None:
-                        continue
-                    
-                    goal_pos = getattr(scn, 'goal_pos', None)
-                    if goal_pos is None and hasattr(scn, 'get_goal_pos'):
-                        try:
-                            goal_pos = scn.get_goal_pos()
-                        except Exception:
-                            goal_pos = None
-                    if goal_pos is None:
-                        continue
-                    
-                    for agent_idx, agent in enumerate(single_env.world.agents):
-                        # 检查是否到达目标（Reach_i）
-                        pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
-                        if pos is None or len(pos) < 3:
-                            agent_success_flags.append(0)
-                            team_success_flag = 0
-                            continue
-                        
-                        # 获取智能体的目标位置
-                        ag_goal = None
-                        if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and getattr(agent.goal_a.state, 'p_pos', None) is not None:
-                            ag_goal = agent.goal_a.state.p_pos
-                        if ag_goal is None:
-                            ag_goal = goal_pos
-                        
-                        # 计算到目标的距离
-                        dx = pos[0] - ag_goal[0]
-                        dy = pos[1] - ag_goal[1]
-                        dz = pos[2] - ag_goal[2]
-                        dist_goal_3d = (dx*dx + dy*dy + dz*dz) ** 0.5
-                        reach_i = (dist_goal_3d <= (1.2 * thr_success))
-                        
-                        # 检查是否无碰撞（Safe_i）
-                        # 🚨 关键修复：完整检查所有碰撞标志，确保无碰撞成功才是成功
-                        # 原因：用户指出"虽然有到达奖励叫做成功奖励但不是无碰撞奖励，无碰撞成功才是成功"
-                        # 修复：检查所有碰撞相关的标志和计数，确保只有真正无碰撞才算成功
-                        safe_i = True
-                        
-                        # 检查1：穿透计数（整个回合的累计值）
-                        if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
-                            penetration_count = agent.debug_info.get('total_penetration_count', 0)
-                            try:
-                                penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
-                            except (ValueError, TypeError, OverflowError):
-                                penetration_count = 0
-                            if penetration_count > 0:
-                                safe_i = False
-                        
-                        # 检查2：碰撞标志（_had_penetration_or_collision, _had_obstacle_collision, _had_terrain_contact_or_penetration）
-                        # 🚨 关键修复：即使penetration_count为0，如果碰撞标志为True，仍然视为有碰撞
-                        if safe_i:
-                            if getattr(agent, '_had_penetration_or_collision', False):
-                                safe_i = False
-                            if getattr(agent, '_had_obstacle_collision', False):
-                                safe_i = False
-                            if getattr(agent, '_had_terrain_contact_or_penetration', False):
-                                safe_i = False
-                        
-                        # 检查3：是否低于地形高度（穿透判定）
-                        if safe_i and hasattr(scn, 'get_terrain_height'):
-                            try:
-                                terrain_h = scn.get_terrain_height(pos[0], pos[1])
-                                terrain_contact_eps = float(os.getenv('TERRAIN_CONTACT_EPS', '1.5'))
-                                if pos[2] < terrain_h + terrain_contact_eps:
-                                    safe_i = False
-                            except Exception:
-                                pass
-                        
-                        # Succ_i := Reach_i ∧ Safe_i
-                        succ_i = 1 if (reach_i and safe_i) else 0
-                        agent_success_flags.append(succ_i)
-                        
-                        # 如果任何智能体失败，团队失败
-                        if succ_i == 0:
-                            team_success_flag = 0
-            
+                base_env = getattr(single_env, 'env', None)
+                if base_env is None:
+                    base_env = single_env
+                world = getattr(base_env, 'world', None)
+                if world is None:
+                    raise RuntimeError(f"[成功记录] Env{env_idx} 缺少world，无法读取权威成功快照")
+
+                w_reach = getattr(world, '_episode_agent_reach_flags', None)
+                w_safe = getattr(world, '_episode_agent_safe_flags', None)
+                w_succ = getattr(world, '_episode_agent_success_flags', None)
+                if not (
+                    isinstance(w_reach, (list, tuple))
+                    and isinstance(w_safe, (list, tuple))
+                    and isinstance(w_succ, (list, tuple))
+                    and len(w_reach) == len(w_safe) == len(w_succ)
+                    and len(w_succ) > 0
+                ):
+                    raise RuntimeError(
+                        f"[成功记录] Env{env_idx} 权威快照无效: "
+                        f"reach={type(w_reach).__name__ if w_reach is not None else 'None'}({len(w_reach) if isinstance(w_reach, (list, tuple)) else 'NA'}), "
+                        f"safe={type(w_safe).__name__ if w_safe is not None else 'None'}({len(w_safe) if isinstance(w_safe, (list, tuple)) else 'NA'}), "
+                        f"succ={type(w_succ).__name__ if w_succ is not None else 'None'}({len(w_succ) if isinstance(w_succ, (list, tuple)) else 'NA'})"
+                    )
+                for i in range(len(w_succ)):
+                    r_i = int(w_reach[i])
+                    s_i = int(w_safe[i])
+                    c_i = int(w_succ[i])
+                    agent_reach_flags.append(r_i)
+                    agent_safe_flags.append(s_i)
+                    agent_success_flags.append(c_i)
+                    if c_i == 0:
+                        team_success_flag = 0
+
+            # 未处理到任何智能体时视为本回合失败
+            if len(agent_success_flags) == 0:
+                team_success_flag = 0
+            episode_success = team_success_flag == 1
+            success_flag = 1 if episode_success else 0
+
             # 记录每个智能体的成功标志
             maddpg._episode_agent_success_flags.append(agent_success_flags)
+            # 更新公平权重（用于下一回合训练）
+            if getattr(maddpg, 'fairness_reweight_enabled', True) and hasattr(maddpg, 'update_agent_fairness_weights'):
+                try:
+                    maddpg.update_agent_fairness_weights(maddpg._episode_agent_success_flags)
+                    if (not quiet_output) and ((episode + 1) % 20 == 0 or episode < 5):
+                        rates = getattr(maddpg, '_last_agent_success_rates', [])
+                        weights = getattr(maddpg, '_last_agent_fairness_weights', [])
+                        if rates and weights:
+                            rates_str = ", ".join(f"{float(v):.3f}" for v in rates)
+                            weights_str = ", ".join(f"{float(v):.3f}" for v in weights)
+                            if not quiet_output:
+                                print(f"[公平权重] 回合{episode+1}: success_rates=[{rates_str}], loss_weights=[{weights_str}]")
+                except Exception as e:
+                    if not quiet_output:
+                        print(f"[警告] 更新公平权重失败: {e}")
             
             # 记录团队成功标志（所有智能体都成功）
             maddpg._episode_team_success_flags.append(team_success_flag)
             
-            # 🚨 保持向后兼容：记录该回合是否成功（使用团队成功标志）
-            episode_success = (team_success_flag == 1)
-            success_flag = 1 if episode_success else 0
+            # 🚨 与 [成功记录] 一致：本回合成功 = 团队成功标志，写入 _episode_success_flags 供 [解锁计数] 使用
             maddpg._episode_success_flags.append(success_flag)
             
             # 🚨 关键修复：更新累计成功计数
@@ -15469,22 +17111,49 @@ def train(args):
             # 🚨 关键调试：输出成功判断结果（每回合输出，帮助诊断问题）
             # 🔧 修复：每回合都输出成功记录，不再限制为前5回合或每10回合
             # 原因：用户需要每回合都能看到成功记录，以便更好地跟踪训练进度
-            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                print(f"[成功记录] 回合{episode+1}: 团队成功={episode_success}, 智能体成功={agent_success_flags}, total_success_count={total_success_count}")
+            # 🚨 关键修复：明确成功定义，区分"到达目标"和"成功"
+            # 成功定义：Reach_i := 终止帧 ||p_T^i - g^i|| ≤ r_goal
+            #          Safe_i := 整个回合无真实碰撞/真实穿透
+            #          Succ_i := Reach_i ∧ Safe_i
+            #          Succ_team := Λ_{i=1}^{M} Succ_i
+            debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', '1').lower() in ('1','true','yes','on')
+            if debug_episode_summary:
+                # 🚨 关键修复：明确打印成功定义，帮助理解为什么"到达目标"不等于"成功"
+                try:
+                    reach_info = []
+                    safe_info = []
+                    for i in range(len(agent_success_flags)):
+                        # 获取Reach_i和Safe_i状态（已在循环中保存）
+                        reach_i = agent_reach_flags[i] if i < len(agent_reach_flags) else 0
+                        safe_i = agent_safe_flags[i] if i < len(agent_safe_flags) else 0
+                        
+                        reach_info.append(f"Agent{i}:{'✓' if reach_i else '✗'}")
+                        safe_info.append(f"Agent{i}:{'✓' if safe_i else '✗'}")
+                    
+                    reach_str = ", ".join(reach_info)
+                    safe_str = ", ".join(safe_info)
+                    print(f"[成功记录] 回合{episode+1}: 团队成功={episode_success} (Reach: {reach_str}, Safe: {safe_str}), 智能体成功={agent_success_flags}, total_success_count={total_success_count}")
+                    if not episode_success:
+                        # 分析失败原因
+                        all_reached = all(agent_reach_flags[i] if i < len(agent_reach_flags) else 0 for i in range(len(agent_success_flags)))
+                        all_safe = all(agent_safe_flags[i] if i < len(agent_safe_flags) else 0 for i in range(len(agent_success_flags)))
+                        if all_reached and not all_safe:
+                            print(f"  [说明] 所有智能体都到达目标但未成功（原因：有碰撞），成功定义=到达目标∧无碰撞")
+                        elif not all_reached and all_safe:
+                            print(f"  [说明] 所有智能体都无碰撞但未成功（原因：未到达目标），成功定义=到达目标∧无碰撞")
+                        elif not all_reached and not all_safe:
+                            print(f"  [说明] 部分智能体未到达目标或有碰撞，成功定义=到达目标∧无碰撞")
+                except Exception as e:
+                    # 如果打印失败，使用简化版本
+                    print(f"[成功记录] 回合{episode+1}: 团队成功={episode_success}, 智能体成功={agent_success_flags}, total_success_count={total_success_count}")
+                    print(f"  [警告] 详细打印失败: {e}")
         except Exception as e:
-            # 如果成功判定失败，默认为失败
-            maddpg._episode_success_flags.append(0)
-            maddpg._episode_agent_success_flags.append([])
-            maddpg._episode_team_success_flags.append(0)
-            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                print(f"[警告] 记录成功率时出错: {e}")
-                import traceback
-                traceback.print_exc()
+            raise RuntimeError(f"[成功记录] 读取/统计失败，已按严格模式终止: {e}") from e
         
         # 🔧 调试：输出碰撞统计信息（每10回合输出一次，或当有碰撞时）
         # 🚨 关键修复：即使total_collisions为0也输出，帮助诊断为什么碰撞数一直是0
-        # 🚨 关键修复：碰撞统计始终输出，不受QUIET_OUTPUT控制（重要调试信息）
-        if len(maddpg._episode_collision_counts) % 10 == 0 or total_collisions > 0:
+        debug_collision_summary = os.getenv('DEBUG_COLLISION_SUMMARY', '1').lower() in ('1','true','yes','on')
+        if debug_collision_summary and (len(maddpg._episode_collision_counts) % 10 == 0 or total_collisions > 0):
             # 🚨 新增：显示每个智能体的碰撞数，帮助诊断问题
             agent_counts = []
             env_count = 0
@@ -15509,13 +17178,13 @@ def train(args):
                                 count = agent.debug_info.get('total_penetration_count', 0)
                             agent_counts.append(f"Env{env_idx}Agent{agent_idx}={count}")
             except Exception as e:
-                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                if debug_collision_summary:
                     print(f"[警告] 收集智能体碰撞计数时出错: {e}")
                 pass
             # 🚨 关键修复：获取当前回合的成功状态和累计成功计数
-            # 🚨 关键修复：碰撞统计始终输出，不受QUIET_OUTPUT控制
             current_episode_success = maddpg._episode_success_flags[-1] if maddpg._episode_success_flags else 0
-            print(f"[碰撞统计] 回合 {len(maddpg._episode_collision_counts)}: 总碰撞次数={total_collisions}, "
+            print(f"[碰撞统计] 回合 {len(maddpg._episode_collision_counts)}: 总碰撞次数={total_collisions} "
+                  f"(地形={episode_terrain_total}, 球形障碍={episode_obstacle_total}), "
                   f"各智能体碰撞次数={agent_counts if agent_counts else '[]'}, "
                   f"汇总列表={episode_collision_counts if episode_collision_counts else '[]'}, "
                   f"环境数量={env_count}, "
@@ -15595,48 +17264,21 @@ def train(args):
                 'min': None
             })
 
-        # 预热期 PF 候选统计：按回合累计成功次数与平均回合奖励
-        if pf_meta_enabled and warmup_enabled and (not warmup_completed) and pf_meta_candidates and (pf_meta_current_idx is not None):
-            try:
-                avg_distance, obstacle_hits, penetration_hits = _pf_meta_measure_episode(env)
-                if not np.isfinite(avg_distance):
-                    avg_distance = 1e3
-                energy_avg = 0.0
-                if pf_meta_episode_state and pf_meta_episode_state.get('energy_samples', 0) > 0:
-                    energy_avg = pf_meta_episode_state['energy_sum'] / pf_meta_episode_state['energy_samples']
-                st = pf_meta_stats[pf_meta_current_idx]
-                st['episodes'] += 1
-                st['sum_reward'] += avg_episode_reward
-                if np.isfinite(avg_distance):
-                    st['distance_total'] += avg_distance
-                st['distance_samples'] += 1
-                st['obstacle_hits'] += obstacle_hits
-                st['penetration_hits'] += penetration_hits
-                st['energy_total'] += energy_avg
-                st['energy_samples'] += 1
-                # 评价函数：仅使用主要奖励分项（距离、障碍/穿透、能量）
-                episode_score = (
-                    -pf_meta_distance_weight * avg_distance
-                    -pf_meta_obstacle_weight * obstacle_hits
-                    -pf_meta_penetration_weight * penetration_hits
-                    -pf_meta_energy_weight * energy_avg
-                )
-                st['score_total'] += episode_score
-                pf_meta_total_evals += 1
-                if pf_meta_method == 'bayes' and pf_meta_bayes is not None and pf_meta_param_bounds:
-                    subset_params = {
-                        name: pf_meta_candidates[pf_meta_current_idx].get(name)
-                        for name in pf_meta_param_names
-                    }
-                    pf_meta_bayes.observe(subset_params, episode_score)
-                if _episode_success_without_collision(env, args):
-                    st['success'] += 1
-            except Exception:
-                pass
-            pf_meta_episode_state = None
-        
         # 自适应学习检查（借鉴旧版本paper3d_train）
         maddpg._adaptive_learning_check(avg_episode_reward)
+
+        # 🔧 记录自适应检查之后的噪声强度（便于观察“跳变点”附近的变化）
+        try:
+            if hasattr(maddpg, 'noise_scale_var') and maddpg.noise_scale_var is not None:
+                _ns = maddpg.noise_scale_var.numpy() if hasattr(maddpg.noise_scale_var, 'numpy') else maddpg.noise_scale_var
+                _ns_float = float(_ns)
+                if not np.isfinite(_ns_float):
+                    _ns_float = float('nan')
+            else:
+                _ns_float = float('nan')
+        except Exception:
+            _ns_float = float('nan')
+        noise_scale_var_history.append(_ns_float)
         
         # === 奖励调试器：记录episode结束 ===
         if reward_debugger is not None:
@@ -15646,206 +17288,64 @@ def train(args):
                 if episode == 0:  # 只在第一个episode打印警告
                     print(f"[调试器警告] 无法记录episode结束: {e}")
         
-        # 课程化/解锁逻辑
-        if curriculum_locked:
-            consecutive_success_count = 0
-            total_success_count = 0
-            episodes_since_best_for_unlock = 0
-        elif not map_change_unlocked:
-            # 成功仅由"到达且未碰撞"判定（移除奖励阈值依赖）
-            if _episode_success_without_collision(env, args):
+        # 课程学习 / 随机地形逻辑
+        maddpg._episode_count = episode
+        if hasattr(env, 'scenario') and hasattr(env.scenario, 'reward_calculator'):
+            env.scenario.reward_calculator._current_episode = episode
+
+        if episode >= 10:
+            recent_rewards = episode_rewards[-10:] if len(episode_rewards) >= 10 else episode_rewards
+            is_stag = bool(maddpg._detect_reward_stagnation(recent_rewards))
+            prev = bool(getattr(maddpg, '_stagnation_prev', False))
+            maddpg._reward_stagnation_detected = is_stag
+            if is_stag != prev:
+                if is_stag:
+                    print(f"\n⚠️  检测到奖励停滞，增加探索噪声 (回合 {episode+1})")
+                else:
+                    print(f"\n✅ 奖励恢复波动，探索噪声回归正常 (回合 {episode+1})")
+            maddpg._stagnation_prev = is_stag
+
+        if curriculum_enabled:
+            current_stage_cfg = curriculum_stages[curriculum_stage_index]
+            # 统一：解锁计数“本回合成功/失败”直接复用回合末团队成功标志，避免再次计算导致错位
+            current_stage_success = bool(maddpg._episode_success_flags[-1]) if getattr(maddpg, '_episode_success_flags', None) else False
+            if current_stage_success:
                 consecutive_success_count += 1
-                total_success_count += 1
+                curriculum_stage_success_count += 1
             else:
-                consecutive_success_count = 0  # 若未成功，则重置连续成功计数
+                consecutive_success_count = 0
 
-            # 检查是否奖励停滞
-            if avg_episode_reward <= best_reward:
+            if avg_episode_reward > curriculum_stage_best_reward:
+                curriculum_stage_best_reward = avg_episode_reward
+                episodes_since_best_for_unlock = 0
+            else:
                 episodes_since_best_for_unlock += 1
-            # 如果是新的最佳奖励，停滞计数将在下面的 best_reward 更新块中被重置
-            
-            # 更新回合计数
-            maddpg._episode_count = episode
-            
-            # 更新奖励计算器的回合数（用于冷却期控制）
-            if hasattr(env, 'scenario') and hasattr(env.scenario, 'reward_calculator'):
-                env.scenario.reward_calculator._current_episode = episode
-            
-            # 检测奖励停滞并调整噪声（仅在状态变更时提示）
-            if episode >= 10:  # 至少10个回合后开始检测
-                recent_rewards = episode_rewards[-10:] if len(episode_rewards) >= 10 else episode_rewards
-                is_stag = bool(maddpg._detect_reward_stagnation(recent_rewards))
-                prev = bool(getattr(maddpg, '_stagnation_prev', False))
-                maddpg._reward_stagnation_detected = is_stag
-                if is_stag != prev:
-                    if is_stag:
-                        print(f"\n⚠️  检测到奖励停滞，增加探索噪声 (回合 {episode+1})")
-                    else:
-                        print(f"\n✅ 奖励恢复波动，探索噪声回归正常 (回合 {episode+1})")
-                maddpg._stagnation_prev = is_stag
-            
-            # 🔧 检查是否满足解锁条件（修复：允许仅满足连续成功或累计成功，避免卡在固定地形）
-            # 只有当两个参数都大于0时才启用解锁功能
-            # 🔧 修复：放宽解锁条件，允许以下任一情况解锁：
-            #   1. 连续成功N次 且 奖励停滞M回合（原条件）
-            #   2. 累计成功达到阈值（新增，避免永远无法解锁）
-            unlock_by_consecutive = (args.unlock_env_on_success > 0 and args.unlock_env_on_plateau > 0 and
-                consecutive_success_count >= args.unlock_env_on_success and 
-                                     episodes_since_best_for_unlock >= args.unlock_env_on_plateau)
-            # 🔧 新增：累计成功解锁条件（累计成功达到连续成功的3倍即可解锁，避免永远卡住）
-            unlock_by_total = (args.unlock_env_on_success > 0 and 
-                               total_success_count >= (args.unlock_env_on_success * 3) and
-                               episode >= 20)  # 至少20回合后才允许累计成功解锁
-            
-            if unlock_by_consecutive or unlock_by_total:
-                
-                map_change_unlocked = True
-                if not quiet_output:
-                    unlock_reason = "连续成功+奖励停滞" if unlock_by_consecutive else "累计成功达到阈值"
-                    tqdm.write(f"🎯 解锁条件已满足！切换到随机地形训练模式 (解锁原因: {unlock_reason})", file=tqdm_file)
-                    tqdm.write(f"   连续成功: {consecutive_success_count}/{args.unlock_env_on_success}", file=tqdm_file)
-                    tqdm.write(f"   奖励停滞: {episodes_since_best_for_unlock}/{args.unlock_env_on_plateau}", file=tqdm_file)
-                    tqdm.write(f"   累计成功: {total_success_count} (阈值: {args.unlock_env_on_success * 3})", file=tqdm_file)
-                
-                # 在切换到随机地形模式之前，保存固定地图的最佳轨迹图（如启用）
-                if enable_prerandom_best and (not pre_random_best_saved):
-                    try:
-                        if best_trajectory_time_major and len(best_trajectory_time_major) > 0:
-                            viz = TrajectoryVisualizer(verbose=not quiet_output)
-                            save_dir = run_dir
-                            os.makedirs(save_dir, exist_ok=True)
-                            img_path_pr = os.path.join(save_dir, f"pre_random_best_trajectory_ep{best_episode+1}_r{best_reward:.0f}.png")
-                            scenario_for_plot_best = global_scenario
-                            goal_positions_best = None
-                            if isinstance(best_vis_context, dict) and best_vis_context.get('terrain') is not None:
-                                import types
-                                scenario_for_plot_best = types.SimpleNamespace(**best_vis_context)
-                                goal_positions_best = best_vis_context
-                            viz.generate_trajectory_image(
-                                trajectories=best_trajectory_time_major,
-                                scenario=scenario_for_plot_best,
-                                save_path=img_path_pr,
-                                episode_num=best_episode+1,
-                                reward=best_reward,
-                                episode_type='pre_random_best',
-                                goal_positions=goal_positions_best,
-                                env_instance=None,
-                                actor_outputs_history=best_actor_outputs_history
-                            )
-                            # 同步生成交互HTML（若启用）
-                            try:
-                                if os.getenv('SAVE_INTERACTIVE_TRAJ', '0').lower() in ('1','true','yes','on'):
-                                    html_path_pr = os.path.join(save_dir, f"pre_random_best_trajectory_ep{best_episode+1}_interactive.html")
-                                    viz.generate_trajectory_interactive(
-                                        trajectories=best_trajectory_time_major,
-                                        save_path=html_path_pr,
-                                        title=f"Pre-Random Best Episode {best_episode+1} (Reward {best_reward:.0f})",
-                                        goal_positions=goal_positions_best,
-                                        scenario=scenario_for_plot_best,
-                                        env_instance=None
-                                    )
-                            except Exception:
-                                pass
-                            if not quiet_output:
-                                tqdm.write(f"固定地图最佳轨迹图已保存: {img_path_pr}", file=tqdm_file)
-                            pre_random_best_saved = True
-                        elif enable_best_traj:
-                            # 回退：临时从环境抓取轨迹
-                            tmp_traj = _snapshot_env_trajectory(env)
-                            if tmp_traj and len(tmp_traj) > 0:
-                                viz = TrajectoryVisualizer(verbose=not quiet_output)
-                                save_dir = run_dir
-                                os.makedirs(save_dir, exist_ok=True)
-                                img_path_pr = os.path.join(save_dir, f"pre_random_best_trajectory_ep{best_episode+1}_r{best_reward:.0f}.png")
-                                viz.generate_trajectory_image(
-                                    trajectories=tmp_traj,
-                                    scenario=global_scenario,
-                                    save_path=img_path_pr,
-                                    episode_num=best_episode+1,
-                                    reward=best_reward,
-                                    episode_type='pre_random_best',
-                                    goal_positions=None,
-                                    env_instance=env,
-                                    actor_outputs_history=best_actor_outputs_history
-                                )
-                                # 同步生成交互HTML（若启用）
-                                try:
-                                    if os.getenv('SAVE_INTERACTIVE_TRAJ', '0').lower() in ('1','true','yes','on'):
-                                        html_path_pr = os.path.join(save_dir, f"pre_random_best_trajectory_ep{best_episode+1}_interactive.html")
-                                        viz.generate_trajectory_interactive(
-                                            trajectories=tmp_traj,
-                                            save_path=html_path_pr,
-                                            title=f"Pre-Random Best Episode {best_episode+1} (Reward {best_reward:.0f})",
-                                            goal_positions=None,
-                                            scenario=global_scenario,
-                                            env_instance=env
-                                        )
-                                except Exception:
-                                    pass
-                                pre_random_best_saved = True
-                    except Exception:
-                        pass
 
-                # 切换到随机地形模式
-                args.random_terrain = True
-                args.use_fixed_positions = False  # 在随机地形模式下，强制使用随机位置
-                
-                # 重建环境以应用新设置
-                try:
-                    if not quiet_output:
-                        tqdm.write("正在重建环境以应用随机地形设置...", file=tqdm_file)
-                    
-                    # 关闭当前环境
-                    if hasattr(env, 'close'):
-                        env.close()
-                    
-                    # 创建新的随机地形环境（spawn兼容）
-                    if args.num_envs > 1:
-                        env_fns = [functools.partial(make_env_init, i, vars(args)) for i in range(args.num_envs)]
-                        env = ParallelEnv(env_fns)
-                    else:
-                        env = SingleEnvWrapper(make_env_init(0, vars(args)))
-                    
-                    # 重置环境并处理观察
-                    obs_n = env.reset()
-                    if hasattr(maddpg.obs_processor, 'batch_process_observations_vectorized'):
-                        processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
-                    else:
-                        processed_obs = maddpg.obs_processor.batch_process_observations_parallel(obs_n)
-                    
-                    if not quiet_output:
-                        tqdm.write("✅ 环境重建完成，现在使用随机地形模式", file=tqdm_file)
-                    
-                    # 🚨 优化：清理经验回放缓冲区，避免旧经验干扰
-                    # 原因：固定地形的经验与随机地形不匹配，会干扰学习
-                    try:
-                        buffer_size_before = replay_buffer.size()
-                        replay_buffer.clear()
-                        buffer_size_after = replay_buffer.size()
-                        if not quiet_output:
-                            tqdm.write(f"🧹 经验回放缓冲区已清理: {buffer_size_before} → {buffer_size_after} 条经验", file=tqdm_file)
-                    except Exception as e:
-                        if not quiet_output:
-                            tqdm.write(f"⚠️ 清理经验回放缓冲区失败: {e}", file=tqdm_file)
-                    
-                    # 🚨 优化：重置目标网络，加快适应新环境
-                    # 原因：目标网络基于固定地形训练，与随机地形不匹配，需要重新学习
-                    try:
-                        for i, agent in enumerate(maddpg.agents):
-                            # 重置Target Actor：从当前Actor复制权重
-                            agent['target_actor'].set_weights(agent['actor'].get_weights())
-                            # 重置Target Critic：从当前Critic复制权重
-                            agent['target_critic'].set_weights(agent['critic'].get_weights())
-                        if not quiet_output:
-                            tqdm.write(f"🔄 目标网络已重置: 所有智能体的Target Actor和Target Critic已从主网络复制", file=tqdm_file)
-                    except Exception as e:
-                        if not quiet_output:
-                            tqdm.write(f"⚠️ 重置目标网络失败: {e}", file=tqdm_file)
-                        
-                except Exception as e:
-                    if not quiet_output:
-                        tqdm.write(f"⚠️ 环境重建失败: {e}", file=tqdm_file)
-                        tqdm.write("继续使用当前环境", file=tqdm_file)
+            if curriculum_stage_index < len(curriculum_stages) - 1:
+                stage_elapsed = (episode - curriculum_stage_start_episode) + 1
+                success_target = stage_success_targets[curriculum_stage_index]
+                plateau_target = stage_plateau_targets[curriculum_stage_index]
+                min_episodes_target = stage_min_episodes[curriculum_stage_index]
+                total_success_target = max(
+                    success_target,
+                    int(np.ceil(success_target * curriculum_total_success_multiplier))
+                )
+                unlock_by_consecutive = (
+                    stage_elapsed >= min_episodes_target and
+                    consecutive_success_count >= success_target and
+                    episodes_since_best_for_unlock >= plateau_target
+                )
+                unlock_by_total = (
+                    stage_elapsed >= min_episodes_target and
+                    curriculum_stage_success_count >= total_success_target
+                )
+                if unlock_by_consecutive or unlock_by_total:
+                    unlock_reason = (
+                        f"连续成功 {consecutive_success_count}/{success_target} 且停滞 {episodes_since_best_for_unlock}/{plateau_target}"
+                        if unlock_by_consecutive else
+                        f"阶段累计成功 {curriculum_stage_success_count}/{total_success_target}"
+                    )
+                    _transition_curriculum_stage(curriculum_stage_index + 1, unlock_reason, episode)
         # 保存每个回合的轨迹图（如果启用）
         if enable_episode_traj:
             try:
@@ -15871,6 +17371,8 @@ def train(args):
                     # 使用运行中环境的场景快照（最佳子环境），避免与global_scenario地形不一致
                     try:
                         _scn = getattr(env, 'scenario', None)
+                        if _scn is None and hasattr(env, 'env') and hasattr(env.env, 'scenario'):
+                            _scn = getattr(env.env, 'scenario', None)
                         if _scn is None and hasattr(env, 'envs') and len(env.envs) > 0:
                             _scn = getattr(env.envs[best_env_idx_this_ep], 'scenario', None)
                     except Exception:
@@ -15885,7 +17387,8 @@ def train(args):
                         episode_type='current',
                         goal_positions=goal_positions,
                         env_instance=env,  # 传递环境实例，确保使用与轨迹相同的数据
-                        actor_outputs_history=episode_actor_outputs_tmp
+                        actor_outputs_history=episode_actor_outputs_tmp,
+                        env_idx=best_env_idx_this_ep
                     )
                     
                     if not quiet_output:
@@ -15914,6 +17417,15 @@ def train(args):
                     except Exception:
                         goal_positions = None
 
+                    try:
+                        _scn_html = getattr(env, 'scenario', None)
+                        if _scn_html is None and hasattr(env, 'env') and hasattr(env.env, 'scenario'):
+                            _scn_html = getattr(env.env, 'scenario', None)
+                        if _scn_html is None and hasattr(env, 'envs') and len(env.envs) > 0:
+                            _scn_html = getattr(env.envs[best_env_idx_this_ep], 'scenario', None)
+                    except Exception:
+                        _scn_html = global_scenario
+
                     viz = TrajectoryVisualizer(verbose=not quiet_output)
                     
                     # 生成交互HTML
@@ -15923,8 +17435,9 @@ def train(args):
                         save_path=html_path,
                         title=f"Episode {episode+1} (reward={avg_episode_reward:.1f})",
                         goal_positions=goal_positions,
-                        scenario=_scn if '_scn' in locals() and _scn is not None else global_scenario,
-                        env_instance=env  # 传递环境实例，确保使用与轨迹相同的数据
+                        scenario=_scn_html if '_scn_html' in locals() and _scn_html is not None else global_scenario,
+                        env_instance=env,  # 传递环境实例，确保使用与轨迹相同的数据
+                        env_idx=best_env_idx_this_ep
                     )
                     if not quiet_output:
                         tqdm.write(f"回合{episode+1}可交互HTML已保存到: {html_path}", file=tqdm_file)
@@ -15945,6 +17458,23 @@ def train(args):
                 if not quiet_output:
                     tqdm.write(f"生成回合{episode+1}可交互HTML失败: {e}", file=tqdm_file)
         
+        # 🚨 关键修复：更新total_steps统计（用于噪声衰减调度器）
+        # 注意：需要在每个episode的step循环结束后更新，确保噪声衰减调度器能正确计算
+        if hasattr(maddpg, 'training_stats'):
+            # 计算本回合实际步数（考虑早停，step是0-based，所以+1）
+            # 注意：step变量在for step in range(args.episode_length)循环中定义
+            # 如果循环正常结束，step应该是args.episode_length-1，所以实际步数是args.episode_length
+            # 如果循环提前结束（break），step会是最后执行的步数
+            try:
+                # 尝试获取step变量（如果循环正常结束）
+                actual_steps_this_episode = args.episode_length
+            except:
+                # 如果无法获取，使用默认值
+                actual_steps_this_episode = args.episode_length
+            maddpg.training_stats['total_steps'] += actual_steps_this_episode
+            if hasattr(maddpg, 'total_steps_var'):
+                maddpg.total_steps_var.assign_add(tf.cast(actual_steps_this_episode, tf.int64))
+
         # 更新最佳回合
         if avg_episode_reward > best_reward:
             best_reward = avg_episode_reward
@@ -15954,8 +17484,8 @@ def train(args):
             # 重置奖励停滞检测
             if hasattr(maddpg, '_reward_stagnation_detected'):
                 maddpg._reward_stagnation_detected = False
-            # 提示刷新最佳（始终输出，不受安静模式影响）
-            print(f"[DEBUG] 发现新最佳奖励: {best_reward:.2f} (第{best_episode+1}回合, FR={best_episode_force_ratio:.3f})")
+            if not quiet_output:
+                print(f"[DEBUG] 发现新最佳奖励: {best_reward:.2f} (第{best_episode+1}回合, FR={best_episode_force_ratio:.3f})")
             
             # 保存最佳模型
             if args.save_model:
@@ -16110,10 +17640,43 @@ def train(args):
                 if isinstance(best_vis_context, dict):
                     terrain_shape = best_vis_context.get('terrain').shape if best_vis_context.get('terrain') is not None else None
                     terrain_source = best_vis_context.get('terrain_source', 'unknown')
-                    print(f"[DEBUG] 最佳回合快照完成: episode={episode+1}, terrain_shape={terrain_shape}, source={terrain_source}")
+                    if not quiet_output:
+                        print(f"[DEBUG] 最佳回合快照完成: episode={episode+1}, terrain_shape={terrain_shape}, source={terrain_source})")
             except Exception as e:
                 print(f"[WARN] 最佳回合快照失败: {e}")
                 best_vis_context = None
+
+        # 按 SR_team 标准保存最佳模型：SR_team = 已完成回合中团队成功标志的均值
+        team_success_flags = getattr(maddpg, '_episode_team_success_flags', [])
+        current_team_success_rate = (
+            float(sum(team_success_flags) / len(team_success_flags))
+            if team_success_flags else 0.0
+        )
+        current_team_sr_metric = (
+            current_team_success_rate,
+            float(avg_episode_reward),
+        )
+        best_team_sr_metric = (
+            float(best_team_success_rate),
+            float(best_team_sr_reward) if np.isfinite(best_team_sr_reward) else -np.inf,
+        )
+        if current_team_sr_metric > best_team_sr_metric:
+            best_team_success_rate = current_team_success_rate
+            best_team_sr_episode = episode
+            best_team_sr_force_ratio = current_fr
+            best_team_sr_reward = float(avg_episode_reward)
+            if not quiet_output:
+                tqdm.write(
+                    (
+                        f"[TEAM-SR] 新最佳模型: 第{episode+1}回合 | "
+                        f"SR_team={best_team_success_rate:.3f} | "
+                        f"Reward={best_team_sr_reward:.1f} | "
+                        f"FR={best_team_sr_force_ratio:.3f}"
+                    ),
+                    file=tqdm_file
+                )
+            if args.save_model:
+                save_checkpoint(episode, "best_by_team_sr")
         
         # 🔧 回合结束：仅在预快照缺失时补全 last_*（避免被重建后的环境覆盖）
         try:
@@ -16213,11 +17776,6 @@ def train(args):
             except NameError:
                 pass # 忽略损失（尚未开始训练）
                 
-            # 添加预热状态显示
-            if warmup_enabled and not warmup_completed:
-                warmup_status = f"🔥 预热: {warmup_step_count}/{max_warmup_steps}"
-                postfix_str = warmup_status + " | " + postfix_str
-            
             progress_bar.set_postfix_str(postfix_str)
 
         # 在每个回合结束后，始终打印一行清晰的摘要信息（附带最近一次loss，便于快速诊断）
@@ -16240,6 +17798,19 @@ def train(args):
             f"{loss_suffix}"
         )
         tqdm.write(summary_line, file=tqdm_file)
+        try:
+            if getattr(args, 'per_enabled', False) and hasattr(maddpg, 'flush_pending_per_updates'):
+                maddpg.flush_pending_per_updates(replay_buffer)
+        except Exception:
+            pass
+        if timing_enabled:
+            if timing_interval_steps > 0 and timing_window_steps > 0:
+                _emit_timing(f"ep{episode+1} tail", timing_window, timing_window_steps)
+                if timing_detail_enabled:
+                    _emit_timing_detail(f"ep{episode+1} tail", timing_window, timing_detail_window, timing_window_steps)
+            _emit_timing(f"episode {episode+1}", timing_ep, timing_steps)
+            if timing_detail_enabled:
+                _emit_timing_detail(f"episode {episode+1}", timing_ep, timing_detail_ep, timing_steps)
         
         # 🔧 传统APF验证：已确认DELTA=0生效（通过之前的调试输出验证）
         # 调试输出已关闭，如需重新启用，取消下面的注释
@@ -16260,11 +17831,16 @@ def train(args):
         #     # 调试输出代码已注释...
         # except Exception as e:
         #     pass
+        debug_setup_info = os.getenv('DEBUG_SETUP_INFO', '1').lower() in ('1','true','yes','on')
         try:
             lvl = int(getattr(args, 'terrain_complexity_level', 1))
         except Exception:
             lvl = getattr(args, 'terrain_complexity_level', 'unknown')
-        tqdm.write(f"[复杂度设置] 当前地图复杂度: 等级 {lvl}", file=tqdm_file)
+        if debug_setup_info:
+            last_reported_lvl = getattr(maddpg, '_last_reported_terrain_level', None)
+            if episode == 0 or lvl != last_reported_lvl:
+                tqdm.write(f"[复杂度设置] 当前地图复杂度: 等级 {lvl}", file=tqdm_file)
+                maddpg._last_reported_terrain_level = lvl
         # 新增：在第1回合结束时抓取首回合轨迹与可视化上下文（一次性）
         if episode == 0:
             try:
@@ -16332,21 +17908,57 @@ def train(args):
 
         # 固定/随机均输出成功计数（成功=到达且未碰撞）
         try:
-            if not random_mode_active:
+            debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', '1').lower() in ('1','true','yes','on')
+            if debug_episode_summary and not random_mode_active:
                 # 🔧 增强输出：显示本回合是否判定为成功
-                current_ep_success = _episode_success_without_collision(env, args)
+                current_ep_success = bool(maddpg._episode_success_flags[-1]) if getattr(maddpg, '_episode_success_flags', None) else False
                 success_mark = "✅" if current_ep_success else "❌"
+                mode_desc = _format_unlock_mode_desc()
+                if curriculum_enabled:
+                    stage_success_target = (
+                        stage_success_targets[curriculum_stage_index]
+                        if curriculum_stage_index < len(stage_success_targets) else getattr(args, 'unlock_env_on_success', 0)
+                    )
+                    stage_plateau_target = (
+                        stage_plateau_targets[curriculum_stage_index]
+                        if curriculum_stage_index < len(stage_plateau_targets) else getattr(args, 'unlock_env_on_plateau', 0)
+                    )
+                    total_success_target = max(
+                        stage_success_target,
+                        int(np.ceil(stage_success_target * curriculum_total_success_multiplier))
+                    )
+                    stage_elapsed = (episode - curriculum_stage_start_episode) + 1
+                    if curriculum_stage_index < len(curriculum_stages) - 1:
+                        unlock_progress_desc = (
+                            f"阶段连续成功={consecutive_success_count}/{stage_success_target} | "
+                            f"阶段停滞={episodes_since_best_for_unlock}/{stage_plateau_target} | "
+                            f"阶段累计成功={curriculum_stage_success_count}/{total_success_target}"
+                        )
+                    else:
+                        unlock_progress_desc = (
+                            f"已在最终阶段 | "
+                            f"阶段连续成功={consecutive_success_count} | "
+                            f"阶段停滞={episodes_since_best_for_unlock} | "
+                            f"阶段累计成功={curriculum_stage_success_count}"
+                        )
+                    stage_meta_desc = (
+                        f"{mode_desc} | "
+                        f"阶段回合数={stage_elapsed} | "
+                        f"全局累计成功={total_success_count}"
+                    )
+                else:
+                    unlock_progress_desc = (
+                        f"连续成功={consecutive_success_count}/{getattr(args, 'unlock_env_on_success', 0)} | "
+                        f"奖励停滞={episodes_since_best_for_unlock}/{getattr(args, 'unlock_env_on_plateau', 0)}"
+                    )
+                    stage_meta_desc = f"{mode_desc} | 全局累计成功={total_success_count}"
                 tqdm.write(
-                    f"[解锁计数] {success_mark} 本回合={('成功' if current_ep_success else '失败')} | 连续成功={consecutive_success_count}/{getattr(args, 'unlock_env_on_success', 0)} | 奖励停滞={episodes_since_best_for_unlock}/{getattr(args, 'unlock_env_on_plateau', 0)} | 累计成功={total_success_count}",
+                    f"[解锁计数] {success_mark} 本回合={('成功' if current_ep_success else '失败')} | {stage_meta_desc} | {unlock_progress_desc}",
                     file=tqdm_file
                 )
-            else:
-                try:
-                    lvl = int(getattr(args, 'terrain_complexity_level', 1))
-                except Exception:
-                    lvl = getattr(args, 'terrain_complexity_level', 'unknown')
+            elif debug_episode_summary:
                 tqdm.write(
-                    f"[随机地图] 成功计数(非连续)={random_success_counter}/{complexity_step_successes} | 地形复杂度=等级 {lvl}",
+                    f"[随机地图] {_format_unlock_mode_desc()} | 成功计数(非连续)={random_success_counter}/{complexity_step_successes}",
                     file=tqdm_file
                 )
         except Exception:
@@ -16373,12 +17985,16 @@ def train(args):
                 # 如果清理失败（可能是GPU停止），记录但不中断训练
                 if not quiet_output:
                     tqdm.write(f"[清理警告] 回合 {episode+1}: GPU缓存清理失败（可能GPU已停止）: {e}", file=tqdm_file)
-        # 每回合结束做内存修剪（默认开启，可通过 MEM_TRIM=0 关闭）
+        # 每回合结束按间隔做内存修剪，避免长跑时每回合都调用 malloc_trim。
         try:
             do_trim = os.getenv('MEM_TRIM', '1').lower() in ('1','true','yes','on')
         except Exception:
             do_trim = True
-        if do_trim:
+        try:
+            trim_interval = max(0, int(os.getenv('MEM_TRIM_INTERVAL', '10')))
+        except Exception:
+            trim_interval = 10
+        if do_trim and trim_interval > 0 and ((episode + 1) % trim_interval == 0):
             _trim_memory()
         
         # 定期输出统计信息（默认安静模式不输出）
@@ -16540,13 +18156,18 @@ def train(args):
             "episode_rewards": episode_rewards,
             "collision_counts": collision_counts,
             "min_distances_to_obstacle": min_distances,
+            "noise_scale_var_history": noise_scale_var_history,
             "success_flags": success_flags,  # 🚨 新增：每回合成功标志列表（向后兼容）
             "agent_success_flags": agent_success_flags,  # 🚨 新增：每回合每个智能体的成功标志
             "team_success_flags": team_success_flags,  # 🚨 新增：每回合团队成功标志
             "agent_success_rates": agent_success_rates,  # 🚨 新增：每个智能体的成功率（SR_i）
             "team_success_rate": float(team_success_rate),  # 🚨 新增：团队成功率（SR_team）
-            "warmup_enabled": bool(warmup_enabled),
-            "pf_meta_warmup_enabled": bool(pf_meta_was_enabled),
+            "best_team_success_rate": float(best_team_success_rate),
+            "best_team_sr_episode": int(best_team_sr_episode),
+            "best_team_sr_force_ratio": float(best_team_sr_force_ratio),
+            "best_team_sr_reward": (
+                float(best_team_sr_reward) if np.isfinite(best_team_sr_reward) else None
+            ),
             "train_episodes": int(getattr(args, 'train_episodes', len(episode_rewards))),
             "timestamp": _run_tag
         }
@@ -16562,9 +18183,22 @@ def train(args):
         if not quiet_output:
             print(f"[WARN] 保存训练指标失败: {metrics_err}")
 
+    final_team_success_flags = getattr(maddpg, '_episode_team_success_flags', [])
+    final_team_success_rate = (
+        float(sum(final_team_success_flags) / len(final_team_success_flags))
+        if final_team_success_flags else 0.0
+    )
+
     if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
         print("\n训练完成!")
         print(f"最佳回合: {best_episode+1}, 奖励: {best_reward:.2f}")
+        print(f"最终 Team SR: {final_team_success_rate:.3f}")
+        if best_team_sr_episode >= 0:
+            print(
+                f"最佳 Team SR 模型: 第{best_team_sr_episode+1}回合 | "
+                f"SR_team={best_team_success_rate:.3f} | "
+                f"Reward={best_team_sr_reward:.2f}"
+            )
     
     # === 生成奖励调试最终报告 ===
     if reward_debugger is not None:
@@ -16718,7 +18352,9 @@ def train(args):
         elif random_mode_active:
             # 已在随机地形：统计"非连续成功"(到达且未碰撞) 次数，达阈值则提升复杂度（最高4）
             try:
-                if _episode_success_without_collision(env, args):
+                # 统一复用 [成功记录] 的团队成功标志，避免重复计算导致口径偏差
+                current_ep_success = bool(maddpg._episode_success_flags[-1]) if getattr(maddpg, '_episode_success_flags', None) else False
+                if current_ep_success:
                     random_success_counter += 1
                     if (random_success_counter >= complexity_step_successes) and hasattr(args, 'terrain_complexity_level'):
                         new_level = int(getattr(args, 'terrain_complexity_level', 1)) + 1
@@ -17073,6 +18709,76 @@ def train(args):
             
             # 关闭图形以释放资源
             plt.close()
+
+            # 🔧 额外绘图：noise_scale_var vs episode
+            try:
+                plot_len_noise = min(len(noise_scale_var_history), len(episode_rewards))
+                if plot_len_noise > 0:
+                    plt = get_plt()
+                    setup_english_fonts()
+
+                    episodes_noise = range(1, plot_len_noise + 1)
+                    noise_vals = noise_scale_var_history[:plot_len_noise]
+
+                    fig_noise, ax_noise = plt.subplots(1, 1, figsize=(12, 5))
+                    # 处理非有限值：用 NaN 让 Matplotlib 断线显示
+                    noise_vals_plot = [v if (v is not None and np.isfinite(v)) else np.nan for v in noise_vals]
+                    ax_noise.plot(episodes_noise, noise_vals_plot, color='#333333', linewidth=2.2, label='noise_scale_var')
+                    ax_noise.set_xlabel('Episode', fontfamily='DejaVu Sans', fontsize=12)
+                    ax_noise.set_ylabel('noise_scale_var', fontfamily='DejaVu Sans', fontsize=12)
+                    ax_noise.set_title('Adaptive Noise Scale (noise_scale_var) vs Episode', fontfamily='DejaVu Sans', fontsize=14, fontweight='bold')
+                    ax_noise.grid(True, linestyle='--', alpha=0.3)
+                    ax_noise.legend(loc='best', fontsize=10, prop={'family': 'DejaVu Sans'})
+                    ax_noise.set_facecolor('#fafafa')
+                    plt.tight_layout()
+
+                    noise_plot_path = os.path.join(log_dir, 'noise_scale_plot.png')
+                    plt.savefig(noise_plot_path, dpi=150, bbox_inches='tight')
+
+                    noise_plot_ep_path = os.path.join(current_episode_dir, 'noise_scale_plot.png')
+                    plt.savefig(noise_plot_ep_path, dpi=150, bbox_inches='tight')
+
+                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                        print(f"噪声强度曲线图已保存到: {noise_plot_path}")
+                        print(f"同时保存到: {noise_plot_ep_path}")
+                    plt.close(fig_noise)
+            except Exception as e_noise:
+                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                    print(f"生成 noise_scale_var 曲线图失败: {e_noise}")
+            
+            # 新增：每回合碰撞次数分项曲线图（地形 vs 球形障碍）
+            terrain_counts = getattr(maddpg, '_episode_terrain_collision_counts', [])
+            obstacle_counts = getattr(maddpg, '_episode_obstacle_collision_counts', [])
+            if (terrain_counts or obstacle_counts) and len(episode_rewards) > 0:
+                try:
+                    plot_len = min(
+                        max(len(terrain_counts), len(obstacle_counts)) if (terrain_counts or obstacle_counts) else 0,
+                        len(episode_rewards)
+                    )
+                    if plot_len > 0:
+                        fig2, ax = plt.subplots(1, 1, figsize=(12, 5))
+                        eps = range(1, plot_len + 1)
+                        t_plot = (terrain_counts + [0] * plot_len)[:plot_len]
+                        o_plot = (obstacle_counts + [0] * plot_len)[:plot_len]
+                        ax.plot(eps, t_plot, linewidth=2.0, color='#2E86AB', label='Terrain', marker='o', markersize=3, alpha=0.8)
+                        ax.plot(eps, o_plot, linewidth=2.0, color='#E94F37', label='Obstacle', marker='o', markersize=3, alpha=0.8)
+                        ax.set_xlabel('Episode', fontfamily='DejaVu Sans', fontsize=12)
+                        ax.set_ylabel('Collision Count', fontfamily='DejaVu Sans', fontsize=12)
+                        ax.set_title('Episode Collision Counts: Terrain vs Obstacle', fontfamily='DejaVu Sans', fontsize=14, fontweight='bold')
+                        ax.legend(loc='best', fontsize=10, prop={'family': 'DejaVu Sans'})
+                        ax.grid(True, linestyle='--', alpha=0.3)
+                        ax.set_facecolor('#fafafa')
+                        plt.tight_layout()
+                        breakdown_path = os.path.join(log_dir, 'collision_breakdown_plot.png')
+                        plt.savefig(breakdown_path, dpi=150, bbox_inches='tight')
+                        breakdown_ep_path = os.path.join(current_episode_dir, 'collision_breakdown_plot.png')
+                        plt.savefig(breakdown_ep_path, dpi=150, bbox_inches='tight')
+                        plt.close(fig2)
+                        if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                            print(f"碰撞分项曲线图已保存到: {breakdown_path}")
+                except Exception as e2:
+                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                        print(f"生成碰撞分项曲线图失败: {e2}")
             
         except Exception as e:
             print(f"生成奖励曲线图失败: {e}")
@@ -17448,6 +19154,17 @@ def train(args):
     except Exception:
         pass
 
+    try:
+        maddpg._final_team_success_rate = float(final_team_success_rate)
+        maddpg._best_team_success_rate = float(best_team_success_rate)
+        maddpg._best_team_sr_episode = int(best_team_sr_episode)
+        maddpg._best_team_sr_force_ratio = float(best_team_sr_force_ratio)
+        maddpg._best_team_sr_reward = (
+            float(best_team_sr_reward) if np.isfinite(best_team_sr_reward) else None
+        )
+    except Exception:
+        pass
+
     # 结束 TensorFlow Profiler（如已启动）
     try:
         if 'profiling' in locals() and profiling and '_tf_prof_started' in locals() and _tf_prof_started:
@@ -17497,8 +19214,8 @@ def parse_args():
     parser.add_argument("--noise-min", type=float, default=0.05, help="OU噪声标准差下限")
     # 参数空间噪声（Actor权重级扰动）
     # 参数空间噪声已移除，仅保留OU噪声探索；以下参数删除以避免误用
-    parser.add_argument("--random-action-prob", type=float, default=0.01, help="随机动作概率（预热阶段，epsilon-greedy）")
-    parser.add_argument("--random-action-prob-training", type=float, default=0.05, help="🔧 随机动作概率（训练阶段，epsilon-greedy）")
+    parser.add_argument("--random-action-prob", type=float, default=0.01, help="统一随机动作概率（主训练路径与旧回退路径共用，epsilon-greedy）")
+    parser.add_argument("--random-action-prob-training", type=float, default=0.05, help="历史兼容别名；当前主训练路径优先使用 --random-action-prob")
     
     # 训练参数
     parser.add_argument("--batch-size", type=int, default=1024, help="批大小")
@@ -17524,6 +19241,41 @@ def parse_args():
     parser.add_argument("--policy-noise", type=float, default=0.2, help="目标策略平滑噪声标准差 (MATD3)")
     parser.add_argument("--noise-clip", type=float, default=0.5, help="目标策略噪声裁剪幅度 (MATD3)")
     parser.add_argument("--policy-freq", type=int, default=2, help="Actor延迟更新频率 (MATD3)")
+    # 双Q头/分离梯度消融开关
+    parser.add_argument(
+        "--matd3-use-dual-q",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('MATD3_USE_DUAL_Q', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="MATD3是否使用双Q头（默认来自MATD3_USE_DUAL_Q）"
+    )
+    parser.add_argument(
+        "--matd3-use-separated-gradient",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('MATD3_USE_SEPARATED_GRADIENT', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="MATD3是否使用分离式梯度（默认来自MATD3_USE_SEPARATED_GRADIENT）"
+    )
+    parser.add_argument(
+        "--maddpg-use-dual-q",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('MADDPG_USE_DUAL_Q', '0')).lower() in ('true', '1', 'yes', 'on'),
+        help="MADDPG是否使用双Q头（默认来自MADDPG_USE_DUAL_Q）"
+    )
+    parser.add_argument(
+        "--maddpg-use-separated-gradient",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('MADDPG_USE_SEPARATED_GRADIENT', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="MADDPG是否使用分离式梯度（默认来自MADDPG_USE_SEPARATED_GRADIENT）"
+    )
+    parser.add_argument("--fairness-reweight-enabled", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+                       default=True, help="是否启用按agent成功率反向补偿的loss重加权")
+    parser.add_argument("--fairness-window", type=int, default=200,
+                       help="公平权重统计窗口（最近N回合）")
+    parser.add_argument("--fairness-beta", type=float, default=2.0,
+                       help="公平权重强度，越大越偏向低成功率agent")
+    parser.add_argument("--fairness-min-weight", type=float, default=0.7,
+                       help="公平权重下限")
+    parser.add_argument("--fairness-max-weight", type=float, default=1.6,
+                       help="公平权重上限")
 
     # 保存参数
     parser.add_argument("--exp-name", type=str, default="debug", help="实验名称")
@@ -17541,7 +19293,7 @@ def parse_args():
     parser.add_argument("--random-z0-positions", action="store_true", help="随机初始化智能体位置并保持在地形上方")
     parser.add_argument("--dynamic-first-time", action="store_true", help="动态首次运行")
     parser.add_argument("--random-terrain", action="store_true", help="使用随机地形")
-    parser.add_argument("--terrain-complexity-level", type=int, default=1, choices=[1, 2, 3, 4], help="地形复杂度等级 (1-4)")
+    parser.add_argument("--terrain-complexity-level", type=int, default=3, choices=[1, 2, 3, 4], help="地形复杂度等级 (1-4)")
     parser.add_argument("--map-size", type=float, default=float(os.getenv('MAP_SIZE', '200')), help="地图尺寸（边长），用于观察与势场缩放")
     parser.add_argument("--save-positions", action="store_true", help="是否保存位置到文件")
     parser.add_argument("--save-positions-file", type=str, default="./saved_positions/current_positions.json", help="保存位置数据的文件路径")
@@ -17778,6 +19530,11 @@ if __name__ == "__main__":
             'best_episode': best_ep_idx,
             'best_episode_force_ratio': episode_force_ratios[best_ep_idx] if best_ep_idx < len(episode_force_ratios) else getattr(args, 'action_force_ratio', 0.0),  # 🔧 新增：记录最佳回合的FR值
             'last_episode_force_ratio': episode_force_ratios[last_ep_idx] if last_ep_idx < len(episode_force_ratios) else getattr(args, 'action_force_ratio', 0.0),  # 🔧 新增：记录最后回合的FR值
+            'team_success_rate': float(getattr(maddpg, '_final_team_success_rate', 0.0)),
+            'best_team_success_rate': float(getattr(maddpg, '_best_team_success_rate', -1.0)),
+            'best_team_sr_episode': int(getattr(maddpg, '_best_team_sr_episode', -1)),
+            'best_team_sr_force_ratio': float(getattr(maddpg, '_best_team_sr_force_ratio', 0.0)),
+            'best_team_sr_reward': getattr(maddpg, '_best_team_sr_reward', None),
             'args': vars(args)
         }
         

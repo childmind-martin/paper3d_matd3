@@ -7,7 +7,74 @@ numpy向量化奖励计算器
 
 import numpy as np
 import os
+import time
 from typing import Dict, List, Tuple, Any
+
+
+def _bilinear_interpolate_terrain_xy(
+    terrain: np.ndarray,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+    terrain_heights: np.ndarray,
+    map_size: int,
+):
+    """双线性插值获取地形高度（xy 专用向量化实现）。"""
+    if terrain is None or x_coords is None or y_coords is None or len(x_coords) == 0:
+        return
+
+    x_coords = np.asarray(x_coords, dtype=np.float32).reshape(-1)
+    y_coords = np.asarray(y_coords, dtype=np.float32).reshape(-1)
+    if x_coords.shape[0] != y_coords.shape[0]:
+        return
+
+    terrain_h, terrain_w = terrain.shape[0], terrain.shape[1]
+    if terrain_h != map_size or terrain_w != map_size:
+        scale_x = float(terrain_w) / float(map_size)
+        scale_y = float(terrain_h) / float(map_size)
+        x_coords = np.clip(x_coords * scale_x, 0.0, float(terrain_w - 1))
+        y_coords = np.clip(y_coords * scale_y, 0.0, float(terrain_h - 1))
+    else:
+        x_coords = np.clip(x_coords, 0.0, float(map_size - 1))
+        y_coords = np.clip(y_coords, 0.0, float(map_size - 1))
+
+    x_low = np.floor(x_coords).astype(np.int32)
+    y_low = np.floor(y_coords).astype(np.int32)
+    x_high = np.minimum(x_low + 1, terrain_w - 1)
+    y_high = np.minimum(y_low + 1, terrain_h - 1)
+
+    x_low = np.clip(x_low, 0, terrain_w - 1)
+    y_low = np.clip(y_low, 0, terrain_h - 1)
+    x_high = np.clip(x_high, 0, terrain_w - 1)
+    y_high = np.clip(y_high, 0, terrain_h - 1)
+
+    x_weight = x_coords - x_low.astype(np.float32)
+    y_weight = y_coords - y_low.astype(np.float32)
+
+    h00 = terrain[y_low, x_low]
+    h10 = terrain[y_low, x_high]
+    h01 = terrain[y_high, x_low]
+    h11 = terrain[y_high, x_high]
+
+    valid_mask = np.isfinite(h00) & np.isfinite(h10) & np.isfinite(h01) & np.isfinite(h11)
+    if not np.all(valid_mask):
+        invalid_mask = ~valid_mask
+        if np.any(invalid_mask):
+            h00[invalid_mask] = np.where(np.isfinite(h00[invalid_mask]), h00[invalid_mask],
+                                        np.where(np.isfinite(h10[invalid_mask]), h10[invalid_mask],
+                                                np.where(np.isfinite(h01[invalid_mask]), h01[invalid_mask], h11[invalid_mask])))
+            h10[invalid_mask] = np.where(np.isfinite(h10[invalid_mask]), h10[invalid_mask], h00[invalid_mask])
+            h01[invalid_mask] = np.where(np.isfinite(h01[invalid_mask]), h01[invalid_mask], h00[invalid_mask])
+            h11[invalid_mask] = np.where(np.isfinite(h11[invalid_mask]), h11[invalid_mask], h00[invalid_mask])
+
+    h0 = h00 * (1.0 - x_weight) + h10 * x_weight
+    h1 = h01 * (1.0 - x_weight) + h11 * x_weight
+    terrain_heights[:] = h0 * (1.0 - y_weight) + h1 * y_weight
+
+    invalid_output = ~np.isfinite(terrain_heights)
+    if np.any(invalid_output):
+        x_nearest = np.clip(x_low[invalid_output], 0, terrain_w - 1)
+        y_nearest = np.clip(y_low[invalid_output], 0, terrain_h - 1)
+        terrain_heights[invalid_output] = terrain[y_nearest, x_nearest]
 
 
 def _bilinear_interpolate_terrain(terrain: np.ndarray, positions: np.ndarray, terrain_heights: np.ndarray, map_size: int):
@@ -35,75 +102,30 @@ def _bilinear_interpolate_terrain(terrain: np.ndarray, positions: np.ndarray, te
     else:
         positions_2d = positions[:, :2]
     
-    num_pos = len(positions_2d)
-    
-    # 🚨 关键修复：确保地形尺寸与map_size一致
-    # 如果地形尺寸与map_size不一致（降采样情况），需要缩放坐标
-    terrain_h, terrain_w = terrain.shape[0], terrain.shape[1]
-    if terrain_h != map_size or terrain_w != map_size:
-        # 地形已降采样，需要缩放坐标
-        scale_x = float(terrain_w) / float(map_size)
-        scale_y = float(terrain_h) / float(map_size)
-        x_coords = np.clip(positions_2d[:, 0] * scale_x, 0.0, float(terrain_w - 1))
-        y_coords = np.clip(positions_2d[:, 1] * scale_y, 0.0, float(terrain_h - 1))
-    else:
-        # 地形尺寸与map_size一致，直接使用
-        x_coords = np.clip(positions_2d[:, 0], 0.0, float(map_size - 1))
-        y_coords = np.clip(positions_2d[:, 1], 0.0, float(map_size - 1))
-    
-    # 计算四个角点的索引
-    x_low = np.floor(x_coords).astype(np.int32)
-    y_low = np.floor(y_coords).astype(np.int32)
-    x_high = np.minimum(x_low + 1, terrain_w - 1)
-    y_high = np.minimum(y_low + 1, terrain_h - 1)
-    
-    # 🚨 关键修复：确保索引不越界
-    x_low = np.clip(x_low, 0, terrain_w - 1)
-    y_low = np.clip(y_low, 0, terrain_h - 1)
-    x_high = np.clip(x_high, 0, terrain_w - 1)
-    y_high = np.clip(y_high, 0, terrain_h - 1)
-    
-    # 计算插值权重
-    x_weight = x_coords - x_low.astype(np.float32)
-    y_weight = y_coords - y_low.astype(np.float32)
-    
-    # 获取四个角点的高度值
-    h00 = terrain[y_low, x_low]  # 左下
-    h10 = terrain[y_low, x_high]  # 右下
-    h01 = terrain[y_high, x_low]  # 左上
-    h11 = terrain[y_high, x_high]  # 右上
-    
-    # 🚨 关键修复：处理NaN和Inf值
-    # 如果某个角点的高度无效，使用其他有效值或默认值
-    valid_mask = np.isfinite(h00) & np.isfinite(h10) & np.isfinite(h01) & np.isfinite(h11)
-    if not np.all(valid_mask):
-        # 对于无效值，使用最近邻值
-        invalid_mask = ~valid_mask
-        if np.any(invalid_mask):
-            # 使用最近的有效值（优先使用h00）
-            h00[invalid_mask] = np.where(np.isfinite(h00[invalid_mask]), h00[invalid_mask], 
-                                        np.where(np.isfinite(h10[invalid_mask]), h10[invalid_mask],
-                                                np.where(np.isfinite(h01[invalid_mask]), h01[invalid_mask], h11[invalid_mask])))
-            h10[invalid_mask] = np.where(np.isfinite(h10[invalid_mask]), h10[invalid_mask], h00[invalid_mask])
-            h01[invalid_mask] = np.where(np.isfinite(h01[invalid_mask]), h01[invalid_mask], h00[invalid_mask])
-            h11[invalid_mask] = np.where(np.isfinite(h11[invalid_mask]), h11[invalid_mask], h00[invalid_mask])
-    
-    # 双线性插值
-    h0 = h00 * (1.0 - x_weight) + h10 * x_weight  # 下边插值
-    h1 = h01 * (1.0 - x_weight) + h11 * x_weight  # 上边插值
-    terrain_heights[:] = h0 * (1.0 - y_weight) + h1 * y_weight  # 最终插值
-    
-    # 🚨 关键修复：确保输出值有效
-    invalid_output = ~np.isfinite(terrain_heights)
-    if np.any(invalid_output):
-        # 对于无效输出，使用最近邻值
-        x_nearest = np.clip(x_low[invalid_output], 0, terrain_w - 1)
-        y_nearest = np.clip(y_low[invalid_output], 0, terrain_h - 1)
-        terrain_heights[invalid_output] = terrain[y_nearest, x_nearest]
+    _bilinear_interpolate_terrain_xy(
+        terrain,
+        positions_2d[:, 0],
+        positions_2d[:, 1],
+        terrain_heights,
+        map_size,
+    )
 
 
 class VectorizedRewardCalculator:
     """numpy向量化奖励计算器"""
+    REWARD_TIMING_KEYS = (
+        'rew_cache',
+        'rew_state',
+        'rew_numeric',
+        'rew_explore',
+        'rew_motion',
+        'rew_success',
+        'rew_collision',
+        'rew_clearance',
+        'rew_lateral',
+        'rew_team',
+        'rew_reduce',
+    )
     
     def __init__(self, reward_weights: Dict[str, float], max_reward: float = 800.0, min_reward: float = -800.0,
                  success_reward_value: float = 150.0, success_distance_threshold: float = 2.0,
@@ -116,7 +138,7 @@ class VectorizedRewardCalculator:
             max_reward: 最大奖励值
             min_reward: 最小奖励值
         """
-        # 将权重转换为numpy数组，按固定顺序排列（14通道，必须与分项索引严格一致）
+        # 将权重转换为numpy数组，按固定顺序排列（16通道，必须与分项索引严格一致）
         self.reward_weights = np.array([
             reward_weights['distance'],          # 0
             reward_weights['exploration'],       # 1
@@ -131,7 +153,9 @@ class VectorizedRewardCalculator:
             reward_weights.get('collision', 0.0),# 10
             reward_weights.get('global', 0.0),   # 11
             reward_weights.get('shaping', 0.0),  # 12
-            reward_weights.get('clearance', 0.0) # 13
+            reward_weights.get('clearance', 0.0),# 13
+            reward_weights.get('lateral', 0.0),  # 14
+            reward_weights.get('collision_reduction', 0.0)  # 15
         ], dtype=np.float32)
         self._base_reward_weights = self.reward_weights.copy()
         
@@ -143,6 +167,7 @@ class VectorizedRewardCalculator:
         self._obstacle_cache = {}  # 障碍物数据缓存
         self._terrain_cache = {}   # 地形数据缓存
         self._goal_cache = {}      # 目标数据缓存
+        self._terrain_distance_scratch = {}
         
         # 其他参数（预转换为合适类型避免运行时转换）
         self.success_reward_value = np.float32(success_reward_value)
@@ -152,6 +177,22 @@ class VectorizedRewardCalculator:
         self.no_collision_reward_value = np.float32(no_collision_reward_value)
         self.global_reward_mode = str(global_reward_mode)
         self.shaping_gamma = np.float32(shaping_gamma)
+        try:
+            raw_reward_profile = kwargs.get(
+                'reward_profile',
+                os.getenv('CURRICULUM_REWARD_PROFILE', os.getenv('REWARD_PROFILE', 'fixed_route'))
+            )
+            self.reward_profile = self._normalize_reward_profile_name(raw_reward_profile)
+            self.curriculum_stage_id = int(kwargs.get('curriculum_stage_id', os.getenv('CURRICULUM_STAGE_ID', '0')))
+        except Exception:
+            self.reward_profile = 'fixed_route'
+            self.curriculum_stage_id = 0
+        try:
+            self.lateral_activation_distance = np.float32(
+                float(kwargs.get('lateral_activation_distance', os.getenv('LATERAL_ACTIVATION_DISTANCE', '15.0')))
+            )
+        except Exception:
+            self.lateral_activation_distance = np.float32(15.0)
         # 新增：穿透深度系数与探索严格模式（环境变量可覆盖）以及轨迹平滑权重
         try:
             import os
@@ -164,44 +205,235 @@ class VectorizedRewardCalculator:
             else:
                 self.terrain_penalty_value = self.collision_penalty_value
             # 新增：地形接触阈值（触地即罚/终止的高度缓冲）
-            # 🚨 调试：默认值从2.5改为10.0，用于诊断碰撞计数问题
-            # 原因：大幅提高阈值，让碰撞检测更频繁触发，判断是计数过多还是没有记录上
-            # 大幅提高阈值以确保能检测到所有碰撞和接近地形的接触
-            self.terrain_contact_eps = np.float32(float(os.getenv('TERRAIN_CONTACT_EPS', '10.0')))
+            # 🚨 关键修复：区分"真实碰撞"和"净空不足"两个概念
+            # TERRAIN_COLLISION_EPS：真实碰撞阈值（0.3米）- 用于统计碰撞次数，影响成功判定
+            #   - 智能体在地形+0.3米以内才算真正碰撞，会增加 total_penetration_count
+            #   - 这个阈值应该很小，只检测实际接触或极度接近地形的情况
+            # TERRAIN_CLEARANCE_EPS：净空监测阈值（1.5米）- 用于净空不足惩罚，鼓励保持安全距离
+            #   - 智能体在地形+1.5米以内会受到净空不足的惩罚（通过奖励计算）
+            #   - 但不会增加碰撞计数，不影响成功判定
+            # 原问题：之前用1.5米作为碰撞阈值，导致智能体飞在0.5-1.0米高度也被误报为"碰撞"
+            # 修复：碰撞阈值降到0.3米，只有真正接触地形才算碰撞
+            self.terrain_collision_eps = np.float32(float(os.getenv('TERRAIN_COLLISION_EPS', '0.3')))  # 真实碰撞阈值
+            self.terrain_clearance_eps = np.float32(float(os.getenv('TERRAIN_CLEARANCE_EPS', '1.5')))  # 净空监测阈值
+            # 兼容旧代码：保留 terrain_contact_eps 变量（指向 collision_eps）
+            self.terrain_contact_eps = self.terrain_collision_eps
+            self.goal_hold_reward = np.float32(float(kwargs.get('goal_hold_reward', os.getenv('GOAL_HOLD_REWARD', '5.0'))))
+            self.leave_goal_penalty = np.float32(float(kwargs.get('leave_goal_penalty', os.getenv('LEAVE_GOAL_PENALTY', '5.0'))))
+            self.hover_speed_threshold = np.float32(float(kwargs.get('hover_speed_threshold', os.getenv('HOVER_SPEED_THRESHOLD', '1.0'))))
+            self.hover_reward_interval = int(kwargs.get('hover_reward_interval', os.getenv('HOVER_REWARD_INTERVAL', '5')))
             # 轨迹平滑奖励权重：优先使用kwargs，回退到环境变量TURN_SMOOTH_WEIGHT
             self.turn_smooth_weight = np.float32(
                 float(kwargs.get('turn_smooth_weight', os.getenv('TURN_SMOOTH_WEIGHT', '0.0')))
             )
+            self.distance_reward_near_goal_radius = np.float32(
+                float(os.getenv('DISTANCE_REWARD_NEAR_GOAL_RADIUS', '12.0'))
+            )
+            self.distance_reward_near_goal_factor = np.float32(
+                float(os.getenv('DISTANCE_REWARD_NEAR_GOAL_FACTOR', '0.2'))
+            )
+            self.distance_reward_progress_only_near_goal = (
+                str(os.getenv('DISTANCE_REWARD_PROGRESS_ONLY_NEAR_GOAL', '0')).lower()
+                in ('1', 'true', 'yes', 'on')
+            )
+            self.height_penalty_only_near_goal_radius = np.float32(
+                float(os.getenv('HEIGHT_PENALTY_ONLY_NEAR_GOAL_RADIUS', '10.0'))
+            )
+            self.height_near_goal_positive_factor = np.float32(
+                float(os.getenv('HEIGHT_NEAR_GOAL_POSITIVE_FACTOR', '0.08'))
+            )
+            self.clearance_penalty_only_near_goal_radius = np.float32(
+                float(os.getenv('CLEARANCE_PENALTY_ONLY_NEAR_GOAL_RADIUS', '12.0'))
+            )
+            self.clearance_near_goal_positive_factor = np.float32(
+                float(os.getenv('CLEARANCE_NEAR_GOAL_POSITIVE_FACTOR', '0.06'))
+            )
+            self.approach_near_goal_threshold = np.float32(
+                float(os.getenv('APPROACH_NEAR_GOAL_THRESHOLD', '50.0'))
+            )
+            _app_mx = float(os.getenv('APPROACH_NEAR_GOAL_MAX_MULT', '1.22'))
+            self.approach_near_goal_max_mult = np.float32(max(_app_mx, 1.0))
+            self.stationary_near_goal_radius = np.float32(
+                float(os.getenv('STATIONARY_NEAR_GOAL_RADIUS', '8.0'))
+            )
+            self.stationary_near_goal_threshold = np.float32(
+                float(os.getenv('STATIONARY_NEAR_GOAL_THRESHOLD', '0.02'))
+            )
+            self.stationary_near_goal_min_penalty = np.float32(
+                float(os.getenv('STATIONARY_NEAR_GOAL_MIN_PENALTY', '6.0'))
+            )
+            self.stationary_near_goal_max_penalty = np.float32(
+                float(os.getenv('STATIONARY_NEAR_GOAL_MAX_PENALTY', '16.0'))
+            )
+            self.terminal_failure_penalty_base = np.float32(
+                float(os.getenv('TERMINAL_FAILURE_PENALTY_BASE', '30.0'))
+            )
+            self.terminal_failure_penalty_per_meter = np.float32(
+                float(os.getenv('TERMINAL_FAILURE_PENALTY_PER_METER', '120.0'))
+            )
+            self.terminal_failure_penalty_max = np.float32(
+                float(os.getenv('TERMINAL_FAILURE_PENALTY_MAX', '180.0'))
+            )
+            goal_ring_schedule = os.getenv(
+                'GOAL_RING_REWARD_SCHEDULE',
+                '18:20,10:35,6:55,3.5:80'
+            )
+            self.goal_ring_radii, self.goal_ring_bonus_values = self._parse_goal_ring_schedule(goal_ring_schedule)
         except Exception:
             self.penetration_alpha = np.float32(0.5)
             self.expl_reward_strict = False
             self.terrain_penalty_value = self.collision_penalty_value
             # 🚨 关键修复：异常处理中的默认值也从1.5改为2.5，与run_optimized.sh保持一致
+            self.terrain_collision_eps = np.float32(0.3)
+            self.terrain_clearance_eps = np.float32(1.5)
             self.terrain_contact_eps = np.float32(2.5)
+            self.goal_hold_reward = np.float32(5.0)
+            self.leave_goal_penalty = np.float32(5.0)
+            self.hover_speed_threshold = np.float32(1.0)
+            self.hover_reward_interval = 5
             self.turn_smooth_weight = np.float32(0.0)
+            self.distance_reward_near_goal_radius = np.float32(12.0)
+            self.distance_reward_near_goal_factor = np.float32(0.2)
+            self.distance_reward_progress_only_near_goal = False
+            self.height_penalty_only_near_goal_radius = np.float32(10.0)
+            self.height_near_goal_positive_factor = np.float32(0.08)
+            self.clearance_penalty_only_near_goal_radius = np.float32(12.0)
+            self.clearance_near_goal_positive_factor = np.float32(0.06)
+            self.approach_near_goal_threshold = np.float32(50.0)
+            self.approach_near_goal_max_mult = np.float32(1.22)
+            self.stationary_near_goal_radius = np.float32(8.0)
+            self.stationary_near_goal_threshold = np.float32(0.02)
+            self.stationary_near_goal_min_penalty = np.float32(6.0)
+            self.stationary_near_goal_max_penalty = np.float32(16.0)
+            self.terminal_failure_penalty_base = np.float32(30.0)
+            self.terminal_failure_penalty_per_meter = np.float32(120.0)
+            self.terminal_failure_penalty_max = np.float32(180.0)
+            self.goal_ring_radii, self.goal_ring_bonus_values = self._parse_goal_ring_schedule(
+                '18:20,10:35,6:55,3.5:80'
+            )
         
         # 性能优化开关
         self.debug_mode = False  # 关闭调试输出
         self.use_fast_path = True  # 启用快速路径
         self._printed_once = False  # 首回合一次性打印关键配置
         
-        # 奖励分项名称（用于调试，14通道，对应索引0-13）
+        # 奖励分项名称（用于调试，16通道，对应索引0-15）
         self.reward_names = [
-            'distance',    # 0
+            'distance',    # 0 (主训练中承载 merged progress)
             'exploration', # 1
             'stationary',  # 2
             'direction',   # 3
             'deviation',   # 4
             'start_area',  # 5
-            'approach',    # 6
+            'approach',    # 6 (legacy，占位保留，默认主路径已并入 progress)
             'energy',      # 7
             'height',      # 8
             'success',     # 9
             'collision',   # 10
-            'global',      # 11
+            'global',      # 11 (主训练中承载 team-sync dense + 终局团队语义)
             'shaping',     # 12
-            'clearance'    # 13
+            'clearance',   # 13
+            'lateral',     # 14
+            'collision_reduction'  # 15
         ]
+
+        # === Reward structure (dense vs terminal) ===
+        # 默认启用“结构收缩”：
+        # - 主 dense reward：仅保留少数可学性必需项（progress/collision/clearance/height/stationary/success/team-sync）
+        # - terminal 奖励/惩罚：在 episode end 额外结算
+        # - 其余分项：保留计算与日志，但从主 reward 移出
+        try:
+            import os as _os
+            self.restructured_reward_enabled = _os.getenv('RESTRUCTURED_REWARD', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.restructured_reward_enabled = True
+
+        # dense 主通道索引（按 reward_names 顺序）
+        # progress(distance:0), stationary(2), success(9), collision(10), team-sync/global(11), clearance(13), height(8)
+        self._dense_indices_core_fixed = (0, 2, 8, 9, 10, 11, 13)
+        self._dense_indices_core_obstacle = (0, 2, 8, 9, 10, 11, 13, 14)
+        self._dense_indices_core = (
+            self._dense_indices_core_obstacle
+            if self._is_obstacle_reward_route()
+            else self._dense_indices_core_fixed
+        )
+
+        # progress 合并：将 distance(状态锚点) 与 approach(步进结果) 融合成单一主通道
+        self.progress_merge_enabled = True
+
+        # 可选弱正则：energy(7)
+        try:
+            import os as _os
+            self.dense_energy_enabled = _os.getenv('DENSE_ENERGY_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.dense_energy_enabled = True
+
+        # 结构收缩时是否仍计算全部 16 通道（默认否：只算主 dense 用到的通道，省算力；设 1 则恢复全通道便于对照日志）
+        try:
+            import os as _os
+            self.restructured_full_channel_compute = _os.getenv(
+                'RESTRUCTURED_FULL_CHANNEL_COMPUTE', '0'
+            ).lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.restructured_full_channel_compute = False
+
+        # terminal 奖励/惩罚（仅 episode end 生效）
+        try:
+            import os as _os
+            self.team_success_bonus = np.float32(float(_os.getenv('TEAM_SUCCESS_BONUS', '3000.0')))
+        except Exception:
+            self.team_success_bonus = np.float32(3000.0)
+        try:
+            import os as _os
+            self.unsafe_arrival_penalty = np.float32(float(_os.getenv('UNSAFE_ARRIVAL_PENALTY', '1200.0')))
+        except Exception:
+            self.unsafe_arrival_penalty = np.float32(1200.0)
+
+        # success-only 质量奖励（仅 team_success=True 时给）
+        try:
+            import os as _os
+            self.clearance_quality_bonus_weight = np.float32(float(_os.getenv('CLEARANCE_QUALITY_BONUS_WEIGHT', '800.0')))
+        except Exception:
+            self.clearance_quality_bonus_weight = np.float32(800.0)
+        try:
+            import os as _os
+            self.efficiency_bonus_weight = np.float32(float(_os.getenv('EFFICIENCY_BONUS_WEIGHT', '800.0')))
+        except Exception:
+            self.efficiency_bonus_weight = np.float32(800.0)
+
+        # === Team-sync dense reward ===
+        try:
+            import os as _os
+            self.team_sync_enabled = _os.getenv('TEAM_SYNC_REWARD_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.team_sync_enabled = True
+        try:
+            import os as _os
+            self.team_goal_occupancy_scale = np.float32(float(_os.getenv('TEAM_GOAL_OCCUPANCY_SCALE', '1.0')))
+        except Exception:
+            self.team_goal_occupancy_scale = np.float32(1.0)
+        try:
+            import os as _os
+            self.team_bottleneck_progress_scale = np.float32(float(_os.getenv('TEAM_BOTTLENECK_PROGRESS_SCALE', '4.0')))
+        except Exception:
+            self.team_bottleneck_progress_scale = np.float32(4.0)
+        try:
+            import os as _os
+            self.team_waiting_scale = np.float32(float(_os.getenv('TEAM_WAITING_SCALE', '0.6')))
+        except Exception:
+            self.team_waiting_scale = np.float32(0.6)
+        try:
+            import os as _os
+            self.team_waiting_speed_threshold = np.float32(
+                float(_os.getenv('TEAM_WAITING_SPEED_THRESHOLD', str(kwargs.get('hover_speed_threshold', 1.0))))
+            )
+        except Exception:
+            self.team_waiting_speed_threshold = np.float32(kwargs.get('hover_speed_threshold', 1.0))
+        try:
+            import os as _os
+            self.team_bottleneck_delta_clip = np.float32(float(_os.getenv('TEAM_BOTTLENECK_DELTA_CLIP', '1.0')))
+        except Exception:
+            self.team_bottleneck_delta_clip = np.float32(1.0)
         
         # 奖励多样性检测
         self.reward_history = []
@@ -209,6 +441,21 @@ class VectorizedRewardCalculator:
         self.diversity_window = 10  # 检测窗口大小
         self.last_warning_episode = 0  # 上次警告的回合数
         self.warning_cooldown = 20  # 警告冷却期（回合数）
+        try:
+            import os as _os
+            self.enable_reward_diversity_check = _os.getenv(
+                'ENABLE_REWARD_DIVERSITY_CHECK', '0'
+            ).lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.enable_reward_diversity_check = False
+        try:
+            import os as _os
+            self.reward_diversity_check_interval = max(
+                1, int(_os.getenv('REWARD_DIVERSITY_CHECK_INTERVAL', '1'))
+            )
+        except Exception:
+            self.reward_diversity_check_interval = 1
+        self._last_diversity_checked_episode = None
         
         # 高度奖励可配置开关与范围（支持kwargs与环境变量）
         try:
@@ -225,6 +472,415 @@ class VectorizedRewardCalculator:
             self.height_reward_enabled = True
             self.height_ideal_min = np.float32(2.0)
             self.height_ideal_max = np.float32(5.0)
+
+        self._timing_detail_enabled_cache = None
+        self._last_reward_timing = None
+        self._terrain_search_directions = np.array([
+            [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+            [0.707, 0.707], [-0.707, 0.707], [0.707, -0.707], [-0.707, -0.707],
+            [0.923, 0.383], [-0.923, 0.383], [0.923, -0.383], [-0.923, -0.383],
+            [0.383, 0.923], [-0.383, 0.923], [0.383, -0.923], [-0.383, -0.923],
+        ], dtype=np.float32)
+        self._terrain_search_radii = np.array([2.0, 5.0, 10.0, 20.0, 30.0, 50.0], dtype=np.float32)
+        terrain_sample_offsets = (
+            self._terrain_search_directions[:, None, :] * self._terrain_search_radii[None, :, None]
+        ).astype(np.float32)
+        self._terrain_sample_offsets_flat = terrain_sample_offsets.reshape(-1, 2)
+        self._terrain_sample_offset_sq_flat = np.sum(
+            self._terrain_sample_offsets_flat * self._terrain_sample_offsets_flat,
+            axis=1,
+            dtype=np.float32,
+        ).astype(np.float32)
+
+    @staticmethod
+    def _normalize_reward_profile_name(raw_profile):
+        try:
+            profile = str(raw_profile).strip().lower()
+        except Exception:
+            profile = 'fixed_route'
+        if profile == 'obstacle_route':
+            return 'obstacle_route'
+        return 'fixed_route'
+
+    def _is_obstacle_reward_route(self) -> bool:
+        return getattr(self, 'reward_profile', 'fixed_route') == 'obstacle_route'
+
+    def _attenuate_distance_reward_near_goal(
+        self,
+        base_rewards: np.ndarray,
+        current_dist: np.ndarray,
+    ) -> np.ndarray:
+        """处理成功圈外近目标区域的 distance 状态奖励，减少“停在目标外刷分”局部最优。"""
+        adjusted = np.asarray(base_rewards, dtype=np.float32).copy()
+        try:
+            radius = float(self.distance_reward_near_goal_radius)
+            floor_factor = float(self.distance_reward_near_goal_factor)
+            success_thr = float(self.success_distance_threshold)
+            if radius <= success_thr or floor_factor >= 1.0:
+                return adjusted
+
+            near_mask = (
+                (current_dist > success_thr) &
+                (current_dist < radius) &
+                (adjusted > 0.0)
+            )
+            if not np.any(near_mask):
+                return adjusted
+
+            if bool(getattr(self, 'distance_reward_progress_only_near_goal', False)):
+                adjusted[near_mask] = 0.0
+                return adjusted
+
+            span = max(radius - success_thr, 1e-6)
+            ramp = (current_dist[near_mask] - success_thr) / span
+            ramp = np.clip(ramp, 0.0, 1.0)
+            scale = floor_factor + (1.0 - floor_factor) * ramp
+            adjusted[near_mask] = adjusted[near_mask] * scale.astype(np.float32)
+            return adjusted
+        except Exception:
+            return adjusted
+
+    def _parse_goal_ring_schedule(self, schedule_text: str) -> Tuple[np.ndarray, np.ndarray]:
+        """解析阶段性 goal ring 奖励配置，格式为 '半径:奖励,半径:奖励,...'。"""
+        radii = []
+        bonuses = []
+        try:
+            success_thr = float(getattr(self, 'success_distance_threshold', 2.0))
+            for chunk in str(schedule_text or '').split(','):
+                item = chunk.strip()
+                if not item or ':' not in item:
+                    continue
+                radius_text, bonus_text = item.split(':', 1)
+                radius = float(radius_text.strip())
+                bonus = float(bonus_text.strip())
+                if radius <= success_thr or bonus <= 0.0:
+                    continue
+                radii.append(radius)
+                bonuses.append(bonus)
+        except Exception:
+            radii = []
+            bonuses = []
+
+        if not radii:
+            return (
+                np.zeros(0, dtype=np.float32),
+                np.zeros(0, dtype=np.float32),
+            )
+
+        order = np.argsort(np.asarray(radii, dtype=np.float32))
+        return (
+            np.asarray(radii, dtype=np.float32)[order],
+            np.asarray(bonuses, dtype=np.float32)[order],
+        )
+
+    def _goal_ring_bonus_vectorized(
+        self,
+        agent: Any,
+        distances: np.ndarray,
+        success_state: Dict[str, Any],
+    ) -> np.ndarray:
+        """一次性阶段奖励：首次进入若干目标半径时发放小额 bonus。"""
+        rewards = np.zeros(len(distances), dtype=np.float32)
+        try:
+            if self.goal_ring_radii.size == 0 or self.goal_ring_bonus_values.size == 0:
+                return rewards
+
+            ring_state = success_state.get('goal_ring_rewards_given')
+            if not isinstance(ring_state, list) or len(ring_state) != int(self.goal_ring_radii.size):
+                ring_state = [False] * int(self.goal_ring_radii.size)
+
+            for idx, (radius, bonus) in enumerate(zip(self.goal_ring_radii, self.goal_ring_bonus_values)):
+                if ring_state[idx]:
+                    continue
+                ring_mask = distances <= float(radius)
+                if np.any(ring_mask):
+                    rewards[ring_mask] += float(bonus)
+                    ring_state[idx] = True
+
+            success_state['goal_ring_rewards_given'] = ring_state
+            return rewards
+        except Exception:
+            return rewards
+
+    def _merge_progress_rewards(
+        self,
+        distance_reward: np.ndarray,
+        approach_reward: np.ndarray,
+        distance_weight: float = None,
+        approach_weight: float = None,
+    ) -> np.ndarray:
+        """
+        将 distance(状态锚点) 与 approach(步进结果) 合并成单一 progress 通道。
+
+        设计目标：
+        - 保留 distance 的“全局接近度”锚点；
+        - 保留 approach 的“本步真实推进”梯度；
+        - 避免两个通道并列时对“接近目标”重复计分。
+        """
+        distance_reward = np.asarray(distance_reward, dtype=np.float32)
+        approach_reward = np.asarray(approach_reward, dtype=np.float32)
+
+        if distance_weight is None:
+            distance_weight = float(self.reward_weights[0]) if len(self.reward_weights) > 0 else 1.0
+        if approach_weight is None:
+            approach_weight = float(self.reward_weights[6]) if len(self.reward_weights) > 6 else 1.0
+
+        total_weight = abs(float(distance_weight)) + abs(float(approach_weight))
+        if total_weight < 1e-6:
+            return np.zeros_like(distance_reward, dtype=np.float32)
+
+        merged = (
+            float(distance_weight) * distance_reward +
+            float(approach_weight) * approach_reward
+        ) / total_weight
+        return merged.astype(np.float32)
+
+    def _relax_approach_for_obstacle_route(
+        self,
+        approach_reward: np.ndarray,
+        geometry_context: Dict[str, Any],
+    ) -> np.ndarray:
+        """
+        第二阶段（随机障碍路线）的最简 progress 调整：
+        仅在靠近随机障碍时放宽负 approach，正 approach 保持不变，不新增调参项。
+        """
+        adjusted = np.asarray(approach_reward, dtype=np.float32).copy()
+        if not self._is_obstacle_reward_route():
+            return adjusted
+        if geometry_context is None or not isinstance(geometry_context, dict):
+            return adjusted
+
+        try:
+            obstacle_min_dist = np.asarray(geometry_context['obstacle_min_dist'], dtype=np.float32)
+            if obstacle_min_dist.shape != adjusted.shape:
+                return adjusted
+            activation_distance = max(float(getattr(self, 'lateral_activation_distance', 15.0)), 1e-6)
+            relax = np.clip(obstacle_min_dist / activation_distance, 0.0, 1.0).astype(np.float32)
+            negative_mask = adjusted < 0.0
+            if np.any(negative_mask):
+                adjusted[negative_mask] = adjusted[negative_mask] * relax[negative_mask]
+            return adjusted
+        except Exception:
+            return adjusted
+
+    def _team_sync_reward_vectorized(
+        self,
+        agents: List[Any],
+        world: Any,
+        scenario: Any,
+        positions: np.ndarray,
+        goal_positions: np.ndarray,
+        valid_goal_mask: np.ndarray,
+    ) -> np.ndarray:
+        """
+        团队同步过程奖励（dense）：
+        - 所有阶段统一：occupancy/waiting 按 Succ_i（Reach_i ∧ Safe_i）
+        - bottleneck progress：统一看未成功体
+
+        该项不改严格 TeamSuccess 定义，只补“过程梯度”。
+        """
+        rewards = np.zeros(len(agents), dtype=np.float32)
+        if not getattr(self, 'team_sync_enabled', True):
+            return rewards
+        if world is None or len(agents) == 0:
+            return rewards
+
+        try:
+            cur_step = int(getattr(world, 'current_step', -1))
+        except Exception:
+            cur_step = -1
+
+        cache = getattr(world, '_team_sync_step_cache', None)
+        if cache is not None and cache[0] == cur_step:
+            cached_rewards = np.asarray(cache[1], dtype=np.float32)
+            if cached_rewards.shape == rewards.shape:
+                return cached_rewards.copy()
+
+        state = getattr(world, '_team_sync_state', None)
+        is_new_episode = False
+        if state is None or not isinstance(state, dict):
+            state = {}
+            is_new_episode = True
+        else:
+            last_step = state.get('last_step', None)
+            if last_step is None:
+                is_new_episode = True
+            elif cur_step >= 0 and last_step is not None and cur_step < int(last_step):
+                is_new_episode = True
+            elif cur_step == 0 and last_step is not None and int(last_step) != 0:
+                is_new_episode = True
+
+        n_agents = max(len(agents), 1)
+        current_dists = np.full((len(agents),), np.inf, dtype=np.float32)
+        if goal_positions is not None and len(goal_positions) == len(agents):
+            valid_idx = np.where(valid_goal_mask)[0]
+            if valid_idx.size > 0:
+                current_dists[valid_idx] = np.linalg.norm(
+                    positions[valid_idx] - goal_positions[valid_idx], axis=-1
+                ).astype(np.float32)
+
+        safe_flags = np.array([bool(self._agent_safe_so_far(ag)) for ag in agents], dtype=bool)
+        reach_mask = np.isfinite(current_dists) & (current_dists <= float(self.success_distance_threshold))
+        succ_mask = reach_mask & safe_flags
+        progress_mask = succ_mask
+
+        occupancy_ratio = float(np.count_nonzero(progress_mask)) / float(n_agents)
+        incomplete_mask = np.isfinite(current_dists) & (~progress_mask)
+        if np.any(incomplete_mask):
+            bottleneck_dist = float(np.max(current_dists[incomplete_mask]))
+        else:
+            bottleneck_dist = 0.0
+
+        if is_new_episode:
+            state['last_bottleneck_dist'] = bottleneck_dist
+        last_bottleneck_dist = float(state.get('last_bottleneck_dist', bottleneck_dist))
+        bottleneck_delta = max(0.0, last_bottleneck_dist - bottleneck_dist)
+        bottleneck_delta = min(bottleneck_delta, float(self.team_bottleneck_delta_clip))
+
+        speeds = np.zeros((len(agents),), dtype=np.float32)
+        for idx, ag in enumerate(agents):
+            try:
+                speeds[idx] = float(np.linalg.norm(getattr(getattr(ag, 'state', None), 'p_vel', np.zeros(3))))
+            except Exception:
+                speeds[idx] = 0.0
+
+        all_progress = bool(np.all(progress_mask)) if len(progress_mask) > 0 else False
+        waiting_mask = progress_mask & (speeds <= float(self.team_waiting_speed_threshold)) & (~all_progress)
+        waiting_ratio = float(np.count_nonzero(waiting_mask)) / float(n_agents)
+
+        reward_scalar = (
+            float(self.team_goal_occupancy_scale) * occupancy_ratio +
+            float(self.team_bottleneck_progress_scale) * bottleneck_delta +
+            float(self.team_waiting_scale) * waiting_ratio
+        )
+
+        state['last_bottleneck_dist'] = bottleneck_dist
+        state['last_step'] = cur_step
+        world._team_sync_state = state
+
+        rewards.fill(np.float32(reward_scalar))
+        world._team_sync_step_cache = (cur_step, rewards.copy())
+        world._team_sync_reward = float(reward_scalar)
+        world._team_sync_occupancy_ratio = float(occupancy_ratio)
+        world._team_sync_bottleneck_dist = float(bottleneck_dist)
+        world._team_sync_bottleneck_delta = float(bottleneck_delta)
+        world._team_sync_waiting_ratio = float(waiting_ratio)
+        world._team_sync_occupancy_basis = 'succ'
+
+        for ag in agents:
+            try:
+                if not hasattr(ag, 'debug_info') or not isinstance(ag.debug_info, dict):
+                    ag.debug_info = {}
+                ag.debug_info['team_sync_reward'] = float(reward_scalar)
+                ag.debug_info['team_sync_occupancy_ratio'] = float(occupancy_ratio)
+                ag.debug_info['team_sync_bottleneck_dist'] = float(bottleneck_dist)
+                ag.debug_info['team_sync_bottleneck_delta'] = float(bottleneck_delta)
+                ag.debug_info['team_sync_waiting_ratio'] = float(waiting_ratio)
+                ag.debug_info['team_sync_occupancy_basis'] = 'succ'
+            except Exception:
+                pass
+        return rewards
+
+    def _is_episode_finished(self, world: Any) -> bool:
+        """判断当前回合是否结束，用于仅在终局结算的奖励/惩罚。"""
+        try:
+            if world is None:
+                return False
+
+            if bool(getattr(world, '_episode_success', False)):
+                return True
+
+            episode_length = None
+            if hasattr(world, 'episode_length') and world.episode_length is not None:
+                episode_length = int(world.episode_length)
+            elif hasattr(world, 'max_steps') and world.max_steps is not None:
+                episode_length = int(world.max_steps)
+            else:
+                episode_length = int(os.getenv('EPISODE_LENGTH', '2800'))
+
+            cur_step = int(getattr(world, 'current_step', -1))
+            return bool(episode_length is not None and episode_length > 0 and cur_step >= episode_length)
+        except Exception:
+            return False
+
+    def _agent_reached_goal_ever(self, agent: Any, current_dist: float) -> bool:
+        """与成功统计保持一致：当前进入成功圈，或本回合曾经进入过成功圈。"""
+        try:
+            if current_dist <= float(self.success_distance_threshold):
+                return True
+            if bool(getattr(agent, '_ever_reached_goal', False)):
+                return True
+            if hasattr(agent, '_success_state') and isinstance(agent._success_state, dict):
+                if bool(agent._success_state.get('success_reward_given', False)):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _terminal_failure_penalty_batch(
+        self,
+        agents: List[Any],
+        positions: np.ndarray,
+        goal_positions: np.ndarray,
+        valid_goal_mask: np.ndarray,
+        start_positions: np.ndarray,
+        world: Any,
+    ) -> np.ndarray:
+        """回合结束时，对从未成功进入目标圈的智能体按剩余距离施加终局惩罚。"""
+        num_positions = positions.shape[0]
+        penalties = np.zeros(num_positions, dtype=np.float32)
+        try:
+            if not self._is_episode_finished(world):
+                return penalties
+
+            base_penalty = max(float(self.terminal_failure_penalty_base), 0.0)
+            per_meter = max(float(self.terminal_failure_penalty_per_meter), 0.0)
+            max_penalty = max(float(self.terminal_failure_penalty_max), 0.0)
+            success_thr = float(self.success_distance_threshold)
+            if max_penalty <= 0.0 or (base_penalty <= 0.0 and per_meter <= 0.0):
+                return penalties
+
+            for idx, agent in enumerate(agents):
+                if not valid_goal_mask[idx]:
+                    continue
+
+                current_dist = float(np.linalg.norm(positions[idx] - goal_positions[idx]))
+                if self._agent_reached_goal_ever(agent, current_dist):
+                    continue
+
+                excess_dist = max(current_dist - success_thr, 0.0)
+                initial_dist = float(np.linalg.norm(start_positions[idx] - goal_positions[idx]))
+                denom = max(initial_dist, success_thr, 1e-6)
+                remaining_ratio = np.clip(excess_dist / denom, 0.0, 1.0)
+
+                raw_penalty = base_penalty + per_meter * remaining_ratio
+                penalties[idx] = -min(max_penalty, raw_penalty)
+        except Exception:
+            return np.zeros(num_positions, dtype=np.float32)
+        return penalties
+
+    def _reward_timing_enabled(self) -> bool:
+        cached = self._timing_detail_enabled_cache
+        if cached is None:
+            try:
+                level = int(os.getenv('TIMING_LEVEL', '1'))
+            except Exception:
+                level = 1
+            try:
+                detail_flag = os.getenv('TIMING_DETAIL', '0').lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                detail_flag = False
+            cached = bool(level >= 2 or detail_flag)
+            self._timing_detail_enabled_cache = cached
+        return bool(cached)
+
+    def _new_reward_timing_bucket(self) -> Dict[str, float]:
+        return {key: 0.0 for key in self.REWARD_TIMING_KEYS}
+
+    def get_last_reward_timing(self) -> Dict[str, float]:
+        if isinstance(self._last_reward_timing, dict):
+            return dict(self._last_reward_timing)
+        return {}
     
     def update_collision_parameters(self, collision_weight: float, collision_penalty_value: float = None):
         """动态更新碰撞权重与惩罚。"""
@@ -238,6 +894,795 @@ class VectorizedRewardCalculator:
                 self.terrain_penalty_value = np.float32(collision_penalty_value)
             except Exception:
                 pass
+
+    def _piecewise_collision_penalty(self, signed_distances: np.ndarray, threshold: float, base_penalty: float = None) -> np.ndarray:
+        """真实碰撞带内的分段线性惩罚。
+
+        - d >= threshold: 0
+        - 0 <= d < threshold: 从 0 线性下降到 -base_penalty
+        - d < 0: 在 -base_penalty 的基础上继续按穿透深度增加惩罚
+        """
+        distances = np.asarray(signed_distances, dtype=np.float32)
+        safe_threshold = max(float(threshold), 1e-6)
+        base = float(self.collision_penalty_value if base_penalty is None else base_penalty)
+
+        distances = np.nan_to_num(distances, nan=safe_threshold, posinf=safe_threshold, neginf=-safe_threshold)
+        band_ratio = np.clip((safe_threshold - distances) / safe_threshold, 0.0, 1.0).astype(np.float32)
+        penetration_depth = np.maximum(-distances, 0.0).astype(np.float32)
+
+        penalties = -np.float32(base) * band_ratio - penetration_depth * float(self.penetration_alpha)
+        penalties = np.where(distances >= safe_threshold, 0.0, penalties)
+        return penalties.astype(np.float32)
+
+    def _get_agent_velocity_array(self, agent: Any, num_positions: int) -> np.ndarray:
+        """将智能体当前速度转换为与 positions 对齐的二维数组。"""
+        velocities = np.zeros((num_positions, 3), dtype=np.float32)
+        try:
+            raw_vel = getattr(getattr(agent, 'state', None), 'p_vel', None)
+            if raw_vel is None:
+                return velocities
+
+            vel_arr = np.asarray(raw_vel, dtype=np.float32)
+            if vel_arr.ndim == 0:
+                return velocities
+            if vel_arr.ndim == 1:
+                if vel_arr.shape[0] >= 3:
+                    velocities[:] = vel_arr[:3]
+                return velocities
+
+            flat_vel = vel_arr.reshape(-1, vel_arr.shape[-1])
+            if flat_vel.shape[1] < 3:
+                return velocities
+            if flat_vel.shape[0] == num_positions:
+                velocities = flat_vel[:, :3].astype(np.float32)
+            else:
+                velocities[:] = flat_vel[0, :3]
+        except Exception:
+            pass
+        return velocities
+
+    def _query_terrain_heights_batch(
+        self,
+        scenario: Any,
+        cached_data: Dict[str, Any],
+        positions: np.ndarray,
+        out: np.ndarray = None,
+    ) -> np.ndarray:
+        """批量查询地形高度，优先使用缓存地形和向量化接口。"""
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        query_xy = np.asarray(positions[:, :2], dtype=np.float32)
+        if out is not None and isinstance(out, np.ndarray) and out.shape[0] >= query_xy.shape[0]:
+            heights = out[:query_xy.shape[0]]
+            heights.fill(np.nan)
+        else:
+            heights = np.full(query_xy.shape[0], np.nan, dtype=np.float32)
+        if scenario is None or query_xy.shape[0] == 0:
+            return heights
+
+        cached_data = cached_data if isinstance(cached_data, dict) else {}
+        cached_terrain = cached_data.get('terrain')
+        cached_map_size = int(cached_data.get('map_size', getattr(scenario, 'map_size', 200)))
+
+        try:
+            if cached_terrain is not None:
+                _bilinear_interpolate_terrain_xy(
+                    cached_terrain,
+                    query_xy[:, 0],
+                    query_xy[:, 1],
+                    heights,
+                    cached_map_size,
+                )
+                if np.all(np.isfinite(heights)):
+                    return heights
+
+            if hasattr(scenario, 'get_terrain_height_vectorized'):
+                sampled = scenario.get_terrain_height_vectorized(query_xy[:, 0], query_xy[:, 1])
+                sampled = np.asarray(sampled, dtype=np.float32)
+                if sampled.ndim == 0:
+                    heights[:] = np.float32(sampled)
+                    return heights
+                if sampled.shape[0] == query_xy.shape[0]:
+                    return sampled
+
+            if hasattr(scenario, 'get_terrain_height'):
+                for idx, xy in enumerate(query_xy):
+                    try:
+                        heights[idx] = scenario.get_terrain_height(float(xy[0]), float(xy[1]))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return heights
+
+    def _get_terrain_distance_scratch(self, num_positions: int) -> Dict[str, np.ndarray]:
+        """获取 terrain distance 计算用的预分配 scratch buffer。"""
+        sample_count = int(self._terrain_sample_offsets_flat.shape[0])
+        key = (int(num_positions), sample_count)
+        scratch = self._terrain_distance_scratch.get(key)
+        total_samples = int(num_positions) * sample_count
+        merged_count = int(num_positions) + total_samples
+        if scratch is None:
+            scratch = {
+                'sample_xys_flat': np.zeros((total_samples, 2), dtype=np.float32),
+                'valid_map_mask': np.zeros(total_samples, dtype=bool),
+                'sample_heights_flat': np.full(total_samples, np.nan, dtype=np.float32),
+                'merged_queries': np.zeros((merged_count, 2), dtype=np.float32),
+                'merged_heights': np.full(merged_count, np.nan, dtype=np.float32),
+            }
+            self._terrain_distance_scratch[key] = scratch
+        return scratch
+
+    def _compute_obstacle_distance_data(
+        self,
+        positions: np.ndarray,
+        cached_data: Dict[str, Any] = None,
+        world: Any = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """批量计算到最近障碍物表面的距离与参考点。"""
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        positions = np.asarray(positions[:, :3], dtype=np.float32)
+        num_positions = positions.shape[0]
+
+        obstacle_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
+        nearest_obstacle_centers = np.zeros((num_positions, 3), dtype=np.float32)
+        nearest_obstacle_radii = np.zeros(num_positions, dtype=np.float32)
+
+        cached_data = cached_data if isinstance(cached_data, dict) else {}
+        obstacles_centers = cached_data.get('obstacles_centers')
+        obstacles_radii = cached_data.get('obstacles_radii')
+
+        if obstacles_centers is not None and obstacles_radii is not None:
+            try:
+                centers = np.asarray(obstacles_centers, dtype=np.float32)
+                radii = np.asarray(obstacles_radii, dtype=np.float32)
+                if (
+                    centers.ndim == 2
+                    and centers.shape[0] > 0
+                    and centers.shape[1] >= 3
+                    and radii.ndim == 1
+                    and radii.shape[0] == centers.shape[0]
+                ):
+                    diff = positions[:, None, :] - centers[None, :, :3]
+                    center_dist = np.linalg.norm(diff, axis=-1)
+                    surface_dist = center_dist - radii[None, :]
+                    nearest_indices = np.argmin(surface_dist, axis=1)
+                    obstacle_min_dist = surface_dist[np.arange(num_positions), nearest_indices].astype(np.float32)
+                    nearest_obstacle_centers = centers[nearest_indices, :3].astype(np.float32)
+                    nearest_obstacle_radii = radii[nearest_indices].astype(np.float32)
+                    return obstacle_min_dist, nearest_obstacle_centers, nearest_obstacle_radii
+            except Exception:
+                obstacle_min_dist.fill(np.inf)
+
+        scenario = getattr(world, 'scenario', None)
+        if bool(hasattr(scenario, 'obstacles') and scenario.obstacles):
+            for obstacle_data in scenario.obstacles:
+                if 'center' not in obstacle_data or 'radius' not in obstacle_data:
+                    continue
+                obstacle_center = np.asarray(obstacle_data['center'][:3], dtype=np.float32)
+                obstacle_radius = float(obstacle_data['radius'])
+                dist_3d = np.linalg.norm(positions - obstacle_center, axis=-1)
+                dist_to_surface = dist_3d - obstacle_radius
+                update_mask = dist_to_surface < obstacle_min_dist
+                if np.any(update_mask):
+                    nearest_obstacle_centers[update_mask] = obstacle_center
+                    nearest_obstacle_radii[update_mask] = obstacle_radius
+                    obstacle_min_dist[update_mask] = dist_to_surface[update_mask]
+
+        return obstacle_min_dist, nearest_obstacle_centers, nearest_obstacle_radii
+
+    def _compute_terrain_distance_data(
+        self,
+        positions: np.ndarray,
+        scenario: Any,
+        cached_data: Dict[str, Any] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """计算当前位置对应的地形高度、地形最小距离和参考点。"""
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        positions = np.asarray(positions[:, :3], dtype=np.float32)
+        num_positions = positions.shape[0]
+
+        terrain_heights_current = np.full(num_positions, np.nan, dtype=np.float32)
+        terrain_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
+        terrain_reference_points = positions.copy()
+
+        if num_positions == 0 or scenario is None or not hasattr(scenario, 'get_terrain_height'):
+            return terrain_heights_current, terrain_min_dist, terrain_reference_points
+
+        cached_data = cached_data if isinstance(cached_data, dict) else {}
+        cached_map_size = int(cached_data.get('map_size', getattr(scenario, 'map_size', 200.0)))
+
+        try:
+            map_size = float(getattr(scenario, 'map_size', cached_map_size if cached_map_size > 0 else 200.0))
+            sample_offsets_flat = self._terrain_sample_offsets_flat
+            offset_sq_flat = self._terrain_sample_offset_sq_flat
+            num_samples = int(sample_offsets_flat.shape[0])
+            cached_terrain = cached_data.get('terrain')
+            scratch = self._get_terrain_distance_scratch(num_positions)
+            sample_xys_flat = scratch['sample_xys_flat']
+            sample_xys = sample_xys_flat.reshape(num_positions, num_samples, 2)
+            np.add(positions[:, None, :2], sample_offsets_flat[None, :, :], out=sample_xys)
+            valid_map_mask = scratch['valid_map_mask']
+            valid_map_mask[:] = (
+                (sample_xys_flat[:, 0] >= 0.0) & (sample_xys_flat[:, 0] < map_size) &
+                (sample_xys_flat[:, 1] >= 0.0) & (sample_xys_flat[:, 1] < map_size)
+            )
+
+            sample_heights_flat = scratch['sample_heights_flat']
+            sample_heights_flat.fill(np.nan)
+            if isinstance(cached_terrain, np.ndarray) and cached_terrain.size > 0:
+                _bilinear_interpolate_terrain_xy(
+                    cached_terrain,
+                    positions[:, 0],
+                    positions[:, 1],
+                    terrain_heights_current,
+                    cached_map_size,
+                )
+                _bilinear_interpolate_terrain_xy(
+                    cached_terrain,
+                    sample_xys_flat[:, 0],
+                    sample_xys_flat[:, 1],
+                    sample_heights_flat,
+                    cached_map_size,
+                )
+                sample_heights_flat[~valid_map_mask] = np.nan
+            else:
+                merged_queries = scratch['merged_queries']
+                merged_queries[:num_positions] = positions[:, :2]
+                merged_count = num_positions
+                if np.any(valid_map_mask):
+                    valid_sample_xys = sample_xys_flat[valid_map_mask]
+                    valid_count = valid_sample_xys.shape[0]
+                    merged_queries[num_positions:num_positions + valid_count] = valid_sample_xys
+                    merged_count += valid_count
+
+                merged_heights = self._query_terrain_heights_batch(
+                    scenario,
+                    cached_data,
+                    merged_queries[:merged_count],
+                    out=scratch['merged_heights'],
+                )
+                terrain_heights_current = np.asarray(merged_heights[:num_positions], dtype=np.float32).copy()
+                if merged_count > num_positions:
+                    sample_heights_flat[valid_map_mask] = merged_heights[num_positions:merged_count]
+
+            valid_current_terrain = np.isfinite(terrain_heights_current)
+            if np.any(valid_current_terrain):
+                terrain_min_dist[valid_current_terrain] = (
+                    positions[valid_current_terrain, 2] - terrain_heights_current[valid_current_terrain]
+                ).astype(np.float32)
+                terrain_reference_points[valid_current_terrain, 0] = positions[valid_current_terrain, 0]
+                terrain_reference_points[valid_current_terrain, 1] = positions[valid_current_terrain, 1]
+                terrain_reference_points[valid_current_terrain, 2] = terrain_heights_current[valid_current_terrain]
+
+            sample_heights = sample_heights_flat.reshape(num_positions, num_samples)
+            delta_heights = sample_heights - positions[:, None, 2]
+            sample_distances = np.sqrt(offset_sq_flat[None, :] + delta_heights * delta_heights).astype(
+                np.float32,
+                copy=False,
+            )
+            sample_distances[~np.isfinite(sample_heights)] = np.inf
+
+            nearest_sample_idx = np.argmin(sample_distances, axis=1)
+            nearest_sample_dist = sample_distances[np.arange(num_positions), nearest_sample_idx]
+            nearest_sample_points = np.zeros((num_positions, 3), dtype=np.float32)
+            nearest_sample_points[:, :2] = sample_xys[np.arange(num_positions), nearest_sample_idx]
+            nearest_sample_points[:, 2] = sample_heights[np.arange(num_positions), nearest_sample_idx]
+
+            use_sample_mask = np.isfinite(nearest_sample_dist) & (nearest_sample_dist < terrain_min_dist)
+            terrain_min_dist = np.where(
+                use_sample_mask,
+                nearest_sample_dist.astype(np.float32),
+                terrain_min_dist,
+            )
+            terrain_reference_points[use_sample_mask] = nearest_sample_points[use_sample_mask].astype(np.float32)
+        except Exception:
+            pass
+
+        return terrain_heights_current, terrain_min_dist.astype(np.float32), terrain_reference_points.astype(np.float32)
+
+    def _build_reward_geometry_context(
+        self,
+        positions: np.ndarray,
+        world: Any,
+        scenario: Any,
+        cached_data: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        """构建同一步共享的几何上下文，供 clearance/collision 复用。"""
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        positions = np.asarray(positions[:, :3], dtype=np.float32)
+
+        obstacle_min_dist, nearest_obstacle_centers, nearest_obstacle_radii = self._compute_obstacle_distance_data(
+            positions,
+            cached_data=cached_data,
+            world=world,
+        )
+        terrain_heights_current, terrain_min_dist, terrain_reference_points = self._compute_terrain_distance_data(
+            positions,
+            scenario,
+            cached_data=cached_data,
+        )
+
+        return {
+            'num_positions': int(positions.shape[0]),
+            'obstacle_min_dist': obstacle_min_dist.astype(np.float32, copy=False),
+            'nearest_obstacle_centers': nearest_obstacle_centers.astype(np.float32, copy=False),
+            'nearest_obstacle_radii': nearest_obstacle_radii.astype(np.float32, copy=False),
+            'terrain_heights_current': terrain_heights_current.astype(np.float32, copy=False),
+            'terrain_min_dist': terrain_min_dist.astype(np.float32, copy=False),
+            'terrain_reference_points': terrain_reference_points.astype(np.float32, copy=False),
+        }
+
+    def _batch_clearance_reward_vectorized(
+        self,
+        agents: List[Any],
+        world: Any,
+        positions: np.ndarray,
+        cached_data: Dict[str, Any] = None,
+        geometry_context: Dict[str, Any] = None,
+    ) -> np.ndarray:
+        """按当前 world 的所有智能体批量计算净空奖励。"""
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        positions = np.asarray(positions[:, :3], dtype=np.float32)
+        num_positions = positions.shape[0]
+        if num_positions == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        if len(agents) != num_positions:
+            rewards = np.zeros(num_positions, dtype=np.float32)
+            for idx in range(min(len(agents), num_positions)):
+                single = self._clearance_reward_vectorized(agents[idx], world, positions[idx:idx + 1])
+                rewards[idx] = single[0] if isinstance(single, np.ndarray) else float(single)
+            return rewards
+
+        safe_distance = max(float(os.getenv('OBSTACLE_SAFE_DISTANCE', '15.0')), 1e-6)
+        collision_threshold = max(float(self.collision_distance_threshold), 1e-6)
+        warning_span = max(safe_distance - collision_threshold, 1e-6)
+        penalty_weight = float(os.getenv('CLEARANCE_PENALTY_WEIGHT', '5.0'))
+        clearance_weight = float(os.getenv('CLEARANCE_WEIGHT', '3.5'))
+        clearance_d_max = max(float(os.getenv('CLEARANCE_D_MAX', '80.0')), 1e-6)
+        trend_penalty_factor = float(os.getenv('CLEARANCE_APPROACH_PENALTY_FACTOR', '2.0'))
+        velocity_weight = float(os.getenv('CLEARANCE_VELOCITY_WEIGHT', '0.5'))
+        speed_scale = max(float(os.getenv('CLEARANCE_SPEED_SCALE', '5.0')), 1e-6)
+        trend_eps = float(os.getenv('CLEARANCE_TREND_EPS', '1e-6'))
+        speed_eps = float(os.getenv('CLEARANCE_SPEED_EPS', '1e-4'))
+        far_distance_fill = safe_distance + clearance_d_max
+
+        scenario = getattr(world, 'scenario', None)
+        cached_data = cached_data if isinstance(cached_data, dict) else {}
+        geometry_ready = False
+        if isinstance(geometry_context, dict):
+            try:
+                obstacle_min_dist = np.asarray(geometry_context['obstacle_min_dist'], dtype=np.float32)
+                nearest_obstacle_centers = np.asarray(geometry_context['nearest_obstacle_centers'], dtype=np.float32)
+                nearest_obstacle_radii = np.asarray(geometry_context['nearest_obstacle_radii'], dtype=np.float32)
+                terrain_warning_dist = np.asarray(geometry_context['terrain_min_dist'], dtype=np.float32)
+                terrain_reference_points = np.asarray(geometry_context['terrain_reference_points'], dtype=np.float32)
+                terrain_heights_current = np.asarray(geometry_context['terrain_heights_current'], dtype=np.float32)
+                geometry_ready = (
+                    int(geometry_context.get('num_positions', -1)) == num_positions
+                    and obstacle_min_dist.shape == (num_positions,)
+                    and nearest_obstacle_centers.shape == (num_positions, 3)
+                    and nearest_obstacle_radii.shape == (num_positions,)
+                    and terrain_warning_dist.shape == (num_positions,)
+                    and terrain_reference_points.shape == (num_positions, 3)
+                    and terrain_heights_current.shape == (num_positions,)
+                )
+            except Exception:
+                geometry_ready = False
+
+        if not geometry_ready:
+            obstacle_min_dist, nearest_obstacle_centers, nearest_obstacle_radii = self._compute_obstacle_distance_data(
+                positions,
+                cached_data=cached_data,
+                world=world,
+            )
+            terrain_heights_current, terrain_warning_dist, terrain_reference_points = self._compute_terrain_distance_data(
+                positions,
+                scenario,
+                cached_data=cached_data,
+            )
+
+        obstacle_reference_points = positions.copy()
+        obstacle_vector = positions - nearest_obstacle_centers
+        obstacle_norm = np.linalg.norm(obstacle_vector, axis=1, keepdims=True)
+        default_dirs = np.zeros_like(obstacle_vector)
+        default_dirs[:, 2] = 1.0
+        obstacle_dirs = np.where(obstacle_norm > 1e-6, obstacle_vector / np.maximum(obstacle_norm, 1e-6), default_dirs)
+        valid_obstacle_mask = np.isfinite(obstacle_min_dist)
+        if np.any(valid_obstacle_mask):
+            obstacle_reference_points[valid_obstacle_mask] = (
+                nearest_obstacle_centers[valid_obstacle_mask]
+                + obstacle_dirs[valid_obstacle_mask] * nearest_obstacle_radii[valid_obstacle_mask, None]
+            )
+
+        d_min_current = np.minimum(obstacle_min_dist, terrain_warning_dist).astype(np.float32)
+        use_terrain_reference = terrain_warning_dist <= obstacle_min_dist
+        reference_points = np.where(use_terrain_reference[:, None], terrain_reference_points, obstacle_reference_points).astype(np.float32)
+        invalid_reference = ~np.all(np.isfinite(reference_points), axis=1)
+        if np.any(invalid_reference):
+            reference_points[invalid_reference] = positions[invalid_reference]
+
+        goal_positions = np.zeros((num_positions, 3), dtype=np.float32)
+        valid_goal_mask = np.zeros(num_positions, dtype=bool)
+        cached_goal_positions = cached_data.get('goal_positions')
+        fallback_goal = None
+        try:
+            if scenario is not None and hasattr(scenario, 'goal_pos') and scenario.goal_pos is not None:
+                fallback_goal = np.asarray(scenario.goal_pos, dtype=np.float32).reshape(-1)[:3]
+                if fallback_goal.shape[0] < 3:
+                    fallback_goal = None
+        except Exception:
+            fallback_goal = None
+
+        for idx, agent in enumerate(agents):
+            goal_pos = None
+            if cached_goal_positions is not None and idx < len(cached_goal_positions):
+                try:
+                    goal_pos = np.asarray(cached_goal_positions[idx], dtype=np.float32).reshape(-1)[:3]
+                    if goal_pos.shape[0] < 3:
+                        goal_pos = None
+                except Exception:
+                    goal_pos = None
+            if goal_pos is None:
+                try:
+                    if hasattr(agent, 'goal_a') and agent.goal_a is not None:
+                        if hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                            goal_pos = np.asarray(agent.goal_a.state.p_pos, dtype=np.float32).reshape(-1)[:3]
+                            if goal_pos.shape[0] < 3:
+                                goal_pos = None
+                except Exception:
+                    goal_pos = None
+            if goal_pos is None:
+                goal_pos = fallback_goal
+            if goal_pos is not None:
+                goal_positions[idx] = goal_pos
+                valid_goal_mask[idx] = True
+
+        FAR_THRESHOLD = float(os.getenv('CLEARANCE_FAR_THRESHOLD', '50.0'))
+        NEAR_THRESHOLD = float(os.getenv('CLEARANCE_NEAR_THRESHOLD', '20.0'))
+        WEIGHT_FAR = float(os.getenv('CLEARANCE_WEIGHT_FAR', '0.5'))
+        WEIGHT_NEAR = float(os.getenv('CLEARANCE_WEIGHT_NEAR', '12.0'))
+
+        dists_to_goal = np.full(num_positions, 100.0, dtype=np.float32)
+        if np.any(valid_goal_mask):
+            try:
+                dists_to_goal[valid_goal_mask] = np.linalg.norm(
+                    positions[valid_goal_mask] - goal_positions[valid_goal_mask],
+                    axis=-1,
+                ).astype(np.float32)
+            except Exception:
+                pass
+
+        dynamic_weights = np.full(num_positions, WEIGHT_FAR, dtype=np.float32)
+        try:
+            far_mask = dists_to_goal > FAR_THRESHOLD
+            near_mask = dists_to_goal < NEAR_THRESHOLD
+            transition_mask = ~(far_mask | near_mask)
+            dynamic_weights[far_mask] = WEIGHT_FAR
+            dynamic_weights[near_mask] = WEIGHT_NEAR
+            if np.any(transition_mask):
+                ratio = (dists_to_goal[transition_mask] - NEAR_THRESHOLD) / (FAR_THRESHOLD - NEAR_THRESHOLD)
+                dynamic_weights[transition_mask] = WEIGHT_NEAR - ratio * (WEIGHT_NEAR - WEIGHT_FAR)
+        except Exception:
+            dynamic_weights.fill(WEIGHT_FAR)
+
+        d_min_current = np.nan_to_num(
+            d_min_current,
+            nan=far_distance_fill,
+            posinf=far_distance_fill,
+            neginf=-far_distance_fill,
+        )
+
+        d_min_previous = np.full(num_positions, far_distance_fill, dtype=np.float32)
+        velocities = np.zeros((num_positions, 3), dtype=np.float32)
+        for idx, agent in enumerate(agents):
+            try:
+                prev_value = getattr(agent, 'last_min_distance')
+                if isinstance(prev_value, np.ndarray):
+                    if prev_value.size > 0:
+                        prev_scalar = float(prev_value.item() if prev_value.ndim == 0 else prev_value.reshape(-1)[-1])
+                    else:
+                        prev_scalar = far_distance_fill
+                else:
+                    prev_scalar = float(prev_value)
+                if np.isfinite(prev_scalar):
+                    d_min_previous[idx] = prev_scalar
+            except Exception:
+                d_min_previous[idx] = d_min_current[idx]
+
+            try:
+                raw_vel = getattr(getattr(agent, 'state', None), 'p_vel', None)
+                if raw_vel is not None:
+                    vel_arr = np.asarray(raw_vel, dtype=np.float32).reshape(-1)
+                    if vel_arr.shape[0] >= 3:
+                        velocities[idx] = vel_arr[:3]
+            except Exception:
+                pass
+
+        distance_change = d_min_current - d_min_previous
+        normalized_change = np.clip(distance_change / clearance_d_max, -1.0, 1.0)
+
+        hazard_vectors = positions - reference_points
+        hazard_norms = np.linalg.norm(hazard_vectors, axis=1, keepdims=True)
+        hazard_dirs = np.zeros_like(hazard_vectors)
+        valid_hazard_mask = hazard_norms[:, 0] > 1e-6
+        if np.any(valid_hazard_mask):
+            hazard_dirs[valid_hazard_mask] = hazard_vectors[valid_hazard_mask] / hazard_norms[valid_hazard_mask]
+
+        speeds = np.linalg.norm(velocities, axis=1)
+        radial_speed = np.sum(velocities * hazard_dirs, axis=1)
+        motion_signal = np.zeros(num_positions, dtype=np.float32)
+        moving_mask = valid_hazard_mask & (speeds > speed_eps)
+        if np.any(moving_mask):
+            motion_signal[moving_mask] = np.clip(radial_speed[moving_mask] / speed_scale, -1.0, 1.0)
+
+        combined_trend = np.clip(normalized_change + velocity_weight * motion_signal, -1.0, 1.0)
+        trend_reward = np.zeros(num_positions, dtype=np.float32)
+        improving_mask = combined_trend > trend_eps
+        worsening_mask = combined_trend < -trend_eps
+        if np.any(improving_mask):
+            trend_reward[improving_mask] = dynamic_weights[improving_mask] * combined_trend[improving_mask]
+        if np.any(worsening_mask):
+            trend_reward[worsening_mask] = (
+                dynamic_weights[worsening_mask]
+                * combined_trend[worsening_mask]
+                * trend_penalty_factor
+            )
+
+        try:
+            goal_focus_radius = float(self.clearance_penalty_only_near_goal_radius)
+            success_thr = float(self.success_distance_threshold)
+            if goal_focus_radius > success_thr:
+                clearance_goal_focus_mask = (
+                    (dists_to_goal > success_thr) &
+                    (dists_to_goal < goal_focus_radius)
+                )
+                if np.any(clearance_goal_focus_mask):
+                    positive_mask = clearance_goal_focus_mask & (trend_reward > 0.0)
+                    if np.any(positive_mask):
+                        trend_reward[positive_mask] *= float(self.clearance_near_goal_positive_factor)
+        except Exception:
+            pass
+
+        warning_ratio = np.clip((safe_distance - d_min_current) / warning_span, 0.0, 1.0)
+        warning_penalty = -penalty_weight * warning_ratio
+        trend_active_mask = d_min_current >= collision_threshold
+        rewards = warning_penalty + np.where(trend_active_mask, trend_reward, 0.0)
+
+        max_positive = max(clearance_weight, WEIGHT_NEAR)
+        min_negative = penalty_weight + max(clearance_weight, WEIGHT_NEAR) * trend_penalty_factor
+        rewards = np.clip(rewards, -min_negative, max_positive * 2.0)
+        rewards = np.nan_to_num(rewards, nan=0.0, posinf=max_positive * 2.0, neginf=-min_negative).astype(np.float32)
+
+        for idx, agent in enumerate(agents):
+            agent.last_min_distance = float(d_min_current[idx])
+            try:
+                if not hasattr(agent, 'debug_info') or not isinstance(agent.debug_info, dict):
+                    agent.debug_info = {}
+                agent.debug_info['d_min_current'] = float(d_min_current[idx])
+                agent.debug_info['clearance_radial_speed'] = float(radial_speed[idx])
+                agent.debug_info['clearance_motion_signal'] = float(motion_signal[idx])
+                agent.debug_info['clearance_reference'] = 'terrain' if bool(use_terrain_reference[idx]) else 'obstacle'
+                # 维护 episode 级最小安全距离（用于 success-only 质量奖励）
+                try:
+                    if world is not None:
+                        prev_min = getattr(world, '_episode_dmin_min', None)
+                        cur = float(d_min_current[idx])
+                        if prev_min is None or (np.isfinite(cur) and (not np.isfinite(prev_min) or cur < float(prev_min))):
+                            setattr(world, '_episode_dmin_min', cur)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        return rewards
+
+    def _batch_collision_penalty_vectorized(
+        self,
+        agents: List[Any],
+        world: Any,
+        scenario: Any,
+        positions: np.ndarray,
+        cached_data: Dict[str, Any] = None,
+        geometry_context: Dict[str, Any] = None,
+    ) -> np.ndarray:
+        """按当前 world 的所有智能体批量计算碰撞惩罚。"""
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        positions = np.asarray(positions[:, :3], dtype=np.float32)
+        num_positions = positions.shape[0]
+        if num_positions == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        if len(agents) != num_positions or cached_data is None or not self.use_fast_path:
+            penalties = np.zeros(num_positions, dtype=np.float32)
+            for idx in range(min(len(agents), num_positions)):
+                single = self._collision_penalty_vectorized(idx, world, scenario, positions[idx:idx + 1], cached_data)
+                penalties[idx] = single[0] if isinstance(single, np.ndarray) else float(single)
+            return penalties
+
+        penalties = np.zeros(num_positions, dtype=np.float32)
+        cached_data = cached_data if isinstance(cached_data, dict) else {}
+        collision_threshold = float(self.collision_distance_threshold)
+        geometry_ready = False
+        if isinstance(geometry_context, dict):
+            try:
+                obstacle_min_dist = np.asarray(geometry_context['obstacle_min_dist'], dtype=np.float32)
+                terrain_min_dist = np.asarray(geometry_context['terrain_min_dist'], dtype=np.float32)
+                terrain_heights_current = np.asarray(geometry_context['terrain_heights_current'], dtype=np.float32)
+                geometry_ready = (
+                    int(geometry_context.get('num_positions', -1)) == num_positions
+                    and obstacle_min_dist.shape == (num_positions,)
+                    and terrain_min_dist.shape == (num_positions,)
+                    and terrain_heights_current.shape == (num_positions,)
+                )
+            except Exception:
+                geometry_ready = False
+
+        if not geometry_ready:
+            obstacle_min_dist, _, _ = self._compute_obstacle_distance_data(
+                positions,
+                cached_data=cached_data,
+                world=world,
+            )
+            try:
+                terrain_heights_current, terrain_min_dist, _ = self._compute_terrain_distance_data(
+                    positions,
+                    scenario,
+                    cached_data=cached_data,
+                )
+            except Exception:
+                terrain_heights_current = np.full(num_positions, np.nan, dtype=np.float32)
+                terrain_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
+        d_min_current = np.minimum(obstacle_min_dist, terrain_min_dist)
+
+        distance_based_collision_mask = (d_min_current < collision_threshold) | (d_min_current < 0.0)
+        real_distance_collision_mask = d_min_current < 0.0
+        if np.any(distance_based_collision_mask):
+            penalties[distance_based_collision_mask] = self._piecewise_collision_penalty(
+                d_min_current[distance_based_collision_mask],
+                collision_threshold,
+                self.collision_penalty_value,
+            )
+
+        terrain = cached_data.get('terrain')
+        terrain_heights = np.full(num_positions, np.nan, dtype=np.float32)
+        invalid_mask = np.zeros(num_positions, dtype=bool)
+        penetration_mask = np.zeros(num_positions, dtype=bool)
+        contact_penalty_mask = np.zeros(num_positions, dtype=bool)
+        actual_penetration_mask = np.zeros(num_positions, dtype=bool)
+        obs_collision_mask = np.zeros(num_positions, dtype=bool)
+
+        if terrain is not None:
+            terrain_heights = terrain_heights_current.copy() if geometry_ready else self._query_terrain_heights_batch(scenario, cached_data, positions)
+            invalid_mask = ~np.isfinite(terrain_heights)
+
+            if np.any(invalid_mask):
+                penalties[invalid_mask] = np.minimum(
+                    penalties[invalid_mask],
+                    -float(self.terrain_penalty_value),
+                )
+                terrain_heights = terrain_heights.copy()
+                terrain_heights[invalid_mask] = positions[invalid_mask, 2]
+
+            eps = float(self.terrain_collision_eps)
+            penetration_mask = (positions[:, 2] < terrain_heights + eps) & (~distance_based_collision_mask)
+            if np.any(penetration_mask):
+                terrain_signed_clearance = positions[penetration_mask, 2] - terrain_heights[penetration_mask]
+                penalties[penetration_mask] = np.minimum(
+                    penalties[penetration_mask],
+                    self._piecewise_collision_penalty(
+                        terrain_signed_clearance,
+                        eps,
+                        self.terrain_penalty_value,
+                    ),
+                )
+
+            success_thresh = float(getattr(self, 'success_distance_threshold', 2.0))
+            goal_positions = cached_data.get('goal_positions')
+            in_goal_area = np.zeros(num_positions, dtype=bool)
+            if goal_positions is not None and len(goal_positions) > 0:
+                goal_pos = np.asarray(goal_positions[0], dtype=np.float32).reshape(-1)[:3]
+                if goal_pos.shape[0] == 3:
+                    dists_to_goal = np.linalg.norm(positions - goal_pos, axis=-1)
+                    in_goal_area = dists_to_goal <= success_thresh
+
+            contact_mask = positions[:, 2] <= (terrain_heights + float(self.terrain_contact_eps))
+            contact_penalty_mask = contact_mask & (~in_goal_area) & (~distance_based_collision_mask)
+            if np.any(contact_penalty_mask):
+                contact_signed_clearance = positions[contact_penalty_mask, 2] - terrain_heights[contact_penalty_mask]
+                penalties[contact_penalty_mask] = np.minimum(
+                    penalties[contact_penalty_mask],
+                    self._piecewise_collision_penalty(
+                        contact_signed_clearance,
+                        float(self.terrain_contact_eps),
+                        self.terrain_penalty_value,
+                    ),
+                )
+                collision_eps = float(self.terrain_collision_eps)
+                actual_penetration_mask = contact_penalty_mask & (
+                    positions[:, 2] <= terrain_heights + collision_eps
+                )
+
+        obs_collision_mask = (obstacle_min_dist < 0.0) & (~distance_based_collision_mask)
+        if np.any(obs_collision_mask):
+            penalties[obs_collision_mask] = np.minimum(
+                penalties[obs_collision_mask],
+                self._piecewise_collision_penalty(
+                    obstacle_min_dist[obs_collision_mask],
+                    collision_threshold,
+                    self.collision_penalty_value,
+                ),
+            )
+
+        for idx, agent in enumerate(agents):
+            if not hasattr(agent, 'debug_info') or not isinstance(agent.debug_info, dict):
+                agent.debug_info = {}
+            agent.debug_info.setdefault('terrain_penetration_count', 0)
+            agent.debug_info.setdefault('obstacle_collision_count', 0)
+
+            total_add = 0
+            terrain_add = 0
+            obstacle_add = 0
+
+            if real_distance_collision_mask[idx]:
+                agent._episode_has_collision = True
+                agent._had_penetration_or_collision = True
+                total_add += 1
+                if terrain_min_dist[idx] <= obstacle_min_dist[idx]:
+                    agent._had_terrain_contact_or_penetration = True
+                    terrain_add += 1
+                else:
+                    agent._had_obstacle_collision = True
+                    obstacle_add += 1
+
+            if invalid_mask[idx]:
+                agent._episode_has_collision = True
+                agent._had_penetration_or_collision = True
+                agent._had_terrain_contact_or_penetration = True
+                total_add += 1
+                terrain_add += 1
+
+            if penetration_mask[idx]:
+                agent._episode_has_collision = True
+                agent._had_penetration_or_collision = True
+                agent._had_terrain_contact_or_penetration = True
+                total_add += 1
+                terrain_add += 1
+
+            if contact_penalty_mask[idx]:
+                if actual_penetration_mask[idx]:
+                    agent._episode_has_collision = True
+                    agent._had_penetration_or_collision = True
+                    agent._had_terrain_contact_or_penetration = True
+                    total_add += 1
+                    terrain_add += 1
+
+            if obs_collision_mask[idx]:
+                agent._episode_has_collision = True
+                agent._had_penetration_or_collision = True
+                agent._had_obstacle_collision = True
+                total_add += 1
+                obstacle_add += 1
+
+            if total_add > 0:
+                new_total = int(agent.debug_info.get('total_penetration_count', 0)) + total_add
+                agent.debug_info['total_penetration_count'] = min(new_total, 1000000)
+            if terrain_add > 0:
+                agent.debug_info['terrain_penetration_count'] = (
+                    agent.debug_info.get('terrain_penetration_count', 0) + terrain_add
+                )
+            if obstacle_add > 0:
+                agent.debug_info['obstacle_collision_count'] = (
+                    agent.debug_info.get('obstacle_collision_count', 0) + obstacle_add
+                )
+
+        return penalties
 
     def _update_caches(self, world: Any, scenario: Any) -> Dict[str, Any]:
         """预处理和缓存环境数据，减少重复计算"""
@@ -388,25 +1833,37 @@ class VectorizedRewardCalculator:
         Returns:
             rewards: (batch_size, n_agents) 奖励数组
         """
+        reward_timing_enabled = self._reward_timing_enabled()
+        reward_timing = self._new_reward_timing_bucket() if reward_timing_enabled else None
+        _reward_perf_counter = time.perf_counter if reward_timing_enabled else None
+        self._last_reward_timing = None
         try:
             batch_size = len(agents_batch)
             n_agents = len(agents_batch[0]) if batch_size > 0 else 0
             
             if batch_size == 0 or n_agents == 0:
+                if reward_timing is not None:
+                    self._last_reward_timing = reward_timing
                 return np.zeros((batch_size, n_agents), dtype=np.float32)
             
             # 预处理缓存数据（性能优化）
+            if reward_timing is not None:
+                _t_reward_seg = _reward_perf_counter()
             cached_data_batch = []
             for b in range(batch_size):
                 world = world_batch[b] if world_batch else None
                 scenario = scenario_batch[b] if scenario_batch and b < len(scenario_batch) else None
                 cached_data = self._update_caches(world, scenario) if self.use_fast_path else None
                 cached_data_batch.append(cached_data)
+            if reward_timing is not None:
+                reward_timing['rew_cache'] += _reward_perf_counter() - _t_reward_seg
             
             # 预分配数组
             arrays = self._get_preallocated_arrays(batch_size, n_agents)
             
             # 向后兼容：若未提供批次数据，则从agents提取，或用保守默认值
+            if reward_timing is not None:
+                _t_reward_seg = _reward_perf_counter()
             if positions_batch is None or prev_positions_batch is None or actions_batch is None or start_positions_batch is None:
                 # 提取当前位置与速度
                 self._extract_batch_states(agents_batch, arrays)
@@ -446,16 +1903,27 @@ class VectorizedRewardCalculator:
                 scenario_batch = []
                 for w in world_batch:
                     scenario_batch.append(getattr(w, 'scenario', None))
+            if reward_timing is not None:
+                reward_timing['rew_state'] += _reward_perf_counter() - _t_reward_seg
 
             # 核心奖励计算
             try:
-                self._calculate_all_rewards_vectorized(agents_batch, world_batch, scenario_batch, arrays, cached_data_batch)
+                self._calculate_all_rewards_vectorized(
+                    agents_batch,
+                    world_batch,
+                    scenario_batch,
+                    arrays,
+                    cached_data_batch,
+                    reward_timing=reward_timing,
+                )
             except Exception as e:
                 print(f"批量奖励计算异常: {e}")
                 import traceback
                 traceback.print_exc()
 
             # 应用权重并求和（对齐通道数，防御性处理）
+            if reward_timing is not None:
+                _t_reward_seg = _reward_perf_counter()
             rewards_mat = arrays['rewards']
             weights_vec = self.reward_weights
             try:
@@ -469,7 +1937,115 @@ class VectorizedRewardCalculator:
                         weights_vec = weights_vec[:ch]
             except Exception:
                 pass
-            total_rewards = np.sum(rewards_mat * weights_vec, axis=2)
+            # === 主奖励：默认启用“结构收缩”的 dense reward ===
+            # dense: 仅保留少数核心项（progress / success / collision / clearance / height / stationary / team-sync）；
+            # 其余通道仍可保留实现与日志，但不参与主优化目标。
+            if getattr(self, 'restructured_reward_enabled', False):
+                dense_indices = list(getattr(self, '_dense_indices_core', ()))
+                if getattr(self, 'dense_energy_enabled', False):
+                    dense_indices.append(7)  # energy 作为弱正则
+                dense_indices = [int(i) for i in dense_indices if 0 <= int(i) < rewards_mat.shape[2]]
+                if dense_indices:
+                    if getattr(self, 'progress_merge_enabled', False) and weights_vec.shape[0] > 6:
+                        dense_weights_vec = np.array(weights_vec, copy=True)
+                        dense_weights_vec[0] = np.float32(abs(float(weights_vec[0])) + abs(float(weights_vec[6])))
+                        dense_weights_vec[6] = np.float32(0.0)
+                    else:
+                        dense_weights_vec = weights_vec
+                    dense_rewards = rewards_mat[:, :, dense_indices]
+                    dense_weights = dense_weights_vec[dense_indices]
+                    total_rewards = np.sum(dense_rewards * dense_weights[None, None, :], axis=2)
+                else:
+                    total_rewards = np.zeros(rewards_mat.shape[:2], dtype=np.float32)
+            else:
+                total_rewards = np.sum(rewards_mat * weights_vec, axis=2)
+
+            # === 终局项：episode end 单独结算（不参与逐步累积竞争） ===
+            # - team_success_bonus（团队成功主导项）
+            # - unsafe_arrival_penalty（全员到达但非安全成功）
+            # - terminal_failure_penalty（从未进入成功圈的终局惩罚）
+            # - success-only quality bonuses（仅 team_success=True：clearance/efficiency）
+            try:
+                for b, world in enumerate(world_batch):
+                    if not self._is_episode_finished(world):
+                        continue
+
+                    n_agents_b = int(total_rewards[b].shape[0]) if hasattr(total_rewards[b], 'shape') else 0
+                    n_agents_b = max(n_agents_b, 1)
+
+                    # 1) 终局失败惩罚：未曾进入成功圈者按剩余距离惩罚
+                    try:
+                        valid_goal_mask = np.isfinite(arrays['goals'][b]).all(axis=1)
+                        penalties = self._terminal_failure_penalty_batch(
+                            agents_batch[b],
+                            arrays['positions'][b],
+                            arrays['goals'][b],
+                            valid_goal_mask,
+                            arrays['start_positions'][b],
+                            world,
+                        ).astype(np.float32)
+                        total_rewards[b] = total_rewards[b] + penalties
+                    except Exception:
+                        pass
+
+                    team_success = bool(getattr(world, '_episode_success', False))
+                    all_reached = bool(getattr(world, '_episode_all_reached', False))
+
+                    if team_success:
+                        # 2) 团队成功终局奖励：平均分配
+                        tsb = float(getattr(self, 'team_success_bonus', 0.0))
+                        if tsb != 0.0:
+                            total_rewards[b] = total_rewards[b] + (tsb / float(n_agents_b))
+
+                        # 3) success-only 质量奖励：净空（D_min^(k)）越大越好
+                        try:
+                            dmin = float(getattr(world, '_episode_dmin_min', np.inf))
+                            if np.isfinite(dmin):
+                                safe_d = None
+                                try:
+                                    scenario = scenario_batch[b] if scenario_batch and b < len(scenario_batch) else None
+                                    if scenario is not None:
+                                        safe_d = getattr(scenario, 'obstacle_safe_distance', None)
+                                except Exception:
+                                    safe_d = None
+                                if safe_d is None:
+                                    safe_d = 5.0
+                                safe_d = float(max(float(safe_d), 1e-6))
+                                q = float(np.clip(dmin / safe_d, 0.0, 1.0))
+                                cqb = float(getattr(self, 'clearance_quality_bonus_weight', 0.0)) * q
+                                if cqb != 0.0:
+                                    total_rewards[b] = total_rewards[b] + (cqb / float(n_agents_b))
+                        except Exception:
+                            pass
+
+                        # 4) success-only 质量奖励：效率（effective_steps 越少越好）
+                        try:
+                            eff_steps = float(getattr(world, 'current_step', 0))
+                            ep_len = None
+                            try:
+                                if hasattr(world, 'episode_length') and world.episode_length is not None:
+                                    ep_len = float(world.episode_length)
+                                elif hasattr(world, 'max_steps') and world.max_steps is not None:
+                                    ep_len = float(world.max_steps)
+                            except Exception:
+                                ep_len = None
+                            if ep_len is None or ep_len <= 0:
+                                import os as _os
+                                ep_len = float(_os.getenv('EPISODE_LENGTH', '2800'))
+                            ep_len = float(max(ep_len, 1.0))
+                            eff = float(np.clip(1.0 - (eff_steps / ep_len), 0.0, 1.0))
+                            eb = float(getattr(self, 'efficiency_bonus_weight', 0.0)) * eff
+                            if eb != 0.0:
+                                total_rewards[b] = total_rewards[b] + (eb / float(n_agents_b))
+                        except Exception:
+                            pass
+                    else:
+                        # 全员到达但不安全成功：终局惩罚（平均分配）
+                        uap = float(getattr(self, 'unsafe_arrival_penalty', 0.0))
+                        if all_reached and uap != 0.0:
+                            total_rewards[b] = total_rewards[b] - (uap / float(n_agents_b))
+            except Exception:
+                pass
             
             # 检查奖励值是否异常 - 只在调试模式和异常时输出
             if self.debug_mode and (np.isnan(total_rewards).any() or np.isinf(total_rewards).any()):
@@ -503,13 +2079,30 @@ class VectorizedRewardCalculator:
                 except Exception:
                     pass
                 self._printed_once = True
-            # 检测奖励多样性（添加回合数参数）
-            self._check_reward_diversity(total_rewards, episode=episode)
+            # 奖励多样性诊断默认关闭；显式启用时也只在有效 episode 编号上按回合间隔检查一次。
+            if self.enable_reward_diversity_check:
+                try:
+                    episode_int = int(episode)
+                except Exception:
+                    episode_int = -1
+                if episode_int >= 0:
+                    should_check_diversity = (
+                        self._last_diversity_checked_episode != episode_int
+                        and (episode_int % self.reward_diversity_check_interval == 0)
+                    )
+                    if should_check_diversity:
+                        self._check_reward_diversity(total_rewards, episode=episode_int)
+                        self._last_diversity_checked_episode = episode_int
+            if reward_timing is not None:
+                reward_timing['rew_reduce'] += _reward_perf_counter() - _t_reward_seg
+                self._last_reward_timing = reward_timing
             
             # 限制范围
             return np.clip(total_rewards, self.min_reward, self.max_reward)
             
         except Exception as e:
+            if reward_timing is not None:
+                self._last_reward_timing = reward_timing
             print(f"批量奖励计算异常: {e}")
             import traceback
             traceback.print_exc()
@@ -527,7 +2120,7 @@ class VectorizedRewardCalculator:
                 'velocities': np.zeros((batch_size, n_agents, 3), dtype=np.float32),
                 'goals': np.zeros((batch_size, n_agents, 3), dtype=np.float32),
                 'distances': np.zeros((batch_size, n_agents), dtype=np.float32),
-                'rewards': np.zeros((batch_size, n_agents, 14), dtype=np.float32),
+                'rewards': np.zeros((batch_size, n_agents, len(self.reward_names)), dtype=np.float32),
                 'pos_changes': np.zeros((batch_size, n_agents), dtype=np.float32),
                 'relative_distances': np.zeros((batch_size, n_agents), dtype=np.float32),
                 'speed_efficiency': np.zeros((batch_size, n_agents), dtype=np.float32)
@@ -553,9 +2146,18 @@ class VectorizedRewardCalculator:
             arrays['positions'] - arrays['goals'], axis=2
         )
     
-    def _calculate_all_rewards_vectorized(self, agents_batch: List[List[Any]], world_batch: List[Any], scenario_batch: List[Any], arrays: Dict[str, np.ndarray], cached_data_batch: List[Any] = None):
+    def _calculate_all_rewards_vectorized(
+        self,
+        agents_batch: List[List[Any]],
+        world_batch: List[Any],
+        scenario_batch: List[Any],
+        arrays: Dict[str, np.ndarray],
+        cached_data_batch: List[Any] = None,
+        reward_timing: Dict[str, float] = None,
+    ):
         """向量化计算所有奖励分项"""
         batch_size, n_agents = arrays['rewards'].shape[:2]
+        _reward_perf_counter = time.perf_counter if reward_timing is not None else None
         
         # 重置奖励数组
         arrays['rewards'].fill(0.0)
@@ -566,98 +2168,564 @@ class VectorizedRewardCalculator:
             cached_data = None
             if cached_data_batch is not None and b < len(cached_data_batch):
                 cached_data = cached_data_batch[b]
+            pos_batch = arrays['positions'][b]
+            prev_pos_batch = arrays['prev_positions'][b]
+            start_pos_batch = arrays['start_positions'][b]
+            action_batch = arrays['actions'][b]
+            rewards_batch = arrays['rewards'][b]
+
+            _full_ch = (
+                not getattr(self, 'restructured_reward_enabled', False)
+                or getattr(self, 'restructured_full_channel_compute', False)
+            )
+            if _full_ch:
+                _need_ch = set(range(16))
+            else:
+                _need_ch = {int(i) for i in getattr(self, '_dense_indices_core', ())}
+                if getattr(self, 'dense_energy_enabled', False):
+                    _need_ch.add(7)
+
+            goal_positions = np.zeros((n_agents, 3), dtype=np.float32)
+            valid_goal_mask = np.zeros(n_agents, dtype=bool)
+
+            fallback_goal = None
+            try:
+                if scenario is not None and hasattr(scenario, 'goal_pos') and scenario.goal_pos is not None:
+                    fallback_goal = np.asarray(scenario.goal_pos, dtype=np.float32).reshape(-1)[:3]
+                    if fallback_goal.shape[0] < 3:
+                        fallback_goal = None
+            except Exception:
+                fallback_goal = None
+
             for a, agent in enumerate(agents):
-                # 计算各项奖励（转换为标量形式以匹配现有函数签名）
-                pos = arrays['positions'][b, a]
-                prev_pos = arrays['prev_positions'][b, a] 
-                start_pos = arrays['start_positions'][b, a]
-                action = arrays['actions'][b, a]
-                
-                # 1. 距离奖励
-                dist_reward = self._distance_reward_vectorized(agent, scenario, pos.reshape(1, -1), start_pos.reshape(1, -1))
-                arrays['rewards'][b, a, 0] = dist_reward[0] if isinstance(dist_reward, np.ndarray) else dist_reward
-                
-                # 2. 探索奖励  
-                expl_reward = self._exploration_reward_vectorized(agent, scenario, pos.reshape(1, -1))
-                arrays['rewards'][b, a, 1] = expl_reward[0] if isinstance(expl_reward, np.ndarray) else expl_reward
-                
-                # 3. 停滞惩罚
-                stat_penalty = self._stationary_penalty_vectorized(agent, pos.reshape(1, -1), prev_pos.reshape(1, -1))
-                arrays['rewards'][b, a, 2] = stat_penalty[0] if isinstance(stat_penalty, np.ndarray) else stat_penalty
-                
-                # 4. 方向奖励
-                dir_reward = self._direction_reward_vectorized(agent, pos.reshape(1, -1), prev_pos.reshape(1, -1))
-                arrays['rewards'][b, a, 3] = dir_reward[0] if isinstance(dir_reward, np.ndarray) else dir_reward
-                
-                # 5. 偏离惩罚
-                dev_penalty = self._deviation_reward_vectorized(agent, scenario, start_pos.reshape(1, -1), pos.reshape(1, -1))
-                arrays['rewards'][b, a, 4] = dev_penalty[0] if isinstance(dev_penalty, np.ndarray) else dev_penalty
-                
-                # 6. 起始区奖励
-                start_reward = self._start_area_reward_vectorized(agent, scenario, pos.reshape(1, -1), start_pos.reshape(1, -1))
-                arrays['rewards'][b, a, 5] = start_reward[0] if isinstance(start_reward, np.ndarray) else start_reward
-                
-                # 7. 接近奖励
-                appr_reward = self._approach_reward_vectorized(agent, scenario, pos.reshape(1, -1), prev_pos.reshape(1, -1))
-                arrays['rewards'][b, a, 6] = appr_reward[0] if isinstance(appr_reward, np.ndarray) else appr_reward
-                
-                # 8. 能量消耗惩罚
-                energy_reward = self._energy_reward_vectorized(action.reshape(1, -1))
-                arrays['rewards'][b, a, 7] = energy_reward[0] if isinstance(energy_reward, np.ndarray) else energy_reward
-                
-                # 9. 高度奖励（传入上一时刻位置和动作，用于判断向上飞行）
-                height_reward = self._height_reward_vectorized(
-                    agent, scenario, pos.reshape(1, -1), 
-                    prev_pos.reshape(1, -1) if prev_pos is not None else None,
-                    action.reshape(1, -1) if action is not None else None
-                )
-                arrays['rewards'][b, a, 8] = height_reward[0] if isinstance(height_reward, np.ndarray) else height_reward
-                
-                # 10. 成功奖励（使用缓存数据）
-                # 🚨 关键修复：传入循环索引a作为agent_idx，避免对象身份比较失败
-                success_reward = self._success_reward_vectorized(agent, scenario, pos.reshape(1, -1), cached_data, agent_idx=a)
-                arrays['rewards'][b, a, 9] = success_reward[0] if isinstance(success_reward, np.ndarray) else success_reward
-                
-                # 11. 碰撞惩罚（使用循环索引a作为agent索引，避免依赖agent.index，使用缓存数据）
-                collision_penalty = self._collision_penalty_vectorized(a, world, scenario, pos.reshape(1, -1), cached_data)
-                arrays['rewards'][b, a, 10] = collision_penalty[0] if isinstance(collision_penalty, np.ndarray) else collision_penalty
-                
-                # 12. 全局奖励（临时设为0，将在批处理结束后统一计算）
-                arrays['rewards'][b, a, 11] = 0.0
-                
-                # 13. 塑形奖励（按每智能体真实目标计算距离）
+                goal_pos = None
                 try:
-                    if hasattr(agent, 'goal_a') and agent.goal_a is not None and agent.goal_a.state.p_pos is not None:
-                        _g = agent.goal_a.state.p_pos
-                    else:
-                        _g = scenario.goal_pos if hasattr(scenario, 'goal_pos') else None
-                    dist_to_goal = float(np.linalg.norm(pos - _g)) if _g is not None else 0.0
+                    if hasattr(agent, 'goal_a') and agent.goal_a is not None:
+                        if hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                            goal_pos = np.asarray(agent.goal_a.state.p_pos, dtype=np.float32).reshape(-1)[:3]
+                            if goal_pos.shape[0] < 3:
+                                goal_pos = None
                 except Exception:
-                    dist_to_goal = 0.0
-                arrays['rewards'][b, a, 12] = self._potential_shaping_vectorized(agent, dist_to_goal)
-                
-                # 14. 间隙奖励
-                clear_reward = self._clearance_reward_vectorized(agent, world, pos.reshape(1, -1))
-                arrays['rewards'][b, a, 13] = clear_reward[0] if isinstance(clear_reward, np.ndarray) else clear_reward
+                    goal_pos = None
 
+                if goal_pos is None:
+                    goal_pos = fallback_goal
 
-            # 批内全局奖励（同一b共享）- 修复：统一计算全局奖励
-            global_val = self._global_reward_vectorized(agents_batch[b])
-            arrays['rewards'][b, :, 11] = global_val
-            
-            # 🚨 关键修复：无碰撞奖励是全队奖励，应该给所有智能体（而不是只给到达目标的智能体）
-            # 在所有智能体计算完成后，统一给所有智能体加上无碰撞奖励（类似全局奖励的处理方式）
+                if goal_pos is not None:
+                    goal_positions[a] = goal_pos
+                    valid_goal_mask[a] = True
+
+            if np.any(valid_goal_mask) and (
+                _full_ch or (0 in _need_ch) or (4 in _need_ch) or (6 in _need_ch) or (9 in _need_ch) or (11 in _need_ch)
+            ):
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                valid_pos = pos_batch[valid_goal_mask]
+                valid_prev_pos = prev_pos_batch[valid_goal_mask]
+                valid_start_pos = start_pos_batch[valid_goal_mask]
+                valid_goals = goal_positions[valid_goal_mask]
+
+                current_dist = np.linalg.norm(valid_pos - valid_goals, axis=-1)
+                prev_dist = np.linalg.norm(valid_prev_pos - valid_goals, axis=-1)
+
+                distance_reward = np.zeros_like(current_dist, dtype=np.float32)
+                approach_reward = np.zeros_like(current_dist, dtype=np.float32)
+
+                if _full_ch or (0 in _need_ch) or (6 in _need_ch):
+                    # 1. progress 合并前的 distance 锚点：接近目标时逐步衰减成功圈外的状态型正奖励，
+                    # 防止策略停在目标外几米稳定刷分。
+                    initial_dist = np.linalg.norm(valid_start_pos - valid_goals, axis=-1)
+                    denom = np.maximum(initial_dist, 1.0)
+                    ratio = np.clip(current_dist / denom, 0.0, 2.0)
+                    distance_reward = (1.0 - ratio) * 10.0
+                    distance_reward = self._attenuate_distance_reward_near_goal(
+                        distance_reward,
+                        current_dist,
+                    )
+
+                if _full_ch or (4 in _need_ch):
+                    # 5. 偏离惩罚：与原实现一致，按起点-目标线段计算侧向偏离
+                    path_vec = valid_goals - valid_start_pos
+                    path_len = np.linalg.norm(path_vec, axis=-1)
+                    denom_dev = np.maximum(path_len, 1.0)
+                    w = valid_pos - valid_start_pos
+                    t = np.sum(w * path_vec, axis=-1) / (denom_dev * denom_dev)
+                    t = np.clip(t, 0.0, 1.0)
+                    proj = valid_start_pos + t[:, None] * path_vec
+                    d_perp = np.linalg.norm(valid_pos - proj, axis=-1)
+                    norm_dev = np.clip(d_perp / denom_dev, 0.0, 2.0)
+                    rewards_batch[valid_goal_mask, 4] = 1.0 - norm_dev
+
+                if _full_ch or (0 in _need_ch) or (6 in _need_ch):
+                    # 2. progress 合并前的 approach：近目标区倍数由 APPROACH_NEAR_GOAL_MAX_MULT 限制（默认弱化，避免终点外强刷）
+                    approach_reward = prev_dist - current_dist
+                    near_goal_threshold = float(
+                        getattr(self, 'approach_near_goal_threshold', np.float32(50.0))
+                    )
+                    near_goal_threshold = max(near_goal_threshold, 1e-3)
+                    app_max = float(getattr(self, 'approach_near_goal_max_mult', np.float32(1.22)))
+                    app_max = max(app_max, 1.0)
+                    approach_weight_multipliers = np.ones_like(current_dist, dtype=np.float32)
+                    near_goal_mask = current_dist < near_goal_threshold
+                    if np.any(near_goal_mask):
+                        t = current_dist[near_goal_mask] / near_goal_threshold
+                        approach_weight_multipliers[near_goal_mask] = (
+                            np.float32(1.0) + (np.float32(app_max) - np.float32(1.0)) * (np.float32(1.0) - t)
+                        ).astype(np.float32)
+                    approach_weight_multipliers = np.clip(
+                        approach_weight_multipliers, 1.0, max(app_max, 1.0)
+                    )
+                    approach_reward = approach_reward * 5.0 * approach_weight_multipliers
+
+                if _full_ch or (0 in _need_ch):
+                    # 主 dense progress：将 distance(状态锚点) 与 approach(步进结果) 收成单一通道
+                    merged_progress = self._merge_progress_rewards(
+                        distance_reward,
+                        approach_reward,
+                        distance_weight=float(self.reward_weights[0]) if len(self.reward_weights) > 0 else 1.0,
+                        approach_weight=float(self.reward_weights[6]) if len(self.reward_weights) > 6 else 1.0,
+                    )
+                    rewards_batch[valid_goal_mask, 0] = merged_progress
+
+                # legacy approach 通道保留占位，但默认主路径不再单独计分
+                rewards_batch[valid_goal_mask, 6] = 0.0
+                if reward_timing is not None:
+                    reward_timing['rew_numeric'] += _reward_perf_counter() - _t_reward_seg
+
+            # 8. 能量消耗惩罚：保持现有公式，避免每个 agent 单独构造小数组
+            if _full_ch or (7 in _need_ch):
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                energy_consumption = np.linalg.norm(action_batch, axis=-1) * 0.1
+                current_speed = np.linalg.norm(action_batch, axis=-1)
+                energy_reward = np.zeros_like(current_speed, dtype=np.float32)
+                active_energy_mask = energy_consumption > 0.1
+                if np.any(active_energy_mask):
+                    speed_efficiency = current_speed[active_energy_mask] / np.maximum(
+                        energy_consumption[active_energy_mask], 1e-6
+                    )
+                    energy_reward[active_energy_mask] = np.minimum(speed_efficiency * 0.1, 2.0)
+                rewards_batch[:, 7] = energy_reward
+                if reward_timing is not None:
+                    reward_timing['rew_numeric'] += _reward_perf_counter() - _t_reward_seg
+
+            geometry_context = None
+            _need_geom = _full_ch or (10 in _need_ch) or (13 in _need_ch)
+            if _need_geom and self.use_fast_path and len(agents) == pos_batch.shape[0]:
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                try:
+                    geometry_context = self._build_reward_geometry_context(
+                        pos_batch,
+                        world,
+                        scenario,
+                        cached_data=cached_data,
+                    )
+                except Exception:
+                    geometry_context = None
+                if reward_timing is not None:
+                    reward_timing['rew_state'] += _reward_perf_counter() - _t_reward_seg
+
+            # 9. 高度奖励：保留原数值规则，优先复用几何上下文中的当前位置地形高度
+            if (
+                (_full_ch or (8 in _need_ch))
+                and getattr(self, 'height_reward_enabled', True)
+                and scenario is not None
+                and hasattr(scenario, 'get_terrain_height')
+            ):
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                terrain_heights = np.full(pos_batch.shape[0], np.nan, dtype=np.float32)
+                try:
+                    geometry_ready = False
+                    if isinstance(geometry_context, dict):
+                        try:
+                            terrain_heights_current = np.asarray(
+                                geometry_context['terrain_heights_current'],
+                                dtype=np.float32
+                            )
+                            geometry_ready = (
+                                int(geometry_context.get('num_positions', -1)) == pos_batch.shape[0]
+                                and terrain_heights_current.shape == (pos_batch.shape[0],)
+                            )
+                            if geometry_ready:
+                                terrain_heights = terrain_heights_current
+                        except Exception:
+                            geometry_ready = False
+
+                    if not geometry_ready:
+                        cached_terrain = cached_data.get('terrain') if isinstance(cached_data, dict) else None
+                        cached_map_size = int(
+                            cached_data.get('map_size', getattr(scenario, 'map_size', 200))
+                        ) if isinstance(cached_data, dict) else int(getattr(scenario, 'map_size', 200))
+
+                        if cached_terrain is not None:
+                            query_positions = np.zeros((pos_batch.shape[0], 3), dtype=np.float32)
+                            query_positions[:, :2] = pos_batch[:, :2]
+                            _bilinear_interpolate_terrain(cached_terrain, query_positions, terrain_heights, cached_map_size)
+
+                        invalid_terrain = ~np.isfinite(terrain_heights)
+                        if np.any(invalid_terrain) and hasattr(scenario, 'get_terrain_height_vectorized'):
+                            sampled = scenario.get_terrain_height_vectorized(
+                                pos_batch[invalid_terrain, 0], pos_batch[invalid_terrain, 1]
+                            )
+                            sampled = np.asarray(sampled, dtype=np.float32)
+                            if sampled.ndim == 0:
+                                terrain_heights[invalid_terrain] = np.float32(sampled)
+                            elif sampled.shape[0] == np.count_nonzero(invalid_terrain):
+                                terrain_heights[invalid_terrain] = sampled
+
+                        invalid_terrain = ~np.isfinite(terrain_heights)
+                        if np.any(invalid_terrain):
+                            for idx in np.where(invalid_terrain)[0]:
+                                try:
+                                    terrain_heights[idx] = scenario.get_terrain_height(
+                                        float(pos_batch[idx, 0]), float(pos_batch[idx, 1])
+                                    )
+                                except Exception:
+                                    continue
+                except Exception:
+                    terrain_heights.fill(np.nan)
+
+                if np.any(np.isfinite(terrain_heights)):
+                    height_reward = np.zeros(pos_batch.shape[0], dtype=np.float32)
+                    finite_terrain = np.isfinite(terrain_heights)
+                    terrain_heights = np.nan_to_num(terrain_heights, nan=0.0)
+                    height_diff = pos_batch[:, 2] - terrain_heights
+                    height_goal_focus_mask = np.zeros(pos_batch.shape[0], dtype=bool)
+                    try:
+                        goal_focus_radius = float(self.height_penalty_only_near_goal_radius)
+                        success_thr = float(self.success_distance_threshold)
+                        if goal_focus_radius > success_thr and np.any(valid_goal_mask):
+                            height_goal_dists = np.full(pos_batch.shape[0], np.inf, dtype=np.float32)
+                            height_goal_dists[valid_goal_mask] = np.linalg.norm(
+                                pos_batch[valid_goal_mask] - goal_positions[valid_goal_mask],
+                                axis=-1,
+                            ).astype(np.float32)
+                            height_goal_focus_mask = (
+                                (height_goal_dists > success_thr) &
+                                (height_goal_dists < goal_focus_radius)
+                            )
+                    except Exception:
+                        height_goal_focus_mask = np.zeros(pos_batch.shape[0], dtype=bool)
+
+                    ideal_min = float(getattr(self, 'height_ideal_min', 2.0))
+                    ideal_max = float(getattr(self, 'height_ideal_max', 5.0))
+                    if ideal_min > ideal_max:
+                        ideal_min, ideal_max = ideal_max, ideal_min
+
+                    in_range = finite_terrain & (height_diff >= ideal_min) & (height_diff <= ideal_max)
+                    below_range = finite_terrain & (height_diff < ideal_min)
+                    above_range = finite_terrain & (height_diff > ideal_max)
+
+                    height_reward[in_range & (~height_goal_focus_mask)] = 1.0
+                    if np.any(in_range & height_goal_focus_mask):
+                        height_reward[in_range & height_goal_focus_mask] = float(
+                            self.height_near_goal_positive_factor
+                        )
+
+                    if np.any(below_range):
+                        shortage = ideal_min - height_diff[below_range]
+                        low_reward = -shortage * 1.5
+
+                        low_height = height_diff[below_range]
+                        danger_mask = low_height < 3.0
+                        if np.any(danger_mask):
+                            danger_level = 3.0 - low_height[danger_mask]
+                            low_reward[danger_mask] -= danger_level * 3.0
+
+                        penetration_mask = low_height < 0.0
+                        if np.any(penetration_mask):
+                            penetration_depth = -low_height[penetration_mask]
+                            low_reward[penetration_mask] -= penetration_depth * 15.0
+
+                        upward_reward = np.zeros(np.count_nonzero(below_range), dtype=np.float32)
+                        below_indices = np.where(below_range)[0]
+                        below_z_velocity = pos_batch[below_indices, 2] - prev_pos_batch[below_indices, 2]
+                        upward_mask = below_z_velocity > 0.0
+                        if np.any(upward_mask):
+                            upward_reward[upward_mask] = np.clip(
+                                below_z_velocity[upward_mask] * 2.0, 0.0, 2.0
+                            )
+
+                        if action_batch.shape[1] >= 3:
+                            z_actions = action_batch[below_indices, 2]
+                            upward_action_mask = z_actions > 0.0
+                            if np.any(upward_action_mask):
+                                upward_reward[upward_action_mask] += np.clip(
+                                    z_actions[upward_action_mask] * 1.0, 0.0, 1.0
+                                )
+
+                        if np.any(height_goal_focus_mask[below_indices]):
+                            upward_reward[height_goal_focus_mask[below_indices]] *= float(
+                                self.height_near_goal_positive_factor
+                            )
+
+                        height_reward[below_range] = low_reward + upward_reward
+
+                    if np.any(above_range):
+                        height_reward[above_range] = -(height_diff[above_range] - ideal_max) * 0.5
+
+                    if not self._printed_once:
+                        try:
+                            print(
+                                f"[VecRew] HEIGHT on: {self.height_reward_enabled} "
+                                f"ideal=[{ideal_min:.2f},{ideal_max:.2f}] "
+                                f"clip=[{float(self.min_reward):.1f},{float(self.max_reward):.1f}] "
+                                f"strict_expl={self.expl_reward_strict}"
+                            )
+                        except Exception:
+                            pass
+
+                    rewards_batch[:, 8] = height_reward
+            if reward_timing is not None:
+                reward_timing['rew_numeric'] += _reward_perf_counter() - _t_reward_seg
+
+            if _full_ch or (10 in _need_ch):
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                batch_collision_penalties = self._batch_collision_penalty_vectorized(
+                    agents,
+                    world,
+                    scenario,
+                    pos_batch,
+                    cached_data=cached_data,
+                    geometry_context=geometry_context,
+                )
+                rewards_batch[:, 10] = batch_collision_penalties
+                if reward_timing is not None:
+                    reward_timing['rew_collision'] += _reward_perf_counter() - _t_reward_seg
+
+            if _full_ch or (13 in _need_ch):
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                batch_clearance_rewards = self._batch_clearance_reward_vectorized(
+                    agents,
+                    world,
+                    pos_batch,
+                    cached_data=cached_data,
+                    geometry_context=geometry_context,
+                )
+                rewards_batch[:, 13] = batch_clearance_rewards
+                if reward_timing is not None:
+                    reward_timing['rew_clearance'] += _reward_perf_counter() - _t_reward_seg
+
+            if (_full_ch or (0 in _need_ch)) and self._is_obstacle_reward_route():
+                if reward_timing is not None:
+                    _t_reward_seg = _reward_perf_counter()
+                try:
+                    adjusted_approach_reward = self._relax_approach_for_obstacle_route(
+                        approach_reward,
+                        geometry_context,
+                    )
+                    rewards_batch[valid_goal_mask, 0] = self._merge_progress_rewards(
+                        distance_reward,
+                        adjusted_approach_reward,
+                        distance_weight=float(self.reward_weights[0]) if len(self.reward_weights) > 0 else 1.0,
+                        approach_weight=float(self.reward_weights[6]) if len(self.reward_weights) > 6 else 1.0,
+                    )
+                except Exception:
+                    pass
+                if reward_timing is not None:
+                    reward_timing['rew_numeric'] += _reward_perf_counter() - _t_reward_seg
+
+            for a, agent in enumerate(agents):
+                pos = pos_batch[a]
+                prev_pos = prev_pos_batch[a]
+                start_pos = start_pos_batch[a]
+
+                if _full_ch or (1 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    expl_reward = self._exploration_reward_vectorized(agent, scenario, pos.reshape(1, -1))
+                    rewards_batch[a, 1] = expl_reward[0] if isinstance(expl_reward, np.ndarray) else expl_reward
+                    if reward_timing is not None:
+                        reward_timing['rew_explore'] += _reward_perf_counter() - _t_reward_seg
+
+                if _full_ch or (2 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    stat_penalty = self._stationary_penalty_vectorized(
+                        agent, pos.reshape(1, -1), prev_pos.reshape(1, -1)
+                    )
+                    rewards_batch[a, 2] = stat_penalty[0] if isinstance(stat_penalty, np.ndarray) else stat_penalty
+                    if reward_timing is not None:
+                        reward_timing['rew_motion'] += _reward_perf_counter() - _t_reward_seg
+
+                if _full_ch or (3 in _need_ch):
+                    dir_reward = self._direction_reward_vectorized(
+                        agent, pos.reshape(1, -1), prev_pos.reshape(1, -1)
+                    )
+                    rewards_batch[a, 3] = dir_reward[0] if isinstance(dir_reward, np.ndarray) else dir_reward
+
+                if _full_ch or (5 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    start_reward = self._start_area_reward_vectorized(
+                        agent, scenario, pos.reshape(1, -1), start_pos.reshape(1, -1)
+                    )
+                    rewards_batch[a, 5] = start_reward[0] if isinstance(start_reward, np.ndarray) else start_reward
+                    if reward_timing is not None:
+                        reward_timing['rew_motion'] += _reward_perf_counter() - _t_reward_seg
+
+                if _full_ch or (9 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    success_reward = self._success_reward_vectorized(
+                        agent, scenario, pos.reshape(1, -1), cached_data, agent_idx=a, world=world
+                    )
+                    rewards_batch[a, 9] = success_reward[0] if isinstance(success_reward, np.ndarray) else success_reward
+                    if reward_timing is not None:
+                        reward_timing['rew_success'] += _reward_perf_counter() - _t_reward_seg
+
+                if _full_ch:
+                    rewards_batch[a, 11] = 0.0
+
+                if _full_ch or (12 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    try:
+                        if hasattr(agent, 'goal_a') and agent.goal_a is not None and agent.goal_a.state.p_pos is not None:
+                            _g = agent.goal_a.state.p_pos
+                        else:
+                            _g = scenario.goal_pos if hasattr(scenario, 'goal_pos') else None
+                        dist_to_goal = float(np.linalg.norm(pos - _g)) if _g is not None else 0.0
+                    except Exception:
+                        dist_to_goal = 0.0
+                    rewards_batch[a, 12] = self._potential_shaping_vectorized(agent, dist_to_goal)
+                    if reward_timing is not None:
+                        reward_timing['rew_motion'] += _reward_perf_counter() - _t_reward_seg
+
+                if _full_ch or (14 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    lateral_reward = self._lateral_reward_vectorized(agent, world, scenario, pos.reshape(1, -1))
+                    rewards_batch[a, 14] = lateral_reward[0] if isinstance(lateral_reward, np.ndarray) else lateral_reward
+                    if reward_timing is not None:
+                        reward_timing['rew_lateral'] += _reward_perf_counter() - _t_reward_seg
+
+                if _full_ch or (15 in _need_ch):
+                    if reward_timing is not None:
+                        _t_reward_seg = _reward_perf_counter()
+                    collision_reduction_reward = self._collision_reduction_reward_vectorized(
+                        agent, world, scenario, pos.reshape(1, -1)
+                    )
+                    rewards_batch[a, 15] = (
+                        collision_reduction_reward[0]
+                        if isinstance(collision_reduction_reward, np.ndarray)
+                        else collision_reduction_reward
+                    )
+                    if reward_timing is not None:
+                        reward_timing['rew_motion'] += _reward_perf_counter() - _t_reward_seg
+
+            if reward_timing is not None:
+                _t_reward_seg = _reward_perf_counter()
+            if _full_ch or (11 in _need_ch):
+                team_sync_reward = self._team_sync_reward_vectorized(
+                    agents_batch[b],
+                    world_batch[b],
+                    scenario_batch[b] if scenario_batch and b < len(scenario_batch) else None,
+                    pos_batch,
+                    goal_positions,
+                    valid_goal_mask,
+                )
+                arrays['rewards'][b, :, 11] = team_sync_reward
+            else:
+                team_sync_reward = np.zeros((len(agents_batch[b]),), dtype=np.float32)
+
+            if _full_ch:
+                global_val = self._global_reward_vectorized(agents_batch[b])
+            else:
+                global_val = 0.0
+            if _full_ch and global_val > 0.0:
+                # 🚨 按个体贡献分配全局奖励，表现好的智能体得到更多
+                try:
+                    # 计算每个智能体的贡献度（基于个体成功奖励）
+                    individual_contributions = []
+                    for a, agent in enumerate(agents_batch[b]):
+                        # 贡献度 = 个体成功奖励（已按无碰撞比例缩放）
+                        individual_success = arrays['rewards'][b, a, 9]  # 个体成功奖励
+                        individual_contributions.append(max(0.0, float(individual_success)))
+                    
+                    # 按贡献度分配全局奖励
+                    total_contribution = sum(individual_contributions)
+                    if total_contribution > 0.0:
+                        for a in range(len(agents_batch[b])):
+                            # 按贡献比例分配全局奖励
+                            contribution_ratio = individual_contributions[a] / total_contribution
+                            arrays['rewards'][b, a, 11] = arrays['rewards'][b, a, 11] + (global_val * contribution_ratio)
+                    else:
+                        # 如果所有智能体都没有成功奖励，平均分配（但这种情况不应该发生）
+                        arrays['rewards'][b, :, 11] = arrays['rewards'][b, :, 11] + (global_val / len(agents_batch[b]))
+                except Exception:
+                    arrays['rewards'][b, :, 11] = arrays['rewards'][b, :, 11] + (global_val / len(agents_batch[b]))
+            elif _full_ch:
+                arrays['rewards'][b, :, 11] = arrays['rewards'][b, :, 11]
+                terminal_failure_penalty = self._terminal_failure_penalty_batch(
+                    agents_batch[b],
+                    pos_batch,
+                    goal_positions,
+                    valid_goal_mask,
+                    start_pos_batch,
+                    world,
+                )
+                if np.any(terminal_failure_penalty < 0.0):
+                    arrays['rewards'][b, :, 11] += terminal_failure_penalty
+
+            # 结构收缩且不算全通道时：不往 ch9 写团队无碰撞奖励（主目标不含该通道），但必须清零标志避免累积
             try:
                 world = world_batch[b]
-                if world is not None and hasattr(world, '_team_no_collision_reward'):
+                if not _full_ch and world is not None and hasattr(world, '_team_no_collision_reward'):
+                    world._team_no_collision_reward = 0.0
+            except Exception:
+                pass
+
+            # 🚨 关键修复：无碰撞奖励按个体表现分配，只给无碰撞的智能体
+            try:
+                world = world_batch[b]
+                if _full_ch and world is not None and hasattr(world, '_team_no_collision_reward'):
                     team_no_collision_reward = getattr(world, '_team_no_collision_reward', 0.0)
                     if team_no_collision_reward > 0.0:
-                        # 给所有智能体都加上无碰撞奖励（全队共享）
-                        arrays['rewards'][b, :, 9] = arrays['rewards'][b, :, 9] + team_no_collision_reward
+                        # 🚨 按个体表现分配：只给无碰撞且到达目标的智能体
+                        for a, agent in enumerate(agents_batch[b]):
+                            # 检查当前智能体是否到达目标
+                            agent_reached = False
+                            try:
+                                if hasattr(agent, 'state') and hasattr(agent.state, 'p_pos'):
+                                    agent_pos = agent.state.p_pos
+                                    agent_goal = None
+                                    if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                                        agent_goal = agent.goal_a.state.p_pos
+                                    elif hasattr(scenario_batch[b], 'goal_pos') and scenario_batch[b].goal_pos is not None:
+                                        agent_goal = scenario_batch[b].goal_pos
+                                    
+                                    if agent_goal is not None:
+                                        agent_dist = np.linalg.norm(np.array(agent_pos) - np.array(agent_goal))
+                                        agent_reached = agent_dist <= self.success_distance_threshold
+                            except Exception:
+                                agent_reached = False
+                            
+                            # 检查当前智能体是否有真实碰撞/真实穿透（与成功判断逻辑保持一致）
+                            agent_has_collision = True
+                            try:
+                                agent_has_collision = not self._agent_safe_so_far(agent)
+                            except Exception:
+                                # 如果检查失败，保守地认为有碰撞（不给奖励）
+                                agent_has_collision = True
+                            
+                            # 🚨 关键修复：只有到达目标且无碰撞的智能体才得到无碰撞奖励
+                            # 原因：用户明确指出"有专门的部分到达奖励，无碰撞奖励就应该无碰撞且到达才给"
+                            # 修复：使用严格的碰撞检查（与成功判断逻辑一致），确保只有真正无碰撞的智能体才得到奖励
+                            if agent_reached and not agent_has_collision:
+                                arrays['rewards'][b, a, 9] = arrays['rewards'][b, a, 9] + team_no_collision_reward
+                            # 表现不好的智能体（未到达目标或有碰撞）不得到无碰撞奖励
+                        
                         # 重置标志，避免重复添加
                         world._team_no_collision_reward = 0.0
             except Exception:
                 pass
+            if reward_timing is not None:
+                reward_timing['rew_team'] += _reward_perf_counter() - _t_reward_seg
             
             # 全局奖励调试输出已删除
     
@@ -687,8 +2755,9 @@ class VectorizedRewardCalculator:
             # 稳健归一化
             denom = max(initial_dist, 1.0)
             ratio = np.clip(current_dist / denom, 0.0, 2.0)
-            rewards = 1.0 - ratio
-            return rewards * 10.0
+            rewards = (1.0 - ratio) * 10.0
+            rewards = self._attenuate_distance_reward_near_goal(rewards, current_dist)
+            return rewards
         except Exception:
             return np.zeros(len(positions), dtype=np.float32)
     
@@ -745,8 +2814,18 @@ class VectorizedRewardCalculator:
         # 安全检查：如果stationary_count不存在则初始化
         if not hasattr(agent, 'stationary_count'):
             agent.stationary_count = 0
-        
-        is_stationary = pos_change < 0.005
+
+        near_goal_radius = float(self.stationary_near_goal_radius)
+        base_stationary_threshold = 0.005
+        stationary_threshold = np.full(len(position), base_stationary_threshold, dtype=np.float32)
+        near_goal_mask = dist_to_goal < near_goal_radius
+        if np.any(near_goal_mask):
+            stationary_threshold[near_goal_mask] = max(
+                base_stationary_threshold,
+                float(self.stationary_near_goal_threshold),
+            )
+
+        is_stationary = pos_change < stationary_threshold
         if is_stationary:
             agent.stationary_count += 1
         else:
@@ -765,8 +2844,21 @@ class VectorizedRewardCalculator:
             
             if dist_to_start < 15:
                 rewards -= 10.0 * penalty_multiplier
-            elif dist_to_goal < 5:
-                rewards -= 0.5 * penalty_multiplier
+            elif dist_to_goal < near_goal_radius:
+                span = max(near_goal_radius - float(self.success_distance_threshold), 1e-6)
+                proximity = 1.0 - np.clip(
+                    (dist_to_goal - float(self.success_distance_threshold)) / span,
+                    0.0,
+                    1.0,
+                )
+                near_goal_penalty = (
+                    float(self.stationary_near_goal_min_penalty) +
+                    proximity * (
+                        float(self.stationary_near_goal_max_penalty) -
+                        float(self.stationary_near_goal_min_penalty)
+                    )
+                )
+                rewards -= near_goal_penalty * penalty_multiplier
             else:
                 rewards -= 5.0 * penalty_multiplier
         
@@ -947,10 +3039,37 @@ class VectorizedRewardCalculator:
             if goal_pos is None:
                 return rewards
 
+            # 🚨 关键修复：确保prev_positions和positions形状匹配
+            # positions形状通常是(1, 3)或(n, 3)，prev_positions应该是相同的形状
+            if prev_positions is None or len(prev_positions) != len(positions):
+                # 如果prev_positions无效，使用当前位置作为prev_positions（第一步的情况）
+                prev_positions = positions.copy()
+            
+            # 🚨 关键修复：确保goal_pos可以广播到positions和prev_positions的形状
+            # goal_pos是(3,)，需要reshape为(1, 3)以便与positions (1, 3)相减
+            if goal_pos.ndim == 1:
+                goal_pos = goal_pos.reshape(1, -1) if positions.ndim == 2 else goal_pos
+            
             prev_dist = np.linalg.norm(prev_positions - goal_pos, axis=-1)
             current_dist = np.linalg.norm(positions - goal_pos, axis=-1)
             rewards = prev_dist - current_dist
-            return rewards * 5.0
+            
+            # 🚨 关键修复：根据距离目标的距离动态调整接近奖励权重
+            # 原设计：距离目标越近权重越低（0.3倍），导致智能体缺乏接近目标的动机
+            # 修复：距离目标越近权重越高（2.0倍），鼓励智能体接近目标
+            # 🔧 规划改进：NEAR_GOAL_THRESHOLD 从30米扩大到50米，让更多“朝目标走”的阶段获得增强接近奖励
+            # - 距离目标0米时：权重倍数 = 2.0（大幅增强接近奖励，鼓励到达目标）
+            # - 距离目标50米时：权重倍数 = 1.0（正常接近奖励）
+            # - 距离目标>50米时：权重倍数 = 1.0（正常接近奖励）
+            NEAR_GOAL_THRESHOLD = 50.0  # 距离目标50米内增强接近奖励（从30.0提高，利于规划到达）
+            approach_weight_multipliers = np.ones(len(positions), dtype=np.float32)
+            near_goal_mask = current_dist < NEAR_GOAL_THRESHOLD
+            if np.any(near_goal_mask):
+                # 线性插值：距离0米时倍数2.0（大幅增强），距离30米时倍数1.0（正常）
+                approach_weight_multipliers[near_goal_mask] = 2.0 - (current_dist[near_goal_mask] / NEAR_GOAL_THRESHOLD) * 1.0
+            approach_weight_multipliers = np.clip(approach_weight_multipliers, 1.0, 2.0)
+            
+            return rewards * 5.0 * approach_weight_multipliers
         except Exception:
             return np.zeros(len(positions), dtype=np.float32)
     
@@ -998,6 +3117,24 @@ class VectorizedRewardCalculator:
                 dtype=np.float32
             )
             height_diff = positions[:, 2] - terrain_heights  # 智能体离地高度（米）
+            height_goal_focus_mask = np.zeros(len(positions), dtype=bool)
+            try:
+                goal_pos = None
+                if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                    goal_pos = np.asarray(agent.goal_a.state.p_pos, dtype=np.float32).reshape(-1)[:3]
+                elif hasattr(scenario, 'goal_pos') and scenario.goal_pos is not None:
+                    goal_pos = np.asarray(scenario.goal_pos, dtype=np.float32).reshape(-1)[:3]
+                if goal_pos is not None and goal_pos.shape[0] >= 3:
+                    goal_focus_radius = float(self.height_penalty_only_near_goal_radius)
+                    success_thr = float(self.success_distance_threshold)
+                    if goal_focus_radius > success_thr:
+                        goal_dists = np.linalg.norm(positions - goal_pos[:3], axis=-1)
+                        height_goal_focus_mask = (
+                            (goal_dists > success_thr) &
+                            (goal_dists < goal_focus_radius)
+                        )
+            except Exception:
+                height_goal_focus_mask = np.zeros(len(positions), dtype=bool)
             
             # 可配置的理想高度范围（与场景 paper3d_terrain_weighted._calculate_height_reward 保持一致）
             ideal_min = float(getattr(self, 'height_ideal_min', 2.0))
@@ -1011,7 +3148,11 @@ class VectorizedRewardCalculator:
             above_range = height_diff > ideal_max
             
             # 1) 理想高度区间：给出固定正奖励
-            rewards[in_range] = 1.0
+            rewards[in_range & (~height_goal_focus_mask)] = 1.0
+            if np.any(in_range & height_goal_focus_mask):
+                rewards[in_range & height_goal_focus_mask] = float(
+                    self.height_near_goal_positive_factor
+                )
             
             # 2) 低于理想高度：线性惩罚 + 危险高度额外惩罚 + 穿透惩罚 + 🚨 新增：向上飞行奖励
             if np.any(below_range):
@@ -1066,6 +3207,12 @@ class VectorizedRewardCalculator:
                             upward_reward[below_indices[upward_action_mask]] += np.clip(
                                 z_actions[upward_action_mask] * 1.0, 0.0, 1.0
                             )
+
+                below_indices = np.where(below_range)[0]
+                if len(below_indices) > 0 and np.any(height_goal_focus_mask[below_indices]):
+                    upward_reward[height_goal_focus_mask[below_indices]] *= float(
+                        self.height_near_goal_positive_factor
+                    )
                 
                 # 将向上飞行奖励加到低高度奖励中
                 low_reward = low_reward + upward_reward
@@ -1093,7 +3240,33 @@ class VectorizedRewardCalculator:
             return np.zeros(len(positions), dtype=np.float32)
         return rewards
 
-    def _success_reward_vectorized(self, agent: Any, scenario: Any, positions: np.ndarray, cached_data: Dict[str, Any] = None, agent_idx: int = None) -> np.ndarray:
+    def _agent_safe_so_far(self, agent: Any) -> bool:
+        try:
+            if getattr(agent, '_episode_has_collision', False):
+                return False
+        except Exception:
+            pass
+        try:
+            if getattr(agent, '_had_obstacle_collision', False):
+                return False
+        except Exception:
+            pass
+        try:
+            if getattr(agent, '_had_terrain_contact_or_penetration', False):
+                return False
+        except Exception:
+            pass
+
+        pen_count = 0
+        if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+            pen_count = agent.debug_info.get('total_penetration_count', 0)
+        try:
+            pen_count = int(pen_count) if np.isfinite(pen_count) else 0
+        except Exception:
+            pen_count = 0
+        return pen_count == 0
+
+    def _success_reward_vectorized(self, agent: Any, scenario: Any, positions: np.ndarray, cached_data: Dict[str, Any] = None, agent_idx: int = None, world: Any = None) -> np.ndarray:
         """
         到达目标一次性奖励 + 悬停奖励：优化版本，减少冗余检查
         修复重复成功奖励问题，鼓励智能体在终点处持续停留
@@ -1116,7 +3289,9 @@ class VectorizedRewardCalculator:
         if agent_idx is not None and agent_idx >= 0:
             # 验证agent_idx是否有效
             try:
-                world = getattr(scenario, 'world', None)
+                # 🚀 关键修复：优先使用传入的world参数
+                if world is None:
+                    world = getattr(scenario, 'world', None)
                 if world is not None and hasattr(world, 'agents'):
                     if agent_idx < len(world.agents):
                         # agent_idx有效，直接使用
@@ -1153,7 +3328,9 @@ class VectorizedRewardCalculator:
             # 方式4：从world.agents中查找索引（最后手段，但这是最可靠的方法）
             if agent_id is None:
                 try:
-                    world = getattr(scenario, 'world', None)
+                    # 🚀 关键修复：优先使用传入的world参数
+                    if world is None:
+                        world = getattr(scenario, 'world', None)
                     if world is not None and hasattr(world, 'agents'):
                         for idx, ag in enumerate(world.agents):
                             if ag is agent:
@@ -1192,16 +3369,23 @@ class VectorizedRewardCalculator:
             agent._success_state = {
                 'success_reward_given': False,
                 'first_success_step': None,
-                'hover_reward_count': 0
+                'hover_reward_count': 0,
+                'was_in_goal_zone': False,
+                'goal_ring_rewards_given': [False] * int(getattr(self.goal_ring_radii, 'size', 0)),
             }
-        
+
         success_state = agent._success_state
+        success_state.setdefault('was_in_goal_zone', False)
+        if 'goal_ring_rewards_given' not in success_state or not isinstance(success_state.get('goal_ring_rewards_given'), list):
+            success_state['goal_ring_rewards_given'] = [False] * int(getattr(self.goal_ring_radii, 'size', 0))
         # 每回合重置：检测到步数“回绕”（cur_step < 上次看到的步）或首次观测步数即视为新回合
         # 🚨 关键修复：将cur_step和should_update_last_seen_step声明为函数级变量，确保在函数结束前可用
         cur_step = None
         should_update_last_seen_step = False
         try:
-            world = getattr(scenario, 'world', None)
+            # 🚀 关键修复：优先使用传入的world参数
+            if world is None:
+                world = getattr(scenario, 'world', None)
             if world is not None and hasattr(world, 'current_step'):
                 cur_step = int(getattr(world, 'current_step', -1))
             else:
@@ -1255,11 +3439,14 @@ class VectorizedRewardCalculator:
                     success_state['success_reward_given'] = False
                     success_state['first_success_step'] = None
                     success_state['hover_reward_count'] = 0
+                    success_state['goal_ring_rewards_given'] = [False] * int(getattr(self.goal_ring_radii, 'size', 0))
                     success_state['no_collision_reward_given'] = False  # 🔧 新增：重置无碰撞奖励标志（agent级别，已废弃但保留兼容性）
                     
                     # 🚨 关键修复：重置world级别的无碰撞奖励标志（确保新回合开始时重置）
                     try:
-                        world = getattr(scenario, 'world', None)
+                        # 🚀 关键修复：优先使用传入的world参数
+                        if world is None:
+                            world = getattr(scenario, 'world', None)
                         if world is not None:
                             world._no_collision_reward_given = False
                     except Exception:
@@ -1273,6 +3460,7 @@ class VectorizedRewardCalculator:
                         agent._had_penetration_or_collision = False
                         agent._had_obstacle_collision = False
                         agent._had_terrain_contact_or_penetration = False
+                        agent._episode_has_collision = False
                     except Exception:
                         pass
             # 🚨 关键修复：last_seen_step的更新应该在检查成功条件之后，而不是在之前
@@ -1312,7 +3500,9 @@ class VectorizedRewardCalculator:
                 # 🔧 如果agent_id是-1或None，尝试从world.agents中获取正确的智能体索引
                 if agent_idx_for_goal < 0:
                     try:
-                        world = getattr(scenario, 'world', None)
+                        # 🚀 关键修复：优先使用传入的world参数
+                        if world is None:
+                            world = getattr(scenario, 'world', None)
                         if world is not None and hasattr(world, 'agents'):
                             for idx, ag in enumerate(world.agents):
                                 if ag is agent:
@@ -1360,9 +3550,17 @@ class VectorizedRewardCalculator:
                     success_mask = in_area_mask & (distances <= self.success_distance_threshold)
                 else:
                     success_mask = distances <= self.success_distance_threshold
+
+                ring_bonus = self._goal_ring_bonus_vectorized(agent, distances, success_state)
+                if np.any(ring_bonus > 0.0):
+                    rewards = np.maximum(rewards, ring_bonus.astype(np.float32))
                 
                 if np.any(success_mask):
-                    # 一次性成功奖励（防重复）
+                    # 🚨 关键修复：奖励值必须总是被计算和设置，即使success_reward_given已经是True
+                    # 原因：一次性奖励机制只控制打印和悬停奖励，不应该阻止基础成功奖励的发放
+                    # 修复：将奖励值计算移出if reward_should_be_given块，确保总是执行
+                    
+                    # 一次性成功奖励（防重复）- 只用于控制打印和悬停奖励
                     # 🚨 关键修复：使用原子性检查-设置操作，防止并发调用导致重复触发
                     # 在检查成功条件之前，先检查并设置标志，确保同一回合中只触发一次
                     reward_should_be_given = False
@@ -1374,35 +3572,156 @@ class VectorizedRewardCalculator:
                         success_state['hover_reward_count'] = 0
                         reward_should_be_given = True
                     
-                    # 🚨 关键修复：只有在标志刚被设置时才给予奖励
-                    if reward_should_be_given:
-                        
-                        # 🔧 新增：计算无碰撞比例（基于回合总步数和实际碰撞次数）
-                        # 无碰撞比例 = 1 - (总碰撞次数 / 回合总步数)
-                        no_collision_ratio = 1.0  # 默认值：假设没有碰撞
-                        no_collision_reward = 0.0
-                        total_collision_count = 0
-                        episode_length = 2800  # 默认值
-                        try:
+                    # 🚨 关键修复：计算奖励值（总是执行，不依赖于reward_should_be_given）
+                    # 奖励值计算和设置应该在检测到到达时立即执行，而不是只在第一次到达时执行
+                    # 原因：即使success_reward_given已经是True，奖励值仍然应该被正确设置
+                    # 一次性奖励机制只控制打印和悬停奖励，不应该阻止基础成功奖励的发放
+                    
+                    # 计算无碰撞比例（解耦版）：个体成功奖励只看当前agent自己的碰撞
+                    # 注意：total_collision_count 仍用于团队无碰撞奖励判定，不影响此处的个体奖励缩放
+                    no_collision_ratio = 1.0
+                    no_collision_reward = 0.0
+                    total_collision_count = 0
+                    current_agent_collision_count = 0
+                    episode_length = 2800
+                    try:
+                        if world is None:
                             world = getattr(scenario, 'world', None)
-                            if world is not None:
-                                # 获取回合总步数
-                                if hasattr(world, 'episode_length') and world.episode_length is not None:
-                                    episode_length = int(world.episode_length)
-                                elif hasattr(world, 'max_steps') and world.max_steps is not None:
-                                    episode_length = int(world.max_steps)
-                                else:
-                                    # 从环境变量获取
-                                    import os
-                                    episode_length_str = os.getenv('EPISODE_LENGTH', '2800')
+                        if world is not None:
+                            # 获取回合总步数
+                            if hasattr(world, 'episode_length') and world.episode_length is not None:
+                                episode_length = int(world.episode_length)
+                            elif hasattr(world, 'max_steps') and world.max_steps is not None:
+                                episode_length = int(world.max_steps)
+                            else:
+                                episode_length_str = os.getenv('EPISODE_LENGTH', '2800')
+                                try:
+                                    episode_length = int(episode_length_str)
+                                except (ValueError, TypeError):
+                                    episode_length = 2800
+
+                            # 统计全队碰撞（用于团队奖励）并提取当前agent碰撞（用于个体成功奖励缩放）
+                            if hasattr(world, 'agents') and world.agents is not None:
+                                matched_agent = False
+                                for ag in world.agents:
+                                    penetration_count = 0
+                                    if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
+                                        penetration_count = ag.debug_info.get('total_penetration_count', 0)
+                                        try:
+                                            penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
+                                        except (ValueError, TypeError, OverflowError):
+                                            penetration_count = 0
+                                    total_collision_count += penetration_count
+                                    if ag is agent:
+                                        current_agent_collision_count = penetration_count
+                                        matched_agent = True
+
+                                # 在极端情况下agent对象不在world.agents中，回退到当前agent自身统计
+                                if not matched_agent and hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                                    _cnt = agent.debug_info.get('total_penetration_count', 0)
                                     try:
-                                        episode_length = int(episode_length_str)
-                                    except (ValueError, TypeError):
-                                        episode_length = 2800
+                                        current_agent_collision_count = int(_cnt) if np.isfinite(_cnt) else 0
+                                    except (ValueError, TypeError, OverflowError):
+                                        current_agent_collision_count = 0
+                            elif hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                                _cnt = agent.debug_info.get('total_penetration_count', 0)
+                                try:
+                                    current_agent_collision_count = int(_cnt) if np.isfinite(_cnt) else 0
+                                except (ValueError, TypeError, OverflowError):
+                                    current_agent_collision_count = 0
+
+                            # 个体成功奖励缩放只由当前agent碰撞比例决定
+                            if episode_length > 0:
+                                collision_ratio = float(current_agent_collision_count) / float(episode_length)
+                                no_collision_ratio = max(0.0, 1.0 - collision_ratio)
+                                if collision_ratio < 0.1:
+                                    no_collision_ratio = no_collision_ratio ** 12
+                                elif collision_ratio >= 0.5:
+                                    no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
+                                    no_collision_ratio = max(0.0, no_collision_ratio)
+                            else:
+                                no_collision_ratio = 1.0 if current_agent_collision_count == 0 else 0.0
+                    except Exception as e:
+                        if os.getenv('ENABLE_REWARD_DEBUG', '0').lower() in ('1', 'true', 'yes', 'on'):
+                            print(f"[警告] 获取碰撞计数失败: {e}, 使用默认值current_agent_collision_count=0")
+                        pass
+                    
+                    # 个体成功奖励严格按回合只发一次。
+                    reward_value = self.success_reward_value * no_collision_ratio
+                    if not self._agent_safe_so_far(agent):
+                        reward_value = 0.0
+                    reward_value = min(reward_value, self.success_reward_value)
+                    success_reward_scaled = np.full(len(positions), reward_value, dtype=np.float32)
+                    if reward_should_be_given:
+                        rewards[success_mask] = success_reward_scaled[success_mask]
+                    
+                    # 🚨 关键修复：打印语句应该在第一次到达时总是执行
+                    # 原因：用户需要看到奖励信息，即使success_reward_given已经是True
+                    # 修复：使用reward_should_be_given标志，它在第一次到达时为True
+                    # 注意：reward_should_be_given在success_reward_given被设置为True时也会被设置为True
+                    # 所以如果success_reward_given为False，reward_should_be_given也会是True（第一次到达）
+                    # 如果success_reward_given为True，reward_should_be_given会是False（已经到达过）
+                    # 因此，使用reward_should_be_given可以确保只在第一次到达时打印
+                    if reward_should_be_given:
+                        # 🚨 关键修复：重新获取world用于打印（确保使用正确的world对象）
+                        # 🚀 关键修复：优先使用传入的world参数，如果不存在再从agent.world或scenario.world获取
+                        world_for_print = world if world is not None else None
+                        if world_for_print is None:
+                            world_for_print = getattr(agent, 'world', None)
+                        if world_for_print is None:
+                            world_for_print = getattr(scenario, 'world', None)
+                        
+                        # 🔧 获取环境ID用于打印
+                        env_id = None
+                        try:
+                            if world_for_print is not None:
+                                env_id = getattr(world_for_print, 'env_id', None)
+                            if env_id is None:
+                                env_id = getattr(scenario, 'env_id', None)
+                            if env_id is None and hasattr(agent, 'env_id'):
+                                env_id = getattr(agent, 'env_id', None)
+                        except Exception:
+                            pass
+                        
+                        # 获取智能体ID用于打印
+                        actual_agent_id = agent_id if agent_id is not None and agent_id >= 0 else -1
+                        if actual_agent_id < 0:
+                            try:
+                                if world_for_print is not None and hasattr(world_for_print, 'agents'):
+                                    for idx, ag in enumerate(world_for_print.agents):
+                                        if ag is agent:
+                                            actual_agent_id = idx
+                                            break
+                            except Exception:
+                                pass
+                        if actual_agent_id < 0:
+                            if agent_idx is not None and agent_idx >= 0:
+                                actual_agent_id = agent_idx
+                            else:
+                                actual_agent_id = 0
+                        
+                        min_dist = np.min(distances[success_mask]) if np.any(success_mask) else 999.0
+                        env_display = f"Env{env_id}" if env_id is not None else "Env?"
+                        
+                        # 🚨 关键修复：重新计算total_collision_count用于打印（确保使用正确的world对象）
+                        # 🚀 关键修复：优先使用传入的world参数，确保获取正确的碰撞计数
+                        # 使用与奖励计算相同的逻辑，但使用world_for_print确保一致性
+                        total_collision_count_for_print = total_collision_count  # 默认使用之前计算的值
+                        episode_length_for_print = episode_length  # 默认使用之前计算的值
+                        try:
+                            # 🚀 关键修复：优先使用传入的world参数，如果不存在再使用world_for_print
+                            world_for_collision_count = world if world is not None else world_for_print
+                            if world_for_collision_count is not None:
+                                # 重新获取episode_length
+                                if hasattr(world_for_collision_count, 'episode_length') and world_for_collision_count.episode_length is not None:
+                                    episode_length_for_print = int(world_for_collision_count.episode_length)
+                                elif hasattr(world_for_collision_count, 'max_steps') and world_for_collision_count.max_steps is not None:
+                                    episode_length_for_print = int(world_for_collision_count.max_steps)
                                 
-                                # 统计所有智能体的总碰撞次数
-                                if hasattr(world, 'agents') and world.agents is not None:
-                                    for ag in world.agents:
+                                # 🚀 关键修复：重新统计所有智能体的总碰撞次数（使用正确的world对象）
+                                if hasattr(world_for_collision_count, 'agents') and world_for_collision_count.agents is not None:
+                                    total_collision_count_for_print = 0
+                                    for ag in world_for_collision_count.agents:
                                         penetration_count = 0
                                         if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
                                             penetration_count = ag.debug_info.get('total_penetration_count', 0)
@@ -1410,105 +3729,105 @@ class VectorizedRewardCalculator:
                                                 penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
                                             except (ValueError, TypeError, OverflowError):
                                                 penetration_count = 0
-                                        total_collision_count += penetration_count
-                                    
-                                    # 计算无碰撞比例 = 1 - (总碰撞次数 / 回合总步数)
-                                    if episode_length > 0:
-                                        collision_ratio = float(total_collision_count) / float(episode_length)
-                                        no_collision_ratio = max(0.0, 1.0 - collision_ratio)
+                                        total_collision_count_for_print += penetration_count
+                        except Exception:
+                            pass  # 如果重新计算失败，使用之前的值
+                        
+                        # 🔧 计算所有智能体的到达状态（用于打印）
+                        all_reached_count = 0
+                        total_agents = 0
+                        try:
+                            if world_for_print is not None and hasattr(world_for_print, 'agents') and world_for_print.agents is not None:
+                                total_agents = len(world_for_print.agents)
+                                for ag in world_for_print.agents:
+                                    ag_pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
+                                    if ag_pos is not None:
+                                        ag_goal = None
+                                        if hasattr(ag, 'goal_a') and hasattr(ag.goal_a, 'state') and getattr(ag.goal_a.state, 'p_pos', None) is not None:
+                                            ag_goal = ag.goal_a.state.p_pos
+                                        if ag_goal is None and hasattr(scenario, 'goal_pos') and scenario.goal_pos is not None:
+                                            ag_goal = scenario.goal_pos
                                         
-                                        # 🚨 非线性映射：降低少量碰撞时的奖励，确保"碰了一半及以上就小于0.2"
-                                        # 如果碰撞比例 < 0.1（少量碰撞，如50次/2800=0.018），使用更严厉的惩罚
-                                        if collision_ratio < 0.1:
-                                            # 少量碰撞时，使用更严厉的指数惩罚，让梯度更明显
-                                            # 例如：50次碰撞(0.018) -> 比例 = 0.982^4.5 ≈ 0.920
-                                            # 使用指数4.5，让少量碰撞时的奖励显著降低，形成更明显的梯度
-                                            no_collision_ratio = no_collision_ratio ** 4.5  # 更严厉的指数惩罚，让少量碰撞时比例更低
-                                        # 如果碰撞比例 >= 0.5（碰了一半及以上），使用更严厉的惩罚
-                                        elif collision_ratio >= 0.5:
-                                            # 碰撞比例在[0.5, 1.0]范围内，映射到[0.0, 0.2]
-                                            # 使用线性映射：0.5 -> 0.2, 1.0 -> 0.0
-                                            no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
-                                            no_collision_ratio = max(0.0, no_collision_ratio)
-                                    else:
-                                        no_collision_ratio = 1.0 if total_collision_count == 0 else 0.0
-                                    
-                                    # 🚨 关键修复：使用严格的碰撞检查逻辑，确保判断准确
-                                    # 检查所有智能体是否都没有碰撞（使用与显示逻辑一致的检查）
-                                    all_no_collision_strict = True
+                                        if ag_goal is not None:
+                                            ag_dist = np.linalg.norm(np.array(ag_pos) - np.array(ag_goal))
+                                            if ag_dist <= self.success_distance_threshold:
+                                                all_reached_count += 1
+                        except Exception:
+                            pass
+                        
+                        # 获取当前智能体自己的碰撞次数（用于打印）
+                        # 奖励缩放已改为个体碰撞统计，打印继续展示当前agent碰撞与全队碰撞（便于诊断）
+                        current_agent_collision_count = 0
+                        try:
+                            if agent is not None:
+                                if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                                    current_agent_collision_count = agent.debug_info.get('total_penetration_count', 0)
                                     try:
-                                        if hasattr(world, 'agents') and world.agents is not None:
-                                            for ag in world.agents:
-                                                penetration_count_check = 0
-                                                if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
-                                                    penetration_count_check = ag.debug_info.get('total_penetration_count', 0)
-                                                    try:
-                                                        penetration_count_check = int(penetration_count_check) if np.isfinite(penetration_count_check) else 0
-                                                    except (ValueError, TypeError, OverflowError):
-                                                        penetration_count_check = 0
-                                                if (getattr(ag, '_had_penetration_or_collision', False) or 
-                                                    penetration_count_check > 0 or 
-                                                    getattr(ag, '_had_terrain_contact_or_penetration', False) or
-                                                    getattr(ag, '_had_obstacle_collision', False)):
-                                                    all_no_collision_strict = False
-                                                    break
-                                    except Exception:
-                                        all_no_collision_strict = False
-                                    
-                                    # 如果所有智能体都没有碰撞，给予无碰撞奖励
-                                    if all_no_collision_strict and total_collision_count == 0 and self.no_collision_reward_value > 0.0:
-                                        # 初始化无碰撞奖励状态
-                                        if 'no_collision_reward_given' not in success_state:
-                                            success_state['no_collision_reward_given'] = False
-                                        
-                                        # 只在第一次成功到达时给予无碰撞奖励
-                                        if not success_state.get('no_collision_reward_given', False):
-                                            success_state['no_collision_reward_given'] = True
-                                            no_collision_reward = self.no_collision_reward_value
+                                        current_agent_collision_count = int(current_agent_collision_count) if np.isfinite(current_agent_collision_count) else 0
+                                    except (ValueError, TypeError, OverflowError):
+                                        current_agent_collision_count = 0
+                        except Exception:
+                            pass
+                        
+                        # 计算当前智能体的无碰撞比例（与当前个体成功奖励缩放一致）
+                        current_agent_no_collision_ratio = 1.0
+                        if episode_length_for_print > 0:
+                            current_agent_collision_ratio = float(current_agent_collision_count) / float(episode_length_for_print)
+                            current_agent_no_collision_ratio = max(0.0, 1.0 - current_agent_collision_ratio)
+                        
+                        # 判断是部分到达还是全部到达
+                        debug_reward_events = os.getenv('DEBUG_REWARD_EVENTS', '0').lower() in ('1','true','yes','on')
+                        if debug_reward_events:
+                            if total_agents > 0 and 0 < all_reached_count < total_agents:
+                                # 部分到达：显示部分到达奖励
+                                # 🚨 关键修复：显示当前智能体自己的碰撞次数，而不是全局的
+                                print(f"[部分到达奖励] {env_display} Agent{actual_agent_id}: {all_reached_count}/{total_agents}个智能体到达目标, 距离={min_dist:.2f}m, 碰撞次数={current_agent_collision_count}/{episode_length_for_print}, 无碰撞比例={current_agent_no_collision_ratio:.3f}, 奖励={success_reward_scaled[success_mask][0] if np.any(success_mask) else 0.0:.1f} (基础值={self.success_reward_value:.1f}, 一次性, 全局碰撞={total_collision_count_for_print})")
+                            else:
+                                # 全部到达或单个智能体到达：显示标准成功奖励
+                                # 🚨 关键修复：显示当前智能体自己的碰撞次数，而不是全局的
+                                print(f"[VecSuccessReward] {env_display} Agent{actual_agent_id}: reached goal at {min_dist:.2f}m, collisions={current_agent_collision_count}/{episode_length_for_print}, no_collision_ratio={current_agent_no_collision_ratio:.3f}, reward={success_reward_scaled[success_mask][0] if np.any(success_mask) else 0.0:.1f} (scaled from {self.success_reward_value:.1f}, one-time, global_collisions={total_collision_count_for_print})")
+                    
+                    # 🚨 关键修复：只有在标志刚被设置时才给予额外奖励（如无碰撞奖励）
+                    if reward_should_be_given:
+                        
+                        # 🚨 关键修复：这里不应该重新计算no_collision_ratio，应该使用之前计算的值
+                        # 原因：之前已经计算过了（1395-1451行），重新计算会导致不一致和覆盖
+                        # 修复：直接使用之前计算的no_collision_ratio和total_collision_count
+                        # 只重新获取world对象用于无碰撞奖励检查（如果需要）
+                        no_collision_reward = 0.0
+                        try:
+                            # 🚨 关键修复：优先从agent.world获取world，向量化环境中scenario.world可能不存在
+                            world = getattr(agent, 'world', None)
+                            if world is None:
+                                world = getattr(scenario, 'world', None)
+                            
+                            # 🚨 关键修复：使用严格的碰撞检查逻辑，确保判断准确
+                            # 检查所有智能体是否都没有碰撞（使用与显示逻辑一致的检查）
+                            all_no_collision_strict = True
+                            if world is not None:
+                                try:
+                                    if hasattr(world, 'agents') and world.agents is not None:
+                                        for ag in world.agents:
+                                            if not self._agent_safe_so_far(ag):
+                                                all_no_collision_strict = False
+                                                break
+                                except Exception:
+                                    all_no_collision_strict = False
                             else:
                                 # 如果没有world，回退到只检查当前智能体
-                                penetration_count = 0
-                                if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
-                                    penetration_count = agent.debug_info.get('total_penetration_count', 0)
-                                    try:
-                                        penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
-                                    except (ValueError, TypeError, OverflowError):
-                                        penetration_count = 0
+                                all_no_collision_strict = self._agent_safe_so_far(agent)
+                            
+                            # 如果所有智能体都没有碰撞，给予无碰撞奖励
+                            # 🚨 关键修复：使用之前计算的total_collision_count，而不是重新计算
+                            if all_no_collision_strict and total_collision_count == 0 and self.no_collision_reward_value > 0.0:
+                                # 初始化无碰撞奖励状态
+                                if 'no_collision_reward_given' not in success_state:
+                                    success_state['no_collision_reward_given'] = False
                                 
-                                total_collision_count = penetration_count
-                                
-                                # 获取回合总步数（回退方案）
-                                import os
-                                episode_length_str = os.getenv('EPISODE_LENGTH', '2800')
-                                try:
-                                    episode_length = int(episode_length_str)
-                                except (ValueError, TypeError):
-                                    episode_length = 2800
-                                
-                                # 计算无碰撞比例
-                                if episode_length > 0:
-                                    collision_ratio = float(total_collision_count) / float(episode_length)
-                                    no_collision_ratio = max(0.0, 1.0 - collision_ratio)
-                                    
-                                    # 🚨 非线性映射：确保"碰了一半及以上就小于0.2"
-                                    if collision_ratio >= 0.5:
-                                        no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
-                                        no_collision_ratio = max(0.0, no_collision_ratio)
-                                else:
-                                    no_collision_ratio = 1.0 if total_collision_count == 0 else 0.0
-                                
-                                # 🚨 关键修复：回退路径也使用严格的碰撞检查
-                                all_no_collision_strict = (penetration_count == 0 and 
-                                                          not getattr(agent, '_had_penetration_or_collision', False) and
-                                                          not getattr(agent, '_had_terrain_contact_or_penetration', False) and
-                                                          not getattr(agent, '_had_obstacle_collision', False))
-                                
-                                if all_no_collision_strict and total_collision_count == 0 and self.no_collision_reward_value > 0.0:
-                                    if 'no_collision_reward_given' not in success_state:
-                                        success_state['no_collision_reward_given'] = False
-                                    if not success_state.get('no_collision_reward_given', False):
-                                        success_state['no_collision_reward_given'] = True
-                                        no_collision_reward = self.no_collision_reward_value
+                                # 只在第一次成功到达时给予无碰撞奖励
+                                if not success_state.get('no_collision_reward_given', False):
+                                    success_state['no_collision_reward_given'] = True
+                                    no_collision_reward = self.no_collision_reward_value
                         except Exception:
                             pass
                         
@@ -1516,8 +3835,20 @@ class VectorizedRewardCalculator:
                         # 如果所有智能体都没有碰撞，无碰撞比例 = 1.0，成功奖励 = 原值
                         # 如果部分智能体有碰撞，无碰撞比例 < 1.0，成功奖励会按比例减少
                         # 如果所有智能体都有碰撞，无碰撞比例 = 0.0，成功奖励 = 0
-                        success_reward_scaled = self.success_reward_value * no_collision_ratio
-                        rewards[success_mask] = success_reward_scaled
+                        # 🚀 关键修复：移除precision_bonus，确保奖励不超过基础值（按照碰撞比例来给奖励值）
+                        # 原因：用户要求奖励应该按照碰撞比例来给，不应该超过基础值2000
+                        # 🚀 关键修复：确保success_reward_scaled是数组而不是标量，以便使用数组索引
+                        reward_value = self.success_reward_value * no_collision_ratio
+                        if not self._agent_safe_so_far(agent):
+                            reward_value = 0.0
+                        # 确保奖励值不超过基础值（防止数值误差导致超过）
+                        reward_value = min(reward_value, self.success_reward_value)
+                        # 创建与positions长度相同的数组
+                        success_reward_scaled = np.full(len(positions), reward_value, dtype=np.float32)
+                        # 🚨 关键修复：奖励值必须总是被设置，即使reward_should_be_given为False
+                        # 原因：如果success_reward_given已经是True（例如由于某种原因），奖励值仍然应该被设置
+                        # 修复：将奖励值设置移出if reward_should_be_given块，确保总是执行
+                        rewards[success_mask] = success_reward_scaled[success_mask]
                         
                         # 🚨 关键修复：无碰撞奖励是全队奖励，应该给所有智能体（而不是只给到达目标的智能体）
                         # 只有在所有智能体都到达目标且无碰撞时，才给所有智能体无碰撞奖励
@@ -1545,11 +3876,38 @@ class VectorizedRewardCalculator:
                         except Exception:
                             all_agents_reached = False
                         
+                        # 🚨 关键修复：无碰撞奖励应该只在"所有智能体都到达目标且所有智能体都无碰撞"时才给予
+                        # 原因：用户明确指出"有专门的部分到达奖励，无碰撞奖励就应该无碰撞且到达才给"
+                        # 修复：不仅检查all_agents_reached，还要再次验证all_no_collision_strict
+                        # 注意：all_no_collision_strict在第1719-1753行已经计算过，但为了确保逻辑清晰，我们再次检查
                         if all_agents_reached and no_collision_reward > 0.0:
-                            # 将无碰撞奖励值存储到world中，供后续统一分配
-                            if not hasattr(world, '_team_no_collision_reward'):
-                                world._team_no_collision_reward = 0.0
-                            world._team_no_collision_reward = no_collision_reward
+                            # 🚨 关键修复：再次验证所有智能体都无碰撞（确保逻辑正确）
+                            # 即使no_collision_reward > 0.0，也要再次检查无碰撞条件，防止逻辑错误
+                            all_no_collision_verify = True
+                            try:
+                                world_for_verify = getattr(scenario, 'world', None)
+                                if world_for_verify is None:
+                                    world_for_verify = getattr(agent, 'world', None)
+                                
+                                if world_for_verify is not None and hasattr(world_for_verify, 'agents') and world_for_verify.agents is not None:
+                                    for ag in world_for_verify.agents:
+                                        if not self._agent_safe_so_far(ag):
+                                            all_no_collision_verify = False
+                                            break
+                            except Exception:
+                                all_no_collision_verify = False
+                            
+                            # 🚨 关键修复：只有在"所有智能体都到达目标"且"所有智能体都无碰撞"时，才设置无碰撞奖励
+                            if all_no_collision_verify:
+                                # 将无碰撞奖励值存储到world中，供后续统一分配
+                                if not hasattr(world, '_team_no_collision_reward'):
+                                    world._team_no_collision_reward = 0.0
+                                world._team_no_collision_reward = no_collision_reward
+                            else:
+                                # 🚨 关键修复：如果有任何智能体有碰撞，即使所有智能体都到达目标，也不给予无碰撞奖励
+                                # 原因：无碰撞奖励应该只在"无碰撞且到达"时才给，部分到达奖励已经通过success_reward处理
+                                if hasattr(world, '_team_no_collision_reward'):
+                                    world._team_no_collision_reward = 0.0
                         # 🔧 改进日志：显示环境ID和智能体ID，减少混淆
                         try:
                             # 🚨 关键修复：尝试从多个地方获取环境ID，确保能正确显示
@@ -1579,50 +3937,9 @@ class VectorizedRewardCalculator:
                             # 原代码：if env_id is None or env_id == 0: 只允许第一个环境打印
                             # 问题：这可能导致某些智能体的信息被隐藏
                             # 修复：所有环境都打印，但添加环境ID标识（如果env_id > 0）
-                            if np.any(success_mask):
-                                min_dist = np.min(distances[success_mask]) if np.any(success_mask) else 999.0
-                                # 🚨 关键修复：使用实际的智能体ID（agent_id），而不是位置索引
-                                # 因为success_mask只包含当前智能体的位置，索引总是0
-                                # 🔧 修复：如果agent_id是-1（未找到标记），再次尝试从world.agents中查找
-                                actual_agent_id = agent_id if agent_id is not None and agent_id >= 0 else -1
-                                
-                                # 🔧 改进：如果agent_id是-1或None，尝试从world.agents中获取正确的智能体索引
-                                if actual_agent_id < 0:
-                                    try:
-                                        world = getattr(scenario, 'world', None)
-                                        if world is not None and hasattr(world, 'agents'):
-                                            for idx, ag in enumerate(world.agents):
-                                                if ag is agent:
-                                                    actual_agent_id = idx
-                                                    break
-                                    except Exception:
-                                        pass
-                                
-                                # 🚨 关键修复：如果仍然找不到，尝试使用传入的agent_idx或保持-1标记
-                                # 原因：使用0会导致所有agent都被识别为agent0
-                                if actual_agent_id < 0:
-                                    # 尝试使用传入的agent_idx（如果有效）
-                                    if agent_idx is not None and agent_idx >= 0:
-                                        actual_agent_id = agent_idx
-                                    else:
-                                        # 如果agent_idx也无效，使用-1标记，并在打印时明确标识
-                                        actual_agent_id = -1
-                                        import os as _debug_os
-                                        if _debug_os.getenv('DEBUG_SUCCESS_REWARD', '0').lower() in ('1','true','yes','on'):
-                                            print(f"[DEBUG] Warning: Failed to get agent_id for agent in print, using -1. agent.name={getattr(agent, 'name', 'N/A')}, agent.id={getattr(agent, 'id', 'N/A')}, agent_idx={agent_idx}")
-                                
-                                # 🔧 如果actual_agent_id仍然是-1，使用0作为最后手段（但会记录警告）
-                                # 注意：这应该很少发生，因为我们已经优先使用了传入的agent_idx
-                                if actual_agent_id < 0:
-                                    actual_agent_id = 0
-                                    import os as _debug_os
-                                    if _debug_os.getenv('DEBUG_SUCCESS_REWARD', '0').lower() in ('1','true','yes','on'):
-                                        print(f"[DEBUG] Warning: All methods failed for print, using 0 as last resort. agent.name={getattr(agent, 'name', 'N/A')}, agent.id={getattr(agent, 'id', 'N/A')}, agent_idx={agent_idx}")
-                                
-                                # 🚨 显示无碰撞比例和缩放后的成功奖励
-                                env_display = f"Env{env_id}" if env_id is not None else "Env?"
-                                print(f"[VecSuccessReward] {env_display} Agent{actual_agent_id}: reached goal at {min_dist:.2f}m, collisions={total_collision_count}/{episode_length}, no_collision_ratio={no_collision_ratio:.3f}, reward={success_reward_scaled:.1f} (scaled from {self.success_reward_value:.1f}, one-time)")
-                                
+                            # 🔧 注意：打印逻辑已经移到了if reward_should_be_given块之前（第1509行），这里不再重复打印
+                            # 只在if reward_should_be_given块内处理无碰撞奖励的打印
+                            if np.any(success_mask) and reward_should_be_given:
                                 # 🔧 新增：输出无碰撞奖励提示
                                 # 🚨 关键修复：no_collision_reward > 0.0 表示所有智能体都到达目标且无碰撞
                                 # 只有在所有智能体都到达且无碰撞时，才打印无碰撞奖励
@@ -1737,6 +4054,10 @@ class VectorizedRewardCalculator:
         if goal_pos_fallback is not None:
             distances = np.linalg.norm(positions - goal_pos_fallback, axis=-1)
             success_mask = distances <= self.success_distance_threshold
+
+            ring_bonus = self._goal_ring_bonus_vectorized(agent, distances, success_state)
+            if np.any(ring_bonus > 0.0):
+                rewards = np.maximum(rewards, ring_bonus.astype(np.float32))
             
             if np.any(success_mask):
                 # 一次性成功奖励（防重复）
@@ -1747,14 +4068,16 @@ class VectorizedRewardCalculator:
                     success_state['first_success_step'] = getattr(scenario, 'current_step', 0)
                     success_state['hover_reward_count'] = 0
                     
-                    # 🔧 新增：计算无碰撞比例（基于回合总步数和实际碰撞次数）
-                    # 无碰撞比例 = 1 - (总碰撞次数 / 回合总步数)
-                    no_collision_ratio = 1.0  # 默认值：假设没有碰撞
+                    # 计算无碰撞比例（解耦版）：个体成功奖励只看当前agent自己的碰撞
+                    no_collision_ratio = 1.0
                     no_collision_reward = 0.0
                     total_collision_count = 0
-                    episode_length = 2800  # 默认值
+                    current_agent_collision_count = 0
+                    episode_length = 2800
+                    all_agents_reached_fallback = False
                     try:
-                        world = getattr(scenario, 'world', None)
+                        if world is None:
+                            world = getattr(scenario, 'world', None)
                         if world is not None:
                             # 获取回合总步数
                             if hasattr(world, 'episode_length') and world.episode_length is not None:
@@ -1762,16 +4085,15 @@ class VectorizedRewardCalculator:
                             elif hasattr(world, 'max_steps') and world.max_steps is not None:
                                 episode_length = int(world.max_steps)
                             else:
-                                # 从环境变量获取
-                                import os
                                 episode_length_str = os.getenv('EPISODE_LENGTH', '2800')
                                 try:
                                     episode_length = int(episode_length_str)
                                 except (ValueError, TypeError):
                                     episode_length = 2800
-                            
-                            # 统计所有智能体的总碰撞次数
+
+                            # 全队碰撞用于团队奖励；个体碰撞用于当前agent成功奖励缩放
                             if hasattr(world, 'agents') and world.agents is not None:
+                                matched_agent = False
                                 for ag in world.agents:
                                     penetration_count = 0
                                     if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
@@ -1781,32 +4103,38 @@ class VectorizedRewardCalculator:
                                         except (ValueError, TypeError, OverflowError):
                                             penetration_count = 0
                                     total_collision_count += penetration_count
-                                
-                                # 计算无碰撞比例 = 1 - (总碰撞次数 / 回合总步数)
-                                if episode_length > 0:
-                                    collision_ratio = float(total_collision_count) / float(episode_length)
-                                    no_collision_ratio = max(0.0, 1.0 - collision_ratio)
-                                    
-                                    # 🚨 非线性映射：降低少量碰撞时的奖励，确保"碰了一半及以上就小于0.2"
-                                    # 如果碰撞比例 < 0.1（少量碰撞，如50次/2800=0.018），使用更严厉的惩罚
-                                    if collision_ratio < 0.1:
-                                        # 少量碰撞时，使用更严厉的指数惩罚，让梯度更明显
-                                        # 例如：50次碰撞(0.018) -> 比例 = 0.982^4.5 ≈ 0.920
-                                        # 更严厉：50次碰撞(0.018) -> 比例 = 0.982^5.0 ≈ 0.910
-                                        # 使用指数4.5，让少量碰撞时的奖励显著降低，形成更明显的梯度
-                                        no_collision_ratio = no_collision_ratio ** 4.5  # 更严厉的指数惩罚，让少量碰撞时比例更低
-                                    # 如果碰撞比例 >= 0.5（碰了一半及以上），使用更严厉的惩罚
-                                    elif collision_ratio >= 0.5:
-                                        # 碰撞比例在[0.5, 1.0]范围内，映射到[0.0, 0.2]
-                                        # 使用线性映射：0.5 -> 0.2, 1.0 -> 0.0
-                                        no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
-                                        no_collision_ratio = max(0.0, no_collision_ratio)
-                                else:
-                                    no_collision_ratio = 1.0 if total_collision_count == 0 else 0.0
+                                    if ag is agent:
+                                        current_agent_collision_count = penetration_count
+                                        matched_agent = True
+
+                                if not matched_agent and hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                                    _cnt = agent.debug_info.get('total_penetration_count', 0)
+                                    try:
+                                        current_agent_collision_count = int(_cnt) if np.isfinite(_cnt) else 0
+                                    except (ValueError, TypeError, OverflowError):
+                                        current_agent_collision_count = 0
+                            elif hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                                _cnt = agent.debug_info.get('total_penetration_count', 0)
+                                try:
+                                    current_agent_collision_count = int(_cnt) if np.isfinite(_cnt) else 0
+                                except (ValueError, TypeError, OverflowError):
+                                    current_agent_collision_count = 0
+
+                            if episode_length > 0:
+                                collision_ratio = float(current_agent_collision_count) / float(episode_length)
+                                no_collision_ratio = max(0.0, 1.0 - collision_ratio)
+                                if collision_ratio < 0.1:
+                                    no_collision_ratio = no_collision_ratio ** 12
+                                elif collision_ratio >= 0.5:
+                                    no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
+                                    no_collision_ratio = max(0.0, no_collision_ratio)
+                            else:
+                                no_collision_ratio = 1.0 if current_agent_collision_count == 0 else 0.0
                                 
                                 # 🚨 关键修复：无碰撞奖励应该只在所有智能体都到达目标且无碰撞时才给一次
                                 # 检查所有智能体是否都到达目标
                                 all_agents_reached = False
+                                all_agents_safe = False
                                 if hasattr(world, 'agents') and world.agents is not None:
                                     all_reached_count = 0
                                     for ag in world.agents:
@@ -1827,9 +4155,10 @@ class VectorizedRewardCalculator:
                                     
                                     # 所有智能体都到达目标
                                     all_agents_reached = (all_reached_count == len(world.agents))
+                                    all_agents_safe = all(self._agent_safe_so_far(ag) for ag in world.agents)
                                 
                                 # 如果所有智能体都到达目标且无碰撞，给予无碰撞奖励（只给一次）
-                                if all_agents_reached and total_collision_count == 0 and self.no_collision_reward_value > 0.0:
+                                if all_agents_reached and all_agents_safe and total_collision_count == 0 and self.no_collision_reward_value > 0.0:
                                     # 🚨 关键修复：使用world级别的状态，确保只给一次（而不是每个agent都检查）
                                     if not hasattr(world, '_no_collision_reward_given'):
                                         world._no_collision_reward_given = False
@@ -1851,7 +4180,6 @@ class VectorizedRewardCalculator:
                             total_collision_count = penetration_count
                             
                             # 获取回合总步数（回退方案）
-                            import os
                             episode_length_str = os.getenv('EPISODE_LENGTH', '2800')
                             try:
                                 episode_length = int(episode_length_str)
@@ -1863,11 +4191,9 @@ class VectorizedRewardCalculator:
                                 collision_ratio = float(total_collision_count) / float(episode_length)
                                 no_collision_ratio = max(0.0, 1.0 - collision_ratio)
                                 
-                                # 🚨 非线性映射：降低少量碰撞时的奖励，确保"碰了一半及以上就小于0.2"
-                                # 如果碰撞比例 < 0.1（少量碰撞），使用更严厉的惩罚
+                                # 🚨 非线性映射：大幅压低“有碰撞”时的成功奖励，激励完全避免碰撞
                                 if collision_ratio < 0.1:
-                                    # 少量碰撞时，使用更严厉的指数惩罚，让梯度更明显
-                                    no_collision_ratio = no_collision_ratio ** 4.5  # 更严厉的指数惩罚
+                                    no_collision_ratio = no_collision_ratio ** 12  # 强惩罚少量碰撞，推动零碰撞
                                 # 如果碰撞比例 >= 0.5（碰了一半及以上），使用更严厉的惩罚
                                 elif collision_ratio >= 0.5:
                                     no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
@@ -1884,17 +4210,7 @@ class VectorizedRewardCalculator:
                                     all_reached_count = 0
                                     for ag in world.agents:
                                         # 检查碰撞
-                                        penetration_count_check = 0
-                                        if hasattr(ag, 'debug_info') and isinstance(ag.debug_info, dict):
-                                            penetration_count_check = ag.debug_info.get('total_penetration_count', 0)
-                                            try:
-                                                penetration_count_check = int(penetration_count_check) if np.isfinite(penetration_count_check) else 0
-                                            except (ValueError, TypeError, OverflowError):
-                                                penetration_count_check = 0
-                                        if (getattr(ag, '_had_penetration_or_collision', False) or 
-                                            penetration_count_check > 0 or 
-                                            getattr(ag, '_had_terrain_contact_or_penetration', False) or
-                                            getattr(ag, '_had_obstacle_collision', False)):
+                                        if not self._agent_safe_so_far(ag):
                                             all_no_collision_strict_fallback = False
                                         
                                         # 检查是否到达目标
@@ -1934,8 +4250,15 @@ class VectorizedRewardCalculator:
                     # 🚨 关键修改：成功奖励 = 成功奖励 × 无碰撞比例
                     # 无碰撞比例 = 1 - (总碰撞次数 / 回合总步数)
                     # 如果碰撞比例 >= 0.5，使用非线性映射确保比例 < 0.2
-                    success_reward_scaled = self.success_reward_value * no_collision_ratio
-                    rewards[success_mask] = success_reward_scaled
+                    # 🚀 关键修复：确保success_reward_scaled是数组而不是标量，以便使用数组索引
+                    reward_value = self.success_reward_value * no_collision_ratio
+                    if not self._agent_safe_so_far(agent):
+                        reward_value = 0.0
+                    # 确保奖励值不超过基础值（防止数值误差导致超过）
+                    reward_value = min(reward_value, self.success_reward_value)
+                    # 创建与positions长度相同的数组
+                    success_reward_scaled = np.full(len(positions), reward_value, dtype=np.float32)
+                    rewards[success_mask] = success_reward_scaled[success_mask]
                     
                     # 🚨 关键修复：无碰撞奖励是全队奖励，应该给所有智能体（而不是只给到达目标的智能体）
                     # 只有在所有智能体都到达目标且无碰撞时，才给所有智能体无碰撞奖励（回退路径）
@@ -2008,7 +4331,10 @@ class VectorizedRewardCalculator:
                         
                         # 🚨 显示无碰撞比例和缩放后的成功奖励
                         env_display = f"Env{env_id}" if env_id is not None else "Env?"
-                        print(f"[VecSuccessReward] {env_display} Agent{actual_agent_id}: reached goal at {min_dist:.2f}m (fallback), collisions={total_collision_count}/{episode_length}, no_collision_ratio={no_collision_ratio:.3f}, reward={success_reward_scaled:.1f} (scaled from {self.success_reward_value:.1f})")
+                        # 🚀 关键修复：success_reward_scaled现在是数组，需要提取标量值用于打印
+                        reward_for_print = float(success_reward_scaled[success_mask][0]) if np.any(success_mask) else float(self.success_reward_value * no_collision_ratio)
+                        if os.getenv('DEBUG_REWARD_EVENTS', '0').lower() in ('1','true','yes','on'):
+                            print(f"[VecSuccessReward] {env_display} Agent{actual_agent_id}: reached goal at {min_dist:.2f}m (fallback), collisions={total_collision_count}/{episode_length}, no_collision_ratio={no_collision_ratio:.3f}, reward={reward_for_print:.1f} (scaled from {self.success_reward_value:.1f})")
                         
                         # 🔧 新增：输出无碰撞奖励提示
                         # 🚨 关键修复：no_collision_reward > 0.0 表示所有智能体都到达目标且无碰撞
@@ -2072,7 +4398,8 @@ class VectorizedRewardCalculator:
                                     actual_agent_id = 0
                                 
                                 env_display = f"Env{env_id}" if env_id is not None else "Env?"
-                                print(f"[VecNoCollisionReward] {env_display} All agents: no collision in episode, reward={no_collision_reward} (one-time)")
+                                if os.getenv('DEBUG_REWARD_EVENTS', '0').lower() in ('1','true','yes','on'):
+                                    print(f"[VecNoCollisionReward] {env_display} All agents: no collision in episode, reward={no_collision_reward} (one-time)")
                     except Exception:
                         pass
                 else:
@@ -2105,6 +4432,23 @@ class VectorizedRewardCalculator:
             # 🔧 修复：不再重置成功状态，确保整个回合只给一次成功奖励
             # if not np.any(success_mask):
             #     success_state['success_reward_given'] = False
+
+        current_in_goal_zone = False
+        try:
+            if 'success_mask' in locals():
+                current_in_goal_zone = bool(np.any(success_mask))
+        except Exception:
+            current_in_goal_zone = False
+
+        if not current_in_goal_zone:
+            rewards[:] = 0.0
+            if success_state.get('was_in_goal_zone', False):
+                rewards[:] = -float(self.leave_goal_penalty)
+                success_state['hover_reward_count'] = 0
+        elif not self._agent_safe_so_far(agent):
+            rewards = np.minimum(rewards, 0.0).astype(np.float32, copy=False)
+
+        success_state['was_in_goal_zone'] = current_in_goal_zone
         
         # 🚨 关键修复：在函数结束前更新last_seen_step，确保在同一个step中的多次调用时保持一致
         # 这样可以防止在同一个step中的多次调用时，last_seen_step被提前更新，导致is_new_episode判断出错
@@ -2118,6 +4462,20 @@ class VectorizedRewardCalculator:
         
         return rewards
 
+    def _terrain_min_distance_3d(self, positions: np.ndarray, scenario: Any, cached_data: Dict[str, Any] = None, world: Any = None) -> np.ndarray:
+        """
+        计算位置到地形的 3D 最小距离，与净空奖励 _clearance_reward_vectorized 中地形距离定义一致。
+        用于碰撞惩罚与净空奖励共用同一套 d_min 定义，避免信号矛盾。
+        返回形状 (len(positions),) 的 float32 数组，无有效地形时为 np.inf。
+        """
+        cached_data = cached_data if isinstance(cached_data, dict) else (self._cache.get(id(world), {}) if world is not None else {})
+        _, terrain_min_dist, _ = self._compute_terrain_distance_data(
+            positions,
+            scenario,
+            cached_data=cached_data,
+        )
+        return terrain_min_dist
+
     def _collision_penalty_vectorized(self, agent_idx: int, world: Any, scenario: Any, positions: np.ndarray, cached_data: Dict[str, Any] = None) -> np.ndarray:
         """
         优化版碰撞惩罚计算：使用缓存数据，减少重复计算
@@ -2125,6 +4483,7 @@ class VectorizedRewardCalculator:
         🚨 关键修复：使用综合最小距离（d_min_current）检测碰撞，而不是只检查Z坐标穿透
         原因：图表显示 min_distance_to_obstacle 多次为0，但碰撞计数为0，说明Z坐标检测无法捕获侧面碰撞
         修复：计算障碍物和地形的综合最小距离，如果 < collision_distance_threshold 或 < 0，触发碰撞
+        地形距离与净空奖励一致：使用 3D 最近距离（_terrain_min_distance_3d），避免碰撞与净空信号矛盾。
         """
         if positions.ndim == 1:
             positions = positions.reshape(1, -1)
@@ -2151,20 +4510,8 @@ class VectorizedRewardCalculator:
                         dist_to_surface = dist_3d - obstacle_radius  # 到障碍物表面的距离
                         obstacle_min_dist = np.minimum(obstacle_min_dist, dist_to_surface)
             
-            # 计算到地形的距离（使用Z坐标差作为近似，因为精确的XY距离计算较慢）
-            terrain_min_dist = np.full(len(positions), np.inf, dtype=np.float32)
-            if scenario is not None and hasattr(scenario, 'get_terrain_height'):
-                try:
-                    if hasattr(scenario, 'get_terrain_height_vectorized'):
-                        terrain_heights = scenario.get_terrain_height_vectorized(positions[:, 0], positions[:, 1])
-                        if terrain_heights.ndim == 0:
-                            terrain_heights = np.full(len(positions), float(terrain_heights), dtype=np.float32)
-                    else:
-                        terrain_heights = np.array([scenario.get_terrain_height(float(p[0]), float(p[1])) for p in positions], dtype=np.float32)
-                    # 地形距离 = Z坐标差（简化版本，用于快速检测）
-                    terrain_min_dist = positions[:, 2] - terrain_heights
-                except Exception:
-                    pass
+            # 地形距离：与净空路径一致，使用 3D 最近距离（垂向 + 多方向采样取最小）
+            terrain_min_dist = self._terrain_min_distance_3d(positions, scenario, cached_data=cached_data, world=world)
             
             # 综合最小距离：取障碍物和地形距离的最小值
             d_min_current = np.minimum(obstacle_min_dist, terrain_min_dist)
@@ -2176,14 +4523,45 @@ class VectorizedRewardCalculator:
         # 这是主要的碰撞检测方法，比Z坐标检测更准确（能捕获侧面碰撞）
         collision_threshold = float(self.collision_distance_threshold)
         distance_based_collision_mask = (d_min_current < collision_threshold) | (d_min_current < 0.0)
+        real_distance_collision_mask = (d_min_current < 0.0)
         
         # 🚨 关键修复：如果检测到距离碰撞，立即应用惩罚和更新计数
         if np.any(distance_based_collision_mask):
-            # 计算碰撞深度（负数表示穿透）
-            collision_depths = np.maximum(-d_min_current[distance_based_collision_mask], 0.0)
+            # 🚀 新增：根据距离目标的距离动态调整碰撞惩罚强度
+            # 距离目标越近，碰撞惩罚越强，鼓励智能体在接近目标时更加谨慎
+            goal_dist = None
+            try:
+                # 尝试从agent获取目标位置
+                if agent_idx is not None and hasattr(world, 'agents') and 0 <= agent_idx < len(world.agents):
+                    agent = world.agents[agent_idx]
+                    if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                        goal_pos = np.asarray(agent.goal_a.state.p_pos[:3], dtype=np.float32)
+                        if goal_pos.ndim == 1:
+                            goal_pos = goal_pos.reshape(1, -1)
+                        goal_dist = np.linalg.norm(positions - goal_pos, axis=-1)
+                # 如果无法从agent获取，尝试从scenario获取
+                if goal_dist is None and scenario is not None and hasattr(scenario, 'goal_pos') and scenario.goal_pos is not None:
+                    goal_pos = np.asarray(scenario.goal_pos[:3], dtype=np.float32)
+                    if goal_pos.ndim == 1:
+                        goal_pos = goal_pos.reshape(1, -1)
+                    goal_dist = np.linalg.norm(positions - goal_pos, axis=-1)
+            except Exception:
+                goal_dist = None
+            
+            # 🚨 关键修复：碰撞惩罚不再按距离目标减弱，鼓励完全避免碰撞
+            # 原修复（近目标减弱惩罚）会导致“始终出现小碰撞”：近目标碰撞成本低，智能体倾向接受少量碰撞换到达
+            # 现改为全程使用全额惩罚（1.0倍），使任意一步碰撞都受到完整惩罚，从而激励零碰撞
+            penalty_multipliers = np.ones(len(positions), dtype=np.float32)
+            
+            collision_penalties = self._piecewise_collision_penalty(
+                d_min_current[distance_based_collision_mask],
+                collision_threshold,
+                self.collision_penalty_value
+            )
+            dynamic_penalties = collision_penalties * penalty_multipliers[distance_based_collision_mask]
             penalties[distance_based_collision_mask] = np.minimum(
                 penalties[distance_based_collision_mask],
-                -self.collision_penalty_value - collision_depths * float(self.penetration_alpha)
+                dynamic_penalties
             )
             
             # 🚨 关键修复：更新碰撞计数
@@ -2192,8 +4570,9 @@ class VectorizedRewardCalculator:
                 world_agents_len = len(world.agents) if has_world_agents else 0
                 agent_idx_valid = (has_world_agents and 0 <= agent_idx < world_agents_len)
                 
-                if agent_idx_valid:
+                if agent_idx_valid and np.any(real_distance_collision_mask):
                     ag = world.agents[agent_idx]
+                    ag._episode_has_collision = True
                     ag._had_penetration_or_collision = True
                     if not hasattr(ag, 'debug_info'):
                         ag.debug_info = {}
@@ -2201,7 +4580,7 @@ class VectorizedRewardCalculator:
                         ag.debug_info = {}
                     
                     # 统计本批次中的碰撞次数
-                    collision_count = np.sum(distance_based_collision_mask)
+                    collision_count = np.sum(real_distance_collision_mask)
                     old_count = ag.debug_info.get('total_penetration_count', 0)
                     try:
                         collision_count_int = int(collision_count)
@@ -2213,6 +4592,20 @@ class VectorizedRewardCalculator:
                     if new_count > 1000000:
                         new_count = 1000000
                     ag.debug_info['total_penetration_count'] = int(new_count)
+                    # 分项计数：距离检测为地形与障碍综合，按最小距离来源区分
+                    ag.debug_info.setdefault('terrain_penetration_count', 0)
+                    ag.debug_info.setdefault('obstacle_collision_count', 0)
+                    try:
+                        terrain_add = int(np.sum(real_distance_collision_mask & (terrain_min_dist <= obstacle_min_dist)))
+                        obstacle_add = int(np.sum(real_distance_collision_mask & (obstacle_min_dist < terrain_min_dist)))
+                        if terrain_add > 0:
+                            ag._had_terrain_contact_or_penetration = True
+                            ag.debug_info['terrain_penetration_count'] = ag.debug_info.get('terrain_penetration_count', 0) + terrain_add
+                        if obstacle_add > 0:
+                            ag._had_obstacle_collision = True
+                            ag.debug_info['obstacle_collision_count'] = ag.debug_info.get('obstacle_collision_count', 0) + obstacle_add
+                    except Exception:
+                        pass
                     
                     # 🚨 调试输出：大幅减少输出频率，避免日志过多
                     # 只在每100次碰撞或第一次碰撞时输出，或者完全关闭（通过环境变量控制）
@@ -2294,11 +4687,17 @@ class VectorizedRewardCalculator:
                     try:
                         if hasattr(world, 'agents') and 0 <= agent_idx < len(world.agents):
                             ag = world.agents[agent_idx]
+                            ag._episode_has_collision = True
                             ag._had_penetration_or_collision = True
                             ag._had_terrain_contact_or_penetration = True
                             if not hasattr(ag, 'debug_info') or not isinstance(ag.debug_info, dict):
                                 ag.debug_info = {}
-                            ag.debug_info['total_penetration_count'] = ag.debug_info.get('total_penetration_count', 0) + int(np.sum(invalid_mask))
+                            add_invalid = int(np.sum(invalid_mask))
+                            ag.debug_info['total_penetration_count'] = ag.debug_info.get('total_penetration_count', 0) + add_invalid
+                            ag.debug_info.setdefault('terrain_penetration_count', 0)
+                            ag.debug_info.setdefault('obstacle_collision_count', 0)
+                            if add_invalid > 0:
+                                ag.debug_info['terrain_penetration_count'] = ag.debug_info.get('terrain_penetration_count', 0) + add_invalid
                     except Exception:
                         pass
                 
@@ -2306,8 +4705,10 @@ class VectorizedRewardCalculator:
                 # 🚨 关键修复：Z坐标检测只作为补充，主要依赖距离检测（已在前面完成）
                 # 原因：距离检测能捕获侧面碰撞，Z坐标检测只能捕获垂直穿透
                 # 修复：Z坐标检测只检测距离检测未捕获的情况，避免重复计数
-                eps = float(self.terrain_contact_eps)
-                # Z坐标穿透检测：智能体Z坐标 < 地形高度 + eps
+                # 🚨 关键修复2：使用真实碰撞阈值（0.3米），而不是净空监测阈值（1.5米）
+                # 原问题：使用1.5米阈值导致智能体在0.5-1.0米高度飞行也被误报为"穿透"
+                eps = float(self.terrain_collision_eps)  # 使用真实碰撞阈值（0.3米）
+                # Z坐标穿透检测：智能体Z坐标 < 地形高度 + eps（只检测真实接触）
                 penetration_mask = positions[:, 2] < terrain_heights + eps
                 # 🚨 关键修复：排除已经被距离检测捕获的碰撞，避免重复计数
                 # 如果距离检测已经检测到碰撞，Z坐标检测不再重复计数
@@ -2353,9 +4754,16 @@ class VectorizedRewardCalculator:
                     pass
                 
                 if np.any(penetration_mask):
-                    # 🚨 关键修复：计算穿透深度（地形高度 - 智能体Z坐标），用于惩罚计算
-                    penetration_depth = terrain_heights[penetration_mask] - positions[penetration_mask, 2]
-                    penalties[penetration_mask] = -self.terrain_penalty_value - np.maximum(penetration_depth, 0.0) * float(self.penetration_alpha)
+                    terrain_signed_clearance = positions[penetration_mask, 2] - terrain_heights[penetration_mask]
+                    terrain_penalties = self._piecewise_collision_penalty(
+                        terrain_signed_clearance,
+                        float(self.terrain_collision_eps),
+                        self.terrain_penalty_value
+                    )
+                    penalties[penetration_mask] = np.minimum(
+                        penalties[penetration_mask],
+                        terrain_penalties
+                    )
                     # 🚨 关键修复：标记本回合发生过地形穿透/接触，并更新穿透计数
                     try:
                         has_world_agents = hasattr(world, 'agents')
@@ -2372,6 +4780,7 @@ class VectorizedRewardCalculator:
                         
                         if agent_idx_valid:
                             ag = world.agents[agent_idx]
+                            ag._episode_has_collision = True
                             ag._had_penetration_or_collision = True
                             ag._had_terrain_contact_or_penetration = True
                             # 🚨 新增：更新穿透计数（用于成功判定）
@@ -2394,6 +4803,10 @@ class VectorizedRewardCalculator:
                             if new_count > 1000000:  # 防止溢出
                                 new_count = 1000000
                             ag.debug_info['total_penetration_count'] = int(new_count)
+                            ag.debug_info.setdefault('terrain_penetration_count', 0)
+                            ag.debug_info.setdefault('obstacle_collision_count', 0)
+                            if penetration_count_int > 0:
+                                ag.debug_info['terrain_penetration_count'] = ag.debug_info.get('terrain_penetration_count', 0) + penetration_count_int
                             # 🚨 调试：大幅减少输出频率，避免日志过多
                             # 只在每100次碰撞或第一次碰撞时输出
                             if penetration_count > 0:
@@ -2448,29 +4861,30 @@ class VectorizedRewardCalculator:
                 contact_penalty_mask = contact_mask & (~in_goal_area) & (~distance_based_collision_mask)
                 if np.any(contact_penalty_mask):
                     contact_penalties = np.full(len(positions), 0.0, dtype=np.float32)
-                    contact_penalties[contact_penalty_mask] = -self.terrain_penalty_value
+                    contact_signed_clearance = positions[contact_penalty_mask, 2] - terrain_heights[contact_penalty_mask]
+                    contact_penalties[contact_penalty_mask] = self._piecewise_collision_penalty(
+                        contact_signed_clearance,
+                        float(self.terrain_contact_eps),
+                        self.terrain_penalty_value
+                    )
                     # 合并穿透/接触两种惩罚（取更负者）
                     penalties = np.minimum(penalties, contact_penalties)
-                    # 🚨 关键修复：地面接触也要标记碰撞，并更新穿透计数
-                    # 🔧 修复：检测接近地形的接触，即使没有完全穿透也要更新碰撞计数
-                    # 原因：从可视化图可以看到轨迹被地形掩盖，说明确实发生了碰撞
-                    # 注意：代码中没有复位机制，智能体位置是真实物理模拟的结果
+                    # ⚖️ 语义收紧：仅当满足“真实碰撞阈值”（terrain_collision_eps）时，
+                    # 才拉起 `_had_penetration_or_collision` / `_had_terrain_contact_or_penetration` 并累计计数。
+                    # 处于 contact_eps 带内但未触及 collision_eps 的低空飞行，仅施加数值惩罚，不再作为离散碰撞事件统计。
                     try:
                         if hasattr(world, 'agents') and 0 <= agent_idx < len(world.agents):
                             ag = world.agents[agent_idx]
-                            ag._had_penetration_or_collision = True
-                            ag._had_terrain_contact_or_penetration = True
-                            # 🔧 修复：更新穿透计数，检测接近地形的接触（z <= terrain_height + eps）
-                            # 原因：地形高度可能因为降采样或插值误差而不完全准确，需要容差
                             if not hasattr(ag, 'debug_info'):
                                 ag.debug_info = {}
                             if not isinstance(ag.debug_info, dict):
                                 ag.debug_info = {}
-                            # 🔧 修复：检查是否有接近穿透（z <= terrain_height + eps）
-                            # 🚨 调试：使用TERRAIN_CONTACT_EPS作为阈值，与穿透检测阈值一致，大幅提高到10.0米（用于诊断）
-                            eps = float(self.terrain_contact_eps)  # 使用TERRAIN_CONTACT_EPS（默认10.0米），大幅提高阈值用于诊断
-                            actual_penetration_mask = contact_penalty_mask & (positions[:, 2] <= terrain_heights + eps)
+                            # 只有 z <= terrain_height + collision_eps 才视为“真实碰撞事件”
+                            collision_eps = float(self.terrain_collision_eps)  # 默认0.3米，真实碰撞阈值
+                            actual_penetration_mask = contact_penalty_mask & (positions[:, 2] <= terrain_heights + collision_eps)
                             if np.any(actual_penetration_mask):
+                                ag._had_penetration_or_collision = True
+                                ag._had_terrain_contact_or_penetration = True
                                 penetration_count = np.sum(actual_penetration_mask)
                                 old_count = ag.debug_info.get('total_penetration_count', 0)
                                 try:
@@ -2483,6 +4897,10 @@ class VectorizedRewardCalculator:
                                 if new_count > 1000000:
                                     new_count = 1000000
                                 ag.debug_info['total_penetration_count'] = int(new_count)
+                                ag.debug_info.setdefault('terrain_penetration_count', 0)
+                                ag.debug_info.setdefault('obstacle_collision_count', 0)
+                                if penetration_count_int > 0:
+                                    ag.debug_info['terrain_penetration_count'] = ag.debug_info.get('terrain_penetration_count', 0) + penetration_count_int
                     except Exception:
                         pass
             
@@ -2514,9 +4932,15 @@ class VectorizedRewardCalculator:
                 
                 # 应用障碍物碰撞惩罚（只对未被距离检测捕获的碰撞）
                 if np.any(obs_collision_mask):
+                    obstacle_signed_distance = -max_penetrations[obs_collision_mask]
+                    obstacle_penalties = self._piecewise_collision_penalty(
+                        obstacle_signed_distance,
+                        collision_threshold,
+                        self.collision_penalty_value
+                    )
                     penalties[obs_collision_mask] = np.minimum(
                         penalties[obs_collision_mask],
-                        -self.collision_penalty_value - max_penetrations[obs_collision_mask] * float(self.penetration_alpha)
+                        obstacle_penalties
                     )
                 
                 if np.any(obs_collision_mask):
@@ -2548,6 +4972,10 @@ class VectorizedRewardCalculator:
                             if new_count > 1000000:  # 防止溢出
                                 new_count = 1000000
                             ag.debug_info['total_penetration_count'] = int(new_count)
+                            ag.debug_info.setdefault('terrain_penetration_count', 0)
+                            ag.debug_info.setdefault('obstacle_collision_count', 0)
+                            if penetration_count_int > 0:
+                                ag.debug_info['obstacle_collision_count'] = ag.debug_info.get('obstacle_collision_count', 0) + penetration_count_int
                             # 🚨 调试：大幅减少输出频率，避免日志过多
                             # 只在每100次碰撞或第一次碰撞时输出
                             if obstacle_penetration_count > 0:
@@ -2632,7 +5060,17 @@ class VectorizedRewardCalculator:
             
             penetration = terrain_heights - positions[:, 2]
             collision_mask = penetration > 0
-            penalties[collision_mask] = -self.terrain_penalty_value - penetration[collision_mask] * float(self.penetration_alpha)
+            if np.any(collision_mask):
+                terrain_signed_clearance = positions[collision_mask, 2] - terrain_heights[collision_mask]
+                terrain_penalties = self._piecewise_collision_penalty(
+                    terrain_signed_clearance,
+                    float(self.terrain_collision_eps),
+                    self.terrain_penalty_value
+                )
+                penalties[collision_mask] = np.minimum(
+                    penalties[collision_mask],
+                    terrain_penalties
+                )
             if np.any(collision_mask):
                 try:
                     if hasattr(world, 'agents') and 0 <= agent_idx < len(world.agents):
@@ -2646,7 +5084,12 @@ class VectorizedRewardCalculator:
                             ag.debug_info = {}
                         # 统计本批次中的穿透次数
                         penetration_count = np.sum(collision_mask)
-                        ag.debug_info['total_penetration_count'] = ag.debug_info.get('total_penetration_count', 0) + int(penetration_count)
+                        add_cnt = int(penetration_count)
+                        ag.debug_info['total_penetration_count'] = ag.debug_info.get('total_penetration_count', 0) + add_cnt
+                        ag.debug_info.setdefault('terrain_penetration_count', 0)
+                        ag.debug_info.setdefault('obstacle_collision_count', 0)
+                        if add_cnt > 0:
+                            ag.debug_info['terrain_penetration_count'] = ag.debug_info.get('terrain_penetration_count', 0) + add_cnt
                 except Exception:
                     pass
         
@@ -2780,10 +5223,9 @@ class VectorizedRewardCalculator:
                             collision_ratio = float(total_collision_count) / float(episode_length)
                             no_collision_ratio = max(0.0, 1.0 - collision_ratio)
                             
-                            # 🚨 非线性映射：与成功奖励保持一致
-                            # 如果碰撞比例 < 0.1（少量碰撞），使用更严厉的指数惩罚
+                            # 🚨 非线性映射：与成功奖励一致，强惩罚少量碰撞以推动零碰撞
                             if collision_ratio < 0.1:
-                                no_collision_ratio = no_collision_ratio ** 4.5
+                                no_collision_ratio = no_collision_ratio ** 12
                             # 如果碰撞比例 >= 0.5（碰了一半及以上），使用更严厉的惩罚
                             elif collision_ratio >= 0.5:
                                 no_collision_ratio = 0.2 * (1.0 - (collision_ratio - 0.5) / 0.5)
@@ -2807,373 +5249,321 @@ class VectorizedRewardCalculator:
                 # min_distance模式：每步都给（负奖励，用于引导）
                 return float(-np.min(dists)) * no_collision_ratio
             if self.global_reward_mode == 'success_rate' and successes:
-                # 🚨 关键修复：全局奖励改为一次性，只在第一次所有智能体都到达目标时给一次
-                # 检查是否所有智能体都到达目标
-                all_success = len(successes) > 0 and all(s == 1.0 for s in successes)
-                
-                if all_success and world is not None and not getattr(world, '_global_reward_given', False):
-                    # 第一次所有智能体都到达目标，给一次性奖励
-                    world._global_reward_given = True
-                    success_rate = float(np.mean(successes))
-                    return success_rate * self.success_reward_value * no_collision_ratio
-                else:
-                    # 已经给过奖励或不是所有智能体都到达目标，返回0
+                import os as _os
+                scenario = None
+                if world is not None:
+                    scenario = getattr(world, 'scenario', None)
+                if scenario is None and agents and hasattr(agents[0], 'scenario'):
+                    scenario = agents[0].scenario
+
+                if world is None:
                     return 0.0
+
+                episode_length = None
+                try:
+                    if hasattr(world, 'episode_length') and world.episode_length is not None:
+                        episode_length = int(world.episode_length)
+                    elif hasattr(world, 'max_steps') and world.max_steps is not None:
+                        episode_length = int(world.max_steps)
+                    else:
+                        episode_length = int(_os.getenv('EPISODE_LENGTH', '2800'))
+                except Exception:
+                    episode_length = None
+
+                try:
+                    cur_step = int(getattr(world, 'current_step', -1))
+                except Exception:
+                    cur_step = -1
+
+                # 全局团队奖励仅在“回合结束”时结算：
+                # 1. 正常跑到 episode_length；
+                # 2. 环境已判定本回合团队成功并提前终止。
+                episode_finished = bool(getattr(world, '_episode_success', False))
+                if not episode_finished and not (
+                    episode_length is not None and episode_length > 0 and cur_step >= episode_length
+                ):
+                    return 0.0
+
+                team_success_flags = []
+                thr_success = float(getattr(self, 'success_distance_threshold', 2.0))
+                for ag in agents:
+                    ag_goal = None
+                    try:
+                        if hasattr(ag, 'goal_a') and hasattr(ag.goal_a, 'state') and getattr(ag.goal_a.state, 'p_pos', None) is not None:
+                            ag_goal = ag.goal_a.state.p_pos
+                    except Exception:
+                        ag_goal = None
+                    if ag_goal is None and scenario is not None:
+                        ag_goal = getattr(scenario, 'goal_pos', None)
+
+                    pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
+                    if pos is None or ag_goal is None or len(pos) < 3:
+                        team_success_flags.append(False)
+                        continue
+
+                    dist_goal_3d = float(np.linalg.norm(np.asarray(pos[:3]) - np.asarray(ag_goal[:3])))
+                    # 统一阈值：不再乘 1.2
+                    reach_i = dist_goal_3d <= thr_success
+                    safe_i = self._agent_safe_so_far(ag)
+                    team_success_flags.append(bool(reach_i and safe_i))
+
+                all_success = len(team_success_flags) > 0 and all(team_success_flags)
+                if all_success and not getattr(world, '_global_reward_given', False):
+                    world._global_reward_given = True
+                    return float(self.success_reward_value)
+                return 0.0
         except Exception as e:
             # 异常处理（不输出调试信息）
             return 0.0
         return 0.0
 
+    def _estimate_terrain_normal(self, scenario: Any, x: float, y: float, delta: float = 1.0) -> np.ndarray:
+        """估计地形法向量，失败时返回竖直向上向量。"""
+        default_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        try:
+            if scenario is None or not hasattr(scenario, 'get_terrain_height'):
+                return default_normal
+            h_x_plus = float(scenario.get_terrain_height(x + delta, y))
+            h_x_minus = float(scenario.get_terrain_height(x - delta, y))
+            h_y_plus = float(scenario.get_terrain_height(x, y + delta))
+            h_y_minus = float(scenario.get_terrain_height(x, y - delta))
+            dz_dx = (h_x_plus - h_x_minus) / (2.0 * delta)
+            dz_dy = (h_y_plus - h_y_minus) / (2.0 * delta)
+            normal = np.array([-dz_dx, -dz_dy, 1.0], dtype=np.float32)
+            norm = float(np.linalg.norm(normal))
+            if norm <= 1e-6 or not np.isfinite(norm):
+                return default_normal
+            return normal / norm
+        except Exception:
+            return default_normal
+
+    def _lateral_reward_vectorized(self, agent: Any, world: Any, scenario: Any, positions: np.ndarray) -> np.ndarray:
+        """
+        向量化侧向/绕行奖励。
+        与 weighted 版本对齐：在危险区域内，奖励切向绕行或向外远离动作。
+        """
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        rewards = np.zeros(len(positions), dtype=np.float32)
+        try:
+            vel = getattr(getattr(agent, 'state', None), 'p_vel', None)
+            if vel is None:
+                return rewards
+            vel = np.asarray(vel, dtype=np.float32).reshape(-1)
+            speed = float(np.linalg.norm(vel))
+            if speed < 0.1:
+                return rewards
+            vel_dir = vel / max(speed, 1e-6)
+
+            activation_dist = float(getattr(scenario, 'lateral_activation_distance', 15.0)) if scenario is not None else 15.0
+            activation_dist = max(activation_dist, 1e-6)
+
+            for i, pos in enumerate(positions):
+                min_dist = float('inf')
+                danger_normal = None
+
+                # 障碍物法向量（从障碍物中心指向智能体）
+                if world is not None and hasattr(world, 'landmarks'):
+                    for landmark in getattr(world, 'landmarks', []):
+                        if landmark is None or not hasattr(landmark, 'state') or landmark.state.p_pos is None:
+                            continue
+                        obstacle_pos = np.asarray(landmark.state.p_pos, dtype=np.float32)
+                        to_obstacle = obstacle_pos - pos
+                        dist_center = float(np.linalg.norm(to_obstacle))
+                        radius = float(getattr(landmark, 'size', getattr(landmark, 'radius', 1.0)))
+                        dist_surface = max(0.0, dist_center - radius)
+                        if dist_surface < min_dist and dist_surface < activation_dist:
+                            min_dist = dist_surface
+                            if dist_center > 1e-6:
+                                danger_normal = (-to_obstacle / dist_center).astype(np.float32)
+                            else:
+                                danger_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+                # 地形法向量（优先选更近的危险面）
+                if scenario is not None and hasattr(scenario, 'get_terrain_height'):
+                    try:
+                        terrain_h = float(scenario.get_terrain_height(float(pos[0]), float(pos[1])))
+                        dist_terrain = max(0.0, float(pos[2]) - terrain_h)
+                        if dist_terrain < min_dist and dist_terrain < activation_dist:
+                            min_dist = dist_terrain
+                            danger_normal = self._estimate_terrain_normal(scenario, float(pos[0]), float(pos[1]))
+                    except Exception:
+                        pass
+
+                if danger_normal is None:
+                    continue
+
+                cos_angle = float(np.dot(vel_dir, danger_normal))
+                if cos_angle > -0.05:
+                    dist_factor = 1.0 - (min_dist / activation_dist)
+                    dist_factor = float(np.clip(dist_factor, 0.0, 1.0))
+                    rewards[i] = float((0.3 + 0.7 * np.clip(cos_angle, 0.0, 1.0)) * dist_factor)
+        except Exception:
+            return np.zeros(len(positions), dtype=np.float32)
+        return rewards
+
+    def _collision_reduction_reward_vectorized(self, agent: Any, world: Any, scenario: Any, positions: np.ndarray) -> np.ndarray:
+        """
+        向量化碰撞次数减少奖励。
+        与 weighted 版本语义保持一致：默认仅在回合最后一步产生非零奖励。
+        """
+        if positions.ndim == 1:
+            positions = positions.reshape(1, -1)
+        rewards = np.zeros(len(positions), dtype=np.float32)
+        try:
+            if world is None:
+                return rewards
+
+            current_step = int(getattr(world, 'current_step', 0))
+            episode_length = int(getattr(world, 'episode_length', 2800))
+            if episode_length <= 0:
+                episode_length = 2800
+
+            # 兼容字段：当前回合碰撞计数直接使用累计穿透计数
+            current_count = 0
+            if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                current_count = agent.debug_info.get('total_penetration_count', 0)
+            try:
+                current_count = int(current_count) if np.isfinite(current_count) else 0
+            except (ValueError, TypeError, OverflowError):
+                current_count = 0
+            current_count = max(current_count, 0)
+            agent.current_episode_collision_count = current_count
+
+            state = getattr(agent, '_collision_reduction_state', None)
+            if not isinstance(state, dict):
+                state = {
+                    'last_seen_step': -1,
+                    'reward_given': False,
+                    'prev_collision_count': int(getattr(agent, 'previous_episode_collision_count', 0) or 0),
+                }
+            last_seen_step = int(state.get('last_seen_step', -1))
+
+            # 新回合检测：step回绕到0或变小
+            is_new_episode = False
+            if last_seen_step >= 0:
+                if current_step == 0 and last_seen_step > 0:
+                    is_new_episode = True
+                elif current_step < last_seen_step:
+                    is_new_episode = True
+
+            if is_new_episode:
+                prev_collision_count = int(getattr(agent, '_last_episode_collision_count', state.get('prev_collision_count', 0)))
+                prev_collision_count = max(prev_collision_count, 0)
+                state['prev_collision_count'] = prev_collision_count
+                state['reward_given'] = False
+                agent.collision_reduction_reward_given = False
+
+            is_last_step = current_step >= (episode_length - 1)
+            if (not is_last_step) or bool(state.get('reward_given', False)):
+                state['last_seen_step'] = current_step
+                agent._collision_reduction_state = state
+                return rewards
+
+            prev_count = int(state.get('prev_collision_count', getattr(agent, 'previous_episode_collision_count', 0) or 0))
+            prev_count = max(prev_count, 0)
+
+            reward_val = 0.0
+            if prev_count > 0 and current_count < prev_count:
+                reward_val = float(np.clip(float(prev_count - current_count) / float(prev_count), 0.0, 1.0))
+            elif prev_count == 0 and current_count == 0:
+                reward_val = 0.1
+
+            rewards[:] = reward_val
+
+            # 标记一次性发放，并记录本回合碰撞计数供下一回合比较
+            state['reward_given'] = True
+            state['last_seen_step'] = current_step
+            agent._collision_reduction_state = state
+            agent.collision_reduction_reward_given = True
+            agent._last_episode_collision_count = current_count
+            agent.previous_episode_collision_count = current_count
+        except Exception:
+            return np.zeros(len(positions), dtype=np.float32)
+        return rewards
+
     def _clearance_reward_vectorized(self, agent: Any, world: Any, positions: np.ndarray) -> np.ndarray:
         """
-        向量化净空奖励计算（统一版 - 同时考虑障碍物和地形）
-        
-        设计理念：
-        1. 保持安全距离的奖励：当距离大于安全距离时，根据距离目标的距离动态调整权重
-        2. 避障惩罚：当距离小于安全距离时，无论距离目标多远，都使用高权重惩罚
-        3. 同时考虑障碍物和地形：取两者中的最小距离作为安全距离
-        
-        奖励组成：
-        - 条件化净空奖励：根据距离目标的距离动态调整权重，防止刷分同时保持碰撞避免
+        净空奖励负责碰撞前预警与趋势引导，不再承担真实碰撞事件惩罚。
+
+        分工：
+        1. clearance: safe_distance 外只做趋势 shaping；进入预警带后给连续惩罚
+        2. collision: 仅在真实碰撞阈值内给事件惩罚
+        3. 趋势项同时考虑几何净空变化和当前速度相对危险源的径向分量
         """
-        # 🔧 修复：确保positions是2D数组，防止CUDA内存访问错误
         if positions.ndim == 1:
-            # 1D数组，需要reshape为(1, 3)
             if len(positions) >= 3:
                 positions = positions[:3].reshape(1, -1)
             else:
-                # 长度不足，返回零奖励
                 return np.zeros(1, dtype=np.float32)
         elif positions.ndim > 2:
-            # 多维数组，展平为2D
             positions = positions.reshape(-1, positions.shape[-1])
-        
-        # 确保positions至少有3列（x, y, z）
+
         if positions.shape[-1] < 3:
-            # 列数不足，返回零奖励
             return np.zeros(positions.shape[0], dtype=np.float32)
-        
-        rewards = np.zeros(positions.shape[0], dtype=np.float32)
-        
-        # 获取安全距离参数（可通过环境变量调整）
-        safe_distance = float(os.getenv('OBSTACLE_SAFE_DISTANCE', '15.0'))  # 默认15米安全距离
-        
+
+        positions = positions[:, :3].astype(np.float32, copy=False)
         num_positions = positions.shape[0]
-        min_distances = []
-        
-        # === 1. 计算到障碍物的距离 ===
-        nearest_obstacle_centers = np.zeros((num_positions, 3), dtype=np.float32)
-        nearest_obstacle_radii = np.zeros(num_positions, dtype=np.float32)
-        nearest_obstacle_distances = np.full(num_positions, np.inf, dtype=np.float32)
-        
-        # 确保 has_obstacles 是布尔值，而不是字典或其他类型
-        has_obstacles = bool(hasattr(world, 'scenario') and 
-                             hasattr(world.scenario, 'obstacles') and 
-                             world.scenario.obstacles)
-        
-        if has_obstacles:
-            for obstacle_data in world.scenario.obstacles:
-                if 'center' in obstacle_data and 'radius' in obstacle_data:
-                    obstacle_center = np.array(obstacle_data['center'], dtype=np.float32)
-                    obstacle_radius = float(obstacle_data['radius'])
-                    # 计算3D距离
-                    dist_3d = np.linalg.norm(positions - obstacle_center, axis=-1)
-                    dist_to_surface = dist_3d - obstacle_radius  # 到障碍物表面的距离
-                    min_distances.append(dist_to_surface)
-                    
-                    # 更新最近障碍物信息（向量化）
-                    mask = dist_to_surface < nearest_obstacle_distances
-                    nearest_obstacle_centers[mask] = obstacle_center
-                    nearest_obstacle_radii[mask] = obstacle_radius
-                    nearest_obstacle_distances[mask] = dist_to_surface[mask]
-        
-        # === 2. 计算到地形的距离（同一高度的XY平面距离）===
-        # 🚨 关键修复：不使用高度差，而是使用同一高度的XY平面距离
-        # 原因：智能体可能从侧面贴着山地飞行，此时高度差很大但实际距离很近（会相撞）
-        # 正确方法：在智能体高度z处，找到地形轮廓的XY位置，计算水平距离
-        # 🚨 GPU加速优化：使用向量化方法，批量计算所有采样点，避免Python循环
-        terrain_distances = np.full(num_positions, np.inf, dtype=np.float32)
-        terrain_heights = np.zeros(num_positions, dtype=np.float32)
-        has_terrain = False
-        
+        rewards = np.zeros(num_positions, dtype=np.float32)
+
+        safe_distance = max(float(os.getenv('OBSTACLE_SAFE_DISTANCE', '15.0')), 1e-6)
+        collision_threshold = max(float(self.collision_distance_threshold), 1e-6)
+        warning_span = max(safe_distance - collision_threshold, 1e-6)
+        penalty_weight = float(os.getenv('CLEARANCE_PENALTY_WEIGHT', '5.0'))
+        clearance_weight = float(os.getenv('CLEARANCE_WEIGHT', '3.5'))
+        clearance_d_max = max(float(os.getenv('CLEARANCE_D_MAX', '80.0')), 1e-6)
+        trend_penalty_factor = float(os.getenv('CLEARANCE_APPROACH_PENALTY_FACTOR', '2.0'))
+        velocity_weight = float(os.getenv('CLEARANCE_VELOCITY_WEIGHT', '0.5'))
+        speed_scale = max(float(os.getenv('CLEARANCE_SPEED_SCALE', '5.0')), 1e-6)
+        trend_eps = float(os.getenv('CLEARANCE_TREND_EPS', '1e-6'))
+        speed_eps = float(os.getenv('CLEARANCE_SPEED_EPS', '1e-4'))
+        far_distance_fill = safe_distance + clearance_d_max
+
         scenario = getattr(world, 'scenario', None)
-        cached_data = getattr(self, '_cache', {})
-        terrain = cached_data.get('terrain') if isinstance(cached_data, dict) else None
-        
-        # 🚨 GPU加速优化：向量化计算同一高度的XY平面距离
-        if scenario is not None and hasattr(scenario, 'get_terrain_height'):
-            has_terrain = True
-            # 采样方向数（8个主方向 + 8个对角线方向 = 16个方向）
-            directions = np.array([
-                [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],  # 四个主方向
-                [0.707, 0.707], [-0.707, 0.707], [0.707, -0.707], [-0.707, -0.707],  # 四个对角线
-                [0.923, 0.383], [-0.923, 0.383], [0.923, -0.383], [-0.923, -0.383],  # 额外方向
-                [0.383, 0.923], [-0.383, 0.923], [0.383, -0.923], [-0.383, -0.923]
-            ], dtype=np.float32)
-            n_directions = len(directions)
-            
-            # 搜索半径范围（从近到远）
-            search_radii = np.array([2.0, 5.0, 10.0, 20.0, 30.0, 50.0], dtype=np.float32)
-            n_radii = len(search_radii)
-            
-            try:
-                map_size = float(getattr(scenario, 'map_size', 200.0))
-                agent_zs = positions[:, 2].astype(np.float32)  # (num_positions,)
-                agent_xys = positions[:, :2].astype(np.float32)  # (num_positions, 2)
-                
-                # 🚨 向量化：生成所有采样点的XY坐标
-                # 形状：(num_positions, n_directions, n_radii, 2)
-                # 使用广播：agent_xys[:, None, None, :] + directions[None, :, None, :] * search_radii[None, None, :, None]
-                sample_xys = agent_xys[:, None, None, :] + directions[None, :, None, :] * search_radii[None, None, :, None]
-                # 展平为 (num_positions * n_directions * n_radii, 2)
-                sample_xys_flat = sample_xys.reshape(-1, 2)
-                
-                # 检查是否在地图范围内
-                valid_mask = (sample_xys_flat[:, 0] >= 0) & (sample_xys_flat[:, 0] < map_size) & \
-                            (sample_xys_flat[:, 1] >= 0) & (sample_xys_flat[:, 1] < map_size)
-                
-                # 🚨 GPU加速：批量获取所有采样点的地形高度
-                if hasattr(scenario, 'get_terrain_height_vectorized') and np.any(valid_mask):
-                    # 只计算有效范围内的点
-                    valid_sample_xys = sample_xys_flat[valid_mask]
-                    try:
-                        # 批量获取地形高度
-                        sample_terrain_heights_flat = scenario.get_terrain_height_vectorized(
-                            valid_sample_xys[:, 0], valid_sample_xys[:, 1]
-                        )
-                        if sample_terrain_heights_flat.ndim == 0:
-                            sample_terrain_heights_flat = np.full(len(valid_sample_xys), float(sample_terrain_heights_flat), dtype=np.float32)
-                        else:
-                            sample_terrain_heights_flat = sample_terrain_heights_flat.astype(np.float32)
-                        
-                        # 重建完整数组（无效位置设为-inf）
-                        sample_terrain_heights_full = np.full(len(sample_xys_flat), -np.inf, dtype=np.float32)
-                        sample_terrain_heights_full[valid_mask] = sample_terrain_heights_flat
-                    except Exception:
-                        # 如果向量化失败，回退到逐个调用
-                        sample_terrain_heights_full = np.full(len(sample_xys_flat), -np.inf, dtype=np.float32)
-                        for i, (xy, valid) in enumerate(zip(sample_xys_flat, valid_mask)):
-                            if valid:
-                                try:
-                                    sample_terrain_heights_full[i] = scenario.get_terrain_height(float(xy[0]), float(xy[1]))
-                                except Exception:
-                                    pass
-                else:
-                    # 回退：逐个调用
-                    sample_terrain_heights_full = np.full(len(sample_xys_flat), -np.inf, dtype=np.float32)
-                    for i, (xy, valid) in enumerate(zip(sample_xys_flat, valid_mask)):
-                        if valid:
-                            try:
-                                sample_terrain_heights_full[i] = scenario.get_terrain_height(float(xy[0]), float(xy[1]))
-                            except Exception:
-                                pass
-                
-                # 重塑为 (num_positions, n_directions, n_radii)
-                sample_terrain_heights = sample_terrain_heights_full.reshape(num_positions, n_directions, n_radii)
-                sample_xys_reshaped = sample_xys_flat.reshape(num_positions, n_directions, n_radii, 2)
-                
-                # 🚨 向量化：找到地形高度等于或接近智能体高度z的点（容差1米）
-                agent_zs_expanded = agent_zs[:, None, None]  # (num_positions, 1, 1)
-                height_diff = np.abs(sample_terrain_heights - agent_zs_expanded)  # (num_positions, n_directions, n_radii)
-                match_mask = height_diff < 1.0  # 容差1米
-                
-                # 计算XY距离
-                agent_xys_expanded = agent_xys[:, None, None, :]  # (num_positions, 1, 1, 2)
-                xy_distances = np.linalg.norm(sample_xys_reshaped - agent_xys_expanded, axis=-1)  # (num_positions, n_directions, n_radii)
-                
-                # 🚨 向量化优化：对于每个智能体，在每个方向上找到第一个匹配点（最近的点）
-                # 使用argmax找到每个方向上第一个匹配的半径索引（True的索引）
-                # 将不匹配的位置的距离设为inf，然后取最小值
-                xy_distances_masked = np.where(match_mask, xy_distances, np.inf)  # (num_positions, n_directions, n_radii)
-                # 在每个方向上取最小值（第一个匹配点就是最近的）
-                min_distances_per_direction = np.min(xy_distances_masked, axis=2)  # (num_positions, n_directions)
-                # 取所有方向的最小值
-                terrain_distances = np.min(min_distances_per_direction, axis=1)  # (num_positions,)
-                
-                # 如果找不到匹配点，回退到高度差方法
-                fallback_mask = ~np.isfinite(terrain_distances) | (terrain_distances == np.inf)
-                if np.any(fallback_mask):
-                    try:
-                        if hasattr(scenario, 'get_terrain_height_vectorized'):
-                            fallback_positions = positions[fallback_mask]
-                            terrain_heights_fallback = scenario.get_terrain_height_vectorized(
-                                fallback_positions[:, 0], fallback_positions[:, 1]
-                            )
-                            if terrain_heights_fallback.ndim == 0:
-                                terrain_heights_fallback = np.full(np.sum(fallback_mask), float(terrain_heights_fallback), dtype=np.float32)
-                            else:
-                                terrain_heights_fallback = terrain_heights_fallback.astype(np.float32)
-                            terrain_distances[fallback_mask] = fallback_positions[:, 2] - terrain_heights_fallback
-                        else:
-                            for i in np.where(fallback_mask)[0]:
-                                try:
-                                    terrain_heights[i] = scenario.get_terrain_height(float(positions[i, 0]), float(positions[i, 1]))
-                                    terrain_distances[i] = positions[i, 2] - terrain_heights[i]
-                                except Exception:
-                                    terrain_distances[i] = np.inf
-                    except Exception:
-                        pass
-            except Exception:
-                # 如果向量化计算失败，回退到高度差方法
-                try:
-                    if hasattr(scenario, 'get_terrain_height_vectorized'):
-                        terrain_heights_raw = scenario.get_terrain_height_vectorized(positions[:, 0], positions[:, 1])
-                        if terrain_heights_raw.ndim == 0:
-                            terrain_heights = np.full(num_positions, float(terrain_heights_raw), dtype=np.float32)
-                        elif terrain_heights_raw.shape[0] != num_positions:
-                            terrain_heights = np.zeros(num_positions, dtype=np.float32)
-                        else:
-                            terrain_heights = terrain_heights_raw.astype(np.float32)
-                        terrain_distances = positions[:, 2] - terrain_heights
-                    else:
-                        for i, pos in enumerate(positions):
-                            try:
-                                terrain_heights[i] = scenario.get_terrain_height(float(pos[0]), float(pos[1]))
-                                terrain_distances[i] = positions[i, 2] - terrain_heights[i]
-                            except Exception:
-                                terrain_distances[i] = np.inf
-                except Exception:
-                    pass
-        
-        # === 3. 合并障碍物和地形的距离，取最小值 ===
-        if min_distances:
-            try:
-                # 🔧 修复：确保min_distances是2D数组，防止形状不匹配
-                min_distances_array = np.array(min_distances)  # (n_obstacles, num_positions)
-                if min_distances_array.ndim == 1:
-                    # 如果只有一个障碍物，min_distances_array是1D，需要reshape
-                    obstacle_min_dist = min_distances_array.reshape(-1)
-                else:
-                    # 多个障碍物，沿着axis=0取最小值
-                    obstacle_min_dist = np.min(min_distances_array, axis=0)  # (num_positions,)
-                
-                # 🔧 修复：确保obstacle_min_dist的形状正确
-                if obstacle_min_dist.ndim == 0:
-                    # 标量，需要扩展
-                    obstacle_min_dist = np.full(num_positions, float(obstacle_min_dist), dtype=np.float32)
-                elif obstacle_min_dist.shape[0] != num_positions:
-                    # 形状不匹配，使用默认值
-                    obstacle_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
-            except Exception:
-                # 计算失败，使用默认值
-                obstacle_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
-        else:
-            obstacle_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
-        
-        # 🔧 修复：确保terrain_distances的形状正确
-        if terrain_distances.shape[0] != num_positions:
-            terrain_distances = np.full(num_positions, np.inf, dtype=np.float32)
-        
-        # 合并：取障碍物距离和地形距离的最小值
-        d_min_current = np.minimum(obstacle_min_dist, terrain_distances)
-        
-        # 🔧 修复：确保d_min_current的形状正确
-        if d_min_current.ndim == 0:
-            d_min_current = np.full(num_positions, float(d_min_current), dtype=np.float32)
-        elif d_min_current.shape[0] != num_positions:
-            d_min_current = np.full(num_positions, np.inf, dtype=np.float32)
-        
-        # === 4. 确定最近的危险源（用于计算向上绕行特性）===
-        # 🔧 修复：确保所有中间变量的形状正确
-        # 🔧 XLA友好优化：使用向量化操作，避免Python循环
-        # 如果地形距离更近，使用地形作为参考；否则使用障碍物
-        try:
-            use_terrain_as_reference = terrain_distances < obstacle_min_dist
-            # 确保use_terrain_as_reference是1D布尔数组
-            if use_terrain_as_reference.ndim == 0:
-                use_terrain_as_reference = np.full(num_positions, bool(use_terrain_as_reference), dtype=bool)
-            elif use_terrain_as_reference.shape[0] != num_positions:
-                use_terrain_as_reference = np.zeros(num_positions, dtype=bool)
-        except Exception:
-            use_terrain_as_reference = np.zeros(num_positions, dtype=bool)
-        
-        # 初始化参考点（障碍物或地形）- 向量化构建
-        # 地形参考点：x, y使用智能体位置，z使用地形高度
-        try:
-            terrain_reference_centers = np.zeros((num_positions, 3), dtype=np.float32)
-            terrain_reference_centers[:, 0] = positions[:, 0]  # x
-            terrain_reference_centers[:, 1] = positions[:, 1]  # y
-            terrain_reference_centers[:, 2] = terrain_heights  # z（地形高度）
-        except Exception:
-            terrain_reference_centers = np.zeros((num_positions, 3), dtype=np.float32)
-        
-        # 使用np.where进行向量化选择
-        # 如果地形距离更近且地形可用，使用地形参考；否则使用障碍物参考
-        # 确保 has_terrain 和 has_obstacles 是布尔值，然后与数组进行广播操作
-        has_terrain_bool = bool(has_terrain)
-        has_obstacles_bool = bool(has_obstacles)
-        try:
-            terrain_mask = use_terrain_as_reference & has_terrain_bool
-            obstacle_mask = (~use_terrain_as_reference) & has_obstacles_bool
-            default_terrain_mask = (~terrain_mask) & (~obstacle_mask) & has_terrain_bool
-            
-            # 确保所有mask都是1D布尔数组
-            if terrain_mask.ndim == 0:
-                terrain_mask = np.full(num_positions, bool(terrain_mask), dtype=bool)
-            elif terrain_mask.shape[0] != num_positions:
-                terrain_mask = np.zeros(num_positions, dtype=bool)
-            
-            if obstacle_mask.ndim == 0:
-                obstacle_mask = np.full(num_positions, bool(obstacle_mask), dtype=bool)
-            elif obstacle_mask.shape[0] != num_positions:
-                obstacle_mask = np.zeros(num_positions, dtype=bool)
-            
-            if default_terrain_mask.ndim == 0:
-                default_terrain_mask = np.full(num_positions, bool(default_terrain_mask), dtype=bool)
-            elif default_terrain_mask.shape[0] != num_positions:
-                default_terrain_mask = np.zeros(num_positions, dtype=bool)
-        except Exception:
-            terrain_mask = np.zeros(num_positions, dtype=bool)
-            obstacle_mask = np.zeros(num_positions, dtype=bool)
-            default_terrain_mask = np.zeros(num_positions, dtype=bool)
-        
-        # 向量化构建参考点
-        try:
-            reference_centers = np.where(
-                terrain_mask[:, None] | default_terrain_mask[:, None],
-                terrain_reference_centers,
-                nearest_obstacle_centers
-            )
-            # 确保reference_centers是2D数组
-            if reference_centers.ndim == 1:
-                reference_centers = reference_centers.reshape(1, -1)
-            elif reference_centers.shape[0] != num_positions:
-                reference_centers = np.zeros((num_positions, 3), dtype=np.float32)
-            
-            reference_heights = np.where(
-                terrain_mask | default_terrain_mask,
-                terrain_heights,
-                nearest_obstacle_centers[:, 2]
-            )
-            # 确保reference_heights是1D数组
-            if reference_heights.ndim == 0:
-                reference_heights = np.full(num_positions, float(reference_heights), dtype=np.float32)
-            elif reference_heights.shape[0] != num_positions:
-                reference_heights = np.zeros(num_positions, dtype=np.float32)
-        except Exception:
-            reference_centers = np.zeros((num_positions, 3), dtype=np.float32)
-            reference_heights = np.zeros(num_positions, dtype=np.float32)
-        
-        # === 5. 🔧 条件化净空奖励：根据距离目标的距离动态调整权重 ===
-        # 问题：高权重净空奖励（3.5）可以防止APF撞地形，但会被"仅有动作"方法利用来刷分
-        # 解决：距离目标远时降低权重（防止刷分），距离目标近时提高权重（防止撞地形）
+        cached_data = self._cache.get(id(world), {}) if isinstance(getattr(self, '_cache', None), dict) else {}
+        obstacle_min_dist, nearest_obstacle_centers, nearest_obstacle_radii = self._compute_obstacle_distance_data(
+            positions,
+            cached_data=cached_data,
+            world=world,
+        )
+
+        obstacle_reference_points = positions.copy()
+        obstacle_vector = positions - nearest_obstacle_centers
+        obstacle_norm = np.linalg.norm(obstacle_vector, axis=1, keepdims=True)
+        default_dirs = np.zeros_like(obstacle_vector)
+        default_dirs[:, 2] = 1.0
+        obstacle_dirs = np.where(obstacle_norm > 1e-6, obstacle_vector / np.maximum(obstacle_norm, 1e-6), default_dirs)
+        valid_obstacle_mask = np.isfinite(obstacle_min_dist)
+        obstacle_reference_points[valid_obstacle_mask] = (
+            nearest_obstacle_centers[valid_obstacle_mask]
+            + obstacle_dirs[valid_obstacle_mask] * nearest_obstacle_radii[valid_obstacle_mask, None]
+        )
+        terrain_heights_current, terrain_warning_dist, terrain_reference_points = self._compute_terrain_distance_data(
+            positions,
+            scenario,
+            cached_data=cached_data,
+        )
+
+        d_min_current = np.minimum(obstacle_min_dist, terrain_warning_dist).astype(np.float32)
+        use_terrain_reference = terrain_warning_dist <= obstacle_min_dist
+        reference_points = np.where(use_terrain_reference[:, None], terrain_reference_points, obstacle_reference_points).astype(np.float32)
+
+        invalid_reference = ~np.all(np.isfinite(reference_points), axis=1)
+        if np.any(invalid_reference):
+            reference_points[invalid_reference] = positions[invalid_reference]
+
         goal_pos = None
         try:
             if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
                 goal_pos_raw = agent.goal_a.state.p_pos
                 goal_pos = np.asarray(goal_pos_raw, dtype=np.float32)
-                # 🔧 修复：确保goal_pos是1D数组(3,)，而不是标量或其他形状
                 if goal_pos.ndim == 0:
-                    # 标量，无法使用
                     goal_pos = None
                 elif goal_pos.ndim > 1:
-                    # 多维数组，取前3个元素并展平
                     goal_pos = goal_pos.flatten()[:3]
                 elif len(goal_pos) < 3:
-                    # 长度不足，无法使用
                     goal_pos = None
                 else:
-                    # 确保是1D数组(3,)
                     goal_pos = goal_pos[:3].flatten()
         except Exception:
             goal_pos = None
@@ -3184,7 +5574,6 @@ class VectorizedRewardCalculator:
                 if scenario is not None and hasattr(scenario, 'goal_pos') and scenario.goal_pos is not None:
                     goal_pos_raw = scenario.goal_pos
                     goal_pos = np.asarray(goal_pos_raw, dtype=np.float32)
-                    # 🔧 修复：确保goal_pos是1D数组(3,)
                     if goal_pos.ndim == 0:
                         goal_pos = None
                     elif goal_pos.ndim > 1:
@@ -3195,215 +5584,156 @@ class VectorizedRewardCalculator:
                         goal_pos = goal_pos[:3].flatten()
             except Exception:
                 goal_pos = None
-        
-        # 计算每个位置到目标的距离
-        # 🔧 注意：positions已经在函数开始处被确保为2D数组 (num_positions, 3)
+
         if goal_pos is not None and len(goal_pos) >= 3:
             try:
-                # positions形状: (num_positions, 3)，已经在函数开始处确保
-                # goal_pos形状: (3,)
-                # 确保positions的最后一维是3
-                if positions.shape[-1] >= 3:
-                    positions_3d = positions[..., :3]
-                    # 计算距离：positions_3d (num_positions, 3) - goal_pos (3,) -> (num_positions, 3)
-                    # 然后计算norm得到 (num_positions,)
-                    dists_to_goal = np.linalg.norm(positions_3d - goal_pos, axis=-1)
-                else:
-                    # 形状不匹配，使用默认值
-                    dists_to_goal = np.full(positions.shape[0], 100.0, dtype=np.float32)
+                dists_to_goal = np.linalg.norm(positions - goal_pos[:3], axis=-1)
             except Exception:
-                # 计算失败，使用默认值
-                dists_to_goal = np.full(positions.shape[0], 100.0, dtype=np.float32)
+                dists_to_goal = np.full(num_positions, 100.0, dtype=np.float32)
         else:
-            # 如果没有目标，使用默认权重（保守，假设距离较远）
-            dists_to_goal = np.full(positions.shape[0], 100.0, dtype=np.float32)
-        
-        # 动态权重计算
-        FAR_THRESHOLD = float(os.getenv('CLEARANCE_FAR_THRESHOLD', '50.0'))  # 远距离阈值（米）
-        NEAR_THRESHOLD = float(os.getenv('CLEARANCE_NEAR_THRESHOLD', '20.0'))  # 近距离阈值（米）
-        WEIGHT_FAR = float(os.getenv('CLEARANCE_WEIGHT_FAR', '0.5'))  # 远距离权重（防止刷分）
-        WEIGHT_NEAR = float(os.getenv('CLEARANCE_WEIGHT_NEAR', '5.0'))  # 近距离权重（防止撞地形）
-        
-        # 🔧 修复：确保dists_to_goal的长度与positions匹配
-        # positions已经在函数开始处被确保为2D数组，所以直接使用shape[0]
-        num_pos = positions.shape[0]
-        
-        # 确保dists_to_goal的长度匹配
-        if len(dists_to_goal) != num_pos:
-            # 长度不匹配，重新创建dists_to_goal
-            dists_to_goal = np.full(num_pos, 100.0, dtype=np.float32)
-        
-        # 向量化计算动态权重
+            dists_to_goal = np.full(num_positions, 100.0, dtype=np.float32)
+
+        FAR_THRESHOLD = float(os.getenv('CLEARANCE_FAR_THRESHOLD', '50.0'))
+        NEAR_THRESHOLD = float(os.getenv('CLEARANCE_NEAR_THRESHOLD', '20.0'))
+        WEIGHT_FAR = float(os.getenv('CLEARANCE_WEIGHT_FAR', '0.5'))
+        WEIGHT_NEAR = float(os.getenv('CLEARANCE_WEIGHT_NEAR', '12.0'))
+
         try:
             far_mask = dists_to_goal > FAR_THRESHOLD
             near_mask = dists_to_goal < NEAR_THRESHOLD
             transition_mask = ~(far_mask | near_mask)
-            
-            dynamic_weights = np.zeros(num_pos, dtype=np.float32)
+
+            dynamic_weights = np.zeros(num_positions, dtype=np.float32)
             dynamic_weights[far_mask] = WEIGHT_FAR
             dynamic_weights[near_mask] = WEIGHT_NEAR
-            
-            # 过渡区域：线性插值
+
             if np.any(transition_mask):
                 ratio = (dists_to_goal[transition_mask] - NEAR_THRESHOLD) / (FAR_THRESHOLD - NEAR_THRESHOLD)
                 dynamic_weights[transition_mask] = WEIGHT_NEAR - ratio * (WEIGHT_NEAR - WEIGHT_FAR)
         except Exception:
-            # 计算失败，使用默认权重
-            dynamic_weights = np.full(num_pos, WEIGHT_FAR, dtype=np.float32)
-        
-        # 🔧 关键修复：分离"避障"和"保持安全距离"
-        # 避障（距离<安全距离）：无论距离目标多远，都使用高权重惩罚
-        # 保持安全距离（距离>安全距离）：根据距离目标距离动态调整权重
-        PENALTY_WEIGHT = float(os.getenv('CLEARANCE_PENALTY_WEIGHT', '5.0'))  # 避障惩罚权重（固定高权重）
-        CLEARANCE_WEIGHT = float(os.getenv('CLEARANCE_WEIGHT', '3.5'))  # 净空奖励基础权重
-        
-        # 🔧 修复：确保所有数组形状匹配，防止CUDA内存访问错误
-        # d_min_current形状: (num_positions,)
-        # dynamic_weights形状: (num_positions,)
-        # 需要确保它们都有一致的形状
-        
-        # 确保d_min_current的形状正确
+            dynamic_weights = np.full(num_positions, WEIGHT_FAR, dtype=np.float32)
+
         try:
-            # 检查d_min_current的形状
             if d_min_current.ndim == 0:
-                # 标量，需要扩展
-                d_min_current = np.full(num_pos, float(d_min_current), dtype=np.float32)
-            elif d_min_current.shape[0] != num_pos:
-                # 形状不匹配，使用默认值
-                rewards = np.zeros(num_pos, dtype=np.float32)
-                # 更新last_min_distance后返回
-                if not hasattr(agent, 'last_min_distance'):
-                    agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-                else:
-                    d_min_previous = agent.last_min_distance
-                    if isinstance(d_min_previous, np.ndarray) and len(d_min_previous) != len(d_min_current):
-                        agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-                    else:
-                        agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-                return rewards
-            
-            # 检查dynamic_weights的形状
-            if dynamic_weights.shape[0] != num_pos:
-                # 形状不匹配，重新创建dynamic_weights
-                dynamic_weights = np.full(num_pos, WEIGHT_FAR, dtype=np.float32)
-            
-            # 🚨 关键改进：从"基于绝对距离"改为"基于距离变化"
-            # 核心思想：
-            # 1. 距离增加时：给正奖励（鼓励避障）
-            # 2. 距离减少时：给负奖励（惩罚接近危险）
-            # 3. 距离不变时：给零奖励（避免刷分）
-            # 这样既能保持避障引导，又能避免"保持安全距离但不接近目标"的刷分行为
-            
-            # 🚨 关键修复：防止除以零和NaN/Inf
-            # 确保safe_distance不为0或NaN
-            safe_distance_safe = max(float(safe_distance), 1e-6)  # 防止除以零
-            
-            # 🚨 关键修复：防止NaN/Inf传播
-            d_min_current = np.nan_to_num(d_min_current, nan=0.0, posinf=1e6, neginf=-1e6)
-            
-            # 获取上一时刻的最小距离
+                d_min_current = np.full(num_positions, float(d_min_current), dtype=np.float32)
+            elif d_min_current.shape[0] != num_positions:
+                d_min_current = np.full(num_positions, far_distance_fill, dtype=np.float32)
+
+            d_min_current = np.nan_to_num(
+                d_min_current,
+                nan=far_distance_fill,
+                posinf=far_distance_fill,
+                neginf=-far_distance_fill
+            )
+
             if not hasattr(agent, 'last_min_distance'):
-                # 首次调用，初始化
                 agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
                 d_min_previous = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
             else:
                 d_min_previous = agent.last_min_distance
-                # 确保形状匹配
                 if isinstance(d_min_previous, np.ndarray):
-                    if d_min_previous.shape[0] != num_pos:
-                        d_min_previous = np.full(num_pos, float(d_min_previous[0]) if len(d_min_previous) > 0 else 0.0, dtype=np.float32)
+                    if d_min_previous.shape[0] != num_positions:
+                        seed_value = float(d_min_previous[0]) if len(d_min_previous) > 0 else far_distance_fill
+                        d_min_previous = np.full(num_positions, seed_value, dtype=np.float32)
                 else:
-                    d_min_previous = np.full(num_pos, float(d_min_previous), dtype=np.float32)
-            
-            # 清理d_min_previous中的NaN/Inf
-            d_min_previous = np.nan_to_num(d_min_previous, nan=0.0, posinf=1e6, neginf=-1e6)
-            
-            # 计算距离变化
-            distance_change = d_min_current - d_min_previous
-            
-            # 归一化距离变化
-            clearance_d_max = float(os.getenv('CLEARANCE_D_MAX', '80.0'))
-            clearance_d_max_safe = max(clearance_d_max, 1e-6)  # 防止除以零
-            normalized_change = np.clip(distance_change / clearance_d_max_safe, -1.0, 1.0)
-            
-            # 清理normalized_change中的NaN/Inf
-            normalized_change = np.nan_to_num(normalized_change, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            # 🚨 关键改进：基于距离变化计算奖励
-            # 距离增加时：给正奖励（鼓励避障）
-            # 距离减少时：给负奖励（惩罚接近危险，惩罚因子2.0）
-            # 距离不变时：给零奖励（避免刷分）
-            distance_increase_mask = distance_change > 1e-6  # 距离增加（容差1e-6米）
-            distance_decrease_mask = distance_change < -1e-6  # 距离减少（容差1e-6米）
-            distance_unchanged_mask = ~(distance_increase_mask | distance_decrease_mask)  # 距离不变
-            
-            # 初始化奖励
-            clearance_reward_base = np.zeros(num_pos, dtype=np.float32)
-            
-            # 距离增加：给正奖励（鼓励避障）
-            if np.any(distance_increase_mask):
-                clearance_reward_base[distance_increase_mask] = dynamic_weights[distance_increase_mask] * normalized_change[distance_increase_mask]
-            
-            # 距离减少：给负奖励（惩罚接近危险，惩罚因子2.0）
-            if np.any(distance_decrease_mask):
-                penalty_factor = 2.0  # 惩罚因子，让接近危险的行为受到更严厉的惩罚
-                clearance_reward_base[distance_decrease_mask] = dynamic_weights[distance_decrease_mask] * normalized_change[distance_decrease_mask] * penalty_factor
-            
-            # 距离不变：给零奖励（避免刷分）
-            if np.any(distance_unchanged_mask):
-                clearance_reward_base[distance_unchanged_mask] = 0.0
-            
-            # 所有形状匹配，正常计算
-            # 🚨 关键修复：防止除以零（safe_distance可能为0）
-            safe_distance_for_penalty = max(float(safe_distance), 1e-6)
-            rewards = np.where(
-                d_min_current < safe_distance_for_penalty,
-                # 避障：固定高权重惩罚（无论距离目标多远）
-                -PENALTY_WEIGHT * (1.0 - d_min_current / safe_distance_for_penalty),
-                # 保持安全距离：基于距离变化（而非绝对距离）
-                clearance_reward_base
+                    d_min_previous = np.full(num_positions, float(d_min_previous), dtype=np.float32)
+
+            d_min_previous = np.nan_to_num(
+                d_min_previous,
+                nan=far_distance_fill,
+                posinf=far_distance_fill,
+                neginf=-far_distance_fill
             )
-            # 🚨 关键修复：确保最终奖励是有限值
-            # 限制奖励范围，防止CLEARANCE_WEIGHT=16.0时奖励过大
-            max_reward = CLEARANCE_WEIGHT * 2.0  # 允许奖励达到权重的2倍
-            min_reward = -PENALTY_WEIGHT * 2.0  # 允许惩罚达到权重的2倍
-            rewards = np.clip(rewards, min_reward, max_reward)
-            rewards = np.nan_to_num(rewards, nan=0.0, posinf=max_reward, neginf=min_reward)
-        except Exception as e:
-            # 计算失败，使用默认值
-            rewards = np.zeros(num_pos, dtype=np.float32)
-        
-        # 🚨 关键改进：更新上一时刻的最小距离（用于下次计算距离变化）
-        # 注意：这个更新应该在计算奖励之后，确保下次调用时能正确计算距离变化
-        if not hasattr(agent, 'last_min_distance'):
-            agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-        else:
-            # 确保形状匹配
-            if isinstance(agent.last_min_distance, np.ndarray):
-                if agent.last_min_distance.shape[0] != num_pos:
-                    agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-                else:
-                    agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-            else:
-                agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
-        
-        # 🚨 关键修复：同时更新debug_info中的d_min_current（用于数据收集）
-        # 取最后一个值（当前时刻的值）作为标量存储
+            distance_change = d_min_current - d_min_previous
+            normalized_change = np.clip(distance_change / clearance_d_max, -1.0, 1.0)
+
+            velocities = self._get_agent_velocity_array(agent, num_positions)
+            hazard_vectors = positions - reference_points
+            hazard_norms = np.linalg.norm(hazard_vectors, axis=1, keepdims=True)
+            hazard_dirs = np.zeros_like(hazard_vectors)
+            valid_hazard_mask = hazard_norms[:, 0] > 1e-6
+            if np.any(valid_hazard_mask):
+                hazard_dirs[valid_hazard_mask] = (
+                    hazard_vectors[valid_hazard_mask] / hazard_norms[valid_hazard_mask]
+                )
+
+            speeds = np.linalg.norm(velocities, axis=1)
+            radial_speed = np.sum(velocities * hazard_dirs, axis=1)
+            motion_signal = np.zeros(num_positions, dtype=np.float32)
+            moving_mask = valid_hazard_mask & (speeds > speed_eps)
+            if np.any(moving_mask):
+                motion_signal[moving_mask] = np.clip(radial_speed[moving_mask] / speed_scale, -1.0, 1.0)
+
+            combined_trend = np.clip(normalized_change + velocity_weight * motion_signal, -1.0, 1.0)
+            trend_reward = np.zeros(num_positions, dtype=np.float32)
+            improving_mask = combined_trend > trend_eps
+            worsening_mask = combined_trend < -trend_eps
+            if np.any(improving_mask):
+                trend_reward[improving_mask] = dynamic_weights[improving_mask] * combined_trend[improving_mask]
+            if np.any(worsening_mask):
+                trend_reward[worsening_mask] = (
+                    dynamic_weights[worsening_mask]
+                    * combined_trend[worsening_mask]
+                    * trend_penalty_factor
+                )
+
+            try:
+                goal_focus_radius = float(self.clearance_penalty_only_near_goal_radius)
+                success_thr = float(self.success_distance_threshold)
+                if goal_focus_radius > success_thr:
+                    clearance_goal_focus_mask = (
+                        (dists_to_goal > success_thr) &
+                        (dists_to_goal < goal_focus_radius)
+                    )
+                    if np.any(clearance_goal_focus_mask):
+                        positive_mask = clearance_goal_focus_mask & (trend_reward > 0.0)
+                        if np.any(positive_mask):
+                            trend_reward[positive_mask] *= float(self.clearance_near_goal_positive_factor)
+            except Exception:
+                pass
+
+            warning_ratio = np.clip((safe_distance - d_min_current) / warning_span, 0.0, 1.0)
+            warning_penalty = -penalty_weight * warning_ratio
+            trend_active_mask = d_min_current >= collision_threshold
+            rewards = warning_penalty + np.where(trend_active_mask, trend_reward, 0.0)
+
+            max_positive = max(clearance_weight, WEIGHT_NEAR)
+            min_negative = penalty_weight + max(clearance_weight, WEIGHT_NEAR) * trend_penalty_factor
+            rewards = np.clip(rewards, -min_negative, max_positive * 2.0)
+            rewards = np.nan_to_num(rewards, nan=0.0, posinf=max_positive * 2.0, neginf=-min_negative)
+        except Exception:
+            rewards = np.zeros(num_positions, dtype=np.float32)
+
+        agent.last_min_distance = d_min_current.copy() if hasattr(d_min_current, 'copy') else d_min_current
+
         try:
             if not hasattr(agent, 'debug_info'):
                 agent.debug_info = {}
             if not isinstance(agent.debug_info, dict):
                 agent.debug_info = {}
-            # 如果d_min_current是数组，取最后一个值；否则直接使用
             if isinstance(d_min_current, np.ndarray) and d_min_current.size > 0:
                 d_min_scalar = float(d_min_current[-1] if d_min_current.ndim > 0 else d_min_current.item())
             else:
                 d_min_scalar = float(d_min_current) if not isinstance(d_min_current, np.ndarray) else float(d_min_current.item())
             agent.debug_info['d_min_current'] = d_min_scalar
+            if 'radial_speed' in locals():
+                agent.debug_info['clearance_radial_speed'] = float(radial_speed[-1]) if radial_speed.size > 0 else 0.0
+            if 'motion_signal' in locals():
+                agent.debug_info['clearance_motion_signal'] = float(motion_signal[-1]) if motion_signal.size > 0 else 0.0
+            if 'use_terrain_reference' in locals():
+                agent.debug_info['clearance_reference'] = 'terrain' if bool(use_terrain_reference[-1]) else 'obstacle'
+            # 维护 episode 级最小安全距离（用于 success-only 质量奖励）
+            try:
+                if world is not None:
+                    prev_min = getattr(world, '_episode_dmin_min', None)
+                    cur = float(d_min_scalar)
+                    if prev_min is None or (np.isfinite(cur) and (not np.isfinite(prev_min) or cur < float(prev_min))):
+                        setattr(world, '_episode_dmin_min', cur)
+            except Exception:
+                pass
         except Exception:
-            # 如果更新失败，不影响奖励计算
             pass
-        
+
         return rewards
 
     def _potential_shaping_vectorized(self, agent: Any, dist_to_goal: float) -> float:

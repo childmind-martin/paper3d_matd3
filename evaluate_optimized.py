@@ -157,7 +157,8 @@ class ModelEvaluator:
                 # 尝试从模型路径找到results.json
                 model_path = self.args.load_model_path
                 # 移除 final/best/epXXX 等子目录
-                if model_path.endswith(('final', 'best')) or '/ep' in os.path.basename(model_path):
+                model_leaf = os.path.basename(os.path.normpath(model_path))
+                if model_leaf in ('final', 'best', 'best_by_team_sr', 'best_by_strict_success') or model_leaf.startswith('ep'):
                     model_base_dir = os.path.dirname(model_path)
                 else:
                     model_base_dir = model_path
@@ -234,6 +235,176 @@ class ModelEvaluator:
     def setup_visualizer(self):
         """初始化可视化器"""
         self.visualizer = TrajectoryVisualizer() if not self.args.disable_visualization else None
+
+    def _rebuild_environment(self):
+        """在场景被重新生成后重建world/env，并重新应用关键运行时参数。"""
+        self.world = self.scenario.make_world()
+
+        try:
+            if hasattr(self.world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
+                self.world.gravity = float(self.args.gravity)
+            if hasattr(self.world, 'control_accel_gain') and getattr(self.args, 'control_accel_gain', None) is not None:
+                self.world.control_accel_gain = float(self.args.control_accel_gain)
+            if hasattr(self.world, 'reward_pos_scale') and getattr(self.args, 'reward_pos_scale', None) is not None:
+                self.world.reward_pos_scale = float(self.args.reward_pos_scale)
+            if hasattr(self.world, 'reward_neg_scale') and getattr(self.args, 'reward_neg_scale', None) is not None:
+                self.world.reward_neg_scale = float(self.args.reward_neg_scale)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self.args, 'agent_max_speed', None) is not None or getattr(self.args, 'agent_accel', None) is not None:
+                for ag in getattr(self.world, 'agents', []):
+                    if getattr(self.args, 'agent_max_speed', None) is not None and hasattr(ag, 'max_speed'):
+                        ag.max_speed = float(self.args.agent_max_speed)
+                    if getattr(self.args, 'agent_accel', None) is not None and hasattr(ag, 'accel'):
+                        ag.accel = float(self.args.agent_accel)
+        except Exception:
+            pass
+
+        try:
+            try_apply_scenario_params(self.scenario, self.world, self.args, tqdm_file=None)
+        except Exception:
+            pass
+
+        self.env = MultiAgentEnv(
+            self.world,
+            reset_callback=self.scenario.reset_world,
+            reward_callback=self.scenario.reward,
+            observation_callback=self.scenario.observation,
+            done_callback=getattr(self.scenario, 'is_done', None),
+            info_callback=None,
+            shared_viewer=False
+        )
+
+        try:
+            ax = getattr(self.args, 'action_range_x', None)
+            ay = getattr(self.args, 'action_range_y', None)
+            az = getattr(self.args, 'action_range_z', None)
+            if any(v is not None for v in (ax, ay, az)) and hasattr(self.env, 'world'):
+                current = getattr(self.env.world, 'action_range', None)
+                if isinstance(current, (list, tuple)) and len(current) >= 3:
+                    new_range = [float(current[0]), float(current[1]), float(current[2])]
+                else:
+                    new_range = [1.0, 1.0, 1.0]
+                if ax is not None:
+                    new_range[0] = float(ax)
+                if ay is not None:
+                    new_range[1] = float(ay)
+                if az is not None:
+                    new_range[2] = float(az)
+                self.env.world.action_range = new_range
+        except Exception:
+            pass
+
+        try:
+            self.world.scenario = self.scenario
+            self.env.scenario = self.scenario
+        except Exception:
+            pass
+
+        try:
+            terrain_sensing_mode = getattr(self.args, 'terrain_sensing_mode', 'local')
+            if terrain_sensing_mode.startswith('oracle') and hasattr(self, 'maddpg'):
+                self.maddpg.scenario_ref = self.scenario
+                self.maddpg.world_ref = self.world
+        except Exception:
+            pass
+
+    def _load_episode_positions(self, episode_idx, terrain_seed=None):
+        """如果存在按回合保存的位置文件，则为当前episode加载。"""
+        episode_positions_dir = os.getenv('EPISODE_POSITIONS_DIR', None)
+        if not episode_positions_dir:
+            return
+
+        try:
+            from pathlib import Path
+
+            positions_dir = Path(episode_positions_dir)
+            candidates = []
+            if terrain_seed is not None:
+                candidates.append(positions_dir / f"episode_{episode_idx:03d}_seed_{terrain_seed}.json")
+            candidates.append(positions_dir / f"episode_{episode_idx:03d}.json")
+
+            positions_file = None
+            for candidate in candidates:
+                if candidate.exists():
+                    positions_file = candidate
+                    break
+
+            if positions_file is None:
+                self.scenario.fixed_positions = None
+                self.scenario.use_fixed_positions = False
+                self.scenario.positions_initialized = False
+                print(f"⚠️  Episode {episode_idx + 1} 位置文件不存在，将使用动态生成")
+                return
+
+            with open(positions_file, 'r', encoding='utf-8') as f:
+                positions_data = json.load(f)
+
+            if 'agents' in positions_data and 'goal' in positions_data:
+                self.scenario.fixed_positions = {
+                    'agents': positions_data['agents'],
+                    'goal': positions_data['goal']
+                }
+                self.scenario.use_fixed_positions = True
+                self.scenario.positions_initialized = True
+                print(f"✅ 加载Episode {episode_idx + 1}固定位置: {positions_file}")
+                print(f"   智能体数量: {len(positions_data['agents'])}")
+                print(f"   目标位置: {positions_data['goal']}")
+                if hasattr(self.scenario, 'validate_and_adjust_fixed_positions'):
+                    self.scenario.validate_and_adjust_fixed_positions()
+                    print("   🔧 已根据当前地形调整智能体Z坐标，确保在地形上方")
+            else:
+                self.scenario.fixed_positions = None
+                self.scenario.use_fixed_positions = False
+                self.scenario.positions_initialized = False
+                print(f"⚠️  Episode {episode_idx + 1}位置文件格式错误，将使用动态生成")
+        except Exception as e:
+            self.scenario.fixed_positions = None
+            self.scenario.use_fixed_positions = False
+            self.scenario.positions_initialized = False
+            print(f"⚠️  加载Episode {episode_idx + 1}位置文件失败: {e}，将使用动态生成")
+
+    def _prepare_episode_terrain(self, episode_idx, terrain_seed_sequence=None):
+        """为当前评估回合显式准备地形，确保每回合地形可控且不会被reset再次改写。"""
+        use_random_terrain = bool(getattr(self.args, 'random_terrain', False)) or bool(terrain_seed_sequence)
+        if not use_random_terrain:
+            try:
+                self.scenario.random_terrain = False
+            except Exception:
+                pass
+            return getattr(self.scenario, 'current_terrain_seed', getattr(self.scenario, 'seed', None))
+
+        if terrain_seed_sequence and episode_idx < len(terrain_seed_sequence):
+            terrain_seed = int(terrain_seed_sequence[episode_idx])
+            print(f"🔧 使用预定义地形种子: {terrain_seed} (回合 {episode_idx + 1})")
+        else:
+            terrain_seed = int(np.random.randint(0, 1000000))
+            print(f"🎲 为回合 {episode_idx + 1} 生成新地形种子: {terrain_seed}")
+
+        if hasattr(self.scenario, 'regenerate_terrain'):
+            self.scenario.regenerate_terrain(new_seed=terrain_seed)
+        else:
+            try:
+                self.scenario.seed = terrain_seed
+                if hasattr(self.scenario, 'rng'):
+                    self.scenario.rng = np.random.RandomState(terrain_seed)
+            except Exception:
+                pass
+
+        self._rebuild_environment()
+        self._load_episode_positions(episode_idx, terrain_seed)
+
+        # 当前回合的地图已经显式准备完毕，禁用reset时的再次随机改图。
+        try:
+            self.scenario.random_terrain = False
+            if hasattr(self.env, 'scenario'):
+                self.env.scenario.random_terrain = False
+        except Exception:
+            pass
+
+        return terrain_seed
     
     def select_actions_eval(self, processed_obs, use_fr=False, use_pf=False):
         """
@@ -333,60 +504,22 @@ class ModelEvaluator:
         
     def load_model(self):
         """加载训练好的模型"""
-        # 🔧 新增：检测并加载元优化基准配置
-        meta_baseline_config = None
         # 从模型路径提取实验名称
         # 例如：models/调试分离梯度、无重力、无早停、预热、随机地图、高变FR低高低_exp_20251201_112141/final
         # 提取：调试分离梯度、无重力、无早停、预热、随机地图、高变FR低高低_exp_20251201_112141
         model_path = self.args.load_model_path
+        model_leaf_dir = os.path.basename(os.path.normpath(model_path))
         # 移除 final/best/epXXX 等子目录
-        if model_path.endswith(('final', 'best')) or '/ep' in os.path.basename(model_path):
+        if model_leaf_dir in ('final', 'best', 'best_by_team_sr', 'best_by_strict_success') or model_leaf_dir.startswith('ep'):
             model_base_dir = os.path.dirname(model_path)
         else:
             model_base_dir = model_path
-        
         exp_name = os.path.basename(model_base_dir)
-        
-        # 尝试查找元优化配置文件（在logs目录下）
         potential_log_dirs = [
-            os.path.join("logs", exp_name),  # logs/{exp_name}
-            model_base_dir,  # models/{exp_name}
-            os.path.dirname(model_base_dir),  # models/{exp_name}/..
+            os.path.join("logs", exp_name),
+            model_base_dir,
+            os.path.dirname(model_base_dir),
         ]
-        
-        for log_dir in potential_log_dirs:
-            meta_baseline_file = os.path.join(log_dir, "pf_meta_baseline.json")
-            if os.path.isfile(meta_baseline_file):
-                try:
-                    with open(meta_baseline_file, 'r', encoding='utf-8') as f:
-                        meta_baseline_config = json.load(f)
-                    print(f"✅ 成功加载元优化配置: {meta_baseline_file}")
-                    # 将元优化配置应用到args
-                    if 'goal_attraction' in meta_baseline_config:
-                        self.args.goal_attraction = float(meta_baseline_config['goal_attraction'])
-                    if 'lambda_1_base' in meta_baseline_config:
-                        self.args.lambda_1_base = float(meta_baseline_config['lambda_1_base'])
-                    if 'terrain_repulsion' in meta_baseline_config:
-                        self.args.terrain_repulsion = float(meta_baseline_config['terrain_repulsion'])
-                    if 'agent_influence_range' in meta_baseline_config:
-                        self.args.agent_influence_range = float(meta_baseline_config['agent_influence_range'])
-                    if 'delta_k_att' in meta_baseline_config:
-                        self.args.delta_k_att = float(meta_baseline_config['delta_k_att'])
-                    if 'delta_lambda_1' in meta_baseline_config:
-                        self.args.delta_lambda_1 = float(meta_baseline_config['delta_lambda_1'])
-                    if 'delta_k_rep' in meta_baseline_config:
-                        self.args.delta_k_rep = float(meta_baseline_config['delta_k_rep'])
-                    if 'delta_radius' in meta_baseline_config:
-                        self.args.delta_radius = float(meta_baseline_config['delta_radius'])
-                    if 'action_force_ratio' in meta_baseline_config:
-                        self.args.action_force_ratio = float(meta_baseline_config['action_force_ratio'])
-                    break
-                except Exception as e:
-                    print(f"⚠️  元优化配置加载失败: {e}")
-        
-        if meta_baseline_config is None:
-            print(f"ℹ️  未找到元优化配置文件: {os.path.join(potential_log_dirs[0] if potential_log_dirs else 'logs', 'pf_meta_baseline.json')}")
-            print(f"   使用默认势场参数")
         
         # 🔧 关键修复：从训练配置（results.json）中读取训练时使用的特征标志、ACTION_FORCE_RATIO和动作范围
         # 优先从results.json读取，确保与训练时完全一致
@@ -401,6 +534,10 @@ class ModelEvaluator:
         training_episode_length = None  # 🚨 新增：读取训练时的episode_length
         training_actor_hidden = None  # 🚨 新增：读取训练时的actor_hidden
         training_critic_hidden = None  # 🚨 新增：读取训练时的critic_hidden
+        training_matd3_use_dual_q = None
+        training_matd3_use_separated_gradient = None
+        training_maddpg_use_dual_q = None
+        training_maddpg_use_separated_gradient = None
         training_gravity = None  # 🔧 新增：读取训练时的gravity
         training_damping = None  # 🔧 新增：读取训练时的damping
         training_agent_max_speed = None  # 🔧 新增：读取训练时的agent_max_speed
@@ -422,7 +559,17 @@ class ModelEvaluator:
                     
                     # 🔧 关键修复：优先从顶层读取最佳回合的FR值（无论是否有args，都应该先检查顶层）
                     # best_episode_force_ratio 保存在 results.json 的顶层，与 best_episode 同级
-                    if 'best_episode_force_ratio' in results:
+                    if model_leaf_dir == 'best_by_team_sr' and 'best_team_sr_force_ratio' in results:
+                        best_episode_force_ratio = float(results['best_team_sr_force_ratio'])
+                        if 'best_team_sr_episode' in results:
+                            best_episode_num = int(results['best_team_sr_episode']) + 1
+                        print(f"✅ 从训练配置读取 Team SR 最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
+                    elif model_leaf_dir == 'best_by_strict_success' and 'best_strict_episode_force_ratio' in results:
+                        best_episode_force_ratio = float(results['best_strict_episode_force_ratio'])
+                        if 'best_strict_episode' in results:
+                            best_episode_num = int(results['best_strict_episode']) + 1
+                        print(f"✅ 从训练配置读取严格最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
+                    elif 'best_episode_force_ratio' in results:
                         best_episode_force_ratio = float(results['best_episode_force_ratio'])
                         if 'best_episode' in results:
                             best_episode_num = int(results['best_episode']) + 1
@@ -453,6 +600,14 @@ class ModelEvaluator:
                             training_actor_hidden = str(results['args']['actor_hidden'])
                         if 'critic_hidden' in results['args']:
                             training_critic_hidden = str(results['args']['critic_hidden'])
+                        if 'matd3_use_dual_q' in results['args']:
+                            training_matd3_use_dual_q = bool(results['args']['matd3_use_dual_q'])
+                        if 'matd3_use_separated_gradient' in results['args']:
+                            training_matd3_use_separated_gradient = bool(results['args']['matd3_use_separated_gradient'])
+                        if 'maddpg_use_dual_q' in results['args']:
+                            training_maddpg_use_dual_q = bool(results['args']['maddpg_use_dual_q'])
+                        if 'maddpg_use_separated_gradient' in results['args']:
+                            training_maddpg_use_separated_gradient = bool(results['args']['maddpg_use_separated_gradient'])
                         # 🔧 新增：读取训练时的物理参数（如果值为None，保持None以便后续报错）
                         if 'gravity' in results['args']:
                             val = results['args']['gravity']
@@ -489,6 +644,14 @@ class ModelEvaluator:
                             training_actor_hidden = str(results['actor_hidden'])
                         if 'critic_hidden' in results:
                             training_critic_hidden = str(results['critic_hidden'])
+                        if 'matd3_use_dual_q' in results:
+                            training_matd3_use_dual_q = bool(results['matd3_use_dual_q'])
+                        if 'matd3_use_separated_gradient' in results:
+                            training_matd3_use_separated_gradient = bool(results['matd3_use_separated_gradient'])
+                        if 'maddpg_use_dual_q' in results:
+                            training_maddpg_use_dual_q = bool(results['maddpg_use_dual_q'])
+                        if 'maddpg_use_separated_gradient' in results:
+                            training_maddpg_use_separated_gradient = bool(results['maddpg_use_separated_gradient'])
                         # 🔧 新增：从顶层读取物理参数（向后兼容，如果值为None，保持None以便后续报错）
                         if 'gravity' in results:
                             val = results['gravity']
@@ -529,19 +692,25 @@ class ModelEvaluator:
         if best_episode_force_ratio is not None:
             # 使用最佳回合的FR值
             eval_action_force_ratio = best_episode_force_ratio
-            ep_str = f"回合 {best_episode_num}" if best_episode_num is not None else "最佳回合"
-            print(f"✅ 使用最佳回合的ACTION_FORCE_RATIO: {eval_action_force_ratio} ({ep_str})")
+            if model_leaf_dir == 'best_by_team_sr':
+                label = "Team SR 最佳回合"
+            elif model_leaf_dir == 'best_by_strict_success':
+                label = "严格评估最佳回合"
+            else:
+                label = "最佳回合"
+            ep_str = f"回合 {best_episode_num}" if best_episode_num is not None else label
+            print(f"✅ 使用{label}的ACTION_FORCE_RATIO: {eval_action_force_ratio} ({ep_str})")
         else:
             # 🚨 关键修复：如果找不到最佳回合的FR值，报错并退出
             # 因为测试应该使用对应训练留下的最佳回合的FR值，使用默认值即使能运行也毫无意义
             error_msg = (
-                "❌ 错误：无法找到训练配置中的最佳回合FR值 (best_episode_force_ratio)\n"
-                "   测试时必须使用对应训练留下的最佳回合的FR值，而不是使用默认值\n"
-                "   请检查训练配置文件 (results.json) 是否包含 best_episode_force_ratio 字段\n"
+                "❌ 错误：无法找到与当前模型目录对应的FR值\n"
+                "   测试时必须使用训练时记录下来的对应回合FR值，而不是使用默认值\n"
+                "   请检查训练配置文件 (results.json) 是否包含 best_episode_force_ratio、best_team_sr_force_ratio 或 best_strict_episode_force_ratio 字段\n"
                 "   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
             )
             print(error_msg)
-            raise ValueError("无法找到最佳回合的FR值，评估无法继续。请确保训练配置文件包含 best_episode_force_ratio 字段。")
+            raise ValueError("无法找到对应模型的FR值，评估无法继续。请确保训练配置文件包含正确的 FR 字段。")
         
         # 更新args中的action_force_ratio，确保后续使用
         self.args.action_force_ratio = eval_action_force_ratio
@@ -691,6 +860,10 @@ class ModelEvaluator:
             noise_min=0.0,  # 评估时不需要最小噪声
             random_action_prob=0.0,  # 评估时禁用随机动作
             per_enabled=False,
+            matd3_use_dual_q=training_matd3_use_dual_q if training_matd3_use_dual_q is not None else getattr(self.args, 'matd3_use_dual_q', True),
+            matd3_use_separated_gradient=training_matd3_use_separated_gradient if training_matd3_use_separated_gradient is not None else getattr(self.args, 'matd3_use_separated_gradient', True),
+            maddpg_use_dual_q=training_maddpg_use_dual_q if training_maddpg_use_dual_q is not None else getattr(self.args, 'maddpg_use_dual_q', False),
+            maddpg_use_separated_gradient=training_maddpg_use_separated_gradient if training_maddpg_use_separated_gradient is not None else getattr(self.args, 'maddpg_use_separated_gradient', True),
             # 🚨 关键修复：使用从训练配置读取的网络结构
             actor_hidden=actor_hidden,
             critic_hidden=critic_hidden,
@@ -800,7 +973,7 @@ class ModelEvaluator:
             # 🔧 关键修复：支持中文路径，在传入路径下查找子目录
             # 首先尝试在传入路径下查找 final -> best -> 最新 ep*
             candidates = []
-            for name in ("final", "best"):
+            for name in ("final", "best", "best_by_team_sr", "best_by_strict_success"):
                 candidates.append(os.path.join(preferred_dir, name))
             try:
                 if os.path.isdir(preferred_dir):
@@ -818,7 +991,7 @@ class ModelEvaluator:
             # 🔧 关键修复：如果传入路径下找不到，再尝试在父目录下查找（兼容旧格式）
             if not any(_is_valid_weights_dir(c, n_agents) for c in candidates):
                 parent = os.path.dirname(preferred_dir)
-                for name in ("final", "best"):
+                for name in ("final", "best", "best_by_team_sr", "best_by_strict_success"):
                     candidates.append(os.path.join(parent, name))
                 try:
                     if os.path.isdir(parent):
@@ -852,6 +1025,7 @@ class ModelEvaluator:
             use_fr = getattr(maddpg_args, 'use_fr_feature', False)
             use_pf = getattr(maddpg_args, 'use_pf_feature', False)
             pf_feature_dim = getattr(maddpg_args, 'pf_feature_dim', 3)
+            matd3_use_dual_q = getattr(maddpg_args, 'matd3_use_dual_q', True)
             
             for i in range(self.n_agents):
                 # 🔧 构建 actor：根据训练配置构建正确的输入结构
@@ -885,11 +1059,12 @@ class ModelEvaluator:
                     # 🚨 标准MATD3：构建critic1和critic2
                     critic1_output = self.maddpg.agents[i]['critic1'](critic_inputs, training=False)
                     critic2_output = self.maddpg.agents[i]['critic2'](critic_inputs, training=False)
-                    # 每个critic输出两个Q值（用于梯度分离）
-                    assert isinstance(critic1_output, (list, tuple)) and len(critic1_output) == 2, \
-                        f"MATD3 Critic1应该输出两个Q值，实际输出: {type(critic1_output)}"
-                    assert isinstance(critic2_output, (list, tuple)) and len(critic2_output) == 2, \
-                        f"MATD3 Critic2应该输出两个Q值，实际输出: {type(critic2_output)}"
+                    if matd3_use_dual_q:
+                        # 每个critic输出两个Q值（用于梯度分离）
+                        assert isinstance(critic1_output, (list, tuple)) and len(critic1_output) == 2, \
+                            f"MATD3 Critic1应该输出两个Q值，实际输出: {type(critic1_output)}"
+                        assert isinstance(critic2_output, (list, tuple)) and len(critic2_output) == 2, \
+                            f"MATD3 Critic2应该输出两个Q值，实际输出: {type(critic2_output)}"
                 else:
                     # MADDPG：单个Critic网络
                     critic_output = self.maddpg.agents[i]['critic'](critic_inputs, training=False)
@@ -1211,9 +1386,20 @@ class ModelEvaluator:
         # 问题：多个回合的进度条同时显示时，如果没有设置position，会导致显示混乱
         # 解决方案：每个回合使用position=0（单行显示），或者使用leave=False（完成后清除）
         # 注意：如果使用position，需要确保所有进度条使用相同的position，否则会显示多行
+        # 🚨 关键优化：大幅降低进度条更新频率，避免并行执行时输出混乱
+        # 从环境变量读取更新频率，默认值更合理
+        try:
+            mininterval = float(os.getenv('TQDM_MININTERVAL', '5.0'))  # 默认5秒更新一次（大幅降低）
+        except Exception:
+            mininterval = 5.0
+        try:
+            miniters = int(os.getenv('TQDM_MINITERS', '200'))  # 默认200步更新一次（大幅降低）
+        except Exception:
+            miniters = 200
+        
         # 这里使用leave=False，让进度条完成后自动清除，避免累积
         pbar = tqdm(range(int(episode_length)), desc=f"回合 {episode_idx + 1}", unit="步",
-                   ncols=120, leave=False, mininterval=0.1, miniters=1,
+                   ncols=120, leave=False, mininterval=mininterval, miniters=miniters,
                    file=tqdm_file, dynamic_ncols=False, ascii=False, disable=tqdm_disable,
                    position=0)  # 🔧 修复：设置position=0，确保所有进度条在同一行显示
         
@@ -1358,8 +1544,22 @@ class ModelEvaluator:
             else:
                 raise ValueError(f"意外的环境step返回值: {len(step_result)}")
 
-            # 累计奖励
-            episode_reward += sum(rew_n)
+            # 累计奖励口径与训练保持一致：
+            # 训练按“当前步所有智能体奖励的均值”累计，而不是直接对智能体求和。
+            try:
+                rew_arr = np.asarray(rew_n, dtype=np.float32)
+                if rew_arr.size > 0:
+                    if not np.all(np.isfinite(rew_arr)):
+                        rew_arr = np.where(np.isfinite(rew_arr), rew_arr, -1000.0)
+                    step_increment = float(np.mean(rew_arr))
+                else:
+                    step_increment = 0.0
+            except Exception:
+                try:
+                    step_increment = float(np.mean(rew_n))
+                except Exception:
+                    step_increment = float(sum(rew_n)) if rew_n is not None else 0.0
+            episode_reward += step_increment
             step_count += 1
             
             # 更新观察
@@ -1462,8 +1662,8 @@ class ModelEvaluator:
                 print(f"⚠️  收集碰撞统计信息时出错: {e}")
         
         # 🔧 新增：计算成功标志（与训练脚本一致）
-        # 定义：Reach_i := ∃t ≤ T_max, ||p_t^i - g^i|| ≤ r_goal
-        #       Safe_i := ∀t ≤ T_max, no-collision for agent i
+        # 定义：Reach_i := 终止帧 ||p_T^i - g^i|| ≤ r_goal
+        #       Safe_i := 整个回合期间无真实碰撞/真实穿透
         #       Succ_i := Reach_i ∧ Safe_i
         #       Succ_team := Λ_{i=1}^{M} Succ_i
         agent_success_flags = []
@@ -1506,10 +1706,38 @@ class ModelEvaluator:
                     dy = pos[1] - ag_goal[1]
                     dz = pos[2] - ag_goal[2]
                     dist_goal_3d = (dx*dx + dy*dy + dz*dz) ** 0.5
-                    reach_i = (dist_goal_3d <= (1.2 * thr_success))
+                    # 统一阈值：评估侧不再乘 1.2
+                    reach_i = (dist_goal_3d <= thr_success)
                     
                     # 检查是否无碰撞（Safe_i）
-                    safe_i = (episode_collision_counts[agent_idx] == 0) if agent_idx < len(episode_collision_counts) else False
+                    safe_i = True
+                    try:
+                        if getattr(agent, '_episode_has_collision', False):
+                            safe_i = False
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(agent, '_had_obstacle_collision', False):
+                            safe_i = False
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(agent, '_had_terrain_contact_or_penetration', False):
+                            safe_i = False
+                    except Exception:
+                        pass
+
+                    pen_count = None
+                    if agent_idx < len(episode_collision_counts):
+                        pen_count = episode_collision_counts[agent_idx]
+                    if pen_count is None and hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                        pen_count = agent.debug_info.get('total_penetration_count', 0)
+                    try:
+                        pen_count = int(pen_count) if np.isfinite(pen_count) else 0
+                    except Exception:
+                        pen_count = None
+                    if pen_count is None or pen_count > 0:
+                        safe_i = False
                     
                     # 单智能体成功 = 到达目标 AND 无碰撞
                     succ_i = 1 if (reach_i and safe_i) else 0
@@ -1629,18 +1857,12 @@ class ModelEvaluator:
         
         try:
             # 生成轨迹图像（同时传入场景提取的目标信息，避免空字典提示）
+            episode_num = int(episode_data.get('episode', 0)) + 1
             terrain_level = episode_data.get('terrain_complexity_level', 'unknown')
-            # 🔧 修改：如果是最佳回合，使用best前缀（与训练脚本一致）
-            if is_best:
-                image_path = os.path.join(
-                    self.args.save_viz_path, 
-                    f"best_trajectory_ep{episode_data['episode']+1}_r{episode_data['reward']:.0f}.png"
-                )
-            else:
-                image_path = os.path.join(
-                    self.args.save_viz_path, 
-                    f"trajectory_ep{episode_data['episode']}_level{terrain_level}_r{episode_data['reward']:.0f}.png"
-                )
+            image_path = os.path.join(
+                self.args.save_viz_path,
+                f"trajectory_ep{episode_num}_level{terrain_level}_r{episode_data['reward']:.0f}.png"
+            )
             goal_positions_img = None
             try:
                 goal_positions_img = self._get_goal_positions_from_scenario()
@@ -1685,8 +1907,12 @@ class ModelEvaluator:
                         if hasattr(self.world, 'landmarks') and len(self.world.landmarks) > 0:
                             landmark = self.world.landmarks[0]
                             if hasattr(landmark, 'state') and hasattr(landmark.state, 'p_pos'):
-                                goal_positions_img = {'goal_pos': landmark.state.p_pos.tolist(), 'agent_goals': []}
+                                # 🚨 关键修复：保留已有的agent_goals，只补充中央目标
+                                if goal_positions_img is None:
+                                    goal_positions_img = {'goal_pos': None, 'agent_goals': []}
+                                goal_positions_img['goal_pos'] = landmark.state.p_pos.tolist()
                                 print(f"✅ 从world.landmarks获取目标位置: {goal_positions_img['goal_pos']}")
+                                print(f"✅ 保留各智能体目标: {len(goal_positions_img.get('agent_goals', []))}个")
                 except Exception as e:
                     print(f"⚠️  获取目标位置失败: {e}")
             
@@ -1707,22 +1933,21 @@ class ModelEvaluator:
             if enable_overlay:
                 overlay_path = os.path.join(
                     self.args.save_viz_path,
-                    f"trajectory_ep{episode_data['episode']}_level{terrain_level}_overlay.png"
+                    f"trajectory_ep{episode_num}_level{terrain_level}_overlay.png"
                 )
                 self._generate_overlay_image(episode_data, overlay_path)
                 print(f"✅ Overlay图片已保存: {overlay_path}")
             else:
                 print(f"⏭️ 跳过overlay图片生成（已禁用）")
             
-            # 🔧 修改：只生成最佳回合的交互式HTML（与训练脚本一致）
-            # 通过环境变量SAVE_INTERACTIVE_TRAJ控制，且只在最佳回合时生成
-            enable_interactive_traj = os.getenv('SAVE_INTERACTIVE_TRAJ', '0').lower() in ('1','true','yes','on')
-            enable_html = enable_interactive_traj and is_best
+            # 默认每个回合都生成交互式HTML；可用 SAVE_INTERACTIVE_TRAJ=0 关闭
+            enable_interactive_traj = os.getenv('SAVE_INTERACTIVE_TRAJ', '1').lower() in ('1','true','yes','on')
+            enable_html = enable_interactive_traj
+            html_path = None
             if enable_html:
-                # 🔧 修改：使用best前缀（与训练脚本一致）
                 html_path = os.path.join(
                     self.args.save_viz_path,
-                    f"best_trajectory_ep{episode_data['episode']+1}_interactive.html"
+                    f"trajectory_ep{episode_num}_interactive.html"
                 )
                 # 🚨 关键修复：确保交互式HTML中显示目标点
                 goal_positions_html = None
@@ -1740,8 +1965,12 @@ class ModelEvaluator:
                         if (not goal_positions_html or goal_positions_html.get('goal_pos') is None) and hasattr(self.world, 'landmarks') and len(self.world.landmarks) > 0:
                             landmark = self.world.landmarks[0]
                             if hasattr(landmark, 'state') and hasattr(landmark.state, 'p_pos'):
-                                goal_positions_html = {'goal_pos': landmark.state.p_pos.tolist(), 'agent_goals': []}
+                                # 🚨 关键修复：保留已有的agent_goals，只补充中央目标
+                                if goal_positions_html is None:
+                                    goal_positions_html = {'goal_pos': None, 'agent_goals': []}
+                                goal_positions_html['goal_pos'] = landmark.state.p_pos.tolist()
                                 print(f"✅ 交互式HTML: 从world.landmarks获取目标位置: {goal_positions_html['goal_pos']}")
+                                print(f"✅ 保留各智能体目标: {len(goal_positions_html.get('agent_goals', []))}个")
                 except Exception as e:
                     print(f"⚠️  获取交互式HTML目标位置失败: {e}")
                     goal_positions_html = None
@@ -1749,17 +1978,17 @@ class ModelEvaluator:
                 self.visualizer.generate_trajectory_interactive(
                     trajectories=episode_data['trajectory'],
                     save_path=html_path,
-                    title=f"Evaluation Episode {episode_data['episode']} (reward={episode_data['reward']:.1f})",
+                    title=f"Evaluation Episode {episode_num} (reward={episode_data['reward']:.1f})",
                     goal_positions=goal_positions_html,
                     scenario=self.scenario,
                     env_instance=self.env  # 🔧 关键修复：传递环境实例，确保能获取目标位置
                 )
 
-            # 🔧 修改：只生成最佳回合的GIF（与训练脚本一致）
+            # GIF仍只在显式允许时生成，默认由shell脚本禁用
             if is_best and len(episode_data['trajectory']) > 10 and not getattr(self.args, 'disable_gif', False):
                 gif_path = os.path.join(
                     self.args.save_viz_path,
-                    f"best_trajectory_ep{episode_data['episode']+1}_animation.gif"
+                    f"best_trajectory_ep{episode_num}_animation.gif"
                 )
                 self.visualizer.generate_trajectory_gif(
                     trajectories=episode_data['trajectory'],
@@ -1800,10 +2029,11 @@ class ModelEvaluator:
         best_episode_data = None
         best_trajectory = None
         best_actor_outputs_history = None
+        save_all_episode_visualizations = os.getenv('SAVE_EVAL_ALL_EPISODES', '1').lower() in ('1','true','yes','on')
         
         # 🔧 新增：检查是否保存最佳回合可视化（与训练脚本一致）
         enable_best_traj = os.getenv('SAVE_BEST_TRAJ', '1').lower() in ('1','true','yes','on')
-        enable_interactive = os.getenv('SAVE_INTERACTIVE_TRAJ', '0').lower() in ('1','true','yes','on')
+        enable_interactive = os.getenv('SAVE_INTERACTIVE_TRAJ', '1').lower() in ('1','true','yes','on')
         
         print(f"\n📊 开始评估 {self.args.eval_episodes} 个回合")
         print(f"🏔️ 地形模式: {'随机地形' if self.args.random_terrain else '固定地形'}")
@@ -1811,7 +2041,8 @@ class ModelEvaluator:
             print(f"🏔️ 地形复杂度等级: {self.args.terrain_complexity_level}")
         else:
             print(f"🏔️ 地形复杂度等级: 随机选择 (1-4)")
-        print(f"📸 保存最佳回合可视化: {'是' if enable_best_traj else '否'}")
+        print(f"📸 保存每回合可视化: {'是' if save_all_episode_visualizations else '否'}")
+        print(f"🏆 最佳回合单独可视化: {'是' if (enable_best_traj and not save_all_episode_visualizations) else '否'}")
         print(f"📊 保存交互式HTML: {'是' if enable_interactive else '否'}")
         
         # 🔧 关键修复：从环境变量读取地形种子序列，确保所有评估模式使用相同的地图顺序
@@ -1828,37 +2059,18 @@ class ModelEvaluator:
         for episode in range(self.args.eval_episodes):
             print(f"\n🚀 开始评估回合 {episode + 1}/{self.args.eval_episodes}")
             
-            # 🔧 关键修复：如果提供了地形种子序列，使用序列中的种子重新生成地形
-            if terrain_seed_sequence and episode < len(terrain_seed_sequence):
-                terrain_seed = terrain_seed_sequence[episode]
-                print(f"🔧 使用预定义地形种子: {terrain_seed} (回合 {episode + 1})")
-                # 重新生成地形（使用指定的种子）
-                if hasattr(self.scenario, 'regenerate_terrain'):
-                    self.scenario.regenerate_terrain(new_seed=terrain_seed)
-                    # 重新创建world（因为地形已变化）
-                    self.world = self.scenario.make_world()
-                    # 重新创建环境（因为world已变化）
-                    self.env = MultiAgentEnv(
-                        self.world,
-                        reset_callback=self.scenario.reset_world,
-                        reward_callback=self.scenario.reward,
-                        observation_callback=self.scenario.observation,
-                        done_callback=self.scenario.is_done,
-                        info_callback=None
-                    )
-            
             # 为每个回合随机选择地形复杂度等级（如果未指定）
             if self.args.terrain_complexity_level is None:
                 terrain_level = np.random.randint(1, 5)  # 1-4
                 print(f"🎲 随机选择地形复杂度等级: {terrain_level}")
-                # 临时设置地形复杂度等级
-                original_level = getattr(self.scenario, 'terrain_complexity_level', None)
-                self.scenario.terrain_complexity_level = terrain_level
             else:
                 terrain_level = self.args.terrain_complexity_level
                 print(f"🏔️ 使用指定地形复杂度等级: {terrain_level}")
-                # 确保场景的terrain_complexity_level也被设置
-                self.scenario.terrain_complexity_level = terrain_level
+            self.scenario.terrain_complexity_level = terrain_level
+
+            terrain_seed = self._prepare_episode_terrain(episode, terrain_seed_sequence)
+            if terrain_seed is not None:
+                print(f"🗺️ 当前回合地形种子: {terrain_seed}")
             
             # 🔧 关键修复：添加异常处理，确保单个回合失败不会导致整个评估失败
             try:
@@ -1874,6 +2086,7 @@ class ModelEvaluator:
                     continue
                 
                 episode_data['terrain_complexity_level'] = terrain_level
+                episode_data['terrain_seed'] = terrain_seed
                 all_rewards.append(episode_data['reward'])
                 all_episodes_data.append(episode_data)
                 
@@ -1886,11 +2099,14 @@ class ModelEvaluator:
                     best_actor_outputs_history = episode_data.get('actions_history', None)
                     print(f"✅ 更新最佳回合: Episode {episode + 1}, Reward = {best_reward:.2f}")
                 
-                # 🔧 修改：不再为每个回合生成可视化，只在最后生成最佳回合的可视化
-                # 与训练脚本保持一致，避免生成大量文件
+                if save_all_episode_visualizations and not self.args.disable_visualization:
+                    try:
+                        self.generate_visualization(episode_data, is_best=False)
+                    except Exception as viz_e:
+                        print(f"⚠️  回合 {episode + 1} 可视化生成失败: {viz_e}")
+                        traceback.print_exc()
             except Exception as ep_e:
                 print(f"❌ 回合 {episode + 1} 评估失败: {ep_e}")
-                import traceback
                 traceback.print_exc()
                 # 继续下一个回合，不中断整个评估流程
                 continue
@@ -1961,6 +2177,7 @@ class ModelEvaluator:
                     'reward': float(ep['reward']),
                     'steps': ep['steps'],
                     'terrain_complexity_level': ep.get('terrain_complexity_level', 'unknown'),
+                    'terrain_seed': ep.get('terrain_seed', None),
                     'duration': ep['duration'],
                     # 🔧 新增：保存轨迹数据（用于生成对比交互图）
                     'trajectory': ep.get('trajectory', []),  # 保存轨迹数据
@@ -2013,8 +2230,10 @@ class ModelEvaluator:
             
         print(f"✅ 评估结果已保存: {results_path}")
         
-        # 🔧 新增：生成最佳回合的可视化（与训练脚本逻辑一致）
-        if enable_best_traj and best_episode_data is not None and not self.args.disable_visualization:
+        # 如果已经为每个回合保存了可视化，则最佳回合对应文件已包含在内，仅保留best别名文件。
+        if save_all_episode_visualizations:
+            print("⏭️  跳过额外的最佳回合可视化生成（每回合可视化已保存）")
+        elif enable_best_traj and best_episode_data is not None and not self.args.disable_visualization:
             print(f"\n🎨 正在生成最佳回合可视化 (Episode {best_episode + 1}, Reward = {best_reward:.2f})...")
             try:
                 # 准备最佳回合数据
@@ -2028,7 +2247,6 @@ class ModelEvaluator:
                 print(f"✅ 最佳回合可视化已生成")
             except Exception as viz_e:
                 print(f"⚠️  最佳回合可视化生成失败: {viz_e}")
-                import traceback
                 traceback.print_exc()
         elif not enable_best_traj:
             print(f"⏭️  跳过最佳回合可视化生成（SAVE_BEST_TRAJ=0）")
@@ -2398,11 +2616,13 @@ HTML交互式轨迹图功能:
     parser.add_argument("--clearance-d-max", type=float, default=None, help="净空奖励归一化因子")
     parser.add_argument("--success-weight", type=float, default=None, help="成功奖励权重")
     parser.add_argument("--collision-weight", type=float, default=None, help="碰撞惩罚权重")
+    parser.add_argument("--collision-reduction-weight", type=float, default=None, help="碰撞次数减少奖励权重")
     parser.add_argument("--global-weight", type=float, default=None, help="全局奖励权重")
     parser.add_argument("--shaping-weight", type=float, default=None, help="潜势函数 shaping 权重")
     parser.add_argument("--max-reward", type=float, default=None, help="最大奖励值")
     parser.add_argument("--min-reward", type=float, default=None, help="最小奖励值")
     parser.add_argument("--success-reward-value", type=float, default=None, help="成功一次性奖励值")
+    parser.add_argument("--no-collision-reward-value", type=float, default=None, help="无碰撞奖励值")
     parser.add_argument("--success-distance-threshold", type=float, default=None, help="成功判定距离阈值")
     parser.add_argument("--collision-penalty-value", type=float, default=None, help="碰撞惩罚绝对值")
     parser.add_argument("--collision-distance-threshold", type=float, default=None, help="碰撞/接触距离阈值")

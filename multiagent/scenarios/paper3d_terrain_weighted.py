@@ -30,6 +30,43 @@ class Scenario(BaseTerrainScenario):
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+        # 课程阶段绑定的 reward profile：
+        # - fixed_route：阶段1/普通固定环境，保持当前主路线
+        # - obstacle_route：阶段2+，针对随机障碍强化局部绕障与团队过程梯度
+        try:
+            import os
+            raw_reward_profile = kwargs.get(
+                'reward_profile',
+                os.getenv('CURRICULUM_REWARD_PROFILE', os.getenv('REWARD_PROFILE', 'fixed_route'))
+            )
+            self.reward_profile = self._normalize_reward_profile_name(raw_reward_profile)
+            self.curriculum_stage_id = int(
+                kwargs.get('curriculum_stage_id', os.getenv('CURRICULUM_STAGE_ID', '0'))
+            )
+        except Exception:
+            self.reward_profile = 'fixed_route'
+            self.curriculum_stage_id = 0
+
+        try:
+            import os
+            self.restructured_reward_enabled = kwargs.get(
+                'restructured_reward_enabled',
+                os.getenv('RESTRUCTURED_REWARD', '1').lower() in ('1', 'true', 'yes', 'on')
+            )
+            self.dense_energy_enabled = kwargs.get(
+                'dense_energy_enabled',
+                os.getenv('DENSE_ENERGY_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on')
+            )
+        except Exception:
+            self.restructured_reward_enabled = True
+            self.dense_energy_enabled = True
+        self._dense_reward_keys_fixed = (
+            'distance', 'stationary', 'height', 'success', 'collision', 'global', 'clearance'
+        )
+        self._dense_reward_keys_obstacle = (
+            'distance', 'stationary', 'height', 'success', 'collision', 'global', 'clearance', 'lateral'
+        )
         
         # 初始化奖励权重配置（可通过参数调整）
         self.reward_weights = {
@@ -70,15 +107,31 @@ class Scenario(BaseTerrainScenario):
             self.hover_reward_max = float(kwargs.get('hover_reward_max', os.getenv('HOVER_REWARD_MAX', '12.0')))
             self.hover_speed_threshold = float(kwargs.get('hover_speed_threshold', os.getenv('HOVER_SPEED_THRESHOLD', '1.0')))
             self.hover_reward_interval = int(kwargs.get('hover_reward_interval', os.getenv('HOVER_REWARD_INTERVAL', '5')))
+            self.goal_hold_reward = float(kwargs.get('goal_hold_reward', os.getenv('GOAL_HOLD_REWARD', str(self.hover_reward_max))))
+            self.leave_goal_penalty = float(kwargs.get('leave_goal_penalty', os.getenv('LEAVE_GOAL_PENALTY', str(self.hover_reward_max))))
         except Exception:
             self.hover_reward_max = 12.0  # 🔧 从5.0提高到12.0，增强悬停奖励
             self.hover_speed_threshold = 1.0
             self.hover_reward_interval = 5  # 🔧 从10改为5，增加悬停奖励频率
+            self.goal_hold_reward = self.hover_reward_max
+            self.leave_goal_penalty = self.hover_reward_max
         
         # 侧向/净空奖励参数
-        self.clearance_d_max = kwargs.get('clearance_d_max', 66.0)  # 最大可能距离（用于归一化）
-        self.lateral_activation_distance = kwargs.get('lateral_activation_distance', 15.0)  # 激活侧向奖励的距离阈值
-        self.terrain_gradient_threshold = kwargs.get('terrain_gradient_threshold', 0.5)  # 地形梯度阈值（米/米）
+        self.clearance_d_max = kwargs.get('clearance_d_max', 66.0)
+        self.lateral_activation_distance = kwargs.get('lateral_activation_distance', 15.0)
+        self.terrain_gradient_threshold = kwargs.get('terrain_gradient_threshold', 0.5)
+        self.team_goal_occupancy_scale = float(kwargs.get('team_goal_occupancy_scale', os.getenv('TEAM_GOAL_OCCUPANCY_SCALE', '1.0')))
+        self.team_bottleneck_progress_scale = float(kwargs.get('team_bottleneck_progress_scale', os.getenv('TEAM_BOTTLENECK_PROGRESS_SCALE', '4.0')))
+        self.team_waiting_scale = float(kwargs.get('team_waiting_scale', os.getenv('TEAM_WAITING_SCALE', '0.6')))
+        self.team_waiting_speed_threshold = float(kwargs.get('team_waiting_speed_threshold', os.getenv('TEAM_WAITING_SPEED_THRESHOLD', str(self.hover_speed_threshold))))
+
+        # 性能优化：缓存环境变量（训练期间不变，避免每步重复os.getenv）
+        import os
+        self._terrain_contact_eps = float(os.getenv('TERRAIN_CONTACT_EPS', '0.3'))
+        self._terrain_collision_eps = float(os.getenv('TERRAIN_COLLISION_EPS', '0.3'))
+        self._enable_collision_debug = os.getenv('ENABLE_COLLISION_DEBUG', '0').lower() in ('1', 'true', 'yes', 'on')
+        self._early_stop_mode = os.getenv('EARLY_STOP_MODE', 'never').lower()
+        self._quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
 
         # 轨迹平滑（最小拐弯角）奖励权重：默认从环境变量读取，可通过CLI覆盖
         try:
@@ -130,6 +183,49 @@ class Scenario(BaseTerrainScenario):
             print(f"[ARW] Adaptive Reward Weighting enabled with config: {arw_config}")
         else:
             print("[ARW] Adaptive Reward Weighting disabled")
+
+    @staticmethod
+    def _normalize_reward_profile_name(raw_profile):
+        try:
+            profile = str(raw_profile).strip().lower()
+        except Exception:
+            profile = 'fixed_route'
+        if profile == 'obstacle_route':
+            return 'obstacle_route'
+        return 'fixed_route'
+
+    def _is_obstacle_reward_route(self):
+        return getattr(self, 'reward_profile', 'fixed_route') == 'obstacle_route'
+
+    def _dense_reward_keys(self):
+        dense_keys = (
+            self._dense_reward_keys_obstacle
+            if self._is_obstacle_reward_route()
+            else self._dense_reward_keys_fixed
+        )
+        if getattr(self, 'dense_energy_enabled', False):
+            dense_keys = dense_keys + ('energy',)
+        return dense_keys
+
+    def _adjust_approach_reward_for_obstacle_route(self, agent, approach_reward):
+        """
+        第二阶段（随机障碍路线）的最简 progress 调整：
+        仅在靠近障碍时放宽“短暂远离目标”的负 approach，不新增额外调参项。
+        """
+        try:
+            approach_reward = float(approach_reward)
+            if approach_reward >= 0.0 or not self._is_obstacle_reward_route():
+                return approach_reward
+
+            activation_distance = max(float(getattr(self, 'lateral_activation_distance', 15.0)), 1e-6)
+            obstacle_min_dist = getattr(agent, '_rc_dmin', None)
+            if obstacle_min_dist is None or not np.isfinite(obstacle_min_dist):
+                return approach_reward
+
+            relax = float(np.clip(float(obstacle_min_dist) / activation_distance, 0.0, 1.0))
+            return approach_reward * relax
+        except Exception:
+            return float(approach_reward)
     
     def reward(self, agent, world):
         """
@@ -153,16 +249,23 @@ class Scenario(BaseTerrainScenario):
                 agent.stationary_count = 0
                 agent.last_position = agent.state.p_pos.copy()
                 agent.last_velocity = np.zeros(3)
-                agent.visited_cells = set()  # 用于记录已访问区域
-                agent.debug_info = {}  # 添加调试信息字典
+                agent.visited_cells = set()
+                agent.debug_info = {}
                 agent.initialized_for_reward = True
-                agent.start_position = agent.state.p_pos.copy()  # 记录起始位置
-                # 🔧 新增：初始化碰撞次数跟踪
-                agent.current_episode_collision_count = 0  # 当前回合碰撞次数
-                agent.previous_episode_collision_count = 0  # 上一回合碰撞次数
-                agent.collision_reduction_reward_given = False  # 标记是否已给予减少奖励
-                # 🔧 修复：初始化debug_info中的total_penetration_count
+                agent.start_position = agent.state.p_pos.copy()
+                agent.current_episode_collision_count = 0
+                agent.previous_episode_collision_count = 0
+                agent.collision_reduction_reward_given = False
                 agent.debug_info['total_penetration_count'] = 0
+                agent.debug_info['terrain_penetration_count'] = 0
+                agent.debug_info['obstacle_collision_count'] = 0
+                # 回合开始时重置全局奖励标记（所有agent共享world，只需置一次）
+                if hasattr(world, '_global_reward_given'):
+                    world._global_reward_given = False
+                if hasattr(world, '_team_sync_step_cache'):
+                    world._team_sync_step_cache = None
+                if hasattr(world, '_team_sync_state'):
+                    world._team_sync_state = None
                 
                 # 计算从起始点到目标点的初始距离和方向（按每智能体的真实目标）
                 agent.initial_distance_to_goal = dist_to_goal  # 记录初始距离
@@ -180,31 +283,54 @@ class Scenario(BaseTerrainScenario):
                 except Exception:
                     pass
                 
-                # 第一次计算默认值
-                return 0.0  # 第一帧没有奖励
-            
-            # 计算各项独立奖励
+                return 0.0
+
+            # 性能优化：预计算本步共享值，用属性存储避免每步分配 dict
+            _th = self.get_terrain_height(agent_pos[0], agent_pos[1]) if hasattr(self, 'get_terrain_height') else 0.0
+            _dmin_obs = None
+            if hasattr(world, 'nearest_obstacle_distance'):
+                try:
+                    _dmin_obs = world.nearest_obstacle_distance(agent)
+                except Exception:
+                    pass
+            _dist_to_start = np.linalg.norm(agent_pos - agent.start_position) if hasattr(agent, 'start_position') else 0.0
+            agent._rc_th = _th
+            agent._rc_dgoal = dist_to_goal
+            agent._rc_dstart = _dist_to_start
+            agent._rc_dmin = _dmin_obs
+            agent._rc_collision = False
+
+            # collision 必须在 collision_reduction 之前求值
+            distance_reward = self._calculate_distance_reward(agent, world, dist_to_goal)
+            approach_reward = self._calculate_approach_reward(agent, world, dist_to_goal)
+            approach_reward = self._adjust_approach_reward_for_obstacle_route(agent, approach_reward)
+            progress_reward = self._merge_progress_reward(distance_reward, approach_reward)
+
             rewards = {
-                'distance': self._calculate_distance_reward(agent, world, dist_to_goal),
-                'exploration': self._calculate_exploration_reward(agent, world),
+                'distance': progress_reward,  # distance 通道承载 merged progress
+                'exploration': 0.0,          # legacy shaping：已归档，默认主路径移出
                 'stationary': self._calculate_stationary_penalty(agent, world),
                 'direction': self._calculate_direction_reward(agent, world),
-                'deviation': self._calculate_deviation_reward(agent, world, dist_to_goal),
-                'start_area': self._calculate_start_area_reward(agent, world),
-                'approach': self._calculate_approach_reward(agent, world, dist_to_goal),
+                'deviation': 0.0,            # legacy shaping：已归档，默认主路径移出
+                'start_area': 0.0,           # legacy shaping：已归档，默认主路径移出
+                'approach': 0.0,             # legacy 占位：已并入 progress
                 'energy': self._calculate_energy_reward(agent, world),
                 'height': self._calculate_height_reward(agent, world),
                 'lateral': self._calculate_lateral_reward(agent, world),
                 'clearance': self._calculate_clearance_reward(agent, world),
                 'success': self._calculate_success_reward(agent, world, dist_to_goal),
                 'collision': self._calculate_collision_penalty(agent, world),
-                'collision_reduction': self._calculate_collision_reduction_reward(agent, world),  # 🔧 新增：碰撞次数减少奖励
-                'global': self._calculate_global_reward(world),
-                'shaping': self._calculate_potential_shaping(agent, dist_to_goal)
+                'collision_reduction': 0.0,  # legacy shaping：已归档，默认主路径移出
+                'global': self._calculate_team_sync_reward(agent, world) + self._calculate_global_reward(world),
+                'shaping': 0.0               # legacy shaping：已归档，默认主路径移出
             }
             
             # 加权求和
-            total_reward = sum(self.reward_weights[key] * rewards[key] for key in rewards.keys())
+            if getattr(self, 'restructured_reward_enabled', False):
+                dense_keys = self._dense_reward_keys()
+                total_reward = sum(self.reward_weights.get(key, 0.0) * rewards.get(key, 0.0) for key in dense_keys)
+            else:
+                total_reward = sum(self.reward_weights[key] * rewards[key] for key in rewards.keys())
             total_before_clip = total_reward
             
             # 应用ARW调整
@@ -212,14 +338,18 @@ class Scenario(BaseTerrainScenario):
                 # 创建奖励项字典用于ARW调整
                 reward_terms = {
                     'collision': rewards.get('collision', 0.0),
-                    'distance': rewards.get('distance', 0.0) + rewards.get('approach', 0.0)  # 合并距离相关奖励
+                    'distance': rewards.get('distance', 0.0)
                 }
                 
                 # 应用ARW调整
                 adjusted_terms = self.arw.apply_to_rewards(reward_terms)
                 
                 # 重新计算总奖励
-                total_reward = sum(self.reward_weights[key] * rewards[key] for key in rewards.keys())
+                if getattr(self, 'restructured_reward_enabled', False):
+                    dense_keys = self._dense_reward_keys()
+                    total_reward = sum(self.reward_weights.get(key, 0.0) * rewards.get(key, 0.0) for key in dense_keys)
+                else:
+                    total_reward = sum(self.reward_weights[key] * rewards[key] for key in rewards.keys())
                 
                 # 应用ARW调整的差异
                 collision_adjustment = adjusted_terms.get('collision', 0.0) - reward_terms.get('collision', 0.0)
@@ -240,7 +370,8 @@ class Scenario(BaseTerrainScenario):
                 agent.debug_info.update({
                     'rewards': rewards,
                     'weights': self.reward_weights,
-                    'total_before_clip': total_before_clip
+                    'total_before_clip': total_before_clip,
+                    'reward_profile': getattr(self, 'reward_profile', 'fixed_route'),
                 })
             
             # 限制奖励范围
@@ -309,6 +440,12 @@ class Scenario(BaseTerrainScenario):
                 self.arw.on_episode_start(ep)
         except Exception:
             pass
+        try:
+            if hasattr(self, 'world') and self.world is not None:
+                self.world._team_sync_step_cache = None
+                self.world._team_sync_state = None
+        except Exception:
+            pass
         
         # 🔧 新增：重置碰撞计数（在回合开始时）
         # 注意：这里会在world.reset_world时被调用，此时agents已经重置
@@ -336,6 +473,8 @@ class Scenario(BaseTerrainScenario):
                     if not isinstance(agent.debug_info, dict):
                         agent.debug_info = {}
                     agent.debug_info['total_penetration_count'] = 0
+                    agent.debug_info['terrain_penetration_count'] = 0
+                    agent.debug_info['obstacle_collision_count'] = 0
                     
                     # 🔧 修复：重置min_distance相关属性
                     if hasattr(agent, 'd_min_prev'):
@@ -347,6 +486,58 @@ class Scenario(BaseTerrainScenario):
                     
                     # 🚨 关键修复：重置防重复计数标志，确保每回合开始时重置
                     agent._last_collision_counted_step = -1
+        except Exception:
+            pass
+
+    def _get_agent_goal_pos(self, agent):
+        try:
+            if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                return agent.goal_a.state.p_pos
+        except Exception:
+            pass
+        return getattr(self, 'goal_pos', None)
+
+    def _get_success_state(self, agent):
+        if not hasattr(agent, '_success_state') or not isinstance(agent._success_state, dict):
+            agent._success_state = {}
+        agent._success_state.setdefault('success_reward_given', False)
+        agent._success_state.setdefault('first_success_step', None)
+        agent._success_state.setdefault('hover_reward_count', 0)
+        agent._success_state.setdefault('was_in_goal_zone', False)
+        return agent._success_state
+
+    def _agent_safe_so_far(self, agent):
+        try:
+            if getattr(agent, '_episode_has_collision', False):
+                return False
+        except Exception:
+            pass
+        try:
+            if getattr(agent, '_had_obstacle_collision', False):
+                return False
+        except Exception:
+            pass
+        try:
+            if getattr(agent, '_had_terrain_contact_or_penetration', False):
+                return False
+        except Exception:
+            pass
+
+        pen_count = 0
+        if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+            pen_count = agent.debug_info.get('total_penetration_count', 0)
+        try:
+            pen_count = int(pen_count) if np.isfinite(pen_count) else 0
+        except Exception:
+            pen_count = 0
+        return pen_count == 0
+
+    def _record_termination_reason(self, world, agent, reason):
+        try:
+            if not hasattr(world, '_termination_reasons') or not isinstance(world._termination_reasons, dict):
+                world._termination_reasons = {}
+            agent_name = getattr(agent, 'name', f'agent_{id(agent)}')
+            world._termination_reasons[agent_name] = [reason]
         except Exception:
             pass
     
@@ -365,6 +556,116 @@ class Scenario(BaseTerrainScenario):
             return -(relative_dist - 1.0) * 3.0  # 归一化到合理范围
         else:
             return -dist_to_goal * 0.01  # 回退到绝对距离
+
+    def _merge_progress_reward(self, distance_reward, approach_reward):
+        """
+        将 distance(状态锚点) 与 approach(步进结果) 合并为单一 progress 通道。
+        使用当前脚本中的 distance/approach 权重做加权平均，避免两条通道重复计分。
+        """
+        try:
+            dw = abs(float(self.reward_weights.get('distance', 0.0)))
+            aw = abs(float(self.reward_weights.get('approach', 0.0)))
+            denom = dw + aw
+            if denom < 1e-6:
+                return 0.0
+            return float((dw * float(distance_reward) + aw * float(approach_reward)) / denom)
+        except Exception:
+            return float(distance_reward)
+
+    def _calculate_team_sync_reward(self, agent, world):
+        """
+        团队同步过程奖励（dense）：
+        - 所有阶段统一：occupancy/waiting 按 Succ_i（Reach_i ∧ Safe_i）
+        - bottleneck：统一看未成功体
+
+        返回值对同一步内所有 agent 相同，并通过 world 级缓存保证只计算一次。
+        """
+        try:
+            agents = getattr(world, 'agents', [])
+            if not agents:
+                return 0.0
+
+            cur_step = int(getattr(world, 'current_step', -1))
+            cache = getattr(world, '_team_sync_step_cache', None)
+            if cache is not None and cache[0] == cur_step:
+                return float(cache[1])
+
+            state = getattr(world, '_team_sync_state', None)
+            is_new_episode = False
+            if state is None or not isinstance(state, dict):
+                state = {}
+                is_new_episode = True
+            else:
+                last_step = state.get('last_step', None)
+                if last_step is None:
+                    is_new_episode = True
+                elif cur_step >= 0 and last_step is not None and cur_step < int(last_step):
+                    is_new_episode = True
+                elif cur_step == 0 and last_step is not None and int(last_step) != 0:
+                    is_new_episode = True
+
+            speeds = []
+            reach_flags = []
+            succ_flags = []
+            remaining_dists = []
+            thr_success = float(self.success_distance_threshold)
+            for ag in agents:
+                pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
+                goal = self._get_agent_goal_pos(ag)
+                if pos is None or goal is None:
+                    reach_flags.append(False)
+                    succ_flags.append(False)
+                    speeds.append(0.0)
+                    continue
+                dist = float(np.linalg.norm(pos - goal))
+                reach_i = bool(dist <= thr_success)
+                safe_i = bool(self._agent_safe_so_far(ag))
+                succ_i = bool(reach_i and safe_i)
+                reach_flags.append(reach_i)
+                succ_flags.append(succ_i)
+                progress_flag = succ_i
+                if not progress_flag:
+                    remaining_dists.append(dist)
+                try:
+                    speeds.append(float(np.linalg.norm(getattr(getattr(ag, 'state', None), 'p_vel', np.zeros(3)))))
+                except Exception:
+                    speeds.append(0.0)
+
+            n_agents = max(len(agents), 1)
+            progress_flags = succ_flags
+            occupancy_ratio = float(sum(1 for v in progress_flags if v)) / float(n_agents)
+            bottleneck_dist = max(remaining_dists) if remaining_dists else 0.0
+            if is_new_episode:
+                state['last_bottleneck_dist'] = bottleneck_dist
+            last_bottleneck_dist = float(state.get('last_bottleneck_dist', bottleneck_dist))
+            bottleneck_delta = max(0.0, last_bottleneck_dist - bottleneck_dist)
+            bottleneck_delta = min(bottleneck_delta, 1.0)
+
+            waiting_speed_thr = float(getattr(self, 'team_waiting_speed_threshold', getattr(self, 'hover_speed_threshold', 1.0)))
+            all_progress = all(progress_flags) if progress_flags else False
+            waiting_ratio = float(
+                sum(1 for progress_i, spd in zip(progress_flags, speeds) if progress_i and spd <= waiting_speed_thr and not all_progress)
+            ) / float(n_agents)
+
+            reward_scalar = (
+                float(getattr(self, 'team_goal_occupancy_scale', 1.0)) * occupancy_ratio +
+                float(getattr(self, 'team_bottleneck_progress_scale', 4.0)) * bottleneck_delta +
+                float(getattr(self, 'team_waiting_scale', 0.6)) * waiting_ratio
+            )
+
+            state['last_bottleneck_dist'] = bottleneck_dist
+            state['last_step'] = cur_step
+            world._team_sync_state = state
+            world._team_sync_step_cache = (cur_step, float(reward_scalar))
+            world._team_sync_reward = float(reward_scalar)
+            world._team_sync_occupancy_ratio = float(occupancy_ratio)
+            world._team_sync_bottleneck_dist = float(bottleneck_dist)
+            world._team_sync_bottleneck_delta = float(bottleneck_delta)
+            world._team_sync_waiting_ratio = float(waiting_ratio)
+            world._team_sync_occupancy_basis = 'reach' if use_reach_progress else 'succ'
+            return float(reward_scalar)
+        except Exception:
+            return 0.0
     
     def _calculate_exploration_reward(self, agent, world):
         """计算探索奖励"""
@@ -401,9 +702,13 @@ class Scenario(BaseTerrainScenario):
         
         # 🔧 修复：改用线性惩罚+上限，避免指数爆炸
         # 只有长时间停滞（>10步）才给予惩罚，且惩罚有明确上限
-        if agent.stationary_count > 10:  # 提高触发阈值（2→10）
-            dist_to_start = np.linalg.norm(agent.state.p_pos - agent.start_position)
-            dist_to_goal = np.linalg.norm(agent.state.p_pos - agent.goal_a.state.p_pos)
+        if agent.stationary_count > 10:
+            dist_to_start = getattr(agent, '_rc_dstart', None)
+            if dist_to_start is None:
+                dist_to_start = np.linalg.norm(agent.state.p_pos - agent.start_position)
+            dist_to_goal = getattr(agent, '_rc_dgoal', None)
+            if dist_to_goal is None:
+                dist_to_goal = np.linalg.norm(agent.state.p_pos - agent.goal_a.state.p_pos)
             
             # 🔧 修复：使用固定惩罚+线性增长，设置明确上限
             base_penalty = -5.0  # 降低基础惩罚（-25 → -5）
@@ -422,15 +727,13 @@ class Scenario(BaseTerrainScenario):
     
     def _calculate_direction_reward(self, agent, world):
         """计算方向一致性奖励 + 基础移动奖励 + 轨迹平滑（最小拐弯角）奖励"""
-        # 当前速度及基础移动奖励（鼓励"至少要动起来"）
         vel = getattr(agent.state, 'p_vel', np.zeros(3))
         speed = np.linalg.norm(vel)
         base_movement_reward = 0.0
-        if speed > 0.05:  # 最低速度阈值
+        if speed > 0.05:
             base_movement_reward = min(speed * 2.0, 5.0)
-        
-        # 与起点→目标方向的一致性（保持原有逻辑）
-        dist_to_start = np.linalg.norm(agent.state.p_pos - agent.start_position)
+        _dstart = getattr(agent, '_rc_dstart', None)
+        dist_to_start = _dstart if _dstart is not None else np.linalg.norm(agent.state.p_pos - agent.start_position)
         alignment_bonus = 0.0
         if dist_to_start < 20 and hasattr(agent, 'start_to_goal_dir') and agent.start_to_goal_dir is not None:
             if speed > 0.1:  # 有明确的移动（3D速度）
@@ -458,8 +761,8 @@ class Scenario(BaseTerrainScenario):
                     goal_pos = getattr(agent.goal_a.state, 'p_pos', None)
                 
                 if goal_pos is not None:
-                    dist_to_goal = float(np.linalg.norm(agent.state.p_pos - goal_pos))
-                    # 距离调节因子：远距离(>50m)允许大转向(权重0.3)，近距离(<15m)要求高平滑度(权重1.2)
+                    _dgoal = getattr(agent, '_rc_dgoal', None)
+                    dist_to_goal = _dgoal if _dgoal is not None else float(np.linalg.norm(agent.state.p_pos - goal_pos))
                     # 使用平滑过渡函数：sigmoid((50-dist)/20)映射到[0.3, 1.2]
                     dist_factor = 0.3 + 0.9 / (1.0 + np.exp((dist_to_goal - 35.0) / 10.0))
                 else:
@@ -510,7 +813,8 @@ class Scenario(BaseTerrainScenario):
     
     def _calculate_start_area_reward(self, agent, world):
         """计算起始区域奖励"""
-        dist_to_start = np.linalg.norm(agent.state.p_pos - agent.start_position)
+        _dstart = getattr(agent, '_rc_dstart', None)
+        dist_to_start = _dstart if _dstart is not None else np.linalg.norm(agent.state.p_pos - agent.start_position)
         
         if dist_to_start < 20 and np.linalg.norm(agent.state.p_vel) > 0.1:
             return (20 - dist_to_start) * 0.5  # 越接近起点，奖励越大
@@ -573,10 +877,16 @@ class Scenario(BaseTerrainScenario):
         height_diff = None
         ideal_max = None
         try:
-            if hasattr(self, 'get_terrain_height'):
+            _th = getattr(agent, '_rc_th', None)
+            if _th is not None:
+                terrain_h = _th
+            elif hasattr(self, 'get_terrain_height'):
                 pos = agent.state.p_pos
                 terrain_h = self.get_terrain_height(pos[0], pos[1])
-                height_diff = float(pos[2] - terrain_h)
+            else:
+                terrain_h = None
+            if terrain_h is not None:
+                height_diff = float(agent.state.p_pos[2] - terrain_h)
                 ideal_max = float(getattr(self, 'height_ideal_max', 5.0))
                 height_ok = (height_diff <= ideal_max)
         except Exception:
@@ -614,9 +924,10 @@ class Scenario(BaseTerrainScenario):
         if not getattr(self, 'height_reward_enabled', True):
             return 0.0
         
-        if hasattr(self, 'get_terrain_height'):
+        _th = getattr(agent, '_rc_th', None)
+        if _th is not None or hasattr(self, 'get_terrain_height'):
             current_pos = agent.state.p_pos
-            terrain_height = self.get_terrain_height(current_pos[0], current_pos[1])
+            terrain_height = _th if _th is not None else self.get_terrain_height(current_pos[0], current_pos[1])
             height_diff = current_pos[2] - terrain_height
             
             # 可配置的理想高度：地形高度 + [min, max] 米
@@ -664,132 +975,87 @@ class Scenario(BaseTerrainScenario):
 
     def _calculate_success_reward(self, agent, world, dist_to_goal):
         """
-        成功奖励：到达目标一次性大额奖励 + 悬停奖励
-        修复重复成功奖励问题，鼓励智能体在终点处持续停留
+        目标区奖励：首次进入目标区奖励 + 目标区保持奖励 + 离开目标区惩罚
+        其中“成功”只按安全到达给一次性奖励；保持/离开用于让终止帧语义可学习。
         """
         try:
-            if dist_to_goal <= float(self.success_distance_threshold):
-                # 获取智能体唯一标识（确保使用正确的ID）
-                agent_id = getattr(agent, 'id', None)
-                if agent_id is None:
-                    # 如果agent.id不存在，尝试从agent.name中提取
-                    agent_name = getattr(agent, 'name', '')
-                    if 'agent_' in agent_name:
-                        try:
-                            agent_id = int(agent_name.split('_')[1])
-                        except (ValueError, IndexError):
-                            agent_id = 0  # 默认值
-                    else:
-                        agent_id = 0  # 默认值
-                
-                # 初始化成功状态跟踪
-                if not hasattr(agent, '_success_state'):
-                    agent._success_state = {
-                        'success_reward_given': False,
-                        'first_success_step': None,
-                        'hover_reward_count': 0
-                    }
-                
-                success_state = agent._success_state
-                
-                # 一次性成功奖励（防重复）
+            success_state = self._get_success_state(agent)
+            in_goal_zone = dist_to_goal <= float(self.success_distance_threshold)
+            was_in_goal_zone = bool(success_state.get('was_in_goal_zone', False))
+            safe_so_far = self._agent_safe_so_far(agent)
+
+            if in_goal_zone:
                 if not success_state['success_reward_given']:
-                    # 🔧 修复：正确获取当前步数
-                    # 注意：reward函数在step方法中被调用，此时步数应该已经更新（在world.step()之后）
-                    # 优先从world.current_step获取（应该已经同步）
+                    agent_id = getattr(agent, 'id', None)
+                    if agent_id is None:
+                        agent_name = getattr(agent, 'name', '')
+                        if 'agent_' in agent_name:
+                            try:
+                                agent_id = int(agent_name.split('_')[1])
+                            except (ValueError, IndexError):
+                                agent_id = 0
+                        else:
+                            agent_id = 0
+
                     current_step = getattr(world, 'current_step', 0)
-                    
-                    # 🔧 如果world.current_step为0或不存在，尝试从环境对象获取
-                    # 环境对象可能通过world.scenario._env_ref访问，或者通过其他方式
                     if current_step == 0:
-                        # 方法1：尝试从场景对象获取环境引用（如果场景保存了环境引用）
                         scenario_obj = getattr(world, 'scenario', None)
-                        if scenario_obj is not None:
-                            # 检查场景是否有环境引用
-                            env_ref = getattr(scenario_obj, '_env_ref', None)
-                            if env_ref is not None and hasattr(env_ref, '_current_step'):
-                                env_step = getattr(env_ref, '_current_step', 0)
+                        env_ref = getattr(scenario_obj, '_env_ref', None) if scenario_obj is not None else None
+                        if env_ref is not None and hasattr(env_ref, '_current_step'):
+                            try:
+                                env_step = int(getattr(env_ref, '_current_step', 0))
                                 if env_step > 0:
                                     current_step = env_step
-                                    # 同步回world，确保一致性
                                     if hasattr(world, 'current_step'):
-                                        world.current_step = int(current_step)
-                    
-                    # 🔧 关键修复：如果步数仍然为0，尝试从环境对象获取
-                    # 注意：在评估时，world.current_step可能在某个时刻被重置或未同步
-                    # 尝试从场景的环境引用获取步数
+                                        world.current_step = env_step
+                            except Exception:
+                                pass
                     if current_step == 0:
-                        # 方法2：尝试通过world.scenario._env_ref获取环境对象的_current_step
-                        scenario_obj = getattr(world, 'scenario', None)
-                        if scenario_obj is not None:
-                            env_ref = getattr(scenario_obj, '_env_ref', None)
-                            if env_ref is not None and hasattr(env_ref, '_current_step'):
-                                env_step = getattr(env_ref, '_current_step', 0)
-                                if env_step > 0:
-                                    current_step = env_step
-                                    # 同步回world，确保一致性
-                                    if hasattr(world, 'current_step'):
-                                        world.current_step = int(current_step)
-                    
-                    # 🔧 如果步数仍然为0，使用默认值1（不输出警告）
-                    # 因为可能是正常情况（重置后的第一步就到达目标）
-                    if current_step == 0:
-                        current_step = 1  # 默认使用1（第一步）
-                    
-                    # 保存首次到达步数
+                        current_step = 1
+
                     success_state['success_reward_given'] = True
                     success_state['first_success_step'] = current_step
                     success_state['hover_reward_count'] = 0
-                    
-                    # 🔧 增强调试输出：显示智能体位置和目标位置，确保能够验证成功判断
-                    # 🔧 修复：使用保存的首次到达步数，而不是当前步数
+
+                    reward_val = float(self.success_reward_value) if safe_so_far else 0.0
                     episode = getattr(world, '_episode_count', getattr(world, 'episode_count', 0))
                     agent_pos = agent.state.p_pos
-                    goal_pos = agent.goal_a.state.p_pos if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') else None
-                    
-                    print(f"✅ [成功奖励] Agent{agent_id} 到达目标！")
-                    print(f"   回合={episode} | 步数={success_state['first_success_step']} | 奖励值={self.success_reward_value:.1f}")
-                    print(f"   智能体位置: ({agent_pos[0]:.2f}, {agent_pos[1]:.2f}, {agent_pos[2]:.2f})")
+                    goal_pos = self._get_agent_goal_pos(agent)
+
+                    safe_str = "Safe" if safe_so_far else "Unsafe"
+                    print(f"[成功奖励] Agent{agent_id} 到达目标区 | 回合={episode} 步={current_step} | {safe_str} | 奖励={reward_val:.0f}")
                     if goal_pos is not None:
                         dist = np.linalg.norm(agent_pos - goal_pos)
-                        print(f"   目标位置: ({goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f}) | 距离={dist:.2f}m")
-                    
-                    return float(self.success_reward_value)
-                
-                # 悬停奖励：鼓励稳定悬停
-                current_speed = np.linalg.norm(agent.state.p_vel)
-                hover_speed_threshold = self.hover_speed_threshold  # 🔧 使用配置的悬停速度阈值
-                hover_reward_max = self.hover_reward_max  # 🔧 使用配置的最大悬停奖励
-                
-                if current_speed < hover_speed_threshold:
-                    # 速度越低，奖励越高
-                    hover_reward = (1.0 - current_speed / hover_speed_threshold) * hover_reward_max
-                    success_state['hover_reward_count'] += 1
-                    
-                    # 🔧 限制悬停奖励频率，使用配置的间隔
-                    if success_state['hover_reward_count'] % self.hover_reward_interval == 0:
-                        return hover_reward
-                    else:
+                        print(f"  位置=({agent_pos[0]:.1f},{agent_pos[1]:.1f},{agent_pos[2]:.1f}) 目标距离={dist:.2f}m")
+
+                    success_state['was_in_goal_zone'] = True
+                    return reward_val
+
+                if safe_so_far:
+                    current_speed = np.linalg.norm(agent.state.p_vel)
+                    if current_speed < self.hover_speed_threshold:
+                        hold_reward = (1.0 - current_speed / self.hover_speed_threshold) * float(self.goal_hold_reward)
+                        success_state['hover_reward_count'] += 1
+                        success_state['was_in_goal_zone'] = True
+                        if success_state['hover_reward_count'] % self.hover_reward_interval == 0:
+                            return hold_reward
                         return 0.0
-                else:
-                    # 在成功范围内但速度过快，给予轻微惩罚
-                    speed_penalty = -current_speed * 0.5
-                    return speed_penalty
+                    success_state['was_in_goal_zone'] = True
+                    return -current_speed * 0.5
+
+                success_state['was_in_goal_zone'] = True
+                return 0.0
         except Exception as e:
             print(f"[SuccessReward] Error: {e}")
             pass
-        
-        # 不在成功范围内：若曾到达过目标点，则开放悬停奖励（区外也按间隔发放）
+
         try:
-            if hasattr(agent, '_success_state') and agent._success_state.get('success_reward_given', False):
-                current_speed = np.linalg.norm(agent.state.p_vel)
-                hover_speed_threshold = self.hover_speed_threshold
-                hover_reward_max = self.hover_reward_max
-                if current_speed < hover_speed_threshold:
-                    hover_reward = (1.0 - current_speed / hover_speed_threshold) * hover_reward_max
-                    agent._success_state['hover_reward_count'] += 1
-                    if agent._success_state['hover_reward_count'] % self.hover_reward_interval == 0:
-                        return hover_reward
+            success_state = self._get_success_state(agent)
+            if success_state.get('was_in_goal_zone', False):
+                success_state['was_in_goal_zone'] = False
+                success_state['hover_reward_count'] = 0
+                return -float(self.leave_goal_penalty)
+            success_state['was_in_goal_zone'] = False
         except Exception:
             pass
         return 0.0
@@ -798,118 +1064,117 @@ class Scenario(BaseTerrainScenario):
         """碰撞惩罚：接触障碍或越界给予强惩罚"""
         try:
             has_collision = False
+            has_terrain_collision = False  # 本步是否因地形触发
+            has_obstacle_collision = False  # 本步是否因球形障碍触发
+            real_terrain_collision = False
+            real_obstacle_collision = False
             penalty = 0.0
-            
-            # 🚨 关键修复：先获取TERRAIN_CONTACT_EPS，确保在异常情况下也能使用
+            eps = self._terrain_contact_eps
+            terrain_h = getattr(agent, '_rc_th', None)
+            dmin = getattr(agent, '_rc_dmin', None)
+
             try:
-                import os
-                eps = float(os.getenv('TERRAIN_CONTACT_EPS', '0.3'))  # 🔧 统一阈值：从0.75降低到0.3米，与shell脚本保持一致
-            except Exception:
-                eps = 0.75  # 回退到默认值0.75米（合理的接触阈值）
-            
-            # 🚨 关键修复：检查障碍物碰撞（使用world.nearest_obstacle_distance）
-            # 这是主要的碰撞检测逻辑，必须正确触发
-            dmin = None
-            try:
-                if hasattr(world, 'nearest_obstacle_distance'):
+                if dmin is None and hasattr(world, 'nearest_obstacle_distance'):
                     dmin = world.nearest_obstacle_distance(agent)
-                # 如果world没有提供障碍物距离，基于地形高度计算
-                if dmin is None and hasattr(self, 'get_terrain_height'):
-                    pos = agent.state.p_pos
-                    terrain_h = self.get_terrain_height(pos[0], pos[1])
-                    # 距地过近也记为潜在碰撞
-                    dmin = max(pos[2] - terrain_h, 1e-3)
-                # 🚨 关键修复：地形贴近/接触惩罚（必须正确触发）
+                if dmin is None:
+                    if terrain_h is None and hasattr(self, 'get_terrain_height'):
+                        pos = agent.state.p_pos
+                        terrain_h = self.get_terrain_height(pos[0], pos[1])
+                    if terrain_h is not None:
+                        dmin = max(agent.state.p_pos[2] - terrain_h, 1e-3)
                 if dmin is not None and dmin < float(self.collision_distance_threshold):
+                    has_obstacle_collision = True
                     has_collision = True
                     penalty = -float(self.collision_penalty_value)
-                    # 🔧 调试：输出碰撞检测信息（仅在非安静模式下）
-                    import os
-                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                        print(f"[障碍物碰撞检测] Agent碰撞: dmin={dmin:.3f}, threshold={self.collision_distance_threshold}")
-            except Exception as e:
-                # 🚨 关键修复：即使异常也要记录，帮助诊断问题
-                import os
-                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                    print(f"[警告] 障碍物碰撞检测异常: {e}")
+                    if dmin <= 0.0:
+                        real_obstacle_collision = True
+                    if self._enable_collision_debug:
+                        collision_count = getattr(agent, 'current_episode_collision_count', 0)
+                        if collision_count == 0 or collision_count % 100 == 0:
+                            print(f"[障碍物碰撞检测] Agent碰撞: dmin={dmin:.3f}, threshold={self.collision_distance_threshold}, 计数={collision_count}")
+            except Exception:
                 pass
 
-            # 非目标点附近的地形"落地/穿透" -> 直接给大额负值（统一规则）
-            # 🚨 关键修复：将地形穿透检测移出内层try-except，确保has_collision能被正确设置
             try:
-                # 🚨 关键：严格按照当前坐标位置判断穿透
                 pos = agent.state.p_pos
-                # 🔧 修复：使用当前坐标位置获取地形高度
-                terrain_h = self.get_terrain_height(pos[0], pos[1])
-                # 🚨 关键：使用更大的eps（2.5米）可以检测到侧面穿透，即使Z坐标没有完全低于地形高度
-                # 🔧 修复：严格判断穿透（pos[2] <= terrain_h + eps表示接近或穿透地形）
-                if pos[2] <= terrain_h + eps:
-                    # 固定值惩罚：避免随剩余步数放大导致奖励饱和
+                if terrain_h is None and hasattr(self, 'get_terrain_height'):
+                    terrain_h = self.get_terrain_height(pos[0], pos[1])
+                if terrain_h is not None and pos[2] <= terrain_h + eps:
                     base = float(self.collision_penalty_value)
+                    has_terrain_collision = True
                     has_collision = True
                     penalty = -base
-            except Exception as e:
-                # 🚨 关键修复：即使异常也要记录，帮助诊断问题
-                import os
-                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                    print(f"[警告] 地形穿透检测异常: {e}")
+                    if pos[2] <= terrain_h + float(self._terrain_collision_eps):
+                        real_terrain_collision = True
+            except Exception:
                 pass
-            
-            # 🔧 新增：更新碰撞计数（用于碰撞减少奖励和统计）
-            # 🚨 关键修复：确保在has_collision为True时，无论penalty是否被设置，都要更新计数
-            # 🚨 关键修复：添加防重复计数机制，确保每步只计数一次
-            if has_collision:
-                # 获取当前步数，用于防重复计数
-                # 🔧 性能优化：直接访问属性，避免getattr开销
+
+            real_collision = real_terrain_collision or real_obstacle_collision
+            if real_collision:
+                agent._episode_has_collision = True
+                agent._had_penetration_or_collision = True
+                if real_terrain_collision:
+                    agent._had_terrain_contact_or_penetration = True
+                if real_obstacle_collision:
+                    agent._had_obstacle_collision = True
+
                 try:
                     current_step = world.current_step if hasattr(world, 'current_step') else -1
                 except (AttributeError, TypeError):
                     current_step = -1
-                
+
                 try:
                     last_counted_step = agent._last_collision_counted_step if hasattr(agent, '_last_collision_counted_step') else -1
                 except (AttributeError, TypeError):
                     last_counted_step = -1
-                
-                # 🚨 关键修复：只有在当前步数不同时才计数，防止同一步重复计数
+
                 if current_step != last_counted_step:
                     if not hasattr(agent, 'current_episode_collision_count'):
                         agent.current_episode_collision_count = 0
                     agent.current_episode_collision_count += 1
-                    
-                    # 🔧 修复：同时更新debug_info中的total_penetration_count（用于数据收集）
+
                     if not hasattr(agent, 'debug_info'):
                         agent.debug_info = {}
                     if not isinstance(agent.debug_info, dict):
                         agent.debug_info = {}
-                    # 🚨 关键修复：确保total_penetration_count被正确初始化
                     if 'total_penetration_count' not in agent.debug_info:
                         agent.debug_info['total_penetration_count'] = 0
+                    if 'terrain_penetration_count' not in agent.debug_info:
+                        agent.debug_info['terrain_penetration_count'] = 0
+                    if 'obstacle_collision_count' not in agent.debug_info:
+                        agent.debug_info['obstacle_collision_count'] = 0
                     old_count = agent.debug_info.get('total_penetration_count', 0)
                     agent.debug_info['total_penetration_count'] = old_count + 1
-                    
-                    # 标记当前步已计数
+                    # 分项统计（仅显示用）：地形优先归因，若同时触发则计为地形
+                    if real_terrain_collision:
+                        agent.debug_info['terrain_penetration_count'] = agent.debug_info.get('terrain_penetration_count', 0) + 1
+                    else:
+                        agent.debug_info['obstacle_collision_count'] = agent.debug_info.get('obstacle_collision_count', 0) + 1
                     agent._last_collision_counted_step = current_step
-                
-                # 🚨 调试：输出每次碰撞检测的详细信息，帮助诊断问题
-                import os
-                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                    try:
-                        pos = agent.state.p_pos
-                        terrain_h = self.get_terrain_height(pos[0], pos[1]) if hasattr(self, 'get_terrain_height') else None
-                        print(f"[碰撞检测] Agent碰撞触发: pos={pos}, terrain_h={terrain_h}, "
-                              f"height_diff={pos[2] - terrain_h if terrain_h is not None else 'N/A'}, "
-                              f"eps={eps}, dmin={dmin}, "
-                              f"计数更新: {old_count} -> {agent.debug_info['total_penetration_count']}")
-                    except Exception:
-                        print(f"[碰撞检测] Agent碰撞触发: 计数更新: {old_count} -> {agent.debug_info['total_penetration_count']}")
-            
+
+                if self._enable_collision_debug:
+                    new_count = agent.debug_info.get('total_penetration_count', 0) if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict) else 0
+                    if new_count == 1 or new_count % 100 == 0:
+                        try:
+                            pos = agent.state.p_pos
+                            th = terrain_h if terrain_h is not None else (self.get_terrain_height(pos[0], pos[1]) if hasattr(self, 'get_terrain_height') else None)
+                            print(f"[碰撞检测] Agent碰撞触发: pos={pos}, terrain_h={th}, "
+                                  f"height_diff={pos[2] - th if th is not None else 'N/A'}, "
+                                  f"eps={eps}, dmin={dmin}, total_count={new_count}")
+                        except Exception:
+                            print(f"[碰撞检测] Agent碰撞触发: total_count={new_count}")
+
+            agent._rc_collision = has_collision
+
+            if has_collision and penalty < 0:
+                cum_count = 0
+                if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                    cum_count = agent.debug_info.get('total_penetration_count', 0)
+                progressive = 1.0 + min(cum_count / 30.0, 3.0)
+                penalty = penalty * progressive
+
             return penalty
-        except Exception as e:
-            # 🚨 关键修复：即使外层异常也要记录，帮助诊断问题
-            import os
-            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                print(f"[警告] _calculate_collision_penalty异常: {e}")
+        except Exception:
             pass
         return 0.0
 
@@ -954,10 +1219,8 @@ class Scenario(BaseTerrainScenario):
     # 统一各场景的"地形碰撞即终止（非目标附近落地）"规则
     def is_done(self, agent, world):
         try:
-            # 🔧 检查早停模式：如果设置为 never 或 disabled，则完全禁用终止条件
             try:
-                import os
-                early_stop_mode = os.getenv('EARLY_STOP_MODE', 'never').lower()
+                early_stop_mode = getattr(self, '_early_stop_mode', 'never')
                 if early_stop_mode in ('never', 'disabled'):
                     # 完全禁用早停，只记录不终止
                     try:
@@ -978,6 +1241,7 @@ class Scenario(BaseTerrainScenario):
             
             # 1. 首先检查严重越界（由environment标记的）
             if hasattr(agent, 'out_of_bounds_info') and agent.out_of_bounds_info.get('out_of_bounds', False):
+                self._record_termination_reason(world, agent, "越界")
                 try:
                     step_idx = int(getattr(world, 'current_step', -1))
                     ep_len = int(getattr(world, 'episode_length', -1))
@@ -998,14 +1262,16 @@ class Scenario(BaseTerrainScenario):
                     # 从world读取可配置阈值，提供默认
                     start_radius = float(getattr(world, 'pre_takeoff_start_radius', 1.0))
                     airborne_thr = float(getattr(world, 'pre_takeoff_airborne_threshold', 0.5))
-                    terrain_h0 = self.get_terrain_height(agent.state.p_pos[0], agent.state.p_pos[1])
+                    _th0 = getattr(agent, '_rc_th', None)
+                    terrain_h0 = _th0 if _th0 is not None else self.get_terrain_height(agent.state.p_pos[0], agent.state.p_pos[1])
                     hdiff = float(agent.state.p_pos[2]) - float(terrain_h0)
                     still_in_start = dist_xy <= start_radius
                     not_airborne = hdiff <= airborne_thr
                     if still_in_start and not_airborne:
                         # 若已实际穿透/接触地形，则不予豁免，直接早停
-                        eps0 = 0.03
+                        eps0 = float(self._terrain_collision_eps)
                         if float(agent.state.p_pos[2]) <= float(terrain_h0) + eps0:
+                            self._record_termination_reason(world, agent, "地形穿透")
                             try:
                                 step_idx = int(getattr(world, 'current_step', -1))
                                 ep_len = int(getattr(world, 'episode_length', -1))
@@ -1027,6 +1293,7 @@ class Scenario(BaseTerrainScenario):
             if hasattr(world, 'is_within_bounds'):
                 pos = agent.state.p_pos
                 if not world.is_within_bounds(pos):
+                    self._record_termination_reason(world, agent, "越界")
                     try:
                         step_idx = int(getattr(world, 'current_step', -1))
                         ep_len = int(getattr(world, 'episode_length', -1))
@@ -1034,22 +1301,12 @@ class Scenario(BaseTerrainScenario):
                     except Exception:
                         pass
                     return True
-            # 地形穿透/落地并且不在目标附近
-            # 🚨 关键：严格按照当前坐标位置判断穿透
             pos = agent.state.p_pos
-            # 🔧 修复：使用当前坐标位置获取地形高度
-            terrain_h = self.get_terrain_height(pos[0], pos[1])
+            _th_done = getattr(agent, '_rc_th', None)
+            terrain_h = _th_done if _th_done is not None else self.get_terrain_height(pos[0], pos[1])
             gx, gy, gz = float(self.goal_pos[0]), float(self.goal_pos[1]), float(self.goal_pos[2]) if hasattr(self, 'goal_pos') and self.goal_pos is not None else (0.0, 0.0, 0.0)
             dist_to_goal = np.linalg.norm(np.asarray(pos) - np.asarray([gx, gy, gz], dtype=np.float32)) if hasattr(self, 'goal_pos') and self.goal_pos is not None else 1e9
-            # 🔧 修复：使用与碰撞检测一致的阈值（0.03），但is_done中使用稍大的阈值（0.15）以容忍更多误差
-            # 注意：is_done中的阈值可以稍大，因为这是终止条件，需要更宽松以避免误判
-            eps = 0.15  # 放宽地形穿透判定阈值，从8cm增加到15cm（用于is_done终止判断）
-            # 🚨 关键修复：使用TERRAIN_CONTACT_EPS环境变量，与_calculate_collision_penalty保持一致
-            try:
-                import os
-                eps_strict = float(os.getenv('TERRAIN_CONTACT_EPS', '0.75'))  # 🚨 修复：使用环境变量（默认0.75米），而不是硬编码0.03
-            except Exception:
-                eps_strict = 0.75  # 回退到默认值0.75米
+            eps = float(self._terrain_collision_eps)
             # 全局接触/穿透宽限期：在训练前K步内不因地形接触而终止，减少无意义早停
             try:
                 cur_step_glob = int(getattr(world, 'current_step', 0))
@@ -1071,6 +1328,7 @@ class Scenario(BaseTerrainScenario):
             # 🔧 修复：严格判断穿透（pos[2] < terrain_h才是真正的穿透，但为了容忍数值误差使用<=）
             # 注意：这里使用<=是为了容忍数值误差，但严格来说应该是< terrain_h
             if pos[2] <= terrain_h + eps:
+                self._record_termination_reason(world, agent, "地形穿透")
                 try:
                     step_idx = int(getattr(world, 'current_step', -1))
                     ep_len = int(getattr(world, 'episode_length', -1))
@@ -1091,7 +1349,8 @@ class Scenario(BaseTerrainScenario):
                         d = float(np.linalg.norm(pos - lp) - r)
                         dmin = d if dmin is None else min(dmin, d)
                 # 任何实体近距离碰撞均视为失败
-                if dmin is not None and dmin <= float(self.collision_distance_threshold):
+                if dmin is not None and dmin <= 0.0:
+                    self._record_termination_reason(world, agent, "实体碰撞")
                     try:
                         step_idx = int(getattr(world, 'current_step', -1))
                         ep_len = int(getattr(world, 'episode_length', -1))
@@ -1106,29 +1365,45 @@ class Scenario(BaseTerrainScenario):
         return False
 
     def _calculate_global_reward(self, world):
-        """全局奖励：基于全体智能体的全局指标"""
+        """全局奖励：一次性团队奖励，仅在所有智能体首次全部到达目标时触发。"""
         try:
-            agents = getattr(world, 'agents', [])
-            # 仅当每个agent有goal_a时启用
-            dists = []
-            progresses = []
-            successes = []
-            for ag in agents:
-                if hasattr(ag, 'goal_a') and ag.goal_a.state.p_pos is not None:
-                    d = np.linalg.norm(ag.state.p_pos - ag.goal_a.state.p_pos)
-                    dists.append(d)
-                    if hasattr(ag, 'last_goal_dist'):
-                        progresses.append(max(0.0, ag.last_goal_dist - d))
-                    successes.append(1.0 if d <= float(self.success_distance_threshold) else 0.0)
-            if not dists:
+            if getattr(world, '_global_reward_given', False):
                 return 0.0
-            mode = getattr(self, 'global_reward_mode', 'success_rate')
-            if mode == 'avg_progress' and progresses:
-                return float(np.mean(progresses)) * 10.0
-            if mode == 'min_distance':
-                return float(-np.min(dists))  # 越小越好
-            if mode == 'success_rate' and successes:
-                return float(np.mean(successes)) * float(self.success_reward_value)
+
+            # 步级缓存：同一步内只遍历一次 agents 列表
+            cur_step = getattr(world, 'current_step', -1)
+            cache = getattr(world, '_global_reward_step_cache', None)
+            if cache is not None and cache[0] == cur_step:
+                return cache[1]
+
+            agents = getattr(world, 'agents', [])
+            if not agents:
+                world._global_reward_step_cache = (cur_step, 0.0)
+                return 0.0
+
+            all_reached = True
+            all_safe = True
+            for ag in agents:
+                if not (hasattr(ag, 'goal_a') and ag.goal_a.state.p_pos is not None):
+                    all_reached = False
+                    break
+                d = np.linalg.norm(ag.state.p_pos - ag.goal_a.state.p_pos)
+                if d > float(self.success_distance_threshold):
+                    all_reached = False
+                    break
+                # 统一“回合安全”语义：episode 内任意碰撞/穿透即不安全
+                # 注意：global reward 不引入“末帧无风险(d_min_last)”约束，避免与回合成功/解锁口径混淆
+                if not self._agent_safe_so_far(ag):
+                    all_safe = False
+
+            if not all_reached:
+                world._global_reward_step_cache = (cur_step, 0.0)
+                return 0.0
+
+            world._global_reward_given = True
+            result = float(self.success_reward_value) if all_safe else 0.0
+            world._global_reward_step_cache = (cur_step, result)
+            return result
         except Exception:
             pass
         return 0.0
@@ -1222,12 +1497,11 @@ class Scenario(BaseTerrainScenario):
                             else:
                                 danger_normal = np.array([0, 0, 1.0]) # 重合时假设向上
             
-            # === 2. 检测3D地形法向量（新增） ===
-            # 使用辅助函数获取地形法向量
-            if hasattr(self, 'get_terrain_height'):
+            # === 2. 检测3D地形法向量 ===
+            _th = getattr(agent, '_rc_th', None)
+            if _th is not None or hasattr(self, 'get_terrain_height'):
                 try:
-                    # 检查当前高度与地形距离
-                    h0 = self.get_terrain_height(agent_pos[0], agent_pos[1])
+                    h0 = _th if _th is not None else self.get_terrain_height(agent_pos[0], agent_pos[1])
                     dist_terrain = max(0.0, agent_pos[2] - h0)
                     
                     if dist_terrain < min_dist and dist_terrain < self.lateral_activation_distance:
@@ -1337,11 +1611,11 @@ class Scenario(BaseTerrainScenario):
             # 这里定义为：当前高度与地形高度的差值
             terrain_clearance = float('inf')
             
-            if hasattr(self, 'get_terrain_height'):
+            _th = getattr(agent, '_rc_th', None)
+            if _th is not None or hasattr(self, 'get_terrain_height'):
                 try:
-                    terrain_h = self.get_terrain_height(agent_pos[0], agent_pos[1])
-                    # 检查周围8个方向的地形高度变化
-                    check_radius = 3.0  # 检查半径3米
+                    terrain_h = _th if _th is not None else self.get_terrain_height(agent_pos[0], agent_pos[1])
+                    check_radius = 3.0
                     directions = [
                         [1, 0], [-1, 0], [0, 1], [0, -1],  # 四个主方向
                         [0.707, 0.707], [-0.707, 0.707], [0.707, -0.707], [-0.707, -0.707]  # 四个对角线
@@ -1406,137 +1680,48 @@ class Scenario(BaseTerrainScenario):
             return 0.0
     
     def _calculate_collision_reduction_reward(self, agent, world):
-        """
-        🔧 新增：碰撞次数减少奖励
-        如果当前回合的碰撞次数比上一回合少，给予奖励
-        奖励值 = (上一回合碰撞次数 - 当前回合碰撞次数) / max(上一回合碰撞次数, 1)
-        """
+        """碰撞次数减少奖励（仅回合最后一步产生非零值）"""
         try:
-            # 确保属性已初始化
+            # 短路：非最后一步直接返回0（避免每步执行is_done和碰撞检测）
+            current_step = int(getattr(world, 'current_step', 0))
+            episode_length = int(getattr(world, 'episode_length', 2500))
+            if current_step < episode_length - 1:
+                return 0.0
+
             if not hasattr(agent, 'current_episode_collision_count'):
                 agent.current_episode_collision_count = 0
             if not hasattr(agent, 'previous_episode_collision_count'):
                 agent.previous_episode_collision_count = 0
             if not hasattr(agent, 'collision_reduction_reward_given'):
                 agent.collision_reduction_reward_given = False
-            
-            # 🚨 关键修复：检查智能体是否已经done，如果已经done则不应该计算这个奖励
-            # 注意：必须在碰撞检测之前检查done状态，避免done后仍然更新碰撞计数
+
+            if agent.collision_reduction_reward_given:
+                return 0.0
+
             agent_is_done = False
             try:
-                # 方法1：直接调用is_done函数检查（最可靠的方法）
                 agent_is_done = self.is_done(agent, world)
             except Exception:
-                # 方法2：如果is_done调用失败，尝试通过world的done标志检查（如果可用）
                 try:
                     if hasattr(world, '_agent_done_flags'):
                         agent_key = getattr(agent, 'name', f'agent_{id(agent)}')
                         agent_is_done = world._agent_done_flags.get(agent_key, False)
                 except Exception:
                     pass
-            
-            # 如果智能体已经done，不应该计算这个奖励（早停后不应该有奖励）
-            # 🔧 关键：早停的智能体不应该在done之后还获得无碰撞奖励
             if agent_is_done:
                 return 0.0
-            
-            # 检测当前步是否发生碰撞（复用碰撞惩罚检测逻辑）
-            # 🔧 修复：使用与_calculate_collision_penalty一致的阈值和判断逻辑
-            has_collision = False
-            try:
-                # 检查地形碰撞：使用当前坐标位置严格判断
-                pos = agent.state.p_pos
-                if hasattr(self, 'get_terrain_height'):
-                    # 🚨 关键：严格按照当前坐标位置获取地形高度
-                    terrain_h = self.get_terrain_height(pos[0], pos[1])
-                    # 🚨 关键修复：使用TERRAIN_CONTACT_EPS环境变量，与_calculate_collision_penalty保持一致
-                    try:
-                        import os
-                        eps = float(os.getenv('TERRAIN_CONTACT_EPS', '0.75'))  # 🚨 修复：使用环境变量（默认0.75米），而不是硬编码0.1
-                    except Exception:
-                        eps = 0.75  # 回退到默认值0.75米
-                    # 🔧 修复：严格判断穿透（pos[2] < terrain_h才是真正的穿透，但为了容忍数值误差使用<=）
-                    # 注意：这里使用<=是为了容忍数值误差，但严格来说应该是< terrain_h
-                    if pos[2] <= terrain_h + eps:
-                        has_collision = True
-                
-                # 检查障碍物碰撞
-                if not has_collision:
-                    dmin = None
-                    if hasattr(world, 'nearest_obstacle_distance'):
-                        dmin = world.nearest_obstacle_distance(agent)
-                    if dmin is None and hasattr(self, 'get_terrain_height'):
-                        # 使用当前坐标位置计算距离
-                        dmin = max(pos[2] - terrain_h, 1e-3)
-                    if dmin is not None and dmin < float(self.collision_distance_threshold):
-                        has_collision = True
-            except Exception:
-                pass
-            
-            # 如果发生碰撞，增加当前回合碰撞计数
-            if has_collision:
-                agent.current_episode_collision_count += 1
-            
-            # 注意：done检查已提前到函数开头，这里不再重复检查
-            # 问题：当启用早停时，智能体可能在current_step < episode_length - 1时就done了
-            # 但如果环境继续运行到current_step >= episode_length - 1，这个奖励仍然会被触发
-            # 解决方案：在计算奖励前检查智能体是否已经done
-            agent_is_done = False
-            try:
-                # 方法1：直接调用is_done函数检查（最可靠的方法）
-                agent_is_done = self.is_done(agent, world)
-            except Exception:
-                # 方法2：如果is_done调用失败，尝试通过world的done标志检查（如果可用）
-                try:
-                    if hasattr(world, '_agent_done_flags'):
-                        agent_key = getattr(agent, 'name', f'agent_{id(agent)}')
-                        agent_is_done = world._agent_done_flags.get(agent_key, False)
-                except Exception:
-                    pass
-            
-            # 如果智能体已经done，不应该计算这个奖励（早停后不应该有奖励）
-            # 🔧 关键：早停的智能体不应该在done之后还获得无碰撞奖励
-            if agent_is_done:
-                return 0.0
-            
-            # 在回合结束时（通过检查world.current_step）计算减少奖励
-            # 注意：这里在每步都检查，但只在回合结束时给予一次奖励
-            try:
-                current_step = int(getattr(world, 'current_step', 0))
-                episode_length = int(getattr(world, 'episode_length', 2500))
-                
-                # 🔧 修复：改为检查是否到达回合结束（current_step >= episode_length - 1）
-                # 但前提是智能体还没有done（早停情况下，done的智能体不应该获得这个奖励）
-                if current_step >= episode_length - 1 and not agent.collision_reduction_reward_given:
-                    # 比较当前回合和上一回合的碰撞次数
-                    prev_count = agent.previous_episode_collision_count
-                    curr_count = agent.current_episode_collision_count
-                    
-                    if prev_count > 0 and curr_count < prev_count:
-                        # 碰撞次数减少，给予奖励
-                        reduction = prev_count - curr_count
-                        # 归一化奖励：减少的碰撞数 / 上一回合碰撞数
-                        reward = float(reduction) / float(prev_count)
-                        # 限制在[0, 1]范围
-                        reward = np.clip(reward, 0.0, 1.0)
-                        agent.collision_reduction_reward_given = True
-                        return reward
-                    elif prev_count == 0 and curr_count == 0:
-                        # 两回合都没有碰撞，给予小奖励（保持无碰撞状态）
-                        reward = 0.1
-                        agent.collision_reduction_reward_given = True
-                        return reward
-                    else:
-                        # 碰撞次数未减少或增加，无奖励
-                        agent.collision_reduction_reward_given = True
-                        return 0.0
-            except Exception:
-                pass
-            
+
+            prev_count = agent.previous_episode_collision_count
+            curr_count = agent.current_episode_collision_count
+
+            agent.collision_reduction_reward_given = True
+            if prev_count > 0 and curr_count < prev_count:
+                reduction = prev_count - curr_count
+                return float(np.clip(float(reduction) / float(prev_count), 0.0, 1.0))
+            elif prev_count == 0 and curr_count == 0:
+                return 0.1
             return 0.0
-            
-        except Exception as e:
-            # 出错时返回0，不影响其他奖励
+        except Exception:
             return 0.0
     
     def update_reward_weights(self, new_weights):

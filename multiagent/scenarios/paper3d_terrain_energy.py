@@ -96,6 +96,33 @@ class Scenario(BaseScenario):
         # 障碍物设置（由复杂度等级控制）
         self.obstacle_size_range = [5, 15]  # 障碍物尺寸范围
         self.obstacle_height_boost = 10  # 障碍物高度提升
+
+        # 观察构建的静态模板与缓存
+        self._obs_centers = np.zeros((0, 3), dtype=np.float32)
+        self._obs_radii = np.zeros((0,), dtype=np.float32)
+        self._obs_forward_distances = np.asarray([2, 4, 6, 10, 15, 20, 25, 30], dtype=np.float32)
+        self._obs_direction_pairs = np.asarray(
+            [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)],
+            dtype=np.float32,
+        )
+        self._obs_gradient_offsets = np.asarray(
+            [[3.0, 0.0], [0.0, 3.0], [-3.0, 0.0], [0.0, -3.0]],
+            dtype=np.float32,
+        )
+        self._obs_near_distance = 5.0
+        self._obs_far_distance = 12.0
+        self._obs_env_info = None
+        self._obs_env_info_agent_count = None
+        self._obs_step_cache_key = None
+        self._obs_step_cache = {}
+        self.observation_dim = 81
+        
+        # 🔧 障碍物生成模式：从环境变量读取
+        try:
+            use_dynamic_obstacles = os.getenv('USE_DYNAMIC_OBSTACLES', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            use_dynamic_obstacles = True  # 默认启用动态障碍物
+        self.use_dynamic_obstacles = use_dynamic_obstacles  # 是否每次reset时重新生成障碍物
         
         # 位置设置模式
         self.use_fixed_positions = use_fixed_positions  # 是否使用固定位置
@@ -104,6 +131,30 @@ class Scenario(BaseScenario):
         self.positions_initialized = False              # 标记是否已经初始化过位置
         self.random_z0_positions = random_z0_positions  # 是否随机化高度位置
         self.random_terrain = random_terrain            # 是否随机生成地形
+        try:
+            self.use_semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.use_semi_random_terrain = False
+        try:
+            default_base_seed = self.seed if self.seed is not None else 67
+            self.terrain_base_seed = int(os.getenv('TERRAIN_BASE_SEED', str(default_base_seed)))
+        except Exception:
+            self.terrain_base_seed = int(self.seed if self.seed is not None else 67)
+        try:
+            self.peak_jitter_range = float(os.getenv('PEAK_JITTER_RANGE', '15.0'))
+        except Exception:
+            self.peak_jitter_range = 15.0
+        try:
+            self.curriculum_multi_terrain_enabled = os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self.curriculum_multi_terrain_enabled = False
+        try:
+            seeds_raw = os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '').strip()
+            self.curriculum_multi_terrain_seeds = [
+                int(tok.strip()) for tok in seeds_raw.split(',') if tok.strip()
+            ]
+        except Exception:
+            self.curriculum_multi_terrain_seeds = []
         
         # 🔧 关键修复：跟踪当前地形种子，用于检测地形变化
         # 当地形种子变化时，重置位置初始化标记，使每个新地图都动态生成位置
@@ -112,6 +163,8 @@ class Scenario(BaseScenario):
         # 固定位置文件
         self.fixed_positions_file = fixed_positions_file
         self.fixed_positions = None
+        # 缓存固定位置验证签名，避免每回合对同一套位置/地形重复校验
+        self._fixed_positions_validation_signature = None
 
         # 🚨 关键修复：DYNAMIC_FIRST_TIME 模式下，在初始化时就删除旧的位置文件
         # 这样可以确保每次新运行都会重新生成初始位置
@@ -141,6 +194,28 @@ class Scenario(BaseScenario):
         # 🚨 修复：如果use_fixed_positions=False，即使有fixed_positions_file也不加载
         elif self.fixed_positions_file and not use_fixed_positions:
             print(f"[固定位置] 已禁用固定位置，忽略文件: {self.fixed_positions_file}")
+
+    def _refresh_observation_static_cache(self, num_agents=None):
+        """刷新 observation 需要的静态障碍物/环境常量缓存。"""
+        try:
+            if self.obstacles:
+                self._obs_centers = np.asarray([ob['center'] for ob in self.obstacles], dtype=np.float32)
+                self._obs_radii = np.asarray([ob['radius'] for ob in self.obstacles], dtype=np.float32)
+            else:
+                self._obs_centers = np.zeros((0, 3), dtype=np.float32)
+                self._obs_radii = np.zeros((0,), dtype=np.float32)
+        except Exception:
+            self._obs_centers = np.zeros((0, 3), dtype=np.float32)
+            self._obs_radii = np.zeros((0,), dtype=np.float32)
+
+        if num_agents is not None:
+            num_agents = int(num_agents)
+            if self._obs_env_info is None or self._obs_env_info_agent_count != num_agents:
+                self._obs_env_info = np.array(
+                    [num_agents / 10.0, -0.8, -0.4, 0.0, 0.4, 0.8],
+                    dtype=np.float32,
+                )
+                self._obs_env_info_agent_count = num_agents
         
     def _get_start_altitude_offset(self):
         """统一获取起始离地高度配置"""
@@ -212,7 +287,8 @@ class Scenario(BaseScenario):
         self.mountain_height_range = config['mountain_height_range']
         self.mountain_width_range = config['mountain_width_range']
         
-        if not (os.getenv('SUPPRESS_TERRAIN_OUTPUT', '0').lower() in ('1','true','yes','on')):
+        quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
+        if not quiet_output and not (os.getenv('SUPPRESS_TERRAIN_OUTPUT', '0').lower() in ('1','true','yes','on')):
             print(f"[复杂度设置] 等级: {self.terrain_complexity_level}")
             print(f"[复杂度设置] 山峰数量: {self.num_mountains}")
             print(f"[复杂度设置] 障碍物数量: {self.num_obstacles}")
@@ -276,29 +352,86 @@ class Scenario(BaseScenario):
         start_area_center_y = (start_area_y[0] + start_area_y[1]) / 2
         min_distance_from_start = start_area_size * 1.5  # 山峰距离起点区域的最小距离
 
-        peak_positions = []
-        for _ in range(num_peaks):
-            attempts = 0
-            while attempts < 200:
-                x = self.rng.randint(margin, max(margin + 1, map_size - margin))
-                y = self.rng.randint(margin, max(margin + 1, map_size - margin))
-
-                # 🔧 检查是否距离起点区域太近
-                dist_from_start = np.sqrt((x - start_area_center_x)**2 + (y - start_area_center_y)**2)
-                if dist_from_start < min_distance_from_start:
-                    attempts += 1
-                    continue
-
-                too_close = False
-                for px, py in peak_positions:
-                    if np.sqrt((x - px)**2 + (y - py)**2) < min_distance:
-                        too_close = True
+        # ========== 🔧 半随机地形生成：固定基准位置，局部波动 ==========
+        # 环境变量控制
+        use_semi_random = bool(getattr(self, 'use_semi_random_terrain',
+            os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')))
+        peak_jitter_range = float(getattr(self, 'peak_jitter_range',
+            os.getenv('PEAK_JITTER_RANGE', '15.0')))  # 山峰位置波动范围（米）
+        
+        if use_semi_random:
+            # 使用固定种子生成基准山峰位置（确保每次训练的基准位置相同）
+            base_seed = int(getattr(self, 'terrain_base_seed', os.getenv('TERRAIN_BASE_SEED', '67')))
+            base_rng = np.random.RandomState(base_seed)
+            
+            # 生成基准山峰位置（固定不变）
+            base_peak_positions = []
+            for _ in range(num_peaks):
+                attempts = 0
+                while attempts < 200:
+                    x = base_rng.randint(margin, max(margin + 1, map_size - margin))
+                    y = base_rng.randint(margin, max(margin + 1, map_size - margin))
+                    
+                    # 检查是否距离起点区域太近
+                    dist_from_start = np.sqrt((x - start_area_center_x)**2 + (y - start_area_center_y)**2)
+                    if dist_from_start < min_distance_from_start:
+                        attempts += 1
+                        continue
+                    
+                    too_close = False
+                    for px, py in base_peak_positions:
+                        if np.sqrt((x - px)**2 + (y - py)**2) < min_distance:
+                            too_close = True
+                            break
+                    
+                    if not too_close:
+                        base_peak_positions.append((x, y))
                         break
+                    attempts += 1
+            
+            # 在基准位置周围生成实际山峰位置（波动）
+            peak_positions = []
+            for base_x, base_y in base_peak_positions:
+                # 在基准位置周围±jitter_range范围内随机偏移
+                jitter_x = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
+                jitter_y = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
+                
+                # 实际山峰位置 = 基准位置 + 随机偏移
+                actual_x = int(np.clip(base_x + jitter_x, margin, map_size - margin - 1))
+                actual_y = int(np.clip(base_y + jitter_y, margin, map_size - margin - 1))
+                
+                peak_positions.append((actual_x, actual_y))
+            
+            if not quiet:
+                avg_jitter = np.mean([np.sqrt((p[0] - bp[0])**2 + (p[1] - bp[1])**2) 
+                                      for p, bp in zip(peak_positions, base_peak_positions)])
+                print(f"[半随机地形] 基准种子: {base_seed}, 山峰数量: {num_peaks}")
+                print(f"[半随机地形] 波动范围: ±{peak_jitter_range}m, 平均偏移: {avg_jitter:.2f}m")
+        else:
+            # 原始的完全随机生成方式
+            peak_positions = []
+            for _ in range(num_peaks):
+                attempts = 0
+                while attempts < 200:
+                    x = self.rng.randint(margin, max(margin + 1, map_size - margin))
+                    y = self.rng.randint(margin, max(margin + 1, map_size - margin))
 
-                if not too_close:
-                    peak_positions.append((x, y))
-                    break
-                attempts += 1
+                    # 🔧 检查是否距离起点区域太近
+                    dist_from_start = np.sqrt((x - start_area_center_x)**2 + (y - start_area_center_y)**2)
+                    if dist_from_start < min_distance_from_start:
+                        attempts += 1
+                        continue
+
+                    too_close = False
+                    for px, py in peak_positions:
+                        if np.sqrt((x - px)**2 + (y - py)**2) < min_distance:
+                            too_close = True
+                            break
+
+                    if not too_close:
+                        peak_positions.append((x, y))
+                        break
+                    attempts += 1
 
         # 純粹依照 visualize_terrain_map.py 的双层循环实现高斯山峰
         for px, py in peak_positions:
@@ -535,6 +668,10 @@ class Scenario(BaseScenario):
             # 确保地形已生成
             if self.terrain is None:
                 self.generate_terrain()
+
+            current_signature = self._build_fixed_positions_validation_signature()
+            if self._fixed_positions_validation_signature == current_signature:
+                return
             
             altitude_offset = self._get_start_altitude_offset()
             min_air_gap = max(1.0, altitude_offset)
@@ -583,12 +720,38 @@ class Scenario(BaseScenario):
                 # 不再根据地形高度调整Z坐标
                 
                 self.fixed_positions['goal'] = goal_pos.tolist()
-                
+
+            self._fixed_positions_validation_signature = self._build_fixed_positions_validation_signature()
             print(f"固定位置已验证并调整: {len(self.fixed_positions['agents'])}个智能体")
         except Exception as e:
             print(f"验证和调整固定位置时出错: {e}")
             import traceback
             traceback.print_exc()
+
+    def _build_fixed_positions_validation_signature(self):
+        """构造固定位置验证签名；地形和固定位置未变时可直接跳过重复校验。"""
+        terrain = getattr(self, 'terrain', None)
+        terrain_token = (
+            id(terrain) if terrain is not None else None,
+            tuple(getattr(terrain, 'shape', ())) if terrain is not None else (),
+            int(getattr(self, 'map_size', 0)),
+            getattr(self, 'current_terrain_seed', getattr(self, 'seed', None)),
+        )
+
+        fp = getattr(self, 'fixed_positions', None)
+        if not isinstance(fp, dict):
+            return (terrain_token, None, None)
+
+        def _pos_sig(pos):
+            try:
+                arr = np.asarray(pos, dtype=np.float32).reshape(-1)
+                return tuple(np.round(arr, 4).tolist())
+            except Exception:
+                return tuple()
+
+        agents_sig = tuple(_pos_sig(pos) for pos in fp.get('agents', []))
+        goal_sig = _pos_sig(fp.get('goal', None)) if fp.get('goal', None) is not None else None
+        return (terrain_token, agents_sig, goal_sig)
 
     def _wait_for_fixed_positions(self, timeout_s: float = 5.0, interval_s: float = 0.05) -> bool:
         """
@@ -899,6 +1062,24 @@ class Scenario(BaseScenario):
         if start_positions is not None and goal_position is not None and len(start_positions) > 0:
             start_positions = [np.asarray(p, dtype=float) for p in list(start_positions)]
             goal_pos = np.asarray(goal_position, dtype=float)
+            # 禁区点：所有起点与目标的 2D 坐标，障碍物中心需与此保持最小距离
+            keep_out_points = [(float(p[0]), float(p[1])) for p in start_positions]
+            keep_out_points.append((float(goal_pos[0]), float(goal_pos[1])))
+            if agent_goal_positions is not None:
+                try:
+                    for g in list(agent_goal_positions):
+                        ag = np.asarray(g, dtype=float)
+                        keep_out_points.append((float(ag[0]), float(ag[1])))
+                except Exception:
+                    pass
+            min_clearance = float(os.getenv('OBSTACLE_MIN_CLEARANCE_START_GOAL', '25.0'))
+
+            def _is_clear_of_start_goal(cx, cy):
+                for (ox, oy) in keep_out_points:
+                    if np.hypot(cx - ox, cy - oy) < min_clearance:
+                        return False
+                return True
+
             # 中枢路径：起点均值 → 中央目标
             start_mean = np.mean(np.stack(start_positions, axis=0), axis=0)
             segments = [(start_mean, goal_pos)]
@@ -912,8 +1093,8 @@ class Scenario(BaseScenario):
                 except Exception:
                     pass
 
-            # 分配比例：85% 路径障碍，15% 全图随机
-            path_obstacles = int(num_obstacles * 0.85)
+            # 分配比例：65% 路径障碍，35% 全图随机
+            path_obstacles = int(num_obstacles * 0.65)
             random_obstacles = max(0, num_obstacles - path_obstacles)
             k = max(1, len(segments))
             base_per_seg = path_obstacles // k
@@ -925,7 +1106,7 @@ class Scenario(BaseScenario):
                 center_z = terrain_height + radius + self.obstacle_height_boost
                 self.obstacles.append({'center': [float(center_x), float(center_y), float(center_z)], 'radius': int(radius)})
 
-            # 沿每条路径投放
+            # 沿每条路径投放（仅当与所有起点/目标保持 min_clearance 以上才放置）
             for si, (s, g) in enumerate(segments):
                 vec = g - s
                 path_len = float(np.linalg.norm(vec[:2]))
@@ -935,25 +1116,46 @@ class Scenario(BaseScenario):
                 # 横向偏移上限：随路径长度变化，限制在[5, 20]米
                 max_perp = float(np.clip(0.10 * path_len, 5.0, 20.0))
                 cnt = base_per_seg + (1 if si < extra else 0)
+                
+                # 计算起点和终点的安全距离（避免障碍物太靠近起点或目标点）
+                start_safe_distance = max(15.0, path_len * 0.15)
+                end_safe_distance = max(15.0, path_len * 0.15)
+                
                 for _ in range(cnt):
-                    t = float(np.clip(self.rng.normal(loc=0.5, scale=0.18), 0.2, 0.8))
-                    cx = s[0] + t * vec[0]
-                    cy = s[1] + t * vec[1]
-                    off = self.rng.uniform(-max_perp, max_perp)
-                    # 垂直于路径的偏移
-                    cx += -unit_y * off
-                    cy +=  unit_x * off
-                    # 边界裁剪
-                    cx = np.clip(cx, 5, self.map_size - 5)
-                    cy = np.clip(cy, 5, self.map_size - 5)
-                    _emit_ob(cx, cy)
+                    t_min = start_safe_distance / path_len if path_len > 0 else 0.2
+                    t_max = 1.0 - (end_safe_distance / path_len) if path_len > 0 else 0.8
+                    t_min = max(0.2, min(0.4, t_min))
+                    t_max = min(0.8, max(0.6, t_max))
+                    placed = False
+                    for _attempt in range(8):
+                        t = float(self.rng.uniform(t_min, t_max))
+                        cx = s[0] + t * vec[0]
+                        cy = s[1] + t * vec[1]
+                        off = self.rng.uniform(-max_perp, max_perp)
+                        cx += -unit_y * off
+                        cy +=  unit_x * off
+                        cx = np.clip(cx, 5, self.map_size - 5)
+                        cy = np.clip(cy, 5, self.map_size - 5)
+                        if _is_clear_of_start_goal(cx, cy):
+                            _emit_ob(cx, cy)
+                            placed = True
+                            break
+                    if not placed:
+                        pass  # 跳过该障碍，避免压在起点/目标附近
 
-            # 其余随机分布（全图，预留边界 5%）
+            # 其余随机分布（全图），且与所有起点/目标保持 min_clearance 以上
             low, high = int(self.map_size * 0.05), int(self.map_size * 0.95)
             for _ in range(random_obstacles):
-                cx = self.rng.randint(low, max(low+1, high))
-                cy = self.rng.randint(low, max(low+1, high))
-                _emit_ob(cx, cy)
+                placed = False
+                for _attempt in range(50):
+                    cx = self.rng.randint(low, max(low+1, high))
+                    cy = self.rng.randint(low, max(low+1, high))
+                    if _is_clear_of_start_goal(cx, cy):
+                        _emit_ob(cx, cy)
+                        placed = True
+                        break
+                if not placed:
+                    pass  # 跳过该随机障碍
         
         else:
             # 回退策略：按 map_size 的百分比区域分布，避免硬编码 10..90 导致偏边
@@ -992,20 +1194,7 @@ class Scenario(BaseScenario):
                     if len(self.obstacles) <= 3:
                         print(f"🏗️ 生成障碍物 {len(self.obstacles)}: 位置=({center_x},{center_y},{center_z:.1f}), 半径={radius}, 地形高度={terrain_height:.1f}")
         
-        # 为矢量化计算缓存numpy数组
-        try:
-            import numpy as _np
-            if self.obstacles:
-                arr = _np.array([ob['center'] for ob in self.obstacles], dtype=_np.float32)
-                r = _np.array([ob['radius'] for ob in self.obstacles], dtype=_np.float32)
-            else:
-                arr = _np.zeros((0, 3), dtype=_np.float32)
-                r = _np.zeros((0,), dtype=_np.float32)
-            self._obs_centers = arr
-            self._obs_radii = r
-        except Exception:
-            self._obs_centers = None
-            self._obs_radii = None
+        self._refresh_observation_static_cache()
         return self.obstacles
         
     def make_world(self):
@@ -1115,11 +1304,62 @@ class Scenario(BaseScenario):
         
         return world
         
+    def _apply_role_randomization(self, world):
+        """
+        🚀 角色随机化 (Index Shuffling)：
+        在分配完起始位置和目标后，随机打乱各智能体的物理状态映射。
+        打破网络对特定索引(Agent 2)与特定出生位置/行为的死板映射，防止某个智能体固化为"逃跑/献祭"角色。
+        """
+        import os
+        # 默认开启，可通过环境变量关闭
+        enable_role_shuffle = os.getenv('ENABLE_ROLE_SHUFFLE', '1').lower() in ('1', 'true', 'yes', 'on')
+        if enable_role_shuffle and len(world.agents) > 1:
+            # 临时保存所有智能体当前的物理状态和目标
+            states = []
+            for agent in world.agents:
+                states.append({
+                    'p_pos': agent.state.p_pos.copy() if agent.state.p_pos is not None else np.zeros(3),
+                    'p_vel': agent.state.p_vel.copy() if agent.state.p_vel is not None else np.zeros(3),
+                    'initial_velocity_hint': getattr(agent, 'initial_velocity_hint', np.zeros(3)).copy(),
+                    'goal_pos': agent.goal_a.state.p_pos.copy() if hasattr(agent, 'goal_a') and agent.goal_a is not None else None,
+                    'last_goal_dist': getattr(agent, 'last_goal_dist', None)
+                })
+            
+            # 使用场景的随机数生成器打乱索引，确保如果种子固定，打乱也是确定的
+            shuffle_indices = list(range(len(world.agents)))
+            self.rng.shuffle(shuffle_indices)
+            
+            # 重新分配给各个智能体（网络 0 可能控制了状态 2）
+            for i, agent in enumerate(world.agents):
+                idx = shuffle_indices[i]
+                agent.state.p_pos = states[idx]['p_pos']
+                agent.state.p_vel = states[idx]['p_vel']
+                agent.initial_velocity_hint = states[idx]['initial_velocity_hint']
+                
+                # 必须连同目标一起交换，否则智能体的轨迹会交叉并导致碰撞！
+                if states[idx]['goal_pos'] is not None and hasattr(agent, 'goal_a') and agent.goal_a is not None:
+                    agent.goal_a.state.p_pos = states[idx]['goal_pos']
+                
+                agent.last_goal_dist = states[idx]['last_goal_dist']
+                
+                # 同步更新 world 级别的可视化记录
+                if hasattr(world, 'agent_goals') and i < len(world.agent_goals):
+                    world.agent_goals[i] = states[idx]['goal_pos']
+                
+                # 如果有观察缓存，也要清空或更新，防止第一步读取到错误的旧位置观察值
+                if hasattr(self, 'observation_cache'):
+                    try:
+                        self.observation_cache[id(agent)] = self.observation(agent, world)
+                    except Exception:
+                        pass
+
     def reset_world(self, world):
         """
         重置世界状态
         初始化智能体和目标位置
         """
+        self._obs_step_cache_key = None
+        self._obs_step_cache = {}
         # 根据环境变量启用软复位：当检测到穿透/落地时，将智能体抬到地表以上，而不提前结束回合
         try:
             import os as _os
@@ -1139,6 +1379,7 @@ class Scenario(BaseScenario):
         
         # 清空智能体完成日志标记（避免跨回合残留）
         self._agent_done_logged = {}
+        self._refresh_observation_static_cache(num_agents=len(world.agents))
         
         # 重置各智能体已访问区域
         self.visited_cells = {i: set() for i in range(len(world.agents))}
@@ -1158,8 +1399,19 @@ class Scenario(BaseScenario):
             agent.last_goal_dist = None  # 上一步到目标的距离
             agent.debug_info = {}  # 调试信息
             agent.debug_info['total_penetration_count'] = 0
+            agent.debug_info['terrain_penetration_count'] = 0  # 地形穿透次数（仅显示用）
+            agent.debug_info['obstacle_collision_count'] = 0   # 球形障碍碰撞次数（仅显示用）
             agent.debug_info['last_pos'] = agent.state.p_pos.copy() if hasattr(agent.state, 'p_pos') else None
             agent.debug_info['stationary_count'] = 0
+            # 🚨 关键修复：重置碰撞计数相关标志
+            agent._last_collision_counted_step = -1
+            agent._last_collision_position = None
+            # 统一 episode 级碰撞语义：本回合是否发生过任何碰撞/穿透（不受去重计数影响）
+            agent._episode_has_collision = False
+            # 兼容旧逻辑：回合开始清零碰撞/穿透标志
+            agent._had_penetration_or_collision = False
+            agent._had_obstacle_collision = False
+            agent._had_terrain_contact_or_penetration = False
             # 确保奖励相关状态在每回合重置
             agent.last_position = agent.state.p_pos.copy()
             agent.stationary_count = 0
@@ -1334,6 +1586,9 @@ class Scenario(BaseScenario):
                     if agent.last_goal_dist is None and self.goal_pos is not None:
                         agent.last_goal_dist = np.linalg.norm(agent.state.p_pos - self.goal_pos)
                 
+                # 🚀 插入角色随机化 (动态首次生成时)
+                self._apply_role_randomization(world)
+                
                 # 标记reset已完成，允许调试信息打印
                 world._reset_completed = True
                 
@@ -1344,7 +1599,7 @@ class Scenario(BaseScenario):
                         obs = self.observation(agent, world)
                         observation_cache[id(agent)] = obs
                     except Exception as e:
-                        observation_cache[id(agent)] = np.zeros(36)
+                        observation_cache[id(agent)] = np.zeros(self.observation_dim, dtype=np.float32)
 
                 # 存储观察值缓存，供环境的reset函数使用
                 self.observation_cache = observation_cache
@@ -1402,15 +1657,74 @@ class Scenario(BaseScenario):
             self._apply_fixed_positions(world)
             # 同地形/同起点/同目标基础上，为每个并行环境引入独立的初始朝向/速度微扰
             self._apply_per_env_randomization(world)
+            
+            # 🚨 关键修复：在固定位置模式下也要生成障碍物（根据USE_DYNAMIC_OBSTACLES决定是否重新生成）
+            # 问题：原代码在_apply_fixed_positions后直接return，导致障碍物生成逻辑（1792-1818行）永远不会被执行
+            # 解决：在return之前添加障碍物生成逻辑，确保即使使用固定位置，障碍物也能正确生成
+            # 🔧 障碍物生成：根据 USE_DYNAMIC_OBSTACLES 环境变量决定是否重新生成
+            # USE_DYNAMIC_OBSTACLES=1: 每次reset时重新生成障碍物（增加训练多样性）
+            # USE_DYNAMIC_OBSTACLES=0: 障碍物位置固定，只在首次生成时创建
+            if getattr(self, 'use_dynamic_obstacles', True):  # 默认启用动态障碍物（向后兼容）
+                # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
+                # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
+                # 每次reset时使用不同的随机种子，但基于原始种子确保可重复性（如果需要）
+                try:
+                    agent_positions_now = [agent.state.p_pos for agent in world.agents]
+                    agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
+                    if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
+                        # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
+                        # 初始化reset计数器（如果不存在）
+                        if not hasattr(self, '_obstacle_reset_count'):
+                            self._obstacle_reset_count = 0
+                        self._obstacle_reset_count += 1
+                        
+                        # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
+                        base_seed = int(self.seed) if self.seed is not None else 42
+                        obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
+                        self.rng = np.random.RandomState(obstacle_seed)
+                        
+                        self.generate_obstacles(start_positions=agent_positions_now,
+                                                goal_position=self.goal_pos,
+                                                agent_goal_positions=agent_goals_now)
+                except Exception:
+                    pass
+            else:
+                # 固定障碍物模式：只在首次生成时创建障碍物，后续不再重新生成
+                # 如果障碍物尚未生成，则生成一次
+                if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
+                    try:
+                        agent_positions_now = [agent.state.p_pos for agent in world.agents]
+                        agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
+                        if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
+                            # 使用固定种子生成障碍物，确保每次运行位置一致
+                            base_seed = int(self.seed) if self.seed is not None else 42
+                            obstacle_seed = base_seed + 10000  # 固定种子，不使用reset计数器
+                            self.rng = np.random.RandomState(obstacle_seed)
+                            
+                            self.generate_obstacles(start_positions=agent_positions_now,
+                                                    goal_position=self.goal_pos,
+                                                    agent_goal_positions=agent_goals_now)
+                    except Exception:
+                        pass
+            
+            # 设置障碍物到world
+            self._place_obstacles(world)
+            
+            # 🚀 插入角色随机化 (固定位置重置时)
+            self._apply_role_randomization(world)
+            
             # print("=== 重置完成 ===\n")
             return
         
         # 如果没有启用固定位置或固定位置不可用，使用动态位置设置
         # 根据DEBUG_ENV_OUTPUT环境变量控制输出
+        quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
         debug_mode = int(os.getenv('DEBUG_ENV_OUTPUT', '0'))
         should_output = False
         
-        if debug_mode == 0:  # 仅主环境输出
+        if quiet_output:
+            should_output = False
+        elif debug_mode == 0:  # 仅主环境输出
             should_output = hasattr(world, 'is_main_env') and world.is_main_env
         elif debug_mode == 1:  # 所有环境都输出
             should_output = True
@@ -1427,6 +1741,10 @@ class Scenario(BaseScenario):
         for agent in world.agents:
             if self.goal_pos is not None:
                 agent.last_goal_dist = np.linalg.norm(agent.state.p_pos - self.goal_pos)
+                
+        # 🚀 插入角色随机化 (完全动态位置生成时)
+        self._apply_role_randomization(world)
+        
         # 根据DEBUG_ENV_OUTPUT环境变量控制完成信息输出
         debug_mode = int(os.getenv('DEBUG_ENV_OUTPUT', '0'))
         should_output = False
@@ -1458,7 +1776,8 @@ class Scenario(BaseScenario):
         except Exception:
             env_id = 0
         # 组合种子：场景种子 + 环境索引，确保并行环境不同扰动但可复现
-        base_seed = int(getattr(self, 'seed', 42))
+        seed_val = getattr(self, 'seed', 42)
+        base_seed = int(seed_val) if seed_val is not None else 42
         rng = np.random.RandomState((base_seed + 10007 * env_id) % 2147483647)
         # 速度微扰幅度（可通过环境变量控制），默认较小
         try:
@@ -1486,11 +1805,12 @@ class Scenario(BaseScenario):
         """应用固定位置设置"""
         try:
             # 🔧 修复：确保地形已经生成，否则强制生成
+            quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
+            debug_setup_info = os.getenv('DEBUG_SETUP_INFO', '1').lower() in ('1', 'true', 'yes', 'on')
             if self.terrain is None:
                 try:
-                    import os
                     suppress_output = os.getenv('SUPPRESS_TERRAIN_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
-                    if not suppress_output:
+                    if debug_setup_info and not suppress_output:
                         print("[警告] 应用固定位置时地形未生成，正在生成地形...")
                 except Exception:
                     pass
@@ -1510,7 +1830,8 @@ class Scenario(BaseScenario):
                 # 解决：检查并确保所有智能体都使用固定位置，如果位置不足则使用第一个位置
                 fixed_agents_pos = self.fixed_positions['agents']
                 if len(fixed_agents_pos) == 0:
-                    print(f"⚠️  警告: fixed_positions['agents']为空，无法应用固定位置")
+                    if debug_setup_info:
+                        print(f"⚠️  警告: fixed_positions['agents']为空，无法应用固定位置")
                     return
                 
                 # 设置智能体位置
@@ -1522,7 +1843,8 @@ class Scenario(BaseScenario):
                         # 如果位置不足，使用第一个位置（确保所有智能体起点一致）
                         pos_source = fixed_agents_pos[0]
                         if i == len(fixed_agents_pos):  # 只在第一次遇到不足时打印警告
-                            print(f"⚠️  警告: 固定位置数量({len(fixed_agents_pos)})少于智能体数量({len(world.agents)})，智能体{i}及之后将使用第一个固定位置")
+                            if debug_setup_info:
+                                print(f"⚠️  警告: 固定位置数量({len(fixed_agents_pos)})少于智能体数量({len(world.agents)})，智能体{i}及之后将使用第一个固定位置")
                     
                     # 确保位置是numpy数组，并复制以避免修改原始数据
                     pos = np.array(pos_source, dtype=float).copy()
@@ -1544,30 +1866,34 @@ class Scenario(BaseScenario):
                         random_height = current_terrain_h + 2 + np.random.uniform(0, 5)
                         pos[2] = random_height
                     else:
-                        # 🚨 关键修复：评估时使用固定位置文件，必须保留文件中的Z坐标，不根据地形高度调整
-                        # 原因：不同评估模式（local/oracle）可能使用不同的地形种子，如果根据地形高度调整Z坐标，
-                        # 会导致不同评估模式中智能体的实际Z坐标不同，影响对比公平性
-                        # 解决方案：完全保留文件中的Z坐标，不进行任何调整
-                        # 注意：这要求固定位置文件中的Z坐标已经是正确的（在地形上方）
-                        # 如果Z坐标确实太低（低于地形高度），只进行最小安全调整，但记录警告
+                        # 🚨 关键修复：必须始终根据当前地形高度调整Z坐标，确保智能体在地形上方
+                        # 原因：
+                        # 1. 固定位置文件中的Z坐标是基于生成位置时的地形高度
+                        # 2. 评估时可能使用不同的地形种子，导致地形高度不同
+                        # 3. 如果保留文件中的Z坐标，可能导致智能体在地形下方（如Agent 2的Z=10.97，但地形高度更高）
+                        # 解决方案：始终根据当前地形高度调整Z坐标，确保在地形上方（地形高度 + min_air_gap）
                         final_terrain_h = self.get_terrain_height(pos[0], pos[1])
                         required_height = final_terrain_h + min_air_gap
+                        old_z = pos[2]
                         if pos[2] < required_height:
-                            # 只有当Z坐标太低时才调整（安全保护）
-                            old_z = pos[2]
+                            # Z坐标太低，必须调整到地形上方
                             pos[2] = required_height
-                            # 🔧 修复：只有在Z坐标实际发生变化时才打印警告
-                            if abs(old_z - pos[2]) > 1e-6 and i < 3:  # 只打印前3个智能体的调整信息
-                                print(f"⚠️  [固定位置调整] Agent{i}: Z坐标从{old_z:.2f}调整到{pos[2]:.2f}（地形高度={final_terrain_h:.2f}）")
-                                print(f"   警告：固定位置文件中的Z坐标可能不正确，建议检查位置文件")
-                        # 否则完全保留文件中的Z坐标，不进行任何调整
+                            if abs(old_z - pos[2]) > 1e-6 and i < 3 and debug_setup_info:  # 只打印前3个智能体的调整信息
+                                print(f"⚠️  [固定位置调整] Agent{i}: Z坐标从{old_z:.2f}调整到{pos[2]:.2f}（地形高度={final_terrain_h:.2f}, 要求高度={required_height:.2f}）")
+                        # 🚨 关键修复：即使Z坐标已经在地形上方，也要确保有足够的安全间隙
+                        # 如果Z坐标刚好在地形上方但间隙太小（< min_air_gap），也要调整
+                        elif pos[2] < final_terrain_h + min_air_gap * 1.5:
+                            # 间隙太小，调整到更安全的高度
+                            pos[2] = final_terrain_h + min_air_gap * 1.5
+                            if abs(old_z - pos[2]) > 1e-6 and i < 3 and not quiet_output:
+                                print(f"🔧 [固定位置优化] Agent{i}: Z坐标从{old_z:.2f}优化到{pos[2]:.2f}（增加安全间隙，地形高度={final_terrain_h:.2f}）")
                     
                     agent.state.p_pos = pos
                     agent.state.p_vel = np.zeros(world.dim_p)
                     agent.state.c = np.zeros(world.dim_c)
                     
                     # 🔧 调试信息：打印前3个智能体的实际位置，验证是否一致
-                    if i < 3:
+                    if i < 3 and not quiet_output:
                         print(f"[固定位置验证] Agent{i}: 位置=[{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}] (来源: {'固定位置' if i < len(fixed_agents_pos) else '第一个位置'})")
                 
                 # 设置目标位置
@@ -1605,17 +1931,12 @@ class Scenario(BaseScenario):
                     if hasattr(world, 'goal_pos'):
                         world.goal_pos = goal_pos.copy()
                     
-                    # 🚨 关键修复：为每个智能体的agent.goal_a设置目标位置
-                    # 问题：观测函数使用agent.goal_a.state.p_pos，但之前只设置了world.landmarks[0]
-                    # 每个智能体的agent.goal_a指向world.landmarks[1], landmarks[2], landmarks[3]等
-                    # 如果这些位置没有被设置，观测中的目标位置就是错误的（可能是默认值或上一次的值）
-                    # 解决方案：为每个智能体的agent.goal_a设置相同的目标位置（所有智能体共享同一个中央目标）
-                    for i, agent in enumerate(world.agents):
-                        if hasattr(agent, 'goal_a') and agent.goal_a is not None:
-                            # 确保每个智能体的目标位置都设置为固定位置文件中的目标位置（中央目标）
-                            agent.goal_a.state.p_pos = goal_pos.copy()
-                            if i < 3:  # 只打印前3个智能体的调试信息
-                                print(f"[目标位置设置] Agent{i}: agent.goal_a位置已设置为中央目标 [{goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f}]")
+                    # 🔧 关键修复：调用_set_agent_goals为每个智能体设置独立的、环绕的目标位置
+                    # 这样评估器和可视化工具可以正确显示每个智能体的独立目标
+                    self._set_agent_goals(world)
+                    if len(world.agents) > 0 and not quiet_output:
+                        print(f"[目标位置设置] 中央目标: [{self.goal_pos[0]:.2f}, {self.goal_pos[1]:.2f}, {self.goal_pos[2]:.2f}]")
+                        print(f"[目标位置设置] 已为{len(world.agents)}个智能体设置独立的环绕目标")
             # 旧格式：列表 [agent1_pos, agent2_pos, ..., goal_pos]
             elif isinstance(self.fixed_positions, list) and len(self.fixed_positions) >= len(world.agents) + 1:
                 # 设置智能体位置
@@ -1675,17 +1996,11 @@ class Scenario(BaseScenario):
                 if hasattr(world, 'goal_pos'):
                     world.goal_pos = self.goal_pos.copy()
                 
-                # 🚨 关键修复：为每个智能体的agent.goal_a设置目标位置（旧格式也需要修复）
-                # 问题：观测函数使用agent.goal_a.state.p_pos，但之前只设置了world.landmarks[0]
-                # 每个智能体的agent.goal_a指向world.landmarks[1], landmarks[2], landmarks[3]等
-                # 如果这些位置没有被设置，观测中的目标位置就是错误的
-                # 解决方案：为每个智能体的agent.goal_a设置相同的目标位置（所有智能体共享同一个目标）
-                for i, agent in enumerate(world.agents):
-                    if hasattr(agent, 'goal_a') and agent.goal_a is not None:
-                        # 确保每个智能体的目标位置都设置为固定位置文件中的目标位置
-                        agent.goal_a.state.p_pos = goal_pos.copy()
-                        if i < 3:  # 只打印前3个智能体的调试信息
-                            print(f"[目标位置设置] Agent{i}: agent.goal_a位置已设置为 [{goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f}]")
+                # 🔧 关键修复：调用_set_agent_goals为每个智能体设置独立的、环绕的目标位置（旧格式）
+                self._set_agent_goals(world)
+                if len(world.agents) > 0:
+                    print(f"[目标位置设置-旧格式] 中央目标: [{self.goal_pos[0]:.2f}, {self.goal_pos[1]:.2f}, {self.goal_pos[2]:.2f}]")
+                    print(f"[目标位置设置-旧格式] 已为{len(world.agents)}个智能体设置独立的环绕目标")
             else:
                 print(f"固定位置格式错误或不完整，将使用动态位置代替")
                 self._dynamic_reset_world(world)
@@ -1700,50 +2015,66 @@ class Scenario(BaseScenario):
         # 🚨 关键修复：使用固定位置时，所有智能体共享同一个中央目标，不需要设置包围目标
         # 问题：_set_agent_goals会将每个智能体的agent.goal_a设置为围绕中央目标的等边三角形位置
         # 但使用固定位置时，所有智能体应该共享同一个中央目标（已经在_apply_fixed_positions中设置）
-        # 解决方案：只在非固定位置模式下调用_set_agent_goals
+        # 🔧 关键修复：_set_agent_goals已在_apply_fixed_positions中调用，这里不需要再次调用
+        # 旧逻辑（已移除）：
+        #   1. 非固定位置模式：调用_set_agent_goals设置独立目标
+        #   2. 固定位置模式：验证每个智能体的goal_a是否与中央目标一致，不一致则强制修复
+        # 问题：
+        #   - _apply_fixed_positions中已调用_set_agent_goals，为每个智能体设置独立的、环绕的目标位置
+        #   - 旧的验证逻辑检测到目标"不一致"，就强制覆盖为中央目标，导致独立目标被撤销
+        #   - 这会导致交互式轨迹图无法显示各智能体的独立目标
+        # 新逻辑：
+        #   - 信任_apply_fixed_positions中的设置，不再进行额外的验证和修复
+        #   - 仅在完全动态模式（不使用固定位置）时补充调用_set_agent_goals
         if not (getattr(self, 'use_fixed_positions', False) and self.fixed_positions is not None):
-            # 先设置每个智能体的包围目标，再依据 start→agent_goal/中央目标 生成障碍
+            # 完全动态模式：_apply_fixed_positions不会被调用，需要在这里设置独立目标
             self._set_agent_goals(world)
-        else:
-            # 使用固定位置时，确保所有智能体的agent.goal_a都指向中央目标（已经在_apply_fixed_positions中设置）
-            # 这里只需要验证一下，不需要重新设置
-            if hasattr(self, 'goal_pos') and self.goal_pos is not None:
-                for i, agent in enumerate(world.agents):
-                    if hasattr(agent, 'goal_a') and agent.goal_a is not None:
-                        # 验证目标位置是否正确（应该已经在_apply_fixed_positions中设置）
-                        if i < 3:  # 只打印前3个智能体的验证信息
-                            actual_goal = agent.goal_a.state.p_pos
-                            expected_goal = self.goal_pos
-                            if np.linalg.norm(actual_goal - expected_goal) > 0.1:
-                                print(f"⚠️  [目标位置验证] Agent{i}: agent.goal_a位置与中央目标不一致！")
-                                print(f"   实际: {actual_goal}")
-                                print(f"   期望: {expected_goal}")
-                                # 修复：重新设置为中央目标
-                                agent.goal_a.state.p_pos = self.goal_pos.copy()
-                                print(f"   已修复为中央目标位置")
-        # 🔧 关键修复：如果使用固定位置且不是随机地形，障碍物应该只在首次生成，后续reset不再重新生成
-        # 原因：每次reset都重新生成障碍物会导致障碍物位置不一致，即使使用固定种子也会因为rng状态累积而不同
-        # 修复：只在首次生成或使用随机地形时才重新生成障碍物
-        should_regenerate_obstacles = (
-            self.random_terrain or  # 随机地形模式：每次重新生成
-            not hasattr(self, 'obstacles') or  # 首次生成
-            self.obstacles is None or  # 障碍物未初始化
-            len(self.obstacles) == 0  # 障碍物为空
-        )
-        if should_regenerate_obstacles:
+        # 固定位置模式：_apply_fixed_positions中已调用_set_agent_goals，这里无需操作
+        # 🔧 障碍物生成：根据 USE_DYNAMIC_OBSTACLES 环境变量决定是否重新生成
+        # USE_DYNAMIC_OBSTACLES=1: 每次reset时重新生成障碍物（增加训练多样性）
+        # USE_DYNAMIC_OBSTACLES=0: 障碍物位置固定，只在首次生成时创建
+        if getattr(self, 'use_dynamic_obstacles', True):  # 默认启用动态障碍物（向后兼容）
+            # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
+            # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
+            # 每次reset时使用不同的随机种子，但基于原始种子确保可重复性（如果需要）
             try:
                 agent_positions_now = [agent.state.p_pos for agent in world.agents]
                 agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
                 if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
-                    # 🔧 关键修复：在生成障碍物前，使用固定的障碍物种子重置rng状态，确保障碍物位置一致
-                    # 使用 scenario_seed + 固定偏移量作为障碍物种子，确保障碍物生成可重复
-                    obstacle_seed = int(self.seed) + 10000 if self.seed is not None else 10042
+                    # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
+                    # 初始化reset计数器（如果不存在）
+                    if not hasattr(self, '_obstacle_reset_count'):
+                        self._obstacle_reset_count = 0
+                    self._obstacle_reset_count += 1
+                    
+                    # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
+                    base_seed = int(self.seed) if self.seed is not None else 42
+                    obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
                     self.rng = np.random.RandomState(obstacle_seed)
+                    
                     self.generate_obstacles(start_positions=agent_positions_now,
                                             goal_position=self.goal_pos,
                                             agent_goal_positions=agent_goals_now)
             except Exception:
                 pass
+        else:
+            # 固定障碍物模式：只在首次生成时创建障碍物，后续不再重新生成
+            # 如果障碍物尚未生成，则生成一次
+            if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
+                try:
+                    agent_positions_now = [agent.state.p_pos for agent in world.agents]
+                    agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
+                    if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
+                        # 使用固定种子生成障碍物，确保每次运行位置一致
+                        base_seed = int(self.seed) if self.seed is not None else 42
+                        obstacle_seed = base_seed + 10000  # 固定种子，不使用reset计数器
+                        self.rng = np.random.RandomState(obstacle_seed)
+                        
+                        self.generate_obstacles(start_positions=agent_positions_now,
+                                                goal_position=self.goal_pos,
+                                                agent_goal_positions=agent_goals_now)
+                except Exception:
+                    pass
         # 设置障碍物位置，确保它们在地形表面
         self._place_obstacles(world)
 
@@ -1765,7 +2096,7 @@ class Scenario(BaseScenario):
                 obs = self.observation(agent, world)
                 observation_cache[id(agent)] = obs
             except Exception as e:
-                observation_cache[id(agent)] = np.zeros(36)
+                observation_cache[id(agent)] = np.zeros(self.observation_dim, dtype=np.float32)
         
         # 存储观察值缓存，供环境的reset函数使用
         self.observation_cache = observation_cache
@@ -1791,21 +2122,61 @@ class Scenario(BaseScenario):
         # 输出各智能体的初始位置坐标信息（与上游保持一致的开关控制，避免重复打印）
         try:
             import os as _os
+            quiet_output = _os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
             debug_mode = int(_os.getenv('DEBUG_ENV_OUTPUT', '0'))
             should_output = False
-            if debug_mode == 0:
+            if quiet_output:
+                should_output = False
+            elif debug_mode == 0:
                 should_output = hasattr(world, 'is_main_env') and world.is_main_env
             elif debug_mode == 1:
                 should_output = True
             elif debug_mode == 2:
                 should_output = False
             if should_output:
-                print(f"[智能体位置] 智能体初始位置坐标:")
+                print(f"[智能体位置] 智能体初始位置坐标与最近3个障碍物:")
+                # 预取障碍物中心，避免在循环中重复解析
+                obstacle_centers = []
+                try:
+                    import numpy as _np
+                    if hasattr(self, 'obstacles') and isinstance(self.obstacles, list):
+                        for ob in self.obstacles:
+                            try:
+                                c = ob.get('center', None)
+                                if c is None:
+                                    continue
+                                c_arr = _np.asarray(c, dtype=_np.float32).reshape(-1)
+                                if c_arr.shape[0] >= 3:
+                                    obstacle_centers.append(c_arr[:3])
+                            except Exception:
+                                continue
+                except Exception:
+                    obstacle_centers = []
                 for i, agent in enumerate(world.agents):
                     pos = agent.state.p_pos
                     terrain_h = self.get_terrain_height(pos[0], pos[1])
                     height_above_terrain = pos[2] - terrain_h
-                    print(f"  Agent{i+1}: pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) | terrain_h={terrain_h:.2f} | 离地高度={height_above_terrain:.2f}m")
+                    # 计算与所有障碍物的水平距离，选出最近的3个
+                    nearest_str = "None"
+                    try:
+                        if obstacle_centers:
+                            import numpy as _np
+                            pos_xy = _np.asarray(pos[:2], dtype=_np.float32)
+                            dists = []
+                            for c in obstacle_centers:
+                                d = float(_np.linalg.norm(pos_xy - c[:2]))
+                                dists.append((d, c))
+                            dists.sort(key=lambda x: x[0])
+                            top3 = dists[:3]
+                            parts = []
+                            for rank, (d, c) in enumerate(top3, start=1):
+                                parts.append(f"{rank}: center=({c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f}), dist_xy={d:.2f}")
+                            nearest_str = " | ".join(parts)
+                    except Exception:
+                        nearest_str = "计算失败"
+                    print(f"  Agent{i+1}: pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) | "
+                          f"terrain_h={terrain_h:.2f} | 离地高度={height_above_terrain:.2f}m")
+                    print(f"           最近障碍物: {nearest_str}")
         except Exception:
             pass
         # print(f"成功使用固定位置配置：{len(world.agents)}个智能体, 目标位置: {self.goal_pos}")
@@ -1883,7 +2254,7 @@ class Scenario(BaseScenario):
                 obs = self.observation(agent, world)
                 observation_cache[id(agent)] = obs
             except Exception as e:
-                observation_cache[id(agent)] = np.zeros(36)
+                observation_cache[id(agent)] = np.zeros(self.observation_dim, dtype=np.float32)
         
         # 存储观察值缓存，供环境的reset函数使用
         self.observation_cache = observation_cache
@@ -2152,26 +2523,26 @@ class Scenario(BaseScenario):
         
         # 在生成障碍前，先设置每个智能体的独立目标
         self._set_agent_goals(world)
-        # 🔧 关键修复：如果使用固定位置且不是随机地形，障碍物应该只在首次生成，后续reset不再重新生成
-        # 原因：每次reset都重新生成障碍物会导致障碍物位置不一致，即使使用固定种子也会因为rng状态累积而不同
-        # 修复：只在首次生成或使用随机地形时才重新生成障碍物
-        should_regenerate_obstacles = (
-            self.random_terrain or  # 随机地形模式：每次重新生成
-            not hasattr(self, 'obstacles') or  # 首次生成
-            self.obstacles is None or  # 障碍物未初始化
-            len(self.obstacles) == 0  # 障碍物为空
-        )
-        if should_regenerate_obstacles:
-            # 🎯 重新生成障碍物，基于起点→各自目标/中央目标
-            agent_positions = [agent.state.p_pos for agent in world.agents]
-            agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
-            # 🔧 关键修复：在生成障碍物前，使用固定的障碍物种子重置rng状态，确保障碍物位置一致
-            # 使用 scenario_seed + 固定偏移量作为障碍物种子，确保障碍物生成可重复
-            obstacle_seed = int(self.seed) + 10000 if self.seed is not None else 10042
-            self.rng = np.random.RandomState(obstacle_seed)
-            self.generate_obstacles(start_positions=agent_positions,
-                                    goal_position=self.goal_pos,
-                                    agent_goal_positions=agent_goals_now)
+        # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
+        # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
+        # 🎯 重新生成障碍物，基于起点→各自目标/中央目标
+        agent_positions = [agent.state.p_pos for agent in world.agents]
+        agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
+        
+        # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
+        # 初始化reset计数器（如果不存在）
+        if not hasattr(self, '_obstacle_reset_count'):
+            self._obstacle_reset_count = 0
+        self._obstacle_reset_count += 1
+        
+        # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
+        base_seed = int(self.seed) if self.seed is not None else 42
+        obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
+        self.rng = np.random.RandomState(obstacle_seed)
+        
+        self.generate_obstacles(start_positions=agent_positions,
+                                goal_position=self.goal_pos,
+                                agent_goal_positions=agent_goals_now)
         
         # 设置障碍物位置
         self._place_obstacles(world)
@@ -2229,26 +2600,45 @@ class Scenario(BaseScenario):
         
         # 先设置包围目标，再生成障碍
         self._set_agent_goals(world)
-        # 🔧 关键修复：如果使用固定位置且不是随机地形，障碍物应该只在首次生成，后续reset不再重新生成
-        # 原因：每次reset都重新生成障碍物会导致障碍物位置不一致，即使使用固定种子也会因为rng状态累积而不同
-        # 修复：只在首次生成或使用随机地形时才重新生成障碍物
-        should_regenerate_obstacles = (
-            self.random_terrain or  # 随机地形模式：每次重新生成
-            not hasattr(self, 'obstacles') or  # 首次生成
-            self.obstacles is None or  # 障碍物未初始化
-            len(self.obstacles) == 0  # 障碍物为空
-        )
-        if should_regenerate_obstacles:
+        # 🔧 障碍物生成：根据 USE_DYNAMIC_OBSTACLES 环境变量决定是否重新生成
+        if getattr(self, 'use_dynamic_obstacles', True):  # 默认启用动态障碍物（向后兼容）
+            # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
+            # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
             # 🎯 重新生成障碍物，基于起点→各自目标/中央目标
             agent_positions = [agent.state.p_pos for agent in world.agents]
             agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
-            # 🔧 关键修复：在生成障碍物前，使用固定的障碍物种子重置rng状态，确保障碍物位置一致
-            # 使用 scenario_seed + 固定偏移量作为障碍物种子，确保障碍物生成可重复
-            obstacle_seed = int(self.seed) + 10000 if self.seed is not None else 10042
+            
+            # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
+            # 初始化reset计数器（如果不存在）
+            if not hasattr(self, '_obstacle_reset_count'):
+                self._obstacle_reset_count = 0
+            self._obstacle_reset_count += 1
+            
+            # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
+            base_seed = int(self.seed) if self.seed is not None else 42
+            obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
             self.rng = np.random.RandomState(obstacle_seed)
+            
             self.generate_obstacles(start_positions=agent_positions,
                                     goal_position=self.goal_pos,
                                     agent_goal_positions=agent_goals_now)
+        else:
+            # 固定障碍物模式：只在首次生成时创建障碍物，后续不再重新生成
+            if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
+                try:
+                    agent_positions = [agent.state.p_pos for agent in world.agents]
+                    agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
+                    if isinstance(agent_positions, list) and len(agent_positions) > 0 and self.goal_pos is not None:
+                        # 使用固定种子生成障碍物，确保每次运行位置一致
+                        base_seed = int(self.seed) if self.seed is not None else 42
+                        obstacle_seed = base_seed + 10000  # 固定种子，不使用reset计数器
+                        self.rng = np.random.RandomState(obstacle_seed)
+                        
+                        self.generate_obstacles(start_positions=agent_positions,
+                                                goal_position=self.goal_pos,
+                                                agent_goal_positions=agent_goals_now)
+                except Exception:
+                    pass
         
         # 设置障碍物
         self._place_obstacles(world)
@@ -2434,6 +2824,101 @@ class Scenario(BaseScenario):
                  x_weight*y_weight*val4
                  
         return height
+    
+    def batch_get_terrain_height(self, coords):
+        """
+        🚀 批量获取地形高度，使用向量化双线性插值
+        
+        Args:
+            coords: (N, 2) array of (x, y) coordinates
+            
+        Returns:
+            heights: (N,) array of terrain heights
+            
+        性能优化：
+        - 使用NumPy向量化操作，避免Python循环
+        - 对XLA加速友好（纯NumPy操作）
+        - 与单点版本数值完全一致
+        """
+        # 确保地形已经生成
+        if self.terrain is None:
+            return np.zeros(len(coords), dtype=np.float32)
+        
+        # 转换为NumPy数组并确保形状正确
+        coords = np.asarray(coords, dtype=np.float32)
+        if coords.ndim == 1:
+            coords = coords.reshape(1, -1)
+        
+        N = coords.shape[0]
+        x_coords = coords[:, 0]  # (N,)
+        y_coords = coords[:, 1]  # (N,)
+        
+        # 🔧 关键修复：支持降采样地形
+        if getattr(self, 'terrain_downsampled', False):
+            terrain_w = self.terrain.shape[1]
+            terrain_h = self.terrain.shape[0]
+            
+            # 批量缩放坐标
+            if self.map_size > 1:
+                x_scaled = x_coords * (terrain_w - 1) / (self.map_size - 1)
+                y_scaled = y_coords * (terrain_h - 1) / (self.map_size - 1)
+            else:
+                x_scaled = np.zeros(N, dtype=np.float32)
+                y_scaled = np.zeros(N, dtype=np.float32)
+            
+            # 批量裁剪到有效范围
+            x_scaled = np.clip(x_scaled, 0, terrain_w - 1)
+            y_scaled = np.clip(y_scaled, 0, terrain_h - 1)
+            
+            # 批量计算索引
+            x_low = np.floor(x_scaled).astype(np.int32)
+            y_low = np.floor(y_scaled).astype(np.int32)
+            x_high = np.ceil(x_scaled).astype(np.int32)
+            y_high = np.ceil(y_scaled).astype(np.int32)
+            
+            # 批量裁剪索引
+            x_low = np.clip(x_low, 0, terrain_w - 1)
+            x_high = np.clip(x_high, 0, terrain_w - 1)
+            y_low = np.clip(y_low, 0, terrain_h - 1)
+            y_high = np.clip(y_high, 0, terrain_h - 1)
+            
+            # 批量计算插值权重
+            x_weight = x_scaled - x_low
+            y_weight = y_scaled - y_low
+        else:
+            # 未降采样：直接使用原始坐标
+            x_clipped = np.clip(x_coords, 0, self.map_size - 1)
+            y_clipped = np.clip(y_coords, 0, self.map_size - 1)
+            
+            # 批量计算索引
+            x_low = np.floor(x_clipped).astype(np.int32)
+            y_low = np.floor(y_clipped).astype(np.int32)
+            x_high = np.ceil(x_clipped).astype(np.int32)
+            y_high = np.ceil(y_clipped).astype(np.int32)
+            
+            # 批量裁剪索引
+            x_low = np.clip(x_low, 0, self.map_size - 1)
+            x_high = np.clip(x_high, 0, self.map_size - 1)
+            y_low = np.clip(y_low, 0, self.map_size - 1)
+            y_high = np.clip(y_high, 0, self.map_size - 1)
+            
+            # 批量计算插值权重
+            x_weight = x_clipped - x_low
+            y_weight = y_clipped - y_low
+        
+        # 批量获取四个角点的地形高度
+        val1 = self.terrain[y_low, x_low]  # (N,)
+        val2 = self.terrain[y_low, x_high]  # (N,)
+        val3 = self.terrain[y_high, x_low]  # (N,)
+        val4 = self.terrain[y_high, x_high]  # (N,)
+        
+        # 批量双线性插值（向量化）
+        heights = ((1 - x_weight) * (1 - y_weight) * val1 +
+                   x_weight * (1 - y_weight) * val2 +
+                   (1 - x_weight) * y_weight * val3 +
+                   x_weight * y_weight * val4)
+        
+        return heights.astype(np.float32)
     
     def get_terrain_grad(self, x, y, dx=1.0, dy=1.0):
         """
@@ -2747,36 +3232,120 @@ class Scenario(BaseScenario):
                 d_min_current = float(np.min(clearance_distances))  # 允许负值
             else:
                 d_min_current = 0.0  # 默认值（如果没有地形和障碍物）
-                    
-                # 获取上一时刻的最小距离
-                if not hasattr(agent, 'last_min_distance'):
-                    agent.last_min_distance = d_min_current
-                    clearance_reward = 0.0
+            
+            # 🚨 关键修复：检测碰撞并更新total_penetration_count
+            # 使用与vectorized_reward_calculator相同的碰撞检测逻辑
+            # 从环境变量或类属性获取碰撞阈值
+            try:
+                import os
+                collision_distance_threshold = float(os.getenv('COLLISION_DISTANCE_THRESHOLD', '0.5'))
+            except Exception:
+                collision_distance_threshold = float(getattr(self, 'collision_distance_threshold', 0.5))
+            
+            # 检测碰撞：d_min_current < collision_distance_threshold 或 < 0（穿透）
+            has_collision = (d_min_current < collision_distance_threshold) or (d_min_current < 0.0)
+            
+            # 如果检测到碰撞，更新碰撞计数
+            if has_collision:
+                # 只要本步检测到碰撞/穿透，即认为本回合已发生危险行为（Safe_i 应为 False）
+                # 计数可按去重策略增量，但 episode 标志必须无条件置 True
+                try:
+                    agent._episode_has_collision = True
+                except Exception:
+                    pass
+                # 确保debug_info已初始化
+                if not hasattr(agent, 'debug_info'):
+                    agent.debug_info = {}
+                if not isinstance(agent.debug_info, dict):
+                    agent.debug_info = {}
+                
+                # 🚨 关键修复：改进防重复计数机制
+                # 如果current_step不可用，使用位置变化来防止重复计数
+                current_step = int(getattr(world, 'current_step', -1))
+                last_counted_step = getattr(agent, '_last_collision_counted_step', -1)
+                
+                # 如果current_step不可用（-1），使用位置变化来检测是否是新碰撞
+                should_count = False
+                if current_step != -1 and current_step >= 0:
+                    # 正常情况：使用步数判断
+                    should_count = (current_step != last_counted_step)
                 else:
-                    d_min_previous = agent.last_min_distance
-                    distance_change = d_min_current - d_min_previous
-                    normalized_change = distance_change / max(1e-6, self.clearance_d_max)
-                    clipped_change = np.clip(normalized_change, -1.0, 1.0)
-                    clearance_reward = self.clearance_weight * clipped_change
-                    if hasattr(agent, 'debug_info'):
-                        agent.debug_info['clearance_reward'] = clearance_reward
-                        agent.debug_info['d_min_current'] = d_min_current
-                        agent.debug_info['d_min_previous'] = d_min_previous
-                        agent.debug_info['distance_change'] = distance_change
-                        agent.debug_info['normalized_change'] = normalized_change
-                        agent.debug_info['clearance_weight'] = self.clearance_weight
-                    # 🔧 新增：记录地形和障碍物的净空值，便于调试
-                    if hasattr(self, 'get_terrain_height'):
-                        terrain_clearance = current_pos[2] - self.get_terrain_height(current_pos[0], current_pos[1])
-                        agent.debug_info['terrain_clearance'] = float(terrain_clearance)
-                    if getattr(self, '_obs_centers', None) is not None and self._obs_centers.shape[0] > 0:
-                        current_pos_obs = agent.state.p_pos.astype(np.float32)
-                        diff = self._obs_centers - current_pos_obs
-                        d = np.sqrt(np.sum(diff * diff, axis=1))
-                        obstacle_clearances = d - self._obs_radii
-                        agent.debug_info['obstacle_clearances'] = obstacle_clearances.tolist()
-                rew += clearance_reward
+                    # 回退方案：使用位置变化判断（如果位置变化超过阈值，认为是新碰撞）
+                    # 这样可以避免在评估时current_step不可用导致计数失效
+                    current_pos = agent.state.p_pos
+                    last_collision_pos = getattr(agent, '_last_collision_position', None)
+                    if last_collision_pos is None:
+                        should_count = True  # 第一次碰撞
+                    else:
+                        pos_change = np.linalg.norm(current_pos - last_collision_pos)
+                        # 位置变化超过0.1m认为是新碰撞（避免同一位置重复计数）
+                        should_count = (pos_change > 0.1)
+                
+                if should_count:
+                    # 更新碰撞计数（逻辑不变）
+                    old_count = agent.debug_info.get('total_penetration_count', 0)
+                    try:
+                        old_count_int = int(old_count) if np.isfinite(old_count) else 0
+                    except (ValueError, TypeError, OverflowError):
+                        old_count_int = 0
+                    
+                    new_count = old_count_int + 1
+                    if new_count > 1000000:  # 防止溢出
+                        new_count = 1000000
+                    
+                    agent.debug_info['total_penetration_count'] = int(new_count)
+                    agent._last_collision_counted_step = current_step if current_step != -1 else -1
+                    agent._last_collision_position = agent.state.p_pos.copy()  # 保存碰撞位置
+                    
+                    # 分项统计（仅显示用）：判断本次碰撞来自地形还是球形障碍
+                    n_terrain = 1 if (hasattr(self, 'get_terrain_height') and clearance_distances) else 0
+                    arr = np.array(clearance_distances, dtype=np.float64)
+                    min_idx = int(np.argmin(arr))
+                    is_terrain_collision = (n_terrain == 1 and min_idx == 0)
+                    if is_terrain_collision:
+                        agent.debug_info['terrain_penetration_count'] = agent.debug_info.get('terrain_penetration_count', 0) + 1
+                    else:
+                        agent.debug_info['obstacle_collision_count'] = agent.debug_info.get('obstacle_collision_count', 0) + 1
+                    
+                    # 同时更新current_episode_collision_count（保持兼容性）
+                    if not hasattr(agent, 'current_episode_collision_count'):
+                        agent.current_episode_collision_count = 0
+                    agent.current_episode_collision_count += 1
+                    
+                    # 标记碰撞状态
+                    agent._had_penetration_or_collision = True
+                    if d_min_current < 0.0:  # 穿透地形
+                        agent._had_terrain_contact_or_penetration = True
+                    
+            # 获取上一时刻的最小距离
+            if not hasattr(agent, 'last_min_distance'):
                 agent.last_min_distance = d_min_current
+                clearance_reward = 0.0
+            else:
+                d_min_previous = agent.last_min_distance
+                distance_change = d_min_current - d_min_previous
+                normalized_change = distance_change / max(1e-6, self.clearance_d_max)
+                clipped_change = np.clip(normalized_change, -1.0, 1.0)
+                clearance_reward = self.clearance_weight * clipped_change
+                if hasattr(agent, 'debug_info'):
+                    agent.debug_info['clearance_reward'] = clearance_reward
+                    agent.debug_info['d_min_current'] = d_min_current
+                    agent.debug_info['d_min_previous'] = d_min_previous
+                    agent.debug_info['distance_change'] = distance_change
+                    agent.debug_info['normalized_change'] = normalized_change
+                    agent.debug_info['clearance_weight'] = self.clearance_weight
+                # 🔧 新增：记录地形和障碍物的净空值，便于调试
+                if hasattr(self, 'get_terrain_height'):
+                    terrain_clearance = current_pos[2] - self.get_terrain_height(current_pos[0], current_pos[1])
+                    agent.debug_info['terrain_clearance'] = float(terrain_clearance)
+                if getattr(self, '_obs_centers', None) is not None and self._obs_centers.shape[0] > 0:
+                    current_pos_obs = agent.state.p_pos.astype(np.float32)
+                    diff = self._obs_centers - current_pos_obs
+                    d = np.sqrt(np.sum(diff * diff, axis=1))
+                    obstacle_clearances = d - self._obs_radii
+                    agent.debug_info['obstacle_clearances'] = obstacle_clearances.tolist()
+            rew += clearance_reward
+            agent.last_min_distance = d_min_current
             
 # === 停滞惩罚/奖励 ===
             # 计算位置变化（仅考虑XY平面，避免Z轴动作导致“快速离开”）
@@ -3042,6 +3611,248 @@ class Scenario(BaseScenario):
         return dist < dist_min
     
     def observation(self, agent, world):
+        """带 step 级缓存的 observation 包装，避免同一步对所有 agent 重复重算。"""
+        try:
+            cache_key = (id(world), int(getattr(world, 'current_step', -1)))
+        except Exception:
+            cache_key = None
+
+        if cache_key is not None and self._obs_step_cache_key == cache_key:
+            cached_obs = self._obs_step_cache.get(id(agent))
+            if cached_obs is not None:
+                return cached_obs
+
+        try:
+            agents = getattr(world, 'agents', None)
+            if cache_key is not None and agents:
+                cache = {}
+                batch_obs = self._compute_observations_batch_uncached(world)
+                if batch_obs:
+                    cache.update(batch_obs)
+                else:
+                    for ag in agents:
+                        cache[id(ag)] = self._compute_observation_uncached(ag, world)
+                self._obs_step_cache_key = cache_key
+                self._obs_step_cache = cache
+                cached_obs = cache.get(id(agent))
+                if cached_obs is not None:
+                    return cached_obs
+        except Exception:
+            self._obs_step_cache_key = None
+            self._obs_step_cache = {}
+
+        return self._compute_observation_uncached(agent, world)
+
+    def _compute_observations_batch_uncached(self, world):
+        """批量构建当前 world 所有智能体的 observation，减少重复地形/障碍查询。"""
+        agents = getattr(world, 'agents', None)
+        if not agents:
+            return {}
+
+        num_agents = len(agents)
+        if num_agents <= 0:
+            return {}
+
+        try:
+            if self._obs_env_info is None or self._obs_env_info_agent_count != num_agents:
+                self._refresh_observation_static_cache(num_agents=num_agents)
+
+            positions = np.asarray([ag.state.p_pos for ag in agents], dtype=np.float32)
+            velocities = np.asarray([ag.state.p_vel for ag in agents], dtype=np.float32)
+            accelerations = np.asarray(
+                [getattr(ag.state, 'p_acc', np.zeros(3, dtype=np.float32)) for ag in agents],
+                dtype=np.float32,
+            )
+            max_speeds = np.asarray(
+                [max(float(getattr(ag, 'max_speed', 22.5)), 1e-6) for ag in agents],
+                dtype=np.float32,
+            )
+
+            # 1. 状态信息 (9维)
+            map_half = max(self.map_size * 0.5, 1e-6)
+            normalized_pos = positions / map_half - 1.0
+            normalized_vel = velocities / max_speeds[:, None]
+            normalized_acc = np.clip(accelerations / 10.0, -1.0, 1.0)
+            state_info = np.concatenate([normalized_pos, normalized_vel, normalized_acc], axis=1).astype(np.float32)
+
+            # 2. 目标信息 (7维)
+            goal_info = np.zeros((num_agents, 7), dtype=np.float32)
+            for idx, ag in enumerate(agents):
+                try:
+                    if hasattr(ag, 'goal_a') and ag.goal_a.state.p_pos is not None:
+                        goal_pos = np.asarray(ag.goal_a.state.p_pos, dtype=np.float32)
+                        goal_rel_pos = goal_pos - positions[idx]
+                        dist_to_goal = float(np.linalg.norm(goal_rel_pos))
+                        norm_direction = goal_rel_pos / (dist_to_goal + 1e-6)
+                        normalized_goal_pos = goal_pos / map_half - 1.0
+                        goal_info[idx, :3] = norm_direction
+                        goal_info[idx, 3] = dist_to_goal / max(self.map_size, 1e-6)
+                        goal_info[idx, 4:] = normalized_goal_pos
+                except Exception:
+                    continue
+
+            # 3. 地形信息 (32维)
+            terrain_info = np.zeros((num_agents, 32), dtype=np.float32)
+            try:
+                if hasattr(self, 'batch_get_terrain_height'):
+                    current_xy = positions[:, :2].astype(np.float32, copy=False)
+                    map_max = np.float32(self.map_size - 1)
+
+                    sample_coords = np.zeros((num_agents, 29, 2), dtype=np.float32)
+                    sample_coords[:, 0, :] = current_xy
+                    sample_coords[:, 1:5, :] = np.clip(
+                        current_xy[:, None, :] + self._obs_gradient_offsets[None, :, :],
+                        0.0,
+                        map_max,
+                    )
+
+                    vel_norm = np.linalg.norm(velocities, axis=1, keepdims=True)
+                    vel_dir3 = np.zeros_like(velocities, dtype=np.float32)
+                    vel_dir3[:, 0] = 1.0
+                    moving_mask = vel_norm[:, 0] > 1e-6
+                    if np.any(moving_mask):
+                        vel_dir3[moving_mask] = velocities[moving_mask] / vel_norm[moving_mask]
+
+                    forward_raw = current_xy[:, None, :] + (
+                        self._obs_forward_distances[None, :, None] * vel_dir3[:, None, :2]
+                    )
+                    forward_valid = np.logical_and.reduce((
+                        forward_raw[:, :, 0] >= 0.0,
+                        forward_raw[:, :, 0] < self.map_size,
+                        forward_raw[:, :, 1] >= 0.0,
+                        forward_raw[:, :, 1] < self.map_size,
+                    ))
+                    sample_coords[:, 5:13, :] = np.where(forward_valid[:, :, None], forward_raw, 0.0)
+
+                    near_raw = current_xy[:, None, :] + self._obs_direction_pairs[None, :, :] * self._obs_near_distance
+                    far_raw = current_xy[:, None, :] + self._obs_direction_pairs[None, :, :] * self._obs_far_distance
+                    near_valid = np.logical_and.reduce((
+                        near_raw[:, :, 0] >= 0.0,
+                        near_raw[:, :, 0] < self.map_size,
+                        near_raw[:, :, 1] >= 0.0,
+                        near_raw[:, :, 1] < self.map_size,
+                    ))
+                    far_valid = np.logical_and.reduce((
+                        far_raw[:, :, 0] >= 0.0,
+                        far_raw[:, :, 0] < self.map_size,
+                        far_raw[:, :, 1] >= 0.0,
+                        far_raw[:, :, 1] < self.map_size,
+                    ))
+                    near_coords = np.where(near_valid[:, :, None], near_raw, 0.0)
+                    far_coords = np.where(far_valid[:, :, None], far_raw, 0.0)
+                    sample_coords[:, 13:29:2, :] = near_coords
+                    sample_coords[:, 14:29:2, :] = far_coords
+
+                    all_heights = self.batch_get_terrain_height(sample_coords.reshape(-1, 2)).reshape(num_agents, 29)
+                    current_height = all_heights[:, 0]
+                    grad_heights = all_heights[:, 1:5]
+                    forward_heights = all_heights[:, 5:13]
+                    surround_heights = all_heights[:, 13:29]
+
+                    terrain_info[:, 0] = (positions[:, 2] - current_height) / 20.0
+                    terrain_info[:, 1] = current_height / 100.0
+                    terrain_info[:, 2] = (grad_heights[:, 0] - current_height) / 10.0
+                    terrain_info[:, 3] = (grad_heights[:, 1] - current_height) / 10.0
+                    terrain_info[:, 4] = (grad_heights[:, 2] - current_height) / 10.0
+                    terrain_info[:, 5] = (grad_heights[:, 3] - current_height) / 10.0
+                    terrain_info[:, 6:14] = np.where(forward_valid, forward_heights / 100.0, 0.0).astype(np.float32)
+
+                    surround_valid = np.empty((num_agents, 16), dtype=bool)
+                    surround_valid[:, 0::2] = near_valid
+                    surround_valid[:, 1::2] = far_valid
+                    terrain_info[:, 14:30] = np.where(
+                        surround_valid,
+                        surround_heights / 100.0,
+                        0.0,
+                    ).astype(np.float32)
+
+                    complexity_heights = np.where(near_valid, surround_heights[:, 0::2], np.nan)
+                    complexity_valid_counts = np.sum(near_valid, axis=1)
+                    terrain_complexity = np.zeros((num_agents,), dtype=np.float32)
+                    valid_complexity_rows = complexity_valid_counts > 1
+                    if np.any(valid_complexity_rows):
+                        terrain_complexity[valid_complexity_rows] = (
+                            np.nanstd(complexity_heights[valid_complexity_rows], axis=1) / 20.0
+                        ).astype(np.float32)
+                    terrain_info[:, 30] = terrain_complexity
+
+                    h_right = grad_heights[:, 0]
+                    h_left = grad_heights[:, 2]
+                    h_forward = grad_heights[:, 1]
+                    h_back = grad_heights[:, 3]
+                    px = (h_right - h_left) / 6.0
+                    py = (h_forward - h_back) / 6.0
+                    dz = positions[:, 2] - current_height
+                    d_n = dz / np.sqrt(1.0 + px * px + py * py)
+                    terrain_info[:, 31] = np.clip(d_n / 20.0, -1.0, 1.0).astype(np.float32)
+            except Exception as e:
+                print(f"地形信息批量计算错误: {e}")
+                terrain_info.fill(0.0)
+
+            # 4. 障碍物信息 (15维)
+            obstacle_info = np.zeros((num_agents, 15), dtype=np.float32)
+            obstacle_info[:, 3::5] = 1.0
+            try:
+                max_dist = max(self.map_size, 1e-6)
+                if getattr(self, '_obs_centers', None) is not None and self._obs_centers.shape[0] > 0:
+                    rel_positions = self._obs_centers[None, :, :] - positions[:, None, :]
+                    dists_to_center = np.linalg.norm(rel_positions, axis=2)
+                    dists_to_surface = np.maximum(0.0, dists_to_center - self._obs_radii[None, :])
+                    sorted_indices = np.argsort(dists_to_surface, axis=1)
+                    top_k = min(3, sorted_indices.shape[1])
+                    row_idx = np.arange(num_agents)
+                    for k in range(top_k):
+                        idx = sorted_indices[:, k]
+                        offset = k * 5
+                        obstacle_info[:, offset:offset + 3] = rel_positions[row_idx, idx] / max_dist
+                        obstacle_info[:, offset + 3] = np.minimum(dists_to_surface[row_idx, idx] / max_dist, 1.0)
+                        obstacle_info[:, offset + 4] = np.minimum(self._obs_radii[idx] / max_dist, 1.0)
+            except Exception as e:
+                print(f"障碍物信息批量计算错误: {e}")
+                obstacle_info.fill(0.0)
+                obstacle_info[:, 3::5] = 1.0
+
+            # 5. 其他智能体信息 (12维)
+            other_agents_obs = np.zeros((num_agents, 12), dtype=np.float32)
+            try:
+                for idx in range(num_agents):
+                    other_indices = [j for j in range(num_agents) if j != idx]
+                    if len(other_indices) >= 2:
+                        for slot, other_idx in enumerate(other_indices[:2]):
+                            base = slot * 6
+                            other_agents_obs[idx, base:base + 3] = (
+                                (positions[other_idx] - positions[idx]) / 100.0
+                            )
+                            other_agents_obs[idx, base + 3:base + 6] = velocities[other_idx] / max_speeds[idx]
+                    elif len(other_indices) == 1:
+                        other_idx = other_indices[0]
+                        rel_pos = (positions[other_idx] - positions[idx]) / 100.0
+                        rel_vel = velocities[other_idx] / max_speeds[idx]
+                        other_agents_obs[idx, 0:3] = rel_pos
+                        other_agents_obs[idx, 3:6] = rel_vel
+                        other_agents_obs[idx, 6:9] = rel_pos
+                        other_agents_obs[idx, 9:12] = rel_vel
+            except Exception as e:
+                print(f"其他智能体信息批量计算错误: {e}")
+                other_agents_obs.fill(0.0)
+
+            env_info = self._obs_env_info.astype(np.float32, copy=False)
+            obs = np.concatenate(
+                [
+                    state_info,
+                    terrain_info,
+                    obstacle_info,
+                    goal_info,
+                    other_agents_obs,
+                    np.broadcast_to(env_info[None, :], (num_agents, env_info.shape[0])),
+                ],
+                axis=1,
+            ).astype(np.float32, copy=False)
+            return {id(ag): obs[idx] for idx, ag in enumerate(agents)}
+        except Exception:
+            return {}
+
+    def _compute_observation_uncached(self, agent, world):
         """构建81维观察值 - 🚨 关键修复：目标信息从4维增加到7维（添加绝对位置3维），总维度从75→81"""
         
         # 1. 完整状态信息 (9维) - 位置、速度、加速度 [🔧 已添加归一化]
@@ -3113,243 +3924,190 @@ class Scenario(BaseScenario):
             print(f"[环境{env_id}] 目标信息计算错误: {e}")
             goal_info = np.zeros(7)  # 🚨 修复：7维
         
-        # 3. 扩展地形信息 (32维) - 🔧 从21维增加到32维：前方探测点从5个增加到8个，周围探测点从8个增加到16个
-        terrain_info = []
+        # 3. 扩展地形信息 (32维) - 🚀 使用批量地形采样优化性能
+        terrain_info = np.zeros(32, dtype=np.float32)
         try:
-            if hasattr(self, 'get_terrain_height'):
+            if hasattr(self, 'batch_get_terrain_height'):
                 current_x, current_y = agent.state.p_pos[0], agent.state.p_pos[1]
-                current_height = self.get_terrain_height(current_x, current_y)
+                current_xy = np.asarray([current_x, current_y], dtype=np.float32)
+                map_max = np.float32(self.map_size - 1)
                 
-                # 🔧 改进：添加相对高度信息（智能体高度 - 地形高度），让网络直接感知离地高度
-                # 相对高度：正值表示在地形上方，负值表示在地形下方（穿透）
-                relative_height = agent.state.p_pos[2] - current_height
-                terrain_info.append(relative_height / 20.0)  # 归一化到合理范围（假设最大相对高度±20米）
+                # 🚀 预分配采样坐标，避免 list append + np.array 二次构造
+                sample_coords = np.zeros((29, 2), dtype=np.float32)
+                sample_coords[0] = current_xy
+                idx_current = 0
+                idx_gradient = slice(1, 5)
+                idx_forward = slice(5, 13)
+                idx_surround = slice(13, 29)
+
+                grad_coords = np.clip(current_xy + self._obs_gradient_offsets, 0.0, map_max)
+                sample_coords[idx_gradient] = grad_coords
                 
-                # 当前地形高度 (1维)
-                terrain_info.append(current_height / 100.0)
-                
-                # 地形梯度信息 (4维) - 四个方向的高度差
-                # 🔧 修复：增加梯度探测距离（从1米增加到3米），提前感知前方障碍
-                gradient_distance = 3.0  # 梯度探测距离（米）
-                dx1 = self.get_terrain_height(min(current_x + gradient_distance, self.map_size - 1), current_y) - current_height
-                dy1 = self.get_terrain_height(current_x, min(current_y + gradient_distance, self.map_size - 1)) - current_height
-                dx2 = self.get_terrain_height(max(current_x - gradient_distance, 0), current_y) - current_height
-                dy2 = self.get_terrain_height(current_x, max(current_y - gradient_distance, 0)) - current_height
-                terrain_info.extend([dx1/10.0, dy1/10.0, dx2/10.0, dy2/10.0])
-                
-                # 前方地形信息 (8维) - 沿3D移动方向的投影（方向用3D，采样仍在XY平面上查询地形）
+                # 计算速度方向（用于前方探测）
                 vel_dir3 = agent.state.p_vel
                 vel_norm = np.linalg.norm(vel_dir3)
                 if vel_norm > 1e-6:
                     vel_dir3 = vel_dir3 / vel_norm
                 else:
                     vel_dir3 = np.array([1.0, 0.0, 0.0])
-                # 🔧 修复地形穿透：增加前方探测点密度，消除盲区
-                # 原来: [5, 10, 15, 20, 25] - 5个点，最近5米，存在0-5米盲区
-                # 现在: [2, 4, 6, 10, 15, 20, 25, 30] - 8个点，最近2米，盲区缩小到0-2米
-                distances = [2, 4, 6, 10, 15, 20, 25, 30]
-                for dist in distances:
-                    future_x = current_x + vel_dir3[0] * dist
-                    future_y = current_y + vel_dir3[1] * dist
-                    if 0 <= future_x < self.map_size and 0 <= future_y < self.map_size:
-                        future_height = self.get_terrain_height(future_x, future_y)
-                        # 🔧 改为绝对高度：与 current_height 归一化方式一致（除以100.0）
-                        terrain_info.append(future_height / 100.0)
-                    else:
-                        terrain_info.append(0.0)
                 
-                # 周围地形信息 (16维) - 🔧 修复：增加探测点数量和距离层
-                # 8个主要方向，每个方向2个距离层（近距和远距），共16个探测点
-                directions = [(1,0), (1,1), (0,1), (-1,1), (-1,0), (-1,-1), (0,-1), (1,-1)]
-                near_distance = 5.0   # 近距探测（米）
-                far_distance = 12.0   # 远距探测（米）
-                for dx, dy in directions:
-                    # 近距探测点
-                    nx_near = current_x + dx * near_distance
-                    ny_near = current_y + dy * near_distance
-                    if 0 <= nx_near < self.map_size and 0 <= ny_near < self.map_size:
-                        height_near = self.get_terrain_height(nx_near, ny_near)
-                        # 🔧 改为绝对高度：与 current_height 归一化方式一致（除以100.0）
-                        terrain_info.append(height_near / 100.0)
-                    else:
-                        terrain_info.append(0.0)
-                    
-                    # 远距探测点
-                    nx_far = current_x + dx * far_distance
-                    ny_far = current_y + dy * far_distance
-                    if 0 <= nx_far < self.map_size and 0 <= ny_far < self.map_size:
-                        height_far = self.get_terrain_height(nx_far, ny_far)
-                        # 🔧 改为绝对高度：与 current_height 归一化方式一致（除以100.0）
-                        terrain_info.append(height_far / 100.0)
-                    else:
-                        terrain_info.append(0.0)
+                # 索引5-12：前方8个探测点
+                forward_offsets = self._obs_forward_distances[:, None] * np.asarray(vel_dir3[:2], dtype=np.float32)[None, :]
+                forward_raw = current_xy[None, :] + forward_offsets
+                forward_valid = np.logical_and.reduce((
+                    forward_raw[:, 0] >= 0.0,
+                        forward_raw[:, 0] < self.map_size,
+                        forward_raw[:, 1] >= 0.0,
+                        forward_raw[:, 1] < self.map_size,
+                ))
+                forward_coords = np.where(forward_valid[:, None], forward_raw, 0.0)
+                sample_coords[idx_forward] = forward_coords
                 
-                # 地形复杂度信息 (1维)
-                # 计算周围地形的标准差作为复杂度指标
-                surround_heights = []
-                for dx, dy in directions:
-                    nx, ny = current_x + dx * 5, current_y + dy * 5
-                    if 0 <= nx < self.map_size and 0 <= ny < self.map_size:
-                        surround_heights.append(self.get_terrain_height(nx, ny))
-                if len(surround_heights) > 1:
-                    terrain_complexity = np.std(surround_heights) / 20.0
+                # 索引13-28：周围16个探测点（8方向×2距离层）
+                near_raw = current_xy[None, :] + self._obs_direction_pairs * self._obs_near_distance
+                far_raw = current_xy[None, :] + self._obs_direction_pairs * self._obs_far_distance
+                near_valid = np.logical_and.reduce((
+                    near_raw[:, 0] >= 0.0,
+                    near_raw[:, 0] < self.map_size,
+                    near_raw[:, 1] >= 0.0,
+                    near_raw[:, 1] < self.map_size,
+                ))
+                far_valid = np.logical_and.reduce((
+                    far_raw[:, 0] >= 0.0,
+                    far_raw[:, 0] < self.map_size,
+                    far_raw[:, 1] >= 0.0,
+                    far_raw[:, 1] < self.map_size,
+                ))
+                near_coords = np.where(near_valid[:, None], near_raw, 0.0)
+                far_coords = np.where(far_valid[:, None], far_raw, 0.0)
+                surround_coords = np.empty((16, 2), dtype=np.float32)
+                surround_coords[0::2] = near_coords
+                surround_coords[1::2] = far_coords
+                surround_valid = np.empty(16, dtype=bool)
+                surround_valid[0::2] = near_valid
+                surround_valid[1::2] = far_valid
+                sample_coords[idx_surround] = surround_coords
+                
+                # 🚀 批量查询：一次性获取所有地形高度
+                all_heights = self.batch_get_terrain_height(sample_coords)
+                
+                # 提取各部分高度
+                current_height = all_heights[idx_current]
+                grad_heights = all_heights[idx_gradient]
+                forward_heights = all_heights[idx_forward]
+                surround_heights = all_heights[idx_surround]
+                complexity_heights = surround_heights[0::2]
+                complexity_valid = near_valid
+                normal_heights = np.asarray(
+                    [grad_heights[0], grad_heights[2], grad_heights[1], grad_heights[3]],
+                    dtype=np.float32,
+                )
+                
+                # 构建地形信息特征（与原逻辑完全一致）
+                # 1. 相对高度 (1维)
+                relative_height = agent.state.p_pos[2] - current_height
+                terrain_info[0] = relative_height / 20.0
+                
+                # 2. 当前地形高度 (1维)
+                terrain_info[1] = current_height / 100.0
+                
+                # 3. 地形梯度信息 (4维)
+                dx1 = grad_heights[0] - current_height
+                dy1 = grad_heights[1] - current_height
+                dx2 = grad_heights[2] - current_height
+                dy2 = grad_heights[3] - current_height
+                terrain_info[2:6] = np.asarray([dx1 / 10.0, dy1 / 10.0, dx2 / 10.0, dy2 / 10.0], dtype=np.float32)
+                
+                # 4. 前方地形信息 (8维)
+                terrain_info[6:14] = np.where(forward_valid, forward_heights / 100.0, 0.0).astype(np.float32)
+                
+                # 5. 周围地形信息 (16维)
+                terrain_info[14:30] = np.where(surround_valid, surround_heights / 100.0, 0.0).astype(np.float32)
+                
+                # 6. 地形复杂度信息 (1维)
+                valid_complexity_heights = complexity_heights[complexity_valid]
+                if valid_complexity_heights.size > 1:
+                    terrain_complexity = np.std(valid_complexity_heights) / 20.0
                 else:
                     terrain_complexity = 0.0
-                terrain_info.append(terrain_complexity)
+                terrain_info[30] = terrain_complexity
                 
-                # 🔧 法向净空 (1维) - 考虑地形坡度的垂直净空
+                # 7. 法向净空 (1维)
                 agent_z = agent.state.p_pos[2]
-                # 计算坡度（使用梯度采样点，距离3.0米）
-                h_right = self.get_terrain_height(min(current_x + 3.0, self.map_size - 1), current_y)
-                h_left = self.get_terrain_height(max(current_x - 3.0, 0), current_y)
-                h_forward = self.get_terrain_height(current_x, min(current_y + 3.0, self.map_size - 1))
-                h_back = self.get_terrain_height(current_x, max(current_y - 3.0, 0))
+                h_right, h_left, h_forward, h_back = normal_heights
                 px = (h_right - h_left) / (2 * 3.0)  # X方向坡度
                 py = (h_forward - h_back) / (2 * 3.0)  # Y方向坡度
                 dz = agent_z - current_height  # 高度差
                 d_n = dz / np.sqrt(1 + px*px + py*py)  # 法向净空
                 normal_clearance = np.clip(d_n / 20.0, -1.0, 1.0)
-                terrain_info.append(normal_clearance)
+                terrain_info[31] = normal_clearance
                 
             else:
-                # 🔧 修复：terrain_info维度从29维增加到32维（前方探测点从5维增加到8维）
                 terrain_info = np.zeros(32)
         except Exception as e:
             print(f"地形信息计算错误: {e}")
-            # 🔧 修复：terrain_info维度从29维增加到32维（前方探测点从5维增加到8维）
+            import traceback
+            traceback.print_exc()
             terrain_info = np.zeros(32)
         
-        # 4. 障碍物信息 (15维) - 🔧 改为扇区/雷达式编码，防止观测突变
-        # 编码结构：8个水平方向距离(8维) + 3个垂直层距离(3维) + 最近障碍物方向(3维) + 最近障碍物距离(1维) = 15维
-        obstacle_info = []
+        # 4. 障碍物信息 (15维) - Top-3最近障碍物编码
+        # 编码结构：3个最近障碍物 × 5维(归一化相对位置3 + 归一化表面距离1 + 归一化半径1) = 15维
+        # 每个障碍物槽位(5维)：
+        #   [0] rel_x / max_dist : 归一化X方向相对位置（智能体→障碍物中心）
+        #   [1] rel_y / max_dist : 归一化Y方向相对位置
+        #   [2] rel_z / max_dist : 归一化Z方向相对位置
+        #   [3] surface_dist / max_dist : 归一化表面距离（到障碍物表面的最短距离）
+        #   [4] radius / max_dist : 归一化障碍物半径
+        # 按表面距离升序排列（最近→最远），不足3个时用sentinel (0,0,0,1,0)填充
+        # 优点：信息密度高（15维全部携带有效障碍物信息），PF修正可直接使用无需重建
+        obstacle_info = np.zeros(15, dtype=np.float32)
         try:
             agent_pos = agent.state.p_pos
             max_dist = max(self.map_size, 1e-6)
             
-            # 获取前进方向（速度方向或目标方向）
-            vel_norm = np.linalg.norm(agent.state.p_vel)
-            if vel_norm > 1e-6:
-                forward_dir = agent.state.p_vel / vel_norm
-            elif hasattr(agent, 'goal_a') and agent.goal_a.state.p_pos is not None:
-                goal_vec = agent.goal_a.state.p_pos - agent_pos
-                goal_dist = np.linalg.norm(goal_vec)
-                forward_dir = goal_vec / goal_dist if goal_dist > 1e-6 else np.array([1.0, 0.0, 0.0])
+            if getattr(self, '_obs_centers', None) is not None and self._obs_centers.shape[0] > 0:
+                rel_positions = self._obs_centers - agent_pos          # (N, 3)
+                dists_to_center = np.linalg.norm(rel_positions, axis=1)  # (N,)
+                dists_to_surface = np.maximum(0.0, dists_to_center - self._obs_radii)  # (N,)
+                
+                sorted_indices = np.argsort(dists_to_surface)
+                top_k = min(3, len(sorted_indices))
+                
+                for k in range(top_k):
+                    idx = sorted_indices[k]
+                    offset = k * 5
+                    obstacle_info[offset:offset+3] = rel_positions[idx] / max_dist
+                    obstacle_info[offset+3] = min(dists_to_surface[idx] / max_dist, 1.0)
+                    obstacle_info[offset+4] = min(self._obs_radii[idx] / max_dist, 1.0)
+                
+                for k in range(top_k, 3):
+                    offset = k * 5
+                    obstacle_info[offset:offset+3] = 0.0
+                    obstacle_info[offset+3] = 1.0   # sentinel: 最大距离 = 无障碍物
+                    obstacle_info[offset+4] = 0.0
             else:
-                forward_dir = np.array([1.0, 0.0, 0.0])
-            
-            # 计算前进方向的水平角度（在XY平面）
-            forward_angle_xy = np.arctan2(forward_dir[1], forward_dir[0])
-            
-            # 初始化8个水平方向扇区的距离（相对于前进方向）
-            # 方向：前(0°), 前右(45°), 右(90°), 后右(135°), 后(180°), 后左(225°), 左(270°), 前左(315°)
-            sector_distances = np.full(8, np.inf, dtype=np.float32)
-            
-            # 初始化3个垂直层的距离
-            vertical_distances = np.full(3, np.inf, dtype=np.float32)  # 上、中、下
-            
-            # 最近障碍物信息（用于最后4维）
-            nearest_obstacle_dir = np.zeros(3)
-            nearest_obstacle_dist = np.inf
-            nearest_obstacle_radius = 0.0
-            
-            # 对每个障碍物，计算其所在扇区
-            for obstacle in self.obstacles:
-                obstacle_center = np.array(obstacle['center'])
-                obstacle_radius = obstacle['radius']
-                
-                # 计算相对位置
-                rel_pos = obstacle_center - agent_pos
-                dist_to_center = np.linalg.norm(rel_pos)
-                dist_to_surface = max(0.0, dist_to_center - obstacle_radius)
-                
-                # 计算障碍物在XY平面的方向（相对于前进方向）
-                rel_pos_xy = rel_pos[:2]  # 只取XY平面
-                if np.linalg.norm(rel_pos_xy) > 1e-6:
-                    obstacle_angle_xy = np.arctan2(rel_pos_xy[1], rel_pos_xy[0])
-                    # 转换为相对于前进方向的角度
-                    relative_angle = obstacle_angle_xy - forward_angle_xy
-                    # 归一化到[0, 2π]
-                    relative_angle = np.mod(relative_angle + 2*np.pi, 2*np.pi)
-                    relative_angle_deg = np.rad2deg(relative_angle)
-                    
-                    # 找到最近的扇区索引（8个方向，每45度一个）
-                    sector_idx = int(np.round(relative_angle_deg / 45.0)) % 8
-                    
-                    # 更新该扇区的最小距离
-                    if dist_to_surface < sector_distances[sector_idx]:
-                        sector_distances[sector_idx] = dist_to_surface
-                
-                # 计算垂直层（3层：上、中、下）
-                z_diff = rel_pos[2]
-                if z_diff > 5.0:  # 上层
-                    if dist_to_surface < vertical_distances[0]:
-                        vertical_distances[0] = dist_to_surface
-                elif z_diff < -5.0:  # 下层
-                    if dist_to_surface < vertical_distances[2]:
-                        vertical_distances[2] = dist_to_surface
-                else:  # 中层
-                    if dist_to_surface < vertical_distances[1]:
-                        vertical_distances[1] = dist_to_surface
-                
-                # 更新最近障碍物信息
-                if dist_to_surface < nearest_obstacle_dist:
-                    nearest_obstacle_dist = dist_to_surface
-                    nearest_obstacle_radius = obstacle_radius
-                    if dist_to_center > 1e-6:
-                        nearest_obstacle_dir = rel_pos / dist_to_center
-                    else:
-                        nearest_obstacle_dir = np.zeros(3)
-            
-            # 归一化8个水平方向的距离
-            sector_distances_normalized = np.clip(sector_distances / max_dist, 0.0, 1.0)
-            # 将inf替换为1.0（表示该方向无障碍物）
-            sector_distances_normalized = np.where(
-                np.isinf(sector_distances_normalized),
-                1.0,
-                sector_distances_normalized
-            )
-            
-            # 归一化3个垂直层的距离
-            vertical_distances_normalized = np.clip(vertical_distances / max_dist, 0.0, 1.0)
-            vertical_distances_normalized = np.where(
-                np.isinf(vertical_distances_normalized),
-                1.0,
-                vertical_distances_normalized
-            )
-            
-            # 归一化最近障碍物距离
-            nearest_dist_normalized = min(nearest_obstacle_dist / max_dist, 1.0) if nearest_obstacle_dist < np.inf else 1.0
-            
-            # 构建15维障碍物信息：
-            # 0-7: 8个水平方向的距离
-            obstacle_info.extend(sector_distances_normalized.tolist())
-            # 8-10: 3个垂直层的距离
-            obstacle_info.extend(vertical_distances_normalized.tolist())
-            # 11-13: 最近障碍物的方向向量
-            obstacle_info.extend(nearest_obstacle_dir.tolist())
-            # 14: 最近障碍物的归一化距离
-            obstacle_info.append(nearest_dist_normalized)
-            
-            # 确保正好15维
-            obstacle_info = np.array(obstacle_info[:15], dtype=np.float32)
+                for k in range(3):
+                    offset = k * 5
+                    obstacle_info[offset+3] = 1.0   # sentinel
             
         except Exception as e:
             print(f"障碍物信息计算错误: {e}")
             obstacle_info = np.zeros(15, dtype=np.float32)
         
         # 5. 其他智能体信息 (12维) - 修复：确保固定12维输出
-        other_agents_info = []
+        other_agents_obs = np.zeros(12, dtype=np.float32)
         try:
             # 固定处理3个智能体的情况
             other_agents = [a for a in world.agents if a is not agent]
             
             # 确保总是有2个其他智能体（3个智能体总数）
             if len(other_agents) == 2:
-                for other in other_agents:
+                for idx, other in enumerate(other_agents):
                     # 🔧 归一化相对位置到约[-2, 2]
                     rel_pos = other.state.p_pos - agent.state.p_pos
                     normalized_rel_pos = rel_pos / 100.0
-                    other_agents_info.append(normalized_rel_pos)  # 3维
+                    base = idx * 6
+                    other_agents_obs[base:base + 3] = normalized_rel_pos
                     
                     # 🔧 归一化速度到[-1, 1]
                     # 🔧 关键修复：使用实际的agent.max_speed而不是硬编码值
@@ -3357,7 +4115,7 @@ class Scenario(BaseScenario):
                     if max_speed <= 0:
                         max_speed = 22.5
                     normalized_vel = other.state.p_vel / max_speed
-                    other_agents_info.append(normalized_vel)  # 3维
+                    other_agents_obs[base + 3:base + 6] = normalized_vel
             elif len(other_agents) == 1:
                 # 只有一个其他智能体，重复一次
                 other = other_agents[0]
@@ -3369,35 +4127,24 @@ class Scenario(BaseScenario):
                 if max_speed <= 0:
                     max_speed = 22.5
                 normalized_vel = other.state.p_vel / max_speed
-                
-                other_agents_info.append(normalized_rel_pos)  # 3维
-                other_agents_info.append(normalized_vel)  # 3维
-                other_agents_info.append(normalized_rel_pos)  # 3维（重复）
-                other_agents_info.append(normalized_vel)  # 3维（重复）
-            else:
-                # 没有其他智能体，用零填充
-                other_agents_info = [np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3)]
-            
-            other_agents_obs = np.concatenate(other_agents_info)
+                other_agents_obs[0:3] = normalized_rel_pos
+                other_agents_obs[3:6] = normalized_vel
+                other_agents_obs[6:9] = normalized_rel_pos
+                other_agents_obs[9:12] = normalized_vel
         except Exception as e:
             print(f"其他智能体信息计算错误: {e}")
             other_agents_obs = np.zeros(12)  # 固定12维
         
         # 6. 环境状态信息 (6维) - 新增
-        env_info = np.array([
-            len(world.agents) / 10.0,  # 归一化智能体数量
-            -0.8,
-            -0.4,
-            0.0,
-            0.4,
-            0.8
-        ], dtype=np.float32)  # 段落标记位（固定常量，方便解析）
+        if self._obs_env_info is None or self._obs_env_info_agent_count != len(world.agents):
+            self._refresh_observation_static_cache(num_agents=len(world.agents))
+        env_info = self._obs_env_info  # 段落标记位（固定常量，方便解析）
         
         # 合并所有观察信息（目标结构：9 + 32 + 15 + 7 + 12 + 6 = 81维）
         obs_components = [
             state_info,       # 9维：位置、速度、加速度
             terrain_info,     # 32维：扩展地形信息
-            obstacle_info,    # 15维：障碍物信息
+            obstacle_info,    # 15维：障碍物信息（Top-3最近障碍物 × 5维：相对位置3 + 表面距离1 + 半径1）
             goal_info,        # 7维：目标信息（方向3 + 距离1 + 绝对位置3）
             other_agents_obs, # 12维：其他智能体信息
             env_info,         # 6维：环境信息 / 段落标记
@@ -3425,15 +4172,15 @@ class Scenario(BaseScenario):
         except Exception as e:
             print(f"观察值合并错误: {e}")
             # 🚨 修复：观察维度从75维增加到81维（目标信息从4维增加到7维，地形从21维增加到32维）
-            obs = np.zeros(81)
+            obs = np.zeros(getattr(self, 'observation_dim', 81), dtype=np.float32)
         
         # 确保观察空间维度一致 - 填充到81维
         # 🚨 关键修复：目标信息从4维增加到7维（添加绝对位置3维），总维度从75→81
-        expected_dim = 81
+        expected_dim = int(getattr(self, 'observation_dim', 81))
         if len(obs) < expected_dim:
             obs = np.pad(obs, (0, expected_dim - len(obs)), 'constant')
         elif len(obs) > expected_dim:
-            obs = obs[:expected_dim]  # 截断到81维
+            obs = obs[:expected_dim]
         
         # 确保返回的是numpy数组而不是列表或嵌套结构
         if not isinstance(obs, np.ndarray):
@@ -3442,42 +4189,37 @@ class Scenario(BaseScenario):
             except:
                 # 最后的后备方案，创建一个零向量
                 # 🔧 修复：观察维度从75维增加到81维（目标信息+3维绝对位置，地形信息从21维增加到32维）
-                obs = np.zeros(81)
+                obs = np.zeros(expected_dim, dtype=np.float32)
         
         # 验证形状正确
         if len(obs.shape) > 1:
             print(f"警告: 观察值形状不正确: {obs.shape}，尝试修复")
             # 尝试展平或重塑
             try:
-                obs = obs.flatten()[:81]  # 🔧 修复：展平后取前81个元素（目标信息+3维绝对位置，地形信息从21维增加到32维）
-                if len(obs) < 81:  # 🔧 修复：如果还不够，填充到81维
-                    obs = np.pad(obs, (0, 81 - len(obs)), 'constant')
+                obs = obs.flatten()[:expected_dim]
+                if len(obs) < expected_dim:
+                    obs = np.pad(obs, (0, expected_dim - len(obs)), 'constant')
             except:
                 # 最终后备方案
-                # 🔧 修复：观察维度从75维增加到81维（目标信息+3维绝对位置，地形信息从21维增加到32维）
-                obs = np.zeros(81)
+                obs = np.zeros(expected_dim, dtype=np.float32)
         
         # 最后的检查确保返回正确形状和类型的数组
-        if not isinstance(obs, np.ndarray) or obs.shape != (81,):  # 🔧 修复：从75维增加到81维（目标信息+3维绝对位置，地形信息从21维增加到32维）
+        if not isinstance(obs, np.ndarray) or obs.shape != (expected_dim,):
             print(f"严重警告: 观察值仍有问题: 类型={type(obs)}, 形状={getattr(obs, 'shape', 'unknown')}")
-            # 🔧 修复：观察维度从75维增加到81维（目标信息+3维绝对位置，地形信息从21维增加到32维）
-            obs = np.zeros(81)
+            obs = np.zeros(expected_dim, dtype=np.float32)
         
         # 最终的安全检查
         try:
-            if obs is None or len(obs) != 81:  # 🔧 修复：从75维增加到81维（目标信息+3维绝对位置，地形信息从21维增加到32维）
+            if obs is None or len(obs) != expected_dim:
                 print(f"最终安全检查失败: 观察值长度 = {len(obs) if obs is not None else 'None'}")
-                # 🔧 修复：观察维度从75维增加到81维（目标信息+3维绝对位置，地形信息从21维增加到32维）
-                obs = np.zeros(81)
+                obs = np.zeros(expected_dim, dtype=np.float32)
         except Exception as e:
             print(f"最终观察值验证出错: {e}")
-            # 🔧 修复：统一为81维
-            obs = np.zeros(81)
+            obs = np.zeros(expected_dim, dtype=np.float32)
         
         # 确保返回正确的numpy数组
-        if not isinstance(obs, np.ndarray) or obs.shape != (81,):  # 🔧 修复：统一为81维
-            # 🔧 修复：统一为81维
-            obs = np.zeros(81)
+        if not isinstance(obs, np.ndarray) or obs.shape != (expected_dim,):
+            obs = np.zeros(expected_dim, dtype=np.float32)
         
         # 🔧 最终安全裁剪：防止极端值影响训练
         obs = np.clip(obs, -10.0, 10.0)
@@ -3923,6 +4665,7 @@ class Scenario(BaseScenario):
                 self.terrain_complexity = terrain_data.get('complexity', {})
                 self.obstacles = terrain_data.get('obstacles', [])
                 self.map_size = terrain_data.get('map_size', self.map_size)
+                self._refresh_observation_static_cache()
                 
                 print(f"成功从文件 {file_path} 加载地形数据")
                 
@@ -3996,16 +4739,27 @@ class Scenario(BaseScenario):
         return True
 
     def _set_agent_goals(self, world):
-        """根据中央目标点，为每个智能体计算并设置其独立的、环绕的最终目标位置。"""
+        """根据中央目标点，为每个智能体计算并设置其独立的、环绕的最终目标位置。
+        
+        🔧 关键修复：每个智能体目标的Z坐标必须根据其自身XY位置的地形高度动态设置，
+        而不是简单地复制中央目标的Z坐标。否则会导致部分智能体目标在地形内部。
+        """
         if self.goal_pos is None:
             print("警告: 中央目标点 (self.goal_pos) 未设置，无法设定智能体目标。")
             return
 
-        formation_radius = 5.0  # 包围圈半径（从10m缩小到5m，让目标更集中，提高所有智能体到达的可能性）
+        # 包围圈半径：各智能体目标绕中央目标分布，适当拉开可减少到终点时的组间斥力
+        formation_radius = float(os.getenv('AGENT_GOAL_FORMATION_RADIUS', '10.0'))
         num_agents = len(world.agents)
         # 维护world级的可视化读取容器
         if hasattr(world, 'agent_goals'):
             world.agent_goals = []
+        
+        # 🔧 获取目标高度偏移量（中央目标相对于其地形的高度）
+        central_terrain_h = self.get_terrain_height(self.goal_pos[0], self.goal_pos[1])
+        goal_altitude = self.goal_pos[2] - central_terrain_h  # 目标点应在地形上方的高度
+        goal_altitude = max(goal_altitude, 5.0)  # 至少5米高度，确保目标在地形上方
+        
         for i, agent in enumerate(world.agents):
             # 为3个智能体创建一个等边三角形
             angle = (2 * np.pi * i / num_agents) + (np.pi / 2) # 旋转90度，让一个点朝上
@@ -4022,8 +4776,11 @@ class Scenario(BaseScenario):
             except Exception:
                 pass
             
-            # 将目标点高度设置在与中央目标点相同的高度层（山顶附近）
-            goal_pos[2] = self.goal_pos[2]
+            # 🔧 关键修复：根据该目标XY位置的地形高度动态设置Z坐标
+            # 原设计：goal_pos[2] = self.goal_pos[2]  ❌ 错误！会导致目标在地形内部
+            # 新设计：goal_pos[2] = 该位置地形高度 + goal_altitude  ✅ 正确！
+            agent_goal_terrain_h = self.get_terrain_height(goal_pos[0], goal_pos[1])
+            goal_pos[2] = agent_goal_terrain_h + goal_altitude
             
             # 确保agent.goal_a存在
             if hasattr(agent, 'goal_a') and agent.goal_a is not None:

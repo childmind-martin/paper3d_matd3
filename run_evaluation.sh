@@ -7,8 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # 设置默认参数
-MODEL_PATH=${1:-"models/双头q改进测试、无重力、无早停、无预热、固定地图、4环境_exp_20260109_220551"}
+MODEL_PATH=${1:-"models/变FR到0.1、公平权重补偿、静态障碍物、课程学习、随机角色、高球形障碍apf、复杂4_exp_20260323_230233/best_by_team_sr"}
 EVAL_EPISODES=${2:-3}
+MODEL_VARIANT=${MODEL_VARIANT:-auto}  # auto|final|best|best_by_team_sr|latest_ep
 
 # 🔧 关键修复：规范化模型路径，移除多余的斜杠
 MODEL_PATH=$(echo "$MODEL_PATH" | sed 's|//|/|g' | sed 's|/$||')
@@ -16,15 +17,19 @@ SAVE_PATH=${3:-"evaluation_results/$(basename "$MODEL_PATH")_$(date +%Y%m%d_%H%M
 POSITIONS_FILE=${4:-"./saved_positions/default_positions.json"}
 USE_FIXED_POSITIONS=${5:-false}
 DISABLE_EARLY_TERMINATION=${6:-true}  # 新增：是否禁用提前终止
+# 严格验证模式：默认开启。要求评估关键参数必须与训练配置一致，否则退出
+STRICT_EVAL_MATCH=${STRICT_EVAL_MATCH:-1}
 
 echo ""
 echo "评估参数:"
 echo "  - 模型路径: $MODEL_PATH"
 echo "  - 评估回合数: $EVAL_EPISODES"
+echo "  - 模型选择: $MODEL_VARIANT"
 echo "  - 结果保存路径: $SAVE_PATH"
 echo "  - 固定位置文件: $POSITIONS_FILE"
 echo "  - 使用固定位置: $USE_FIXED_POSITIONS"
 echo "  - 禁用提前终止: $DISABLE_EARLY_TERMINATION"
+echo "  - 严格对齐训练配置: $STRICT_EVAL_MATCH"
 echo ""
 
 # 🔧 关键修复：确保路径变量正确引用，支持中文路径
@@ -43,6 +48,7 @@ if [ ! -d "$MODEL_PATH" ]; then
     for model_dir in models/optimized_exp_*; do
         if [ -d "$model_dir" ]; then
             timestamp=$(basename "$model_dir" | sed 's/optimized_exp_//')
+            echo "  📅 $model_dir/best_by_team_sr - Team SR最佳模型 (时间戳: $timestamp)"
             echo "  📅 $model_dir/best     - 训练过程中的最佳模型 (时间戳: $timestamp)"
             echo "  📅 $model_dir/final    - 训练完成后的最终模型 (时间戳: $timestamp)"
             echo "  📅 $model_dir/ep500    - 第500轮的模型快照 (时间戳: $timestamp)"
@@ -53,6 +59,7 @@ if [ ! -d "$MODEL_PATH" ]; then
     for model_dir in models/*_*_*; do
         if [ -d "$model_dir" ] && [[ "$model_dir" =~ [0-9]{8}_[0-9]{6}$ ]]; then
             model_name=$(basename "$model_dir")
+            echo "  📁 $model_dir/best_by_team_sr - Team SR最佳模型 ($model_name)"
             echo "  📁 $model_dir/best     - 最佳模型 ($model_name)"
             echo "  📁 $model_dir/final    - 最终模型 ($model_name)"
         fi
@@ -60,6 +67,7 @@ if [ ! -d "$MODEL_PATH" ]; then
     
     # 搜索不带时间戳的旧模型
     if [ -d "models/optimized_exp" ]; then
+        echo "  📁 models/optimized_exp/best_by_team_sr - Team SR最佳模型 (旧版本)"
         echo "  📁 models/optimized_exp/best     - 训练过程中的最佳模型 (旧版本)"
         echo "  📁 models/optimized_exp/final    - 训练完成后的最终模型 (旧版本)"
         echo "  📁 models/optimized_exp/ep500    - 第500轮的模型快照 (旧版本)"
@@ -68,8 +76,13 @@ if [ ! -d "$MODEL_PATH" ]; then
     echo ""
     echo "使用方法:"
     echo "  $0 [模型路径] [评估回合数] [保存路径] [固定位置文件] [是否使用固定位置] [是否禁用提前终止]"
+    echo "  MODEL_VARIANT=best_by_team_sr $0 [实验目录] [评估回合数]"
     echo ""
     echo "示例:"
+    echo "  # 直接评估 Team SR 最佳模型"
+    echo "  $0 models/optimized_exp_20250121_143022/best_by_team_sr 1"
+    echo "  # 只给实验目录，通过 MODEL_VARIANT 自动选择 Team SR 最佳模型"
+    echo "  MODEL_VARIANT=best_by_team_sr $0 models/optimized_exp_20250121_143022 1"
     echo "  # 评估最新训练的最佳模型"
     echo "  $0 models/optimized_exp_20250121_143022/best 1"
     echo "  # 评估最新训练的最终模型"
@@ -87,9 +100,9 @@ if [ ! -d "$MODEL_PATH" ]; then
     echo "  TERRAIN_COMPLEXITY_LEVEL=2     # 地形复杂度等级 (1-4)"
     echo ""
     echo "地形参数示例:"
-    echo "  # 使用固定地形（与训练环境一致，推荐）"
+    echo "  # 使用固定地形"
     echo "  RANDOM_TERRAIN=0 $0 models/optimized_exp/best 3"
-    echo "  # 使用随机地形（测试泛化能力）"
+    echo "  # 使用随机地形（默认；每回合生成新地形）"
     echo "  RANDOM_TERRAIN=1 $0 models/optimized_exp/best 3"
     echo "  # 调整地形复杂度"
     echo "  TERRAIN_COMPLEXITY_LEVEL=3 $0 models/optimized_exp/best 3"
@@ -110,8 +123,8 @@ if [ ! -d "$MODEL_PATH" ]; then
     echo "    - 控制势场参数的整体缩放比例"
     echo "    - 影响目标吸引力、地形排斥力、智能体排斥力的强度"
     echo "  RANDOM_TERRAIN: 地形模式选择"
-    echo "    - 0: 固定地形（与训练环境一致，推荐用于性能评估）"
-    echo "    - 1: 随机地形（测试泛化能力，每回合生成新地形）"
+    echo "    - 0: 固定地形"
+    echo "    - 1: 随机地形（每回合生成新地形，当前默认）"
     echo "  TERRAIN_COMPLEXITY_LEVEL: 地形复杂度等级"
     echo "    - 1: 简单地形 (1个山峰, 4个障碍物)"
     echo "    - 2: 中等地形 (2个山峰, 8个障碍物)"
@@ -133,41 +146,58 @@ if [ -d "$MODEL_PATH" ]; then
         # 没有权重文件，尝试在子目录中查找
         echo "🔍 在指定目录中未找到权重文件，正在搜索子目录..."
         
-        # 优先级：final -> best -> ep*（按数字排序，最新的优先）
+        # 优先级可通过 MODEL_VARIANT 控制
         FOUND_PATH=""
+        MODEL_VARIANT_NORMALIZED=$(printf '%s' "$MODEL_VARIANT" | tr '[:upper:]' '[:lower:]')
+        case "$MODEL_VARIANT_NORMALIZED" in
+            best_by_team_sr|team_sr|sr)
+                SEARCH_PRIORITY=("best_by_team_sr" "best" "final" "ep_latest")
+                ;;
+            best)
+                SEARCH_PRIORITY=("best" "best_by_team_sr" "final" "ep_latest")
+                ;;
+            final)
+                SEARCH_PRIORITY=("final" "best" "best_by_team_sr" "ep_latest")
+                ;;
+            latest_ep|ep|episode)
+                SEARCH_PRIORITY=("ep_latest" "final" "best" "best_by_team_sr")
+                ;;
+            auto|"")
+                SEARCH_PRIORITY=("final" "best" "best_by_team_sr" "ep_latest")
+                ;;
+            *)
+                echo "⚠️ 未识别的 MODEL_VARIANT=$MODEL_VARIANT，回退为 auto"
+                SEARCH_PRIORITY=("final" "best" "best_by_team_sr" "ep_latest")
+                ;;
+        esac
         
-        # 1. 优先查找 final 目录
-        if [ -d "$MODEL_PATH/final" ]; then
-            FINAL_WEIGHTS=$(find "$MODEL_PATH/final" -maxdepth 1 -name "actor_*.weights.h5" -type f 2>/dev/null | head -1)
-            if [ -n "$FINAL_WEIGHTS" ]; then
-                FOUND_PATH="$MODEL_PATH/final"
-                echo "✅ 找到权重文件: $FOUND_PATH"
+        for search_target in "${SEARCH_PRIORITY[@]}"; do
+            if [ -n "$FOUND_PATH" ]; then
+                break
             fi
-        fi
-        
-        # 2. 如果没有找到，查找 best 目录
-        if [ -z "$FOUND_PATH" ] && [ -d "$MODEL_PATH/best" ]; then
-            BEST_WEIGHTS=$(find "$MODEL_PATH/best" -maxdepth 1 -name "actor_*.weights.h5" -type f 2>/dev/null | head -1)
-            if [ -n "$BEST_WEIGHTS" ]; then
-                FOUND_PATH="$MODEL_PATH/best"
-                echo "✅ 找到权重文件: $FOUND_PATH"
-            fi
-        fi
-        
-        # 3. 如果还没找到，查找所有 ep* 目录（按数字排序，最新的优先）
-        if [ -z "$FOUND_PATH" ]; then
-            EP_DIRS=$(find "$MODEL_PATH" -maxdepth 1 -type d -name "ep*" 2>/dev/null | sort -V -r)
-            for ep_dir in $EP_DIRS; do
-                EP_WEIGHTS=$(find "$ep_dir" -maxdepth 1 -name "actor_*.weights.h5" -type f 2>/dev/null | head -1)
-                if [ -n "$EP_WEIGHTS" ]; then
-                    FOUND_PATH="$ep_dir"
-                    echo "✅ 找到权重文件: $FOUND_PATH"
-                    break
+            if [ "$search_target" = "ep_latest" ]; then
+                while IFS= read -r ep_dir; do
+                    [ -z "$ep_dir" ] && continue
+                    EP_WEIGHTS=$(find "$ep_dir" -maxdepth 1 -name "actor_*.weights.h5" -type f 2>/dev/null | head -1)
+                    if [ -n "$EP_WEIGHTS" ]; then
+                        FOUND_PATH="$ep_dir"
+                        echo "✅ 找到权重文件: $FOUND_PATH"
+                        break
+                    fi
+                done < <(find "$MODEL_PATH" -maxdepth 1 -type d -name "ep*" 2>/dev/null | sort -V -r)
+            else
+                CANDIDATE_DIR="$MODEL_PATH/$search_target"
+                if [ -d "$CANDIDATE_DIR" ]; then
+                    CANDIDATE_WEIGHTS=$(find "$CANDIDATE_DIR" -maxdepth 1 -name "actor_*.weights.h5" -type f 2>/dev/null | head -1)
+                    if [ -n "$CANDIDATE_WEIGHTS" ]; then
+                        FOUND_PATH="$CANDIDATE_DIR"
+                        echo "✅ 找到权重文件: $FOUND_PATH"
+                    fi
                 fi
-            done
-        fi
+            fi
+        done
         
-        # 4. 如果找到了，更新 MODEL_PATH
+        # 如果找到了，更新 MODEL_PATH
         if [ -n "$FOUND_PATH" ]; then
             MODEL_PATH="$FOUND_PATH"
             echo "📁 使用模型路径: $MODEL_PATH"
@@ -175,6 +205,7 @@ if [ -d "$MODEL_PATH" ]; then
             echo "❌ 错误: 在 $MODEL_PATH 及其子目录中未找到权重文件"
             echo ""
             echo "请检查以下目录:"
+            echo "  - $MODEL_PATH/best_by_team_sr"
             echo "  - $MODEL_PATH/final"
             echo "  - $MODEL_PATH/best"
             echo "  - $MODEL_PATH/ep*"
@@ -184,6 +215,16 @@ if [ -d "$MODEL_PATH" ]; then
         echo "✅ 在指定目录中找到权重文件: $MODEL_PATH"
     fi
 fi
+
+# 预置关键参数容器（后续优先从训练配置读取）
+TRAINING_SCENARIO_NAME=""
+TRAINING_ALGORITHM=""
+TRAINING_EPISODE_LENGTH=""
+TRAINING_SUCCESS_DISTANCE_THRESHOLD=""
+TRAINING_COLLISION_DISTANCE_THRESHOLD=""
+TRAINING_TERRAIN_CONTACT_EPS=""
+TRAINING_USE_FIXED_POSITIONS=""
+TRAINING_POSITIONS_FILE=""
 
 # 检查GPU
 if command -v nvidia-smi &> /dev/null; then
@@ -201,20 +242,10 @@ export SUPPRESS_MA_PROMPT=1
 echo "开始模型评估..."
 echo "======================================"
 
-# 构造命令参数
-# 🔧 场景选择说明：
-#   - 训练脚本默认使用 paper3d_terrain_weighted（USE_WEIGHTED_REWARD=1, VECTORIZED_SCENARIO=0）
-#     或 paper3d_terrain_vectorized（USE_WEIGHTED_REWARD=1, VECTORIZED_SCENARIO=1）
-#   - paper3d_terrain_vectorized 继承自 paper3d_terrain_weighted，奖励函数逻辑完全一致
-#   - 评估时使用 paper3d_terrain_weighted 即可，确保奖励函数与训练完全一致
-#   - 注意：评估场景与训练场景必须一致，否则奖励计算会不同，影响评估结果
-SCENARIO_NAME="paper3d_terrain_weighted"
-echo "使用评估场景: $SCENARIO_NAME"
-echo "✅ 场景与训练一致（paper3d_terrain_weighted，奖励函数逻辑相同）"
-
-# 🔧 新增：设置默认算法（与训练脚本保持一致）
+# 构造命令参数（关键参数优先由训练配置驱动，确保严格对齐）
+# 场景/算法先设占位默认值，读取训练配置后再覆盖
+SCENARIO_NAME=${SCENARIO_NAME:-paper3d_terrain_weighted}
 export ALGORITHM=${ALGORITHM:-matd3}
-echo "使用算法: $ALGORITHM"
 
 # 🔧 新增：XLA加速配置（与训练脚本保持一致）
 # 默认启用XLA Global加速，提升评估性能
@@ -227,15 +258,12 @@ else
     echo "❌ XLA加速: 禁用"
 fi
 
-# 设置默认地形模式（与训练脚本保持一致）
-export RANDOM_TERRAIN=${RANDOM_TERRAIN:-0}  # 🔧 修复：默认使用固定地形，与训练脚本一致
+# 设置默认地形模式
+export RANDOM_TERRAIN=${RANDOM_TERRAIN:-1}  # 默认每回合随机新地形
 
-# 🔧 关键修复：episode-length 与训练脚本一致（4000步）
-# 🔧 支持通过环境变量 EPISODE_LENGTH 覆盖默认值
-EPISODE_LENGTH=${EPISODE_LENGTH:-4000}
-# 🚨 问题：评估脚本使用2200步，但训练脚本使用2800步，导致评估时步数不足
-# 🚨 修复：改为2800步，与训练脚本完全一致
-# 🔧 关键修复：使用双引号包裹路径变量，确保特殊字符（中文、空格等）正确处理
+# episode-length 先设默认，读取训练配置后再覆盖
+EPISODE_LENGTH=${EPISODE_LENGTH:-2800}
+# 🔧 使用双引号包裹路径变量，确保特殊字符（中文、空格等）正确处理
 CMD_ARGS="--load-model-path \"$MODEL_PATH\" --eval-episodes $EVAL_EPISODES --save-viz-path \"$SAVE_PATH\" --scenario-name $SCENARIO_NAME --episode-length $EPISODE_LENGTH --algorithm $ALGORITHM"
 
 # 根据RANDOM_TERRAIN参数决定是否使用随机地形
@@ -307,38 +335,91 @@ CMD_ARGS="$CMD_ARGS --reward-neg-scale $REWARD_NEG_SCALE"
 TRAINING_FR=""
 RESULTS_JSON_PATH=""
 
-# 从模型路径推断可能的results.json位置
-# 1. 模型目录的父目录（models/xxx/results.json）
+# 从模型路径推断并严格绑定 results.json（按 exp_name 精确匹配）
 MODEL_PARENT_DIR=$(dirname "$MODEL_PATH")
+EXPECTED_EXP_NAME=$(basename "$MODEL_PARENT_DIR")
+
+# 先收集候选，再做精确匹配，避免 head -1 误选到其他实验
+declare -a RESULTS_JSON_CANDIDATES
 if [ -f "$MODEL_PARENT_DIR/results.json" ]; then
-    RESULTS_JSON_PATH="$MODEL_PARENT_DIR/results.json"
+    RESULTS_JSON_CANDIDATES+=("$MODEL_PARENT_DIR/results.json")
 fi
+if [ -d "logs/$EXPECTED_EXP_NAME" ]; then
+    while IFS= read -r p; do
+        [ -n "$p" ] && RESULTS_JSON_CANDIDATES+=("$p")
+    done < <(find "logs/$EXPECTED_EXP_NAME" -name "results.json" -type f 2>/dev/null)
+fi
+if [[ "$MODEL_PARENT_DIR" =~ ([0-9]{8}_[0-9]{6})$ ]]; then
+    TIMESTAMP="${BASH_REMATCH[1]}"
+    while IFS= read -r p; do
+        [ -n "$p" ] && RESULTS_JSON_CANDIDATES+=("$p")
+    done < <(find logs -type f -path "*/${TIMESTAMP}*/results.json" 2>/dev/null)
+fi
+while IFS= read -r p; do
+    [ -n "$p" ] && RESULTS_JSON_CANDIDATES+=("$p")
+done < <(find logs -type d -name "*${EXPECTED_EXP_NAME}*" 2>/dev/null -exec find {} -name "results.json" -type f \; 2>/dev/null)
 
-# 2. 如果没找到，尝试在logs目录中查找（根据模型路径推断实验名称）
-if [ -z "$RESULTS_JSON_PATH" ]; then
-    # 尝试从模型路径提取实验名称（例如：models/xxx_exp_20260105_223843/best -> xxx_exp_20260105_223843）
-    MODEL_BASENAME=$(basename "$MODEL_PARENT_DIR")
-    if [ -d "logs/$MODEL_BASENAME" ]; then
-        # 在logs目录及其子目录中查找results.json（递归搜索）
-        RESULTS_JSON_PATH=$(find "logs/$MODEL_BASENAME" -name "results.json" -type f 2>/dev/null | head -1)
+# 候选去重
+declare -a UNIQUE_RESULTS_JSON_CANDIDATES
+for p in "${RESULTS_JSON_CANDIDATES[@]}"; do
+    skip=0
+    for q in "${UNIQUE_RESULTS_JSON_CANDIDATES[@]}"; do
+        if [ "$p" = "$q" ]; then
+            skip=1
+            break
+        fi
+    done
+    [ $skip -eq 0 ] && UNIQUE_RESULTS_JSON_CANDIDATES+=("$p")
+done
+
+# 优先选择 exp_name 精确匹配的 results.json
+declare -a MATCHED_RESULTS_JSON
+for p in "${UNIQUE_RESULTS_JSON_CANDIDATES[@]}"; do
+    is_match=$(python3 - <<PYTHON_EOF
+import json
+import sys
+path = r"""$p"""
+expected = r"""$EXPECTED_EXP_NAME"""
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    args = data.get("args", {}) if isinstance(data, dict) else {}
+    exp_name = None
+    if isinstance(args, dict):
+        exp_name = args.get("exp_name")
+    if exp_name is None and isinstance(data, dict):
+        exp_name = data.get("exp_name")
+    print("1" if (exp_name is not None and str(exp_name) == expected) else "0")
+except Exception:
+    print("0")
+PYTHON_EOF
+)
+    if [ "$is_match" = "1" ]; then
+        MATCHED_RESULTS_JSON+=("$p")
     fi
-fi
+done
 
-# 3. 如果还没找到，尝试在整个logs目录中搜索（匹配时间戳）
-if [ -z "$RESULTS_JSON_PATH" ]; then
-    # 尝试从模型路径提取时间戳（例如：models/xxx_exp_20260105_223843/best -> 20260105_223843）
-    if [[ "$MODEL_PARENT_DIR" =~ ([0-9]{8}_[0-9]{6})$ ]]; then
-        TIMESTAMP="${BASH_REMATCH[1]}"
-        # 搜索包含该时间戳的logs目录下的results.json（递归搜索）
-        RESULTS_JSON_PATH=$(find logs -type f -path "*/${TIMESTAMP}*/results.json" 2>/dev/null | head -1)
+if [ ${#MATCHED_RESULTS_JSON[@]} -gt 0 ]; then
+    RESULTS_JSON_PATH="${MATCHED_RESULTS_JSON[0]}"
+    if [ ${#MATCHED_RESULTS_JSON[@]} -gt 1 ] && ([ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]); then
+        echo "❌ 严格模式：发现多个与 exp_name=$EXPECTED_EXP_NAME 精确匹配的 results.json，存在歧义："
+        for p in "${MATCHED_RESULTS_JSON[@]}"; do
+            echo "   - $p"
+        done
+        echo "   请保留唯一匹配文件后重试。"
+        exit 1
     fi
+elif [ ${#UNIQUE_RESULTS_JSON_CANDIDATES[@]} -gt 0 ] && ! ([ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]); then
+    # 非严格模式下回退到第一个候选
+    RESULTS_JSON_PATH="${UNIQUE_RESULTS_JSON_CANDIDATES[0]}"
 fi
 
-# 4. 如果还没找到，尝试在整个logs目录中搜索包含实验名称的目录
-if [ -z "$RESULTS_JSON_PATH" ]; then
-    MODEL_BASENAME=$(basename "$MODEL_PARENT_DIR")
-    # 搜索logs目录中包含实验名称的目录下的results.json（递归搜索）
-    RESULTS_JSON_PATH=$(find logs -type d -name "*${MODEL_BASENAME}*" 2>/dev/null -exec find {} -name "results.json" -type f \; 2>/dev/null | head -1)
+if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
+    if [ -z "$RESULTS_JSON_PATH" ] || [ ! -f "$RESULTS_JSON_PATH" ]; then
+        echo "❌ 严格模式：未找到训练配置 results.json，拒绝评估。"
+        echo "   请确认模型目录对应的 logs 下存在 results.json。"
+        exit 1
+    fi
 fi
 
 # 🔧 关键修复：从训练配置（results.json）中读取所有势场参数
@@ -363,6 +444,11 @@ try:
         params = {}
         # 读取所有势场相关参数和动作范围参数
         param_names = [
+            'scenario_name',
+            'scenario',
+            'algorithm',
+            'algo',
+            'episode_length',
             'action_force_ratio',
             'goal_attraction',
             'lambda_1_base',
@@ -377,7 +463,39 @@ try:
             'action_range_z',
             'damping',
             'reward_pos_scale',
-            'reward_neg_scale'
+            'reward_neg_scale',
+            'distance_weight',
+            'exploration_weight',
+            'stationary_weight',
+            'direction_weight',
+            'deviation_weight',
+            'start_area_weight',
+            'approach_weight',
+            'energy_weight',
+            'height_weight',
+            'height_reward_enabled',
+            'height_ideal_min',
+            'height_ideal_max',
+            'lateral_weight',
+            'clearance_weight',
+            'clearance_d_max',
+            'success_weight',
+            'collision_weight',
+            'collision_reduction_weight',
+            'global_weight',
+            'shaping_weight',
+            'max_reward',
+            'min_reward',
+            'success_reward_value',
+            'no_collision_reward_value',
+            'success_distance_threshold',
+            'collision_penalty_value',
+            'collision_distance_threshold',
+            'global_reward_mode',
+            'shaping_gamma',
+            'terrain_contact_eps',
+            'use_fixed_positions',
+            'positions_file'
         ]
         for param_name in param_names:
             if param_name in args:
@@ -393,23 +511,59 @@ sys.exit(1)
 PYTHON_EOF
 )
     
-    if [ -n "$TRAINING_PARAMS" ]; then
+if [ -n "$TRAINING_PARAMS" ]; then
+        json_get_from_training_params() {
+            local key="$1"
+            echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); v=d.get('$key', ''); print('' if v is None else v)" 2>/dev/null
+        }
+
         # 解析JSON并设置环境变量
-        TRAINING_FR=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('action_force_ratio', ''))" 2>/dev/null)
-        TRAINING_GOAL_ATTRACTION=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('goal_attraction', ''))" 2>/dev/null)
-        TRAINING_LAMBDA_1_BASE=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('lambda_1_base', ''))" 2>/dev/null)
-        TRAINING_TERRAIN_REPULSION=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('terrain_repulsion', ''))" 2>/dev/null)
-        TRAINING_AGENT_INFLUENCE_RANGE=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('agent_influence_range', ''))" 2>/dev/null)
-        TRAINING_DELTA_K_ATT=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('delta_k_att', ''))" 2>/dev/null)
-        TRAINING_DELTA_LAMBDA_1=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('delta_lambda_1', ''))" 2>/dev/null)
-        TRAINING_DELTA_K_REP=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('delta_k_rep', ''))" 2>/dev/null)
-        TRAINING_DELTA_RADIUS=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('delta_radius', ''))" 2>/dev/null)
-        TRAINING_ACTION_RANGE_X=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('action_range_x', ''))" 2>/dev/null)
-        TRAINING_ACTION_RANGE_Y=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('action_range_y', ''))" 2>/dev/null)
-        TRAINING_ACTION_RANGE_Z=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('action_range_z', ''))" 2>/dev/null)
-        TRAINING_DAMPING=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('damping', ''))" 2>/dev/null)
-        TRAINING_REWARD_POS_SCALE=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('reward_pos_scale', ''))" 2>/dev/null)
-        TRAINING_REWARD_NEG_SCALE=$(echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('reward_neg_scale', ''))" 2>/dev/null)
+        TRAINING_FR=$(json_get_from_training_params action_force_ratio)
+        TRAINING_GOAL_ATTRACTION=$(json_get_from_training_params goal_attraction)
+        TRAINING_LAMBDA_1_BASE=$(json_get_from_training_params lambda_1_base)
+        TRAINING_TERRAIN_REPULSION=$(json_get_from_training_params terrain_repulsion)
+        TRAINING_AGENT_INFLUENCE_RANGE=$(json_get_from_training_params agent_influence_range)
+        TRAINING_DELTA_K_ATT=$(json_get_from_training_params delta_k_att)
+        TRAINING_DELTA_LAMBDA_1=$(json_get_from_training_params delta_lambda_1)
+        TRAINING_DELTA_K_REP=$(json_get_from_training_params delta_k_rep)
+        TRAINING_DELTA_RADIUS=$(json_get_from_training_params delta_radius)
+        TRAINING_ACTION_RANGE_X=$(json_get_from_training_params action_range_x)
+        TRAINING_ACTION_RANGE_Y=$(json_get_from_training_params action_range_y)
+        TRAINING_ACTION_RANGE_Z=$(json_get_from_training_params action_range_z)
+        TRAINING_DAMPING=$(json_get_from_training_params damping)
+        TRAINING_REWARD_POS_SCALE=$(json_get_from_training_params reward_pos_scale)
+        TRAINING_REWARD_NEG_SCALE=$(json_get_from_training_params reward_neg_scale)
+        TRAINING_SCENARIO_NAME=$(json_get_from_training_params scenario_name)
+        TRAINING_ALGORITHM=$(json_get_from_training_params algorithm)
+        if [ -z "$TRAINING_SCENARIO_NAME" ]; then
+            TRAINING_SCENARIO_NAME=$(json_get_from_training_params scenario)
+        fi
+        if [ -z "$TRAINING_ALGORITHM" ]; then
+            TRAINING_ALGORITHM=$(json_get_from_training_params algo)
+        fi
+        TRAINING_EPISODE_LENGTH=$(json_get_from_training_params episode_length)
+        TRAINING_SUCCESS_DISTANCE_THRESHOLD=$(json_get_from_training_params success_distance_threshold)
+        TRAINING_COLLISION_DISTANCE_THRESHOLD=$(json_get_from_training_params collision_distance_threshold)
+        TRAINING_TERRAIN_CONTACT_EPS=$(json_get_from_training_params terrain_contact_eps)
+        TRAINING_USE_FIXED_POSITIONS=$(json_get_from_training_params use_fixed_positions)
+        TRAINING_POSITIONS_FILE=$(json_get_from_training_params positions_file)
+
+        TRAINING_REWARD_PARAM_KEYS=(
+            distance_weight exploration_weight stationary_weight direction_weight deviation_weight
+            start_area_weight approach_weight energy_weight height_weight height_reward_enabled
+            height_ideal_min height_ideal_max lateral_weight clearance_weight clearance_d_max
+            success_weight collision_weight collision_reduction_weight global_weight shaping_weight
+            max_reward min_reward success_reward_value no_collision_reward_value
+            collision_penalty_value global_reward_mode shaping_gamma
+        )
+        for reward_key in "${TRAINING_REWARD_PARAM_KEYS[@]}"; do
+            reward_val=$(json_get_from_training_params "$reward_key")
+            reward_var="TRAINING_$(printf '%s' "$reward_key" | tr '[:lower:]' '[:upper:]')"
+            printf -v "$reward_var" '%s' "$reward_val"
+            if [ -n "$reward_val" ]; then
+                echo "✅ 从训练配置读取$(printf '%s' "$reward_key" | tr '[:lower:]' '[:upper:]'): $reward_val"
+            fi
+        done
         
         if [ -n "$TRAINING_FR" ]; then
             echo "✅ 从训练配置读取ACTION_FORCE_RATIO: $TRAINING_FR (来源: $RESULTS_JSON_PATH)"
@@ -432,8 +586,109 @@ PYTHON_EOF
         if [ -n "$TRAINING_ACTION_RANGE_Z" ]; then
             echo "✅ 从训练配置读取ACTION_RANGE_Z: $TRAINING_ACTION_RANGE_Z"
         fi
+        if [ -n "$TRAINING_SCENARIO_NAME" ]; then
+            echo "✅ 从训练配置读取SCENARIO_NAME: $TRAINING_SCENARIO_NAME"
+        fi
+        if [ -n "$TRAINING_ALGORITHM" ]; then
+            echo "✅ 从训练配置读取ALGORITHM: $TRAINING_ALGORITHM"
+        fi
+        if [ -n "$TRAINING_EPISODE_LENGTH" ]; then
+            echo "✅ 从训练配置读取EPISODE_LENGTH: $TRAINING_EPISODE_LENGTH"
+        fi
+        if [ -n "$TRAINING_SUCCESS_DISTANCE_THRESHOLD" ]; then
+            echo "✅ 从训练配置读取SUCCESS_DISTANCE_THRESHOLD: $TRAINING_SUCCESS_DISTANCE_THRESHOLD"
+        fi
+        if [ -n "$TRAINING_COLLISION_DISTANCE_THRESHOLD" ]; then
+            echo "✅ 从训练配置读取COLLISION_DISTANCE_THRESHOLD: $TRAINING_COLLISION_DISTANCE_THRESHOLD"
+        fi
+        if [ -n "$TRAINING_TERRAIN_CONTACT_EPS" ]; then
+            echo "✅ 从训练配置读取TERRAIN_CONTACT_EPS: $TRAINING_TERRAIN_CONTACT_EPS"
+        fi
+        if [ -n "$TRAINING_USE_FIXED_POSITIONS" ]; then
+            echo "✅ 从训练配置读取USE_FIXED_POSITIONS: $TRAINING_USE_FIXED_POSITIONS"
+        fi
+        if [ -n "$TRAINING_POSITIONS_FILE" ]; then
+            echo "✅ 从训练配置读取POSITIONS_FILE: $TRAINING_POSITIONS_FILE"
+        fi
     fi
 fi
+
+apply_training_or_default() {
+    local target_var="$1"
+    local training_var="$2"
+    local default_value="$3"
+    local training_value="${!training_var}"
+    local current_value="${!target_var}"
+
+    if [ -n "$training_value" ]; then
+        printf -v "$target_var" '%s' "$training_value"
+    elif [ -z "$current_value" ]; then
+        printf -v "$target_var" '%s' "$default_value"
+    fi
+    export "$target_var"
+}
+
+# ===== 严格对齐训练关键参数（场景/算法/步长/成功与碰撞阈值）=====
+if [ -n "$TRAINING_SCENARIO_NAME" ]; then
+    SCENARIO_NAME="$TRAINING_SCENARIO_NAME"
+fi
+if [ -n "$TRAINING_ALGORITHM" ]; then
+    export ALGORITHM="$TRAINING_ALGORITHM"
+fi
+if [ -n "$TRAINING_EPISODE_LENGTH" ]; then
+    EPISODE_LENGTH="$TRAINING_EPISODE_LENGTH"
+fi
+if [ -n "$TRAINING_SUCCESS_DISTANCE_THRESHOLD" ]; then
+    export SUCCESS_DISTANCE_THRESHOLD="$TRAINING_SUCCESS_DISTANCE_THRESHOLD"
+fi
+if [ -n "$TRAINING_COLLISION_DISTANCE_THRESHOLD" ]; then
+    export COLLISION_DISTANCE_THRESHOLD="$TRAINING_COLLISION_DISTANCE_THRESHOLD"
+fi
+if [ -n "$TRAINING_TERRAIN_CONTACT_EPS" ]; then
+    export TERRAIN_CONTACT_EPS="$TRAINING_TERRAIN_CONTACT_EPS"
+fi
+
+# 对训练配置中常见缺失字段做可追溯回退
+# 说明：
+# - terrain_contact_eps 缺失时，回退到训练脚本默认 0.2
+# - 场景/算法在严格模式下必须从训练配置读取，禁止回退（防止口径漂移）
+if [ -z "$TRAINING_TERRAIN_CONTACT_EPS" ]; then
+    export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}
+    echo "⚠️  训练配置缺少 terrain_contact_eps，回退使用: $TERRAIN_CONTACT_EPS"
+fi
+
+# 固定位置策略：在严格模式下优先对齐训练时的位置文件
+if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
+    if [ "${TRAINING_USE_FIXED_POSITIONS,,}" = "true" ] || [ "$TRAINING_USE_FIXED_POSITIONS" = "1" ]; then
+        USE_FIXED_POSITIONS=true
+        if [ -n "$TRAINING_POSITIONS_FILE" ]; then
+            POSITIONS_FILE="$TRAINING_POSITIONS_FILE"
+        fi
+    fi
+fi
+
+if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
+    missing_keys=()
+    [ -z "$TRAINING_SCENARIO_NAME" ] && missing_keys+=("scenario/scenario_name")
+    [ -z "$TRAINING_ALGORITHM" ] && missing_keys+=("algo/algorithm")
+    [ -z "$TRAINING_EPISODE_LENGTH" ] && missing_keys+=("episode_length")
+    [ -z "$TRAINING_SUCCESS_DISTANCE_THRESHOLD" ] && missing_keys+=("success_distance_threshold")
+    [ -z "$TRAINING_COLLISION_DISTANCE_THRESHOLD" ] && missing_keys+=("collision_distance_threshold")
+    if [ ${#missing_keys[@]} -gt 0 ]; then
+        echo "❌ 严格模式：训练配置缺少关键字段: ${missing_keys[*]}"
+        echo "   为避免评估与训练口径不一致，已中止。"
+        exit 1
+    fi
+fi
+
+echo "使用评估场景: $SCENARIO_NAME"
+echo "使用算法: $ALGORITHM"
+echo "评估步长(episode_length): $EPISODE_LENGTH"
+
+# 更新已构造的基础参数，避免前面默认值遗留到最终命令
+CMD_ARGS=$(echo "$CMD_ARGS" | sed -E "s/--scenario-name [^ ]+/--scenario-name ${SCENARIO_NAME}/")
+CMD_ARGS=$(echo "$CMD_ARGS" | sed -E "s/--episode-length [^ ]+/--episode-length ${EPISODE_LENGTH}/")
+CMD_ARGS=$(echo "$CMD_ARGS" | sed -E "s/--algorithm [^ ]+/--algorithm ${ALGORITHM}/")
 
 # 🔧 关键修复：设置势场参数（优先级：训练配置 > 环境变量 > 默认值）
 # 确保评估时使用的势场参数与训练时完全一致
@@ -549,43 +804,40 @@ if [ -n "$FORCE_PARAM_RATIO" ]; then
 fi
 
 # 设置默认地形复杂度等级（与训练脚本保持一致）
-export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-1}  # 🔧 修复：恢复与训练脚本一致的地形复杂度
+export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3}  # 🔧 修复：与训练脚本一致的地形复杂度
 CMD_ARGS="$CMD_ARGS --terrain-complexity-level $TERRAIN_COMPLEXITY_LEVEL"
 
-# 🔧 修复：设置默认分项加权奖励参数（与训练脚本完全一致）
-export DISTANCE_WEIGHT=${DISTANCE_WEIGHT:-3.5}  # 🔧 修复：与训练脚本一致（1.0→3.5）
-export EXPLORATION_WEIGHT=${EXPLORATION_WEIGHT:-0.3}  # 🔧 修复：与训练脚本一致（0.8→0.3）
-export STATIONARY_WEIGHT=${STATIONARY_WEIGHT:-0.3}  # 🔧 修复：与训练脚本一致（-1.8→0.3）
-export DIRECTION_WEIGHT=${DIRECTION_WEIGHT:-0.6}  # 🔧 修复：与训练脚本一致（0.2→0.6）
-export DEVIATION_WEIGHT=${DEVIATION_WEIGHT:-0.35}  # 🔧 修复：与训练脚本一致（0.5→0.35）
-export START_AREA_WEIGHT=${START_AREA_WEIGHT:-0.3}  # 🔧 修复：与训练脚本一致（0.5→0.3）
-export APPROACH_WEIGHT=${APPROACH_WEIGHT:-0.55}  # 🔧 修复：与训练脚本一致（0.8→0.55）
-export ENERGY_WEIGHT=${ENERGY_WEIGHT:-0.2}  # 🔧 修复：与训练脚本一致（0.05→0.2）
-export HEIGHT_WEIGHT=${HEIGHT_WEIGHT:-0.75}  # 🔧 修复：与训练脚本一致（0.2→0.75）
-export HEIGHT_REWARD_ENABLED=${HEIGHT_REWARD_ENABLED:-1}
-export HEIGHT_IDEAL_MIN=${HEIGHT_IDEAL_MIN:-10.0}  # 🔧 修复：与训练脚本一致（8.0→10.0）
-export HEIGHT_IDEAL_MAX=${HEIGHT_IDEAL_MAX:-60.0}  # 🔧 修复：与训练脚本一致（25.0→60.0）
-export LATERAL_WEIGHT=${LATERAL_WEIGHT:-1.0}  # 🔧 修复：与训练脚本一致（0.8→1.0）
-export CLEARANCE_WEIGHT=${CLEARANCE_WEIGHT:-0.75}  # 🔧 修复：与训练脚本一致（0.8→0.75）
-export CLEARANCE_D_MAX=${CLEARANCE_D_MAX:-60.0}  # 🔧 修复：与训练脚本一致（78.0→60.0）
-export SUCCESS_WEIGHT=${SUCCESS_WEIGHT:-1.8}  # 🔧 修复：与训练脚本一致（5.0→1.8）
-export COLLISION_WEIGHT=${COLLISION_WEIGHT:-4.5}  # 🔧 修复：与训练脚本一致（2.5→4.5）
-export GLOBAL_WEIGHT=${GLOBAL_WEIGHT:-0.4}  # 🔧 修复：与训练脚本一致（0.2→0.4）
-export SHAPING_WEIGHT=${SHAPING_WEIGHT:-0.3}  # 🔧 修复：与训练脚本一致（0.2→0.3）
-export MAX_REWARD=${MAX_REWARD:-800.0}  # 🔧 修复：与训练脚本一致（550.0→800.0）
-export MIN_REWARD=${MIN_REWARD:--800.0}  # 🔧 修复：与训练脚本一致（-550.0→-800.0）
-export SUCCESS_REWARD_VALUE=${SUCCESS_REWARD_VALUE:-8000.0}  # 🔧 修复：与训练脚本一致（500.0→8000.0）
-export SUCCESS_DISTANCE_THRESHOLD=${SUCCESS_DISTANCE_THRESHOLD:-5.0}  # 🔧 关键修复：与训练脚本一致（6.0→5.0）
-                                                                     # 🚨 问题：评估脚本使用6.0，但训练脚本使用5.0，导致评估时成功阈值更严格（7.2米 vs 6.0米）
-                                                                     # 🚨 修复：改为5.0，与训练脚本完全一致
-                                                                     # 实际判断阈值 = 1.2 * SUCCESS_DISTANCE_THRESHOLD = 6.0米（与训练一致）
-# 🚨 关键修复：确保碰撞检测参数与训练脚本完全一致
-# 这些参数直接影响碰撞统计的准确性，必须与run_optimized.sh中的默认值完全一致
-export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}  # 🚨 地形接触阈值（与run_optimized.sh一致：0.2）
-export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.5}  # 🚨 碰撞距离阈值（与run_optimized.sh一致：0.5）
-export COLLISION_PENALTY_VALUE=${COLLISION_PENALTY_VALUE:-60.0}  # 🚨 碰撞惩罚值（与run_optimized.sh一致：60.0）
-export GLOBAL_REWARD_MODE=${GLOBAL_REWARD_MODE:-avg_progress}
-export SHAPING_GAMMA=${SHAPING_GAMMA:-0.9}
+# 🔧 修复：奖励参数优先完全回读训练配置，其次才使用外部环境变量/脚本默认值
+apply_training_or_default DISTANCE_WEIGHT TRAINING_DISTANCE_WEIGHT 3.5
+apply_training_or_default EXPLORATION_WEIGHT TRAINING_EXPLORATION_WEIGHT 0.3
+apply_training_or_default STATIONARY_WEIGHT TRAINING_STATIONARY_WEIGHT 0.3
+apply_training_or_default DIRECTION_WEIGHT TRAINING_DIRECTION_WEIGHT 0.6
+apply_training_or_default DEVIATION_WEIGHT TRAINING_DEVIATION_WEIGHT 0.35
+apply_training_or_default START_AREA_WEIGHT TRAINING_START_AREA_WEIGHT 0.3
+apply_training_or_default APPROACH_WEIGHT TRAINING_APPROACH_WEIGHT 0.55
+apply_training_or_default ENERGY_WEIGHT TRAINING_ENERGY_WEIGHT 0.2
+apply_training_or_default HEIGHT_WEIGHT TRAINING_HEIGHT_WEIGHT 0.42
+apply_training_or_default HEIGHT_REWARD_ENABLED TRAINING_HEIGHT_REWARD_ENABLED 1
+apply_training_or_default HEIGHT_IDEAL_MIN TRAINING_HEIGHT_IDEAL_MIN 10.0
+apply_training_or_default HEIGHT_IDEAL_MAX TRAINING_HEIGHT_IDEAL_MAX 60.0
+apply_training_or_default LATERAL_WEIGHT TRAINING_LATERAL_WEIGHT 1.0
+apply_training_or_default CLEARANCE_WEIGHT TRAINING_CLEARANCE_WEIGHT 0.44
+apply_training_or_default CLEARANCE_D_MAX TRAINING_CLEARANCE_D_MAX 60.0
+apply_training_or_default SUCCESS_WEIGHT TRAINING_SUCCESS_WEIGHT 1.8
+apply_training_or_default COLLISION_WEIGHT TRAINING_COLLISION_WEIGHT 4.5
+apply_training_or_default COLLISION_REDUCTION_WEIGHT TRAINING_COLLISION_REDUCTION_WEIGHT 0.0
+apply_training_or_default GLOBAL_WEIGHT TRAINING_GLOBAL_WEIGHT 0.4
+apply_training_or_default SHAPING_WEIGHT TRAINING_SHAPING_WEIGHT 0.3
+apply_training_or_default MAX_REWARD TRAINING_MAX_REWARD 800.0
+apply_training_or_default MIN_REWARD TRAINING_MIN_REWARD -800.0
+apply_training_or_default SUCCESS_REWARD_VALUE TRAINING_SUCCESS_REWARD_VALUE 8000.0
+apply_training_or_default NO_COLLISION_REWARD_VALUE TRAINING_NO_COLLISION_REWARD_VALUE 0.0
+apply_training_or_default SUCCESS_DISTANCE_THRESHOLD TRAINING_SUCCESS_DISTANCE_THRESHOLD 5.0
+apply_training_or_default TERRAIN_CONTACT_EPS TRAINING_TERRAIN_CONTACT_EPS 0.2
+apply_training_or_default COLLISION_DISTANCE_THRESHOLD TRAINING_COLLISION_DISTANCE_THRESHOLD 0.5
+apply_training_or_default COLLISION_PENALTY_VALUE TRAINING_COLLISION_PENALTY_VALUE 60.0
+apply_training_or_default GLOBAL_REWARD_MODE TRAINING_GLOBAL_REWARD_MODE avg_progress
+apply_training_or_default SHAPING_GAMMA TRAINING_SHAPING_GAMMA 0.9
 
 # 添加分项加权奖励参数（如果使用加权场景）
 CMD_ARGS="$CMD_ARGS --distance-weight $DISTANCE_WEIGHT"
@@ -605,11 +857,13 @@ CMD_ARGS="$CMD_ARGS --clearance-weight $CLEARANCE_WEIGHT"
 CMD_ARGS="$CMD_ARGS --clearance-d-max $CLEARANCE_D_MAX"
 CMD_ARGS="$CMD_ARGS --success-weight $SUCCESS_WEIGHT"
 CMD_ARGS="$CMD_ARGS --collision-weight $COLLISION_WEIGHT"
+CMD_ARGS="$CMD_ARGS --collision-reduction-weight $COLLISION_REDUCTION_WEIGHT"
 CMD_ARGS="$CMD_ARGS --global-weight $GLOBAL_WEIGHT"
 CMD_ARGS="$CMD_ARGS --shaping-weight $SHAPING_WEIGHT"
 CMD_ARGS="$CMD_ARGS --max-reward $MAX_REWARD"
 CMD_ARGS="$CMD_ARGS --min-reward $MIN_REWARD"
 CMD_ARGS="$CMD_ARGS --success-reward-value $SUCCESS_REWARD_VALUE"
+CMD_ARGS="$CMD_ARGS --no-collision-reward-value $NO_COLLISION_REWARD_VALUE"
 CMD_ARGS="$CMD_ARGS --success-distance-threshold $SUCCESS_DISTANCE_THRESHOLD"
 CMD_ARGS="$CMD_ARGS --collision-penalty-value $COLLISION_PENALTY_VALUE"
 CMD_ARGS="$CMD_ARGS --collision-distance-threshold $COLLISION_DISTANCE_THRESHOLD"
@@ -631,8 +885,14 @@ if [ "$USE_FIXED_POSITIONS" = "true" ] || [ "$USE_FIXED_POSITIONS" = "1" ] || [ 
         echo "✅ 检测到固定位置设置，正在加载位置文件: $POSITIONS_FILE"
         CMD_ARGS="$CMD_ARGS --use-fixed-positions --positions-file \"$POSITIONS_FILE\""
     else
-        echo "⚠️  警告: 设置了使用固定位置，但位置文件不存在: $POSITIONS_FILE"
-        echo "将使用随机初始化位置"
+        if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
+            echo "❌ 严格模式：要求固定位置评估，但位置文件不存在: $POSITIONS_FILE"
+            echo "   请提供训练时一致的位置文件路径，或将第5个参数设为 false。"
+            exit 1
+        else
+            echo "⚠️  警告: 设置了使用固定位置，但位置文件不存在: $POSITIONS_FILE"
+            echo "将使用随机初始化位置"
+        fi
     fi
 else
     echo "使用随机初始化位置（不使用固定位置）"
@@ -655,18 +915,24 @@ else
     echo ""
 fi
 
-# 🔧 启用交互式HTML和overlay图片（与训练时的最佳回合图效果一致）
-# 交互式HTML默认已启用（评估脚本默认生成），无需额外设置
+# 默认可视化策略：保留交互式HTML与动作时序图，不生成overlay/GIF
+export SAVE_INTERACTIVE_TRAJ=${SAVE_INTERACTIVE_TRAJ:-1}
+export SAVE_EVAL_ALL_EPISODES=${SAVE_EVAL_ALL_EPISODES:-1}
+export ENABLE_OVERLAY=${ENABLE_OVERLAY:-0}
+export DISABLE_GIF=${DISABLE_GIF:-1}
+
 # 启用overlay图片（包含地形信息）
-if [ "${ENABLE_OVERLAY:-0}" = "1" ] || [ "${ENABLE_OVERLAY,,}" = "true" ] || [ "${ENABLE_OVERLAY,,}" = "yes" ] || [ "${ENABLE_OVERLAY,,}" = "on" ]; then
+if [ "${ENABLE_OVERLAY}" = "1" ] || [ "${ENABLE_OVERLAY,,}" = "true" ] || [ "${ENABLE_OVERLAY,,}" = "yes" ] || [ "${ENABLE_OVERLAY,,}" = "on" ]; then
     CMD_ARGS="$CMD_ARGS --enable-overlay"
     echo "✅ 启用overlay图片（包含地形信息）"
+else
+    echo "⏭️  跳过overlay图片生成"
 fi
 
-# 🔧 新增：禁用GIF生成（如果环境变量DISABLE_GIF=1）
+# 默认禁用GIF生成
 if [ "${DISABLE_GIF:-0}" = "1" ] || [ "${DISABLE_GIF,,}" = "true" ] || [ "${DISABLE_GIF,,}" = "yes" ] || [ "${DISABLE_GIF,,}" = "on" ]; then
     CMD_ARGS="$CMD_ARGS --disable-gif"
-    echo "⏭️  禁用GIF生成（消融实验模式）"
+    echo "⏭️  禁用GIF生成"
 fi
 
 # 运行评估
@@ -692,8 +958,8 @@ if [ $EVAL_EXIT_CODE -eq 0 ]; then
             echo "     $(echo $line | awk '{print $9, $5}')"
         done
         
-        echo "  🎬 生成的动画:"
-        ls -la "$SAVE_PATH"/*.gif 2>/dev/null | head -3 | while read -r line; do
+        echo "  🌐 生成的HTML交互图:"
+        ls -la "$SAVE_PATH"/*.html 2>/dev/null | head -5 | while read -r line; do
             echo "     $(echo $line | awk '{print $9, $5}')"
         done
     fi

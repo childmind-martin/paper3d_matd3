@@ -21,10 +21,13 @@ import json
 import os
 import subprocess
 import sys
+import re  # 🚨 关键修复：在模块级别导入re，确保所有函数都可以访问
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 # 🔧 抑制 TensorFlow/XLA 警告（如 cuFFT 注册警告）
 # 必须在导入 TensorFlow 之前设置
@@ -42,7 +45,11 @@ from ablation_action_pf_comparison import (
     plot_comparison_success_rate_and_clearance,
     plot_comparison_losses,
     generate_interactive_comparison,
-    setup_english_fonts
+    setup_english_fonts,
+    TERRAIN_COMPLEXITY_LEVEL,
+    MAP_SIZE,
+    MOUNTAIN_MIN_DISTANCE,
+    SCENARIO_SEED
 )
 
 try:
@@ -101,9 +108,9 @@ TRAINING_CONFIG = {
         "AGENT_INFLUENCE_RANGE": "150.0",           # ✅ 与run_optimized.sh一致（默认150.0）
         
         # 🔧 新增：显式设置地形参数，确保与run_optimized.sh一致
-        "TERRAIN_COMPLEXITY_LEVEL": "3",  # ✅ 修复：使用3（run_optimized.sh默认），而不是2
-        "MAP_SIZE": "200",                 # ✅ 与run_optimized.sh一致（默认200）
-        "MOUNTAIN_MIN_DISTANCE": "55",     # ✅ 与run_optimized.sh一致（默认55）
+        "TERRAIN_COMPLEXITY_LEVEL": str(TERRAIN_COMPLEXITY_LEVEL),  # ✅ 与run_optimized.sh一致
+        "MAP_SIZE": str(MAP_SIZE),                                 # ✅ 与run_optimized.sh一致
+        "MOUNTAIN_MIN_DISTANCE": str(MOUNTAIN_MIN_DISTANCE),       # ✅ 与run_optimized.sh一致
     }
 }
 
@@ -136,7 +143,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="地形感知模式消融对比实验、测试步长积分对于apf是否穿透的影响")
     parser.add_argument("--script", type=str, default="./run_optimized.sh",
                         help="训练启动脚本路径 (默认 ./run_optimized.sh)")
-    parser.add_argument("--episodes", type=int, default=5,
+    parser.add_argument("--episodes", type=int, default=10,
                         help="每个实验的训练回合数（默认120）")
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="训练批次大小")
@@ -160,11 +167,11 @@ def parse_args():
                         help="仅运行评估，不进行训练")
     parser.add_argument("--trained-model-path", type=str, default=None,
                         help=f"训练好的模型路径（用于--eval-only模式，默认: {DEFAULT_MODEL_PATH}）")
-    parser.add_argument("--eval-episodes", type=int, default=50,
+    parser.add_argument("--eval-episodes", type=int, default=10,
                         help="评估回合数（默认20）")
     parser.add_argument("--eval-seed", type=int, default=42,
                         help="评估随机种子（默认42）")
-    parser.add_argument("--eval-episode-length", type=int, default=6500,
+    parser.add_argument("--eval-episode-length", type=int, default=2800,
                         help="评估回合长度（步数，默认2800，应与训练时一致）")
     return parser.parse_args()
 
@@ -242,6 +249,170 @@ def run_training(cfg: Dict, positions_file: Path, args, gpu_id: Optional[int] = 
     return run_experiment(cfg, positions_file, args, gpu_id=gpu_id)
 
 
+def _run_single_evaluation_worker(args_tuple):
+    """运行单个评估配置的worker函数（用于多进程）"""
+    (eval_cfg, trained_model_path, positions_file, episodes, seed, 
+     episode_length, episode_positions_dir, terrain_seeds, batch_dir) = args_tuple
+    
+    return _run_single_evaluation(
+        eval_cfg, trained_model_path, positions_file, episodes, seed,
+        episode_length, episode_positions_dir, terrain_seeds, batch_dir
+    )
+
+
+def _run_single_evaluation(eval_cfg, trained_model_path, positions_file, episodes, seed, 
+                          episode_length, episode_positions_dir, terrain_seeds, batch_dir):
+    """运行单个评估配置（用于并行执行）"""
+    # 转换字符串参数为Path对象
+    trained_model_path = Path(trained_model_path)
+    positions_file = Path(positions_file)
+    episode_positions_dir = Path(episode_positions_dir)
+    batch_dir = Path(batch_dir) if batch_dir is not None else None
+    
+    label = eval_cfg["label"]
+    terrain_sensing_mode = eval_cfg["terrain_sensing_mode"]
+    
+    print(f"\n{'='*70}")
+    print(f"[评估-{label}] 开始评估: {eval_cfg.get('name', label)}")
+    print(f"[评估-{label}] 地形感知模式: {terrain_sensing_mode}")
+    print(f"[评估-{label}] 模型路径: {trained_model_path}")
+    print(f"[评估-{label}] 评估回合数: {episodes}")
+    print(f"{'='*70}\n")
+    
+    # 设置评估环境变量
+    env = os.environ.copy()
+    env.update(setup_base_env_vars(positions_file, 0))  # 使用默认GPU ID
+    # 🚨 关键修复：使用episode位置文件目录，确保所有评估模式使用相同的初始条件
+    env["EPISODE_POSITIONS_DIR"] = str(episode_positions_dir)
+    env["USE_FIXED_POSITIONS"] = "1"
+    env["SEED"] = str(seed)
+    env["QUIET_OUTPUT"] = "0"  # 🔧 修复：改为0，显示输出，方便调试
+    env["TQDM_DISABLE"] = "0"
+    env["TQDM_TO_STDOUT"] = "1"
+    # 🚨 关键优化：大幅降低进度条更新频率，避免输出混乱
+    env["TQDM_MININTERVAL"] = "5.0"  # 至少5秒更新一次进度条（大幅降低）
+    env["TQDM_MINITERS"] = "200"  # 至少200步更新一次（大幅降低）
+    env["EVAL_DEBUG_ACTION_STEPS"] = "0"
+    env["EVAL_DISABLE_VISUALIZATION"] = "1"
+    env["DISABLE_TRAJECTORY_RECORDING"] = "1"
+    env["NOISE_SCALE"] = "0.0"
+    env["RANDOM_ACTION_PROB"] = "0.0"
+    env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"
+    env["TERRAIN_SENSING_MODE"] = terrain_sensing_mode
+    env["TERRAIN_COMPLEXITY_LEVEL"] = str(TERRAIN_COMPLEXITY_LEVEL)
+    env["MAP_SIZE"] = str(MAP_SIZE)
+    env["MOUNTAIN_MIN_DISTANCE"] = str(MOUNTAIN_MIN_DISTANCE)
+    
+    # 势场参数
+    env["GOAL_ATTRACTION"] = "6.0"
+    env["LAMBDA_1_BASE"] = "8.5"
+    env["TERRAIN_REPULSION"] = "8000.0"
+    env["AGENT_INFLUENCE_RANGE"] = "150.0"
+    env["DELTA_K_ATT"] = "5.0"
+    env["DELTA_LAMBDA_1"] = "2.2"
+    env["DELTA_K_REP"] = "1200.0"
+    env["DELTA_RADIUS"] = "80.0"
+    
+    env["EPISODE_LENGTH"] = str(episode_length)
+    env["DISABLE_GIF"] = "1"
+    env["TERRAIN_SEED_SEQUENCE"] = ",".join(map(str, terrain_seeds))
+    env["SAVE_BEST_TRAJ"] = "1"
+    env["SAVE_INTERACTIVE_TRAJ"] = "0"
+    env["DISABLE_TRAJECTORY_RECORDING"] = "0"
+    
+    env["TERRAIN_CONTACT_EPS"] = "0.2"
+    env["COLLISION_DISTANCE_THRESHOLD"] = "0.5"
+    env["COLLISION_PENALTY_VALUE"] = "60.0"
+    env["SIMULATION_DT"] = "0.08"
+    
+    env["ACTION_FORCE_RATIO"] = "1.0"
+    env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = "DISABLED"
+    env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    
+    # 评估结果保存路径
+    if batch_dir is not None:
+        batch_path = Path(batch_dir)
+        eval_save_path = str(batch_path / "evaluation_results" / f"{label}_{terrain_sensing_mode}")
+        Path(eval_save_path).mkdir(parents=True, exist_ok=True)
+    else:
+        eval_save_path = f"evaluation_results/{label}_{terrain_sensing_mode}"
+    
+    # 运行评估
+    eval_cmd = [
+        "./run_evaluation.sh",
+        str(trained_model_path),
+        str(episodes),
+        eval_save_path,
+        str(positions_file),
+        "1",  # use_fixed_positions
+        "true",  # disable_early_termination
+    ]
+    
+    # 🚨 关键修复：为每个评估进程创建独立的日志文件，支持并行执行 + 实时查看
+    log_dir = Path(eval_save_path).parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{label}_{terrain_sensing_mode}.log"
+    
+    try:
+        print(f"[评估-{label}] 🚀 开始执行评估命令: {' '.join(eval_cmd)}")
+        print(f"[评估-{label}] 📝 日志文件: {log_file}")
+        
+        # 使用Popen启动进程，将输出重定向到日志文件
+        with open(log_file, 'w', encoding='utf-8') as log_f:
+            process = subprocess.Popen(
+                eval_cmd,
+                env=env,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,  # 将stderr也重定向到stdout
+                text=True,
+                bufsize=1  # 行缓冲，确保实时写入
+            )
+            
+            # 等待进程完成
+            return_code = process.wait()
+            
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, eval_cmd)
+        
+        # 验证评估结果
+        eval_results_json = Path(eval_save_path) / "evaluation_results.json"
+        if eval_results_json.exists():
+            with open(eval_results_json, 'r', encoding='utf-8') as f:
+                eval_data = json.load(f)
+            actual_episodes = eval_data.get('episodes', 0)
+            if actual_episodes != episodes:
+                print(f"[评估-{label}] ⚠️  警告: 评估结果回合数不一致！期望: {episodes}, 实际: {actual_episodes}")
+            else:
+                print(f"[评估-{label}] ✅ 验证通过: 评估结果回合数 = {actual_episodes}")
+        
+        return {
+            "label": label,
+            "success": True,
+            "model_path": str(trained_model_path),
+            "terrain_sensing_mode": terrain_sensing_mode,
+            "eval_save_path": eval_save_path,
+            "episodes": episodes,
+        }
+    except subprocess.CalledProcessError as e:
+        print(f"[评估-{label}] ❌ 评估失败: {e}")
+        # 注意：由于移除了capture_output，无法直接获取stderr
+        # 错误信息会直接输出到stderr
+        return {
+            "label": label,
+            "success": False,
+            "error": str(e),
+            "terrain_sensing_mode": terrain_sensing_mode,
+        }
+    except Exception as e:
+        print(f"[评估-{label}] ❌ 评估异常: {e}")
+        return {
+            "label": label,
+            "success": False,
+            "error": str(e),
+            "terrain_sensing_mode": terrain_sensing_mode,
+        }
+
+
 def evaluate_terrain_sensing(trained_model_path: Path, positions_file: Path, 
                             episodes: int = 20, seed: int = 42, episode_length: int = 4000, batch_dir: Optional[Path] = None) -> Dict:
     """
@@ -277,149 +448,311 @@ def evaluate_terrain_sensing(trained_model_path: Path, positions_file: Path,
     print(f"   所有评估模式将使用相同的地图顺序，确保公平对比")
     print(f"{'='*70}\n")
     
+    # 🚨 关键修复：为每个episode生成固定的位置文件，确保所有评估模式使用相同的初始条件
+    # 原因：每个episode使用不同地形，需要为每个地形生成对应的固定位置
+    # 这样所有评估模式（Oracle Same、Oracle Dense、Local）都会使用相同的地形和初始位置
+    if batch_dir is not None:
+        episode_positions_dir: Path = batch_dir / "episode_positions"
+    else:
+        episode_positions_dir: Path = Path("evaluation_results") / "episode_positions"
+    episode_positions_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 检查是否已经生成了位置文件
+    existing_positions = list(episode_positions_dir.glob("episode_*.json"))
+    if len(existing_positions) < episodes:
+        print(f"\n{'='*70}")
+        print(f"🔧 为每个episode生成固定的位置文件")
+        print(f"{'='*70}")
+        print(f"输出目录: {episode_positions_dir}")
+        print(f"需要生成: {episodes} 个位置文件")
+        print(f"{'='*70}\n")
+        
+        # 导入位置生成函数
+        from generate_episode_positions import generate_episode_positions
+        
+        # 基础环境变量（与训练配置一致）
+        base_env_vars = {
+            "MAP_SIZE": str(MAP_SIZE),
+            "TERRAIN_COMPLEXITY_LEVEL": str(TERRAIN_COMPLEXITY_LEVEL),
+            "MOUNTAIN_MIN_DISTANCE": str(MOUNTAIN_MIN_DISTANCE),
+        }
+        
+        # 为每个episode生成位置文件
+        for episode_idx, terrain_seed in enumerate(terrain_seeds):
+            episode_positions_file: Optional[Path] = generate_episode_positions(
+                terrain_seed, episode_idx, episode_positions_dir, base_env_vars
+            )
+            if episode_positions_file is None:
+                print(f"⚠️  Episode {episode_idx}位置文件生成失败，将使用动态生成")
+    else:
+        print(f"✅ 发现已存在的位置文件: {len(existing_positions)} 个")
+    
+    # 选择一个默认位置文件（用于评估脚本初始化阶段）
+    # 优先使用第一个episode的位置文件，避免与地形种子不匹配
+    default_positions_file = positions_file
+    if terrain_seeds:
+        candidate = episode_positions_dir / f"episode_000_seed_{terrain_seeds[0]}.json"
+        if not candidate.exists():
+            candidate = episode_positions_dir / "episode_000.json"
+        if candidate.exists():
+            default_positions_file = candidate
+
     # 🔧 关键修复：验证所有评估配置使用相同的回合数
     # 确保对比的一致性
     expected_episodes = episodes
     print(f"✅ 验证：所有评估配置将使用 {expected_episodes} 个回合进行评估")
     
-    # 对每个评估配置进行评估
-    for eval_cfg in EVALUATION_CONFIGS:
-        label = eval_cfg["label"]
-        terrain_sensing_mode = eval_cfg["terrain_sensing_mode"]
-        
-        print(f"\n{'='*70}")
-        print(f"[评估-{label}] 开始评估: {eval_cfg.get('name', label)}")
-        print(f"[评估-{label}] 地形感知模式: {terrain_sensing_mode}")
-        print(f"[评估-{label}] 模型路径: {trained_model_path}")
-        print(f"[评估-{label}] 评估回合数: {episodes} (与所有其他评估模式一致)")
-        print(f"{'='*70}\n")
-        
-        # 设置评估环境变量
-        env = os.environ.copy()
-        env.update(setup_base_env_vars(positions_file, 0))  # 使用默认GPU ID
-        env["USE_FIXED_POSITIONS"] = "1"
-        env["POSITIONS_FILE"] = str(positions_file)
-        env["SEED"] = str(seed)
-        env["QUIET_OUTPUT"] = "1"
-        env["TQDM_DISABLE"] = "0"
-        env["TQDM_TO_STDOUT"] = "1"
-        env["EVAL_DEBUG_ACTION_STEPS"] = "0"
-        # 🔧 修复：不启用EVAL_LIGHT_MODE，因为需要记录轨迹用于生成交互图
-        # env["EVAL_LIGHT_MODE"] = "1"  # 禁用：需要轨迹数据
-        env["EVAL_DISABLE_VISUALIZATION"] = "1"
-        # 🔧 性能优化：禁用环境中的轨迹记录（减少重复记录开销）
-        # 注意：评估脚本会单独记录轨迹，环境中的记录是冗余的
-        env["DISABLE_TRAJECTORY_RECORDING"] = "1"
-        env["NOISE_SCALE"] = "0.0"
-        env["RANDOM_ACTION_PROB"] = "0.0"
-        env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"
-        # 🔧 关键：设置terrain_sensing_mode（仅用于APF地形力计算）
-        env["TERRAIN_SENSING_MODE"] = terrain_sensing_mode
-        
-        # 🚨 关键修复：确保评估时使用与训练时相同的势场参数
-        # 这些参数必须与训练配置完全一致，确保公平对比
-        env["GOAL_ATTRACTION"] = "6.0"  # 与训练配置一致
-        env["LAMBDA_1_BASE"] = "8.5"  # 与训练配置一致
-        env["TERRAIN_REPULSION"] = "8000.0"  # 与训练配置一致
-        env["AGENT_INFLUENCE_RANGE"] = "150.0"  # 与训练配置一致
-        env["DELTA_K_ATT"] = "5.0"  # 与训练配置一致
-        env["DELTA_LAMBDA_1"] = "2.2"  # 与训练配置一致
-        env["DELTA_K_REP"] = "1200.0"  # 与训练配置一致
-        env["DELTA_RADIUS"] = "80.0"  # 与训练配置一致
-        print(f"🔧 势场参数: GOAL_ATTRACTION={env['GOAL_ATTRACTION']}, TERRAIN_REPULSION={env['TERRAIN_REPULSION']}, DELTA_K_ATT={env['DELTA_K_ATT']}")
-        
-        # 🔧 新增：设置episode_length（通过环境变量传递给run_evaluation.sh）
-        env["EPISODE_LENGTH"] = str(episode_length)
-        # 🔧 新增：禁用GIF生成（消融实验不需要GIF图）
-        env["DISABLE_GIF"] = "1"
-        # 🔧 关键修复：设置固定的地形种子序列，确保所有评估模式使用相同的地图顺序
-        # 将地形种子序列编码为环境变量（用逗号分隔）
-        env["TERRAIN_SEED_SEQUENCE"] = ",".join(map(str, terrain_seeds))
-        # 🔧 关键修复：确保保存最佳回合（不跳过）
-        env["SAVE_BEST_TRAJ"] = "1"  # 保存最佳回合轨迹
-        env["SAVE_INTERACTIVE_TRAJ"] = "0"  # 不生成交互式HTML（节省时间，后续会统一生成对比图）
-        # 🔧 新增：确保评估脚本保存所有episode的轨迹数据（用于生成对比图）
-        # 注意：评估脚本默认会保存轨迹，但为了确保，我们明确设置
-        env["DISABLE_TRAJECTORY_RECORDING"] = "0"  # 确保记录轨迹
-        
-        # 🚨 关键修复：确保评估时使用与训练时相同的碰撞检测参数
-        # 这些参数必须与run_optimized.sh中的默认值完全一致，否则碰撞统计会不准确
-        env["TERRAIN_CONTACT_EPS"] = "0.2"  # 地形接触阈值（与run_optimized.sh一致）
-        env["COLLISION_DISTANCE_THRESHOLD"] = "0.5"  # 碰撞距离阈值（与run_optimized.sh一致）
-        env["COLLISION_PENALTY_VALUE"] = "60.0"  # 碰撞惩罚值（与run_optimized.sh一致）
-        print(f"🔧 碰撞检测参数: TERRAIN_CONTACT_EPS={env['TERRAIN_CONTACT_EPS']}, COLLISION_DISTANCE_THRESHOLD={env['COLLISION_DISTANCE_THRESHOLD']}")
-        
-        # 🔧 关键修复：显式设置积分步长（与训练时一致，使用基础值0.08）
-        # 积分步长：0.08秒
-        # 单步最大移动距离：42.5 m/s × 0.08 s = 3.4 米
-        env["SIMULATION_DT"] = "0.08"  # 积分步长（与multiagent/core.py中的默认值一致）
-        print(f"🔧 积分步长: SIMULATION_DT={env['SIMULATION_DT']} (基础值，单步最大移动距离约3.4米)")
-        
-        # 🚨 关键修复：确保评估时完全使用APF（ACTION_FORCE_RATIO=1.0），不混合网络输出
-        # 这是sensing实验的核心：完全靠APF起作用，网络只用于学习势场参数，不直接输出动作
-        env["ACTION_FORCE_RATIO"] = "1.0"  # 100% APF，0% 网络输出
-        env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = "DISABLED"  # 禁用schedule，保持固定值1.0
-        print(f"🔧 动作混合比例: ACTION_FORCE_RATIO={env['ACTION_FORCE_RATIO']} (100% APF，完全靠势场起作用)")
-        
-        # 🔧 抑制 TensorFlow/XLA 警告（如 cuFFT 注册警告）
-        # TF_CPP_MIN_LOG_LEVEL: 0=全部日志, 1=INFO及以上, 2=WARNING及以上, 3=ERROR及以上
-        env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # 抑制警告，保留错误信息
-        
-        # 🔧 修复：评估结果保存到批次目录中，而不是evaluation_results/目录
-        # 如果提供了batch_dir，则保存到batch_dir/evaluation_results/子目录
-        # 否则保存到evaluation_results/目录（向后兼容）
+    # 🚀 关键优化：并行执行三个评估模式，大幅提升评估速度
+    # 原因：所有评估模式使用相同的初始条件（地形和位置），可以安全并行
+    print(f"\n{'='*70}")
+    print(f"🚀 并行评估模式")
+    print(f"{'='*70}")
+    print(f"评估配置数量: {len(EVALUATION_CONFIGS)}")
+    print(f"并行进程数: {min(len(EVALUATION_CONFIGS), multiprocessing.cpu_count())}")
+    print(f"{'='*70}\n")
+    
+    # 并行执行评估
+    results = {}
+    max_workers = min(len(EVALUATION_CONFIGS), multiprocessing.cpu_count())
+    
+    # 准备任务参数（转换为可序列化的格式）
+    tasks = [
+        (
+            eval_cfg,
+            str(trained_model_path),
+            str(default_positions_file),
+            episodes,
+            seed,
+            episode_length,
+            str(episode_positions_dir),
+            terrain_seeds,
+            str(batch_dir) if batch_dir is not None else None
+        )
+        for eval_cfg in EVALUATION_CONFIGS
+    ]
+    
+    # 🚀 并行执行 + 实时日志监控
+    # 方案：每个进程输出到独立日志文件，主进程实时读取并显示
+    print(f"🚀 启动并行评估（{max_workers}个进程）\n")
+    print(f"📝 每个评估模式的日志将保存到独立的日志文件中")
+    print(f"💡 提示：可以使用 'tail -f <log_file>' 实时查看日志\n")
+    
+    import threading
+    import time
+    
+    # 预先创建日志文件路径（用于监控）
+    log_files = {}
+    for task in tasks:
+        label = task[0]["label"]
+        terrain_sensing_mode = task[0]["terrain_sensing_mode"]
         if batch_dir is not None:
-            eval_save_path = str(batch_dir / "evaluation_results" / f"{label}_{terrain_sensing_mode}")
-            # 确保目录存在
-            Path(eval_save_path).mkdir(parents=True, exist_ok=True)
+            eval_save_path = str(Path(batch_dir) / "evaluation_results" / f"{label}_{terrain_sensing_mode}")
         else:
             eval_save_path = f"evaluation_results/{label}_{terrain_sensing_mode}"
+        log_dir = Path(eval_save_path).parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{label}_{terrain_sensing_mode}.log"
+        log_files[label] = log_file
+        print(f"📝 [{label}] 日志文件: {log_file}")
+    
+    print()  # 空行
+    
+    # 启动日志监控线程（实时显示所有进程的输出）
+    def monitor_logs():
+        """实时监控所有日志文件并显示"""
+        import re  # 🚨 关键修复：在函数内部导入re模块
         
-        # 运行评估
-        # 🔧 关键修复：确保所有评估配置使用相同的回合数
-        eval_episodes_count = episodes  # 使用传入的episodes参数，确保一致性
-        eval_cmd = [
-            "./run_evaluation.sh",
-            str(trained_model_path),
-            str(eval_episodes_count),  # 🔧 确保使用相同的回合数
-            eval_save_path,
-            str(positions_file),
-            "1",  # use_fixed_positions
-            "true",  # disable_early_termination
-        ]
+        # 等待日志文件创建
+        time.sleep(1)
         
-        # 🔧 验证：打印评估命令，确认回合数一致
-        print(f"🔧 评估命令: {' '.join(eval_cmd)}")
-        print(f"   回合数: {eval_episodes_count} (应与所有评估模式一致)")
+        # 实时读取并显示日志
+        file_handles = {}
         
-        try:
-            result = subprocess.run(eval_cmd, check=True, env=env)
-            # 🔧 验证：检查评估结果文件，确认回合数一致
-            eval_results_json = Path(eval_save_path) / "evaluation_results.json"
-            if eval_results_json.exists():
-                with open(eval_results_json, 'r', encoding='utf-8') as f:
-                    eval_data = json.load(f)
-                actual_episodes = eval_data.get('episodes', 0)
-                if actual_episodes != expected_episodes:
-                    print(f"⚠️  警告: 评估结果回合数不一致！期望: {expected_episodes}, 实际: {actual_episodes}")
-                else:
-                    print(f"✅ 验证通过: 评估结果回合数 = {actual_episodes} (与期望一致)")
+        for label, log_file in log_files.items():
+            if log_file.exists():
+                try:
+                    file_handles[label] = open(log_file, 'r', encoding='utf-8')
+                    # 移动到文件末尾（只显示新内容）
+                    file_handles[label].seek(0, 2)
+                except Exception:
+                    pass
+        
+        # 如果文件还没创建，等待一下
+        if not file_handles:
+            time.sleep(2)
+            for label, log_file in log_files.items():
+                if log_file.exists():
+                    try:
+                        file_handles[label] = open(log_file, 'r', encoding='utf-8')
+                        file_handles[label].seek(0, 2)
+                    except Exception:
+                        pass
+        
+        # 持续监控直到所有进程完成
+        last_progress = {}  # 记录每个进程的最后进度信息
+        progress_update_interval = 5.0  # 进度条更新间隔（秒）- 增加到5秒，大幅减少刷新频率
+        last_progress_time = time.time()
+        last_display_time = {}  # 记录每个进程最后显示的时间
+        
+        # 🚨 关键修复：使用更智能的进度条检测和显示逻辑
+        # 问题：tqdm会频繁刷新进度条，导致输出混乱
+        # 解决方案：完全过滤原始进度条，只定期显示简化版本
+        
+        while file_handles:
+            current_time = time.time()
+            # 不再使用全局的should_update_progress，而是每个进程独立检查
             
-            # TODO: 解析评估结果并提取指标（SR_team、穿透/碰撞次数、d_min分位数等）
-            results[label] = {
-                "success": True,
-                "model_path": str(trained_model_path),
-                "terrain_sensing_mode": terrain_sensing_mode,
-                "eval_save_path": eval_save_path,
-                "episodes": expected_episodes,  # 🔧 新增：记录期望的回合数
-            }
-        except Exception as e:
-            print(f"[评估-{label}] 评估失败: {e}")
-            results[label] = {
-                "success": False,
-                "error": str(e),
-                "terrain_sensing_mode": terrain_sensing_mode,
-            }
+            for label, fh in list(file_handles.items()):
+                if fh is None:
+                    continue
+                try:
+                    line = fh.readline()
+                    if line:
+                        line_stripped = line.rstrip()
+                        
+                        # 过滤和优化显示
+                        # 1. 跳过空行
+                        if not line_stripped:
+                            continue
+                        
+                        # 2. 进度条信息：完全过滤原始进度条，只显示简化版本
+                        # 🚨 关键：使用更严格的检测条件，确保完全过滤所有进度条输出
+                        # 检测tqdm进度条的特征：包含"回合"、"%"、"|"、数字/步数等
+                        # 注意：re模块已在monitor_logs函数开头导入
+                        has_episode = "回合" in line_stripped
+                        has_percent = "%" in line_stripped
+                        has_bar = "|" in line_stripped
+                        has_step_info = "步/s" in line_stripped or "步数=" in line_stripped
+                        # 检查是否包含"数字/数字"格式（如"2146/2800"）
+                        has_slash_number = bool(re.search(r'\d+/\d+', line_stripped))
+                        
+                        # 进度条必须同时满足：回合 + 百分比 + 进度条符号 + 步数信息
+                        is_progress_bar = (
+                            has_episode and 
+                            has_percent and 
+                            has_bar and 
+                            (has_step_info or has_slash_number)
+                        )
+                        
+                        if is_progress_bar:
+                            # 🚨 关键修复：完全过滤原始进度条，只定期显示简化版本
+                            # 提取关键信息：回合号、进度百分比、奖励
+                            # 简化进度条显示
+                            # 匹配格式：回合 1:  77%|... 或 回合 1: 77%
+                            match = re.search(r'回合\s*(\d+):\s*(\d+)%', line_stripped)
+                            if match:
+                                ep_num = match.group(1)
+                                pct = match.group(2)
+                                # 提取奖励（可能格式：奖励=46238.5 或 奖励: 46238.5）
+                                reward_match = re.search(r'奖励[=:]?\s*([\d.]+)', line_stripped)
+                                reward = reward_match.group(1) if reward_match else "N/A"
+                                
+                                # 检查是否与上次显示的内容相同，且距离上次显示时间足够长（避免重复显示）
+                                current_progress = (ep_num, pct, reward)
+                                current_display_time = current_time
+                                
+                                # 只有进度发生变化，或者距离上次显示超过更新间隔，才显示
+                                should_display = False
+                                if label not in last_progress:
+                                    should_display = True
+                                elif last_progress[label] != current_progress:
+                                    # 进度变化了，检查时间间隔
+                                    if label not in last_display_time:
+                                        should_display = True
+                                    elif (current_display_time - last_display_time[label]) >= progress_update_interval:
+                                        should_display = True
+                                
+                                if should_display:
+                                    # 🚨 关键优化：使用固定位置显示，每个进程一行，保持稳定
+                                    # 格式：[label] 回合X: Y% | 奖励=Z
+                                    # 不使用\r覆盖，而是每次新行，但更新频率低，看起来稳定
+                                    print(f"[{label}] 回合{ep_num}: {pct}% | 奖励={reward}", flush=True)
+                                    last_progress[label] = current_progress
+                                    last_display_time[label] = current_display_time
+                                    last_progress_time = current_display_time
+                            
+                            # 🚨 关键：完全跳过原始进度条输出，无论是否显示简化版本
+                            continue
+                        
+                        # 3. 过滤掉tqdm的刷新字符和ANSI转义序列
+                        if '\r' in line_stripped or line_stripped.startswith('\x1b') or '\x1b[' in line_stripped:
+                            continue
+                        
+                        # 4. 过滤掉只包含进度条字符的行（如只有████等）
+                        if all(c in ' █▉▊▋▌▍▎▏|' for c in line_stripped.strip()):
+                            continue
+                        
+                        # 5. 过滤掉任何包含进度条特征的行（确保完全过滤）
+                        # 即使检测逻辑没完全匹配，如果包含关键特征也跳过
+                        if "回合" in line_stripped and "%" in line_stripped and "|" in line_stripped:
+                            # 这可能是进度条的一部分，完全跳过
+                            continue
+                        
+                        # 6. 过滤掉包含tqdm特有格式的行
+                        if "步/s" in line_stripped and ("[" in line_stripped or "]" in line_stripped):
+                            # tqdm的格式，跳过
+                            continue
+                        
+                        # 6. 显示重要信息（非进度条）
+                        # 只显示有实际内容的信息
+                        if len(line_stripped.strip()) > 0:
+                            print(f"[{label}] {line_stripped}", flush=True)
+                    else:
+                        # 检查文件是否被关闭（进程完成）
+                        if fh.closed:
+                            file_handles[label] = None
+                except (ValueError, OSError):
+                    # 文件可能被关闭
+                    file_handles[label] = None
+            
+            # 清理None值
+            file_handles = {k: v for k, v in file_handles.items() if v is not None}
+            
+            if file_handles:
+                time.sleep(0.1)  # 稍微增加延迟，减少CPU占用
+            else:
+                break
+        
+        # 关闭文件句柄
+        for fh in file_handles.values():
+            if fh and not fh.closed:
+                fh.close()
+    
+    # 启动日志监控线程
+    monitor_thread = threading.Thread(target=monitor_logs, daemon=True)
+    monitor_thread.start()
+    
+    # 并行执行评估
+    results = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_label = {
+            executor.submit(_run_single_evaluation_worker, task): task[0]["label"]
+            for task in tasks
+        }
+        
+        # 收集结果
+        for future in as_completed(future_to_label):
+            label = future_to_label[future]
+            try:
+                result = future.result()
+                results[label] = result
+                if result.get("success", False):
+                    print(f"\n✅ [评估-{label}] 完成")
+                else:
+                    print(f"\n❌ [评估-{label}] 失败: {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                print(f"\n❌ [评估-{label}] 异常: {e}")
+                import traceback
+                traceback.print_exc()
+                results[label] = {
+                    "label": label,
+                    "success": False,
+                    "error": str(e),
+                }
+    
+    # 等待日志监控线程完成
+    monitor_thread.join(timeout=5)
     
     return results
 
@@ -443,10 +776,10 @@ def main():
         "batch_size": args.batch_size,
         "algorithm": args.algorithm,
         "use_weighted_reward": args.use_weighted_reward,
-        "scenario_seed": 67,
-        "terrain_complexity": 2,
-        "map_size": 200,
-        "mountain_min_distance": 55,
+        "scenario_seed": SCENARIO_SEED,
+        "terrain_complexity": TERRAIN_COMPLEXITY_LEVEL,
+        "map_size": MAP_SIZE,
+        "mountain_min_distance": MOUNTAIN_MIN_DISTANCE,
         "positions_file": str(positions_file),
         "notes": "地形感知模式消融实验：对比local vs oracle感知对APF性能的影响"
     }

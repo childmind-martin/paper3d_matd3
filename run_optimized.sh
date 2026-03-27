@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# 这份脚本使用了 Bash 专有语法（数组、${var,,} 等）。
+# 某些调用链（例如部分 subprocess / shell 包装）可能会意外用 sh/dash 来解析它，
+# 从而在数组赋值附近报出 "Syntax error: ( unexpected"。
+# 这里在最开头做一次自恢复：如果当前不在 Bash 中，立即切回 Bash 重新执行自身。
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /bin/bash "$0" "$@"
+fi
+
 # 确保从脚本所在目录运行，避免相对路径问题
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -45,12 +53,15 @@ echo "MADDPG 优化版训练启动器 (已修复)"
 echo "======================================"
 
 # 设置默认参数
-EPISODES=${1:-500}    
-BATCH_SIZE=${2:-1024}  # 🚀 提升批次大小到4096，充分利用GPU并行能力
-EXP_NAME=${3:-"双头q改进测试、变FR、改动作添加噪声、随机地图、复杂4_exp"}
+EPISODES=${1:-200}    
+BATCH_SIZE=${2:-1024}  # 🔧 好效果复现：与 result.json 一致（1024）
+EXP_NAME=${3:-"变FR到0.1、公平权重补偿、静态障碍物、课程学习、随机角色、高球形障碍apf、复杂4_exp"}
 USE_WEIGHTED_REWARD=${4:-1}  # 新增：是否使用分项加权求和奖励机制（1=启用，0=禁用）
 ALGORITHM=${5:-"matd3"}     # 新增：选择训练算法（maddpg或matd3）
 RESUME_MODEL=${6:-""}       # 🔧 新增：持续训练模型路径（可选，指定要恢复的模型目录）
+# 🔧 消融实验专用：仅解析并导出最终训练配置，不启动训练
+ABLATION_RESOLVE_ONLY=${ABLATION_RESOLVE_ONLY:-0}
+ABLATION_MANIFEST_PATH=${ABLATION_MANIFEST_PATH:-}
 
 # 🔧 持续训练模型配置（优先级：命令行参数 > 环境变量 > 空）
 # 如果通过环境变量指定，优先使用环境变量
@@ -65,18 +76,11 @@ fi
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EXP_NAME_WITH_TIMESTAMP="${EXP_NAME}_${TIMESTAMP}"
 
-# PF元优化基准输出路径（默认写入当前实验日志目录）
-if [ -z "${PF_META_BASELINE_FILE:-}" ]; then
-    export PF_META_BASELINE_FILE="logs/$EXP_NAME_WITH_TIMESTAMP/pf_meta_baseline.json"
-fi
-
 # 🔧 随机种子初始化（在显示参数前生成，确保SEED已设置）
 if [ -z "${SEED:-}" ]; then
-    # 生成随机种子（基于时间戳，范围：100000-999999）
-    # 使用纳秒级时间戳的后6位，确保每次运行都有不同的种子
-    RANDOM_SEED=$(($(date +%s%N) % 900000 + 100000))
-    export SEED=$RANDOM_SEED
-    SEED_SOURCE="自动生成"
+    # 默认使用固定种子 936487，便于复现与对比
+    export SEED=936487
+    SEED_SOURCE="默认(936487)"
 else
     SEED_SOURCE="环境变量（复现模式）"
 fi
@@ -89,6 +93,7 @@ echo "  - 实验名称: $EXP_NAME"
 echo "  - 带时间戳的实验名称: $EXP_NAME_WITH_TIMESTAMP"
 echo "  - 使用分项加权奖励: $USE_WEIGHTED_REWARD"
 echo "  - 训练算法: $ALGORITHM"
+echo "  - 随机角色(Role Shuffle): ${ENABLE_ROLE_SHUFFLE:-1}"
 echo "  - 随机种子: $SEED ($SEED_SOURCE)"
 if [ -n "$RESUME_MODEL" ]; then
     echo "  - 🔧 持续训练: 从模型恢复 - $RESUME_MODEL"
@@ -99,9 +104,11 @@ echo ""
 
 echo ""
 
-# 创建必要的目录
-mkdir -p logs/$EXP_NAME_WITH_TIMESTAMP
-mkdir -p models/$EXP_NAME_WITH_TIMESTAMP
+# 创建必要的目录（仅在真正训练时创建；消融的 resolve-only 模式不产生普通训练目录）
+if ! { [ "${ABLATION_RESOLVE_ONLY}" = "1" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "true" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "yes" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "on" ]; }; then
+    mkdir -p logs/$EXP_NAME_WITH_TIMESTAMP
+    mkdir -p models/$EXP_NAME_WITH_TIMESTAMP
+fi
 
 # 检查GPU
 if command -v nvidia-smi &> /dev/null; then
@@ -110,29 +117,24 @@ if command -v nvidia-smi &> /dev/null; then
     echo ""
 fi
 
-# === 学习率参数 ===
-# 🚨 修复训练波动：降低Critic学习率，提高稳定性
-export LEARNING_RATE_ACTOR=${LEARNING_RATE_ACTOR:-0.0008}   # 🔧 保持Actor学习率
-                                                              # 原因：0.0003是合理的Actor学习率
-export LEARNING_RATE_CRITIC=${LEARNING_RATE_CRITIC:-0.002}  # 🚨 关键修复：提高Critic学习率（0.0005→0.001）
-                                                               # 原因：之前学习率太小导致更新缓慢，Critic Loss过小（~0.01）
-                                                               # 修复：提高到0.001，是Actor的2倍，加快Critic更新速度
-                                                               # 预期：Q值估计更快收敛，Critic Loss提升到0.1-1.0范围
+# === 学习率参数（好效果复现：与 matd3_separated_gradient_20260304_121654 一致）===
+export LEARNING_RATE_ACTOR=${LEARNING_RATE_ACTOR:-0.0003}    # 好效果：0.0003
+export LEARNING_RATE_CRITIC=${LEARNING_RATE_CRITIC:-0.0005}  # 好效果：0.0005
 
 # === 🔧 Loss函数参数（增强梯度信号）===
-export HUBER_DELTA=${HUBER_DELTA:-2.0}                 # 🔧 Huber Delta参数（从2.5降低到2.0）
-                                                        # 原因：reward_scale改为1/1000后，Q值范围~[-500,500]，TD误差~2-20
-                                                        # 作用：delta=1.5使TD误差>1.5进入线性区，<1.5在平方区，让Loss对误差更敏感
-                                                        # 效果：梯度增强，网络更新更快，Critic Loss从0.01-0.015提升到0.1-1.0
-                                                        # 建议范围：1.0-2.0（根据Q值范围调整，通常为Q值范围的0.3-0.5%）
+export HUBER_DELTA=${HUBER_DELTA:-1.0}                 # 🔧 修复NaN：降低Huber Delta（2.0→1.0），减小梯度幅度
+                                                        # 原因：过大的delta会导致TD误差产生过大的梯度，引发数值不稳定
+                                                        # 作用：使用更小的delta让Loss对误差的响应更平滑，避免梯度爆炸
+                                                        # 效果：提高训练稳定性，防止Loss变成NaN
+                                                        # 建议范围：0.5-1.5（根据Q值范围调整）
 
-# === 🔥 学习率衰减参数（保持学习能力）===
-export LR_DECAY_ENABLED=${LR_DECAY_ENABLED:-1}                          # 启用学习率衰减，但设置更高的最小学习率
-export LR_DECAY_STEPS=${LR_DECAY_STEPS:-20000}                           # 🔧 衰减步数放宽到20000，减缓衰减速度
-export LR_DECAY_RATE=${LR_DECAY_RATE:-0.9996}                           # 🔧 衰减更慢（0.999→0.9995），每20000步衰减0.05%
-export LR_STAIRCASE=${LR_STAIRCASE:-1}                                  # 是否使用阶梯式衰减（1=阶梯，0=平滑）
-export LR_MIN_ACTOR=${LR_MIN_ACTOR:-0.00030}                            # 🔧 提高Actor最小学习率（0.00008→0.00015），保持后期学习能力
-export LR_MIN_CRITIC=${LR_MIN_CRITIC:-0.00040}                          # 🔧 提高Critic最小学习率（0.00010→0.00020），保持后期学习能力
+# === 🔥 学习率衰减参数（好效果复现）===
+export LR_DECAY_ENABLED=${LR_DECAY_ENABLED:-1}                          # 好效果：启用
+export LR_DECAY_STEPS=${LR_DECAY_STEPS:-30000}                           # 好效果：30000
+export LR_DECAY_RATE=${LR_DECAY_RATE:-0.9995}                           # 好效果：0.9995
+export LR_STAIRCASE=${LR_STAIRCASE:-1}                                  # 好效果：true
+export LR_MIN_ACTOR=${LR_MIN_ACTOR:-0.00005}                            # 修正：最小学习率必须低于初始学习率，避免“衰减”失效
+export LR_MIN_CRITIC=${LR_MIN_CRITIC:-0.00008}                          # 保持Critic下限略高于Actor，兼顾稳定性
 
 # === 网络架构参数 ===
 # 🔙 恢复到原先结构（不改动逻辑，仅还原规模）
@@ -146,10 +148,10 @@ export CRITIC_HIDDEN=${CRITIC_HIDDEN:-"256,256,256"}   # 🚨 修复训练波动
 export MAX_WEIGHT_THRESHOLD=${MAX_WEIGHT_THRESHOLD:-0.999}   # 从0.15放宽到0.8，给予网络更大学习空间
 export WEIGHT_SCALING_FACTOR=${WEIGHT_SCALING_FACTOR:-0.999}  # 从0.6提高到0.9，更温和的缩放
 
-# === 🚀 加速配置（默认：关闭所有JIT，避免内存对齐问题）===
+# === 🚀 加速配置（默认：仅保留 PF_JIT，禁用通用 JIT_COMPILE）===
 export AMP_MODE=off
-export JIT_COMPILE=${JIT_COMPILE:-0}            # 🔧 修复：默认禁用（1→0），避免与XLA叠加导致内存对齐问题
-export PF_JIT=0                                  # 势场JIT编译（默认禁用）
+export JIT_COMPILE=${JIT_COMPILE:-0}            # 当前 MATD3 separated-gradient 热路径下不稳定，默认关闭
+export PF_JIT=${PF_JIT:-1}                      # 势场热内核 JIT，当前已验证有效
 
 # === 🔧 XLA Global 配置（默认启用，异步执行模式）===
 # 配置说明：
@@ -165,41 +167,64 @@ export TQDM_MININTERVAL=${TQDM_MININTERVAL:-0.3}  # 进度条刷新间隔（秒�
 export TQDM_NCOLS=${TQDM_NCOLS:-100}              # 进度条列宽
 export GPU_ID=${GPU_ID:-0}
 export NUM_ENVS=${NUM_ENVS:-1}                     # 🔧 单环境运行，避免并行环境引入的干扰和复杂性
+export ENABLE_ROLE_SHUFFLE=${ENABLE_ROLE_SHUFFLE:-1}  # 角色随机化：1启用，0禁用（默认开启）
 export TQDM_DISABLE=${TQDM_DISABLE:-1}            # 完全禁用tqdm进度条（默认安静）
 export SAVE_POSITIONS=${SAVE_POSITIONS:-1}        # 默认关闭保存位置
 export USE_LITE_BUFFER=${USE_LITE_BUFFER:-1}      # 默认启用内存友好的sumTree 优先经验回放
 ## 移除：历史TF Buffer开关（实现已移除）
 # export USE_TF_BUFFER=${USE_TF_BUFFER:-0}
 export PER_ENABLED=${PER_ENABLED:-1}              # 启用优先经验回放（对 Lite/ReplayBuffer 生效）
-export BUFFER_SIZE=${BUFFER_SIZE:-500000}   # 经验缓冲区大小（增加到50万）
-export UPDATE_RATE=${UPDATE_RATE:-40}       # 🔧 回滚到30：UPDATE_RATE不是主要问题，奖励尺度才是
-export ACTOR_UPDATE_DELAY=${ACTOR_UPDATE_DELAY:-2}  # 🚨 关键修复：提高Actor更新延迟（从1到2），减少训练频率，提高训练稳定性
-                                                      # 问题：每步都更新Actor导致训练不稳定，Loss波动大
-                                                      # 修复：每2步更新一次Actor，让Critic有更多时间稳定Q值估计
-                                                      # 预期：Loss波动减小，训练更稳定
+export PER_DEBUG_PRINT_INTERVAL=${PER_DEBUG_PRINT_INTERVAL:-2000}  # PER优先级统计输出间隔；0表示禁用
+export BUFFER_SIZE=${BUFFER_SIZE:-450000}   # 经验缓冲区大小（增加到50万）
+export UPDATE_RATE=${UPDATE_RATE:-40}       # 好效果：40
+export ACTOR_UPDATE_DELAY=${ACTOR_UPDATE_DELAY:-2}  # 调低Actor更新频率，减少策略过快追随短期Q波动
 
-# === MATD3算法特有参数 === 
-export POLICY_NOISE=${POLICY_NOISE:-0.28}            # 🔧 修复：降低目标策略平滑噪声（从0.50降到0.25），提高稳定性
-export NOISE_CLIP=${NOISE_CLIP:-0.32}                # 目标策略噪声裁剪幅度（MATD3）- 降低以减少数值波动
-export POLICY_FREQ=${POLICY_FREQ:-1}                # 🔧 修复：降低Actor更新延迟（从2降到1），提高Actor更新频率（MATD3）
-
+# === MATD3算法特有参数（好效果复现）===
+export POLICY_NOISE=${POLICY_NOISE:-0.28}            # 好效果：0.28
+export NOISE_CLIP=${NOISE_CLIP:-0.32}                # 好效果：0.32
+export POLICY_FREQ=${POLICY_FREQ:-2}                 # 恢复TD3延迟策略更新，优先稳定Critic后再推Actor
+# === 训练公平权重参数（低成功率agent反向补偿）===
+# 🔧 弱化极端效应：降低 BETA、缩小 MAX_WEIGHT、提高 MIN_WEIGHT，避免失败 agent 长期顶格权重压制成功 agent 学习
+export FAIRNESS_REWEIGHT_ENABLED=${FAIRNESS_REWEIGHT_ENABLED:-0}  # 启用agent级补偿，降低单个agent掉队导致的团队失败
+export FAIRNESS_WINDOW=${FAIRNESS_WINDOW:-20}
+export FAIRNESS_BETA=${FAIRNESS_BETA:-1.6}              # 降低补偿斜率，避免把训练完全拉向最弱agent
+export FAIRNESS_MIN_WEIGHT=${FAIRNESS_MIN_WEIGHT:-0.90} # 成功agent仍保留足够学习强度
+export FAIRNESS_MAX_WEIGHT=${FAIRNESS_MAX_WEIGHT:-1.25} # 失败agent补偿上限收窄，避免过度重权
 export BUFFER_DTYPE=${BUFFER_DTYPE:-fp32}         # 롤백: fp16 -> fp32 (안정성 우선)
 export PER_REPLACE=${PER_REPLACE:-0}             # PER采样是否放回: 1/0（保持原有采样模式）
 ## === PER增强参数（新） ===
-export PER_UNIFORM_MIX=${PER_UNIFORM_MIX:-0.45}      # PER与均匀采样混合比例（保持原值，不改变分布）
+export PER_UNIFORM_MIX=${PER_UNIFORM_MIX:-0.40}      # PER与均匀采样混合比例（保持原值，不改变分布）
 export PER_TD_WEIGHT=${PER_TD_WEIGHT:-0.80}           # 优先级中TD误差项权重
-export PER_REWARD_WEIGHT=${PER_REWARD_WEIGHT:-0.12}   # 优先级中奖励幅值项权重
+export PER_REWARD_WEIGHT=${PER_REWARD_WEIGHT:-0.10}   # 优先级中奖励幅值项权重
 export PER_AGE_DECAY=${PER_AGE_DECAY:-0.95}           # 年龄衰减系数(0-1]，1不衰减
 export MEM_DEBUG=${MEM_DEBUG:-0}                  # 打印内存/显存
 export DEBUG_PF_FORCES=${DEBUG_PF_FORCES:-0}       # 调试势场力量级
 export PROFILING=${PROFILING:-0}                  # 启用剖析（默认关闭）
+# === 计时/性能输出开关 ===
+# TIMING_SUMMARY: 训练计时总开关。不开启时，TIMING_LEVEL / TIMING_DETAIL 都不会生效。
+# TIMING_LEVEL:
+#   1 = 仅输出 [TIMING]
+#   2 = 额外输出 [TIMING2] 细分项
+# TIMING_DETAIL: 显式细分开关；当 TIMING_SUMMARY=1 时，可与 TIMING_LEVEL 叠加使用。
+# TIMING_INTERVAL_STEPS:
+#   0 = 仅在每回合结束时输出一次汇总（默认，避免刷屏）
+#   >0 = 每 N 步输出一次窗口汇总
+export TIMING_SUMMARY=${TIMING_SUMMARY:-0}         # 计时汇总（默认开启，至少输出回合级计时）
+export TIMING_LEVEL=${TIMING_LEVEL:-2}             # 计时级别（默认输出TIMING2，便于定位热点）
+export TIMING_DETAIL=${TIMING_DETAIL:-1}           # 显式细分开关（默认开启，便于定位热点）
+export TIMING_INTERVAL_STEPS=${TIMING_INTERVAL_STEPS:-0}  # 步间隔汇总（0=仅回合汇总，避免每步刷屏）
 export STEP_WARN_S=${STEP_WARN_S:-5}              # 单步耗时告警阈值
 ## 清理：脚本内未使用 STEP_WARN_ENABLE（仅保留阈值 STEP_WARN_S 透传）
 # export STEP_WARN_ENABLE=${STEP_WARN_ENABLE:-0}
 export STACK_DUMP_TIMEOUT=${STACK_DUMP_TIMEOUT:-0} # 超时打印堆栈（默认禁用）
 export STACK_WATCHDOG_ENABLE=${STACK_WATCHDOG_ENABLE:-0} # 显式看门狗开关（默认禁用）
-export QUIET_OUTPUT=${QUIET_OUTPUT:-0}            # 安静输出（1=安静, 0=详细）（启用详细输出以检查数据质量）
+export QUIET_OUTPUT=${QUIET_OUTPUT:-1}            # 安静输出（1=安静, 0=详细）；默认走性能模式
+export DEBUG_EPISODE_SUMMARY=${DEBUG_EPISODE_SUMMARY:-1}   # 回合级成功/失败诊断摘要，默认保留
+export DEBUG_COLLISION_SUMMARY=${DEBUG_COLLISION_SUMMARY:-1} # 回合级碰撞统计，默认保留
+export DEBUG_SETUP_INFO=${DEBUG_SETUP_INFO:-0}     # 固定位置/地形/初始化关键信息，默认保留
+export DEBUG_REWARD_EVENTS=${DEBUG_REWARD_EVENTS:-0} # 高频奖励事件打印（部分到达/成功奖励细节），默认关闭
 export DEBUG_EFF_SAMPLES=${DEBUG_EFF_SAMPLES:-0}   # 打印每批有效样本计数/批大小（调试数值稳定性）
+export LOSS_SYNC_INTERVAL=${LOSS_SYNC_INTERVAL:-50} # GPU→CPU loss同步间隔（默认降低频率以减少墙钟开销）
 ## 清理：训练脚本未读取 DEBUG_ENV_OUTPUT，请使用 QUIET_OUTPUT/SUPPRESS_ENV_DEBUG 控制
 # export DEBUG_ENV_OUTPUT=${DEBUG_ENV_OUTPUT:-0}
 export LOG_INTERVAL_STEPS=${LOG_INTERVAL_STEPS:-5000}  # 训练步骤日志输出间隔（默认5000步，减少I/O）
@@ -229,11 +254,10 @@ export QUADROTOR_ATTITUDE_RESPONSE_TIME=${QUADROTOR_ATTITUDE_RESPONSE_TIME:-0.05
                                                              # 🔧 关键：设置为0时，姿态能瞬时达到期望值，没有动力学约束
                                                              # 设置为>0时，姿态需要时间响应，真正限制智能体的行为
                                                              # ✅ 修复：从0.0改为0.1，启用真实动力学约束，让智能体受限于动力学
-export ACTION_RANGE_X=${ACTION_RANGE_X:-2.5}      # 🔧 增加动作范围（2.0→2.5），允许更大的加速度输出
-export ACTION_RANGE_Y=${ACTION_RANGE_Y:-2.5}     # 🔧 增加动作范围（2.0→2.5），允许更大的加速度输出
-export ACTION_RANGE_Z=${ACTION_RANGE_Z:-2.2}     # 🔧 增加Z轴动作范围（1.8→2.2），提高向上飞行能力
-                                                                                                 # 问题：网络输出范围依然不大，无法直接给出较大的加速度效果
-                                                                                                 # 修复：增加动作范围，配合降低的正则化，允许更大的加速度输出
+export ACTION_RANGE_X=${ACTION_RANGE_X:-2.5}      # 好效果：2.5
+export ACTION_RANGE_Y=${ACTION_RANGE_Y:-2.5}      # 好效果：2.5
+export ACTION_RANGE_Z=${ACTION_RANGE_Z:-2.2}      # 好效果：2.2
+export AGENT_ACCEL=${AGENT_ACCEL:-4.6}            # 好效果：4.6
 ## 已弃用：垂直力抑制参数移除
 export REWARD_POS_SCALE=${REWARD_POS_SCALE:-1.0}   # 🔧 修复奖励累积：降低到1.0（2.0→1.0），避免过度放大奖励
                                                       # 原因：2.0的缩放会将所有正奖励放大2倍，导致奖励值虚高
@@ -242,49 +266,67 @@ export REWARD_NEG_SCALE=${REWARD_NEG_SCALE:-1.0}    # 🔧 修复奖励累积：
                                                       # 原因：2.5的缩放会将所有负奖励放大2.5倍，导致惩罚过重
                                                       # 新值1.0：不进行缩放，保持原始奖励值
 
-# 动作OU噪声参数（已替换原高斯白噪声）：std_dev/decay/min 与训练脚本一致
-# 🔧 修复：进一步降低OU噪声，减少训练阶段智能体到处跑的问题
-# 问题：训练阶段OU噪声过大，导致动作波动大，智能体无法稳定学习
-# 解决方案：降低噪声初始值和最小值，减少对动作的干扰
-export NOISE_SCALE=${NOISE_SCALE:-0.35}           # 🔧 降低初始噪声（0.45→0.35），减少过度探索
-                                                   # 原因：FR降低时探索过强，动作抖动导致碰撞增多
-                                                   # 新值0.35：减小噪声幅度，让策略更可控
-export NOISE_DECAY=${NOISE_DECAY:-0.9995}        # 🔧 加快噪声衰减（0.999→0.9995），让训练后期更稳定
-                                                   # 原因：奖励曲线有很好的峰值但没有稳住，说明噪声衰减太慢导致后期仍有过大探索
-                                                   # 新值0.9995：加快衰减，让训练后期噪声更小，动作更稳定
-export NOISE_MIN=${NOISE_MIN:-0.05}              # 🔧 进一步降低最小噪声（0.05→0.03），减少后期扰动
-                                                   # 原因：后期仍存在不必要的探索，影响避障稳定性
-                                                   # 新值0.03：更平滑的后期行为
+# 动作OU噪声参数（好效果复现）
+# 🔧 探索策略：前期略增探索、后期降低以保证稳定
+export NOISE_SCALE=${NOISE_SCALE:-0.30}           # 降低初始噪声，减少后期“安全但漂移不到目标”的随机性
+export NOISE_DECAY=${NOISE_DECAY:-0.9995}         # 略放慢衰减，保留前期探索但不靠高方差硬撞
+export NOISE_MIN=${NOISE_MIN:-0.003}              # 进一步降低末段噪声下限，利于精确收敛到目标
 
 # === 🔧 自适应调整参数（修复奖励下降问题）===
-export ADAPTIVE_PATIENCE=${ADAPTIVE_PATIENCE:-15}              # 🔧 修复：降低耐心（20→15），更早触发探索增强
-export ADAPTIVE_LR_DECAY=${ADAPTIVE_LR_DECAY:-0.95}            # 🚨 修复学习率过低：降低衰减力度（0.9→0.95），每次降低5%而非10%
+export ADAPTIVE_PATIENCE=${ADAPTIVE_PATIENCE:-25}              # 🔧 修复：降低耐心（20→15），更早触发探索增强
+export ADAPTIVE_LR_DECAY=${ADAPTIVE_LR_DECAY:-0.98}            # 🚨 修复学习率过低：降低衰减力度（0.9→0.95），每次降低5%而非10%
                                                                  # 问题：当前Actor LR已降到0.000063，接近最小值0.00002，导致无法跳出局部最优
                                                                  # 解决：降低衰减力度，让学习率下降更慢，保持足够的学习能力
-export ADAPTIVE_MIN_LR=${ADAPTIVE_MIN_LR:-5e-5}                # 🚨 修复学习率过低：提高最小学习率（2e-5→5e-5），保持学习能力
+export ADAPTIVE_MIN_LR=${ADAPTIVE_MIN_LR:-8e-5}                # 🚨 修复学习率过低：提高最小学习率（2e-5→5e-5），保持学习能力
                                                                  # 问题：最小学习率2e-5过低，导致网络无法有效学习
                                                                  # 解决：提高到5e-5，确保网络始终有足够的学习能力
-export ADAPTIVE_NOISE_MAX=${ADAPTIVE_NOISE_MAX:-0.4}           # 🔧 修复噪声过大：降低噪声上限（0.8→0.4），避免动作波动过大
-                                                               # 说明：动作范围2.0，噪声0.4占20%，0.8占40%过大
-                                                               # 建议：噪声上限应不超过动作范围的20-25%
+export ADAPTIVE_NOISE_MAX=${ADAPTIVE_NOISE_MAX:-0.12}           # 0.2→0.16：后期自适应/重启时噪声上限更低，避免动作波动、保证稳定
+                                                               # 说明：动作范围2.0，0.16约8%，配合更低NOISE_MIN实现“后期减探索”
 export ADAPTIVE_NOISE_SMOOTH=${ADAPTIVE_NOISE_SMOOTH:-0.4}     # 噪声平滑更新系数（0-1）
-export NOISE_RESTART_INTERVAL=${NOISE_RESTART_INTERVAL:-20}    # 🔧 修复局部最优：更频繁重启噪声（30→20），保持探索活力
+export NOISE_RESTART_INTERVAL=${NOISE_RESTART_INTERVAL:-25}    # 20→25：重启间隔略拉长，减少后期探索波动、利于稳定
 
-# === 分阶段探索策略参数 ===
-# 🔧 修复过拟合：提高随机动作概率，增强探索能力
-export RANDOM_ACTION_PROB=${RANDOM_ACTION_PROB:-0.12}         # 🔧 预热随机动作降低到12%，避免过度发散
-export RANDOM_ACTION_PROB_TRAINING=${RANDOM_ACTION_PROB_TRAINING:-0.00}  # 🔧 训练随机动作降低到5%，减少不必要探索
-## 清理：训练脚本未读取以下两项（已统一采用"预热阶段/训练阶段"）：
-# export EXPLORATION_PHASE_SWITCH=${EXPLORATION_PHASE_SWITCH:-"warmup"}
-# export EXPLORATION_SWITCH_THRESHOLD=${EXPLORATION_SWITCH_THRESHOLD:-10}
+# === 随机动作探索参数 ===
+# 当前主训练路径与旧回退路径统一使用同一个随机动作概率。
+export RANDOM_ACTION_PROB=${RANDOM_ACTION_PROB:-0.01}
+# 兼容旧参数名：保持与 RANDOM_ACTION_PROB 一致，避免历史脚本/结果解析出错。
+export RANDOM_ACTION_PROB_TRAINING=${RANDOM_ACTION_PROB_TRAINING:-$RANDOM_ACTION_PROB}
 
 # === 位置和地形控制参数 ===
 export DYNAMIC_FIRST_TIME=${DYNAMIC_FIRST_TIME:-1}    # 🔧 启用动态首次：第一回合生成固定位置，后续回合使用该固定位置
                                                         # 配合 USE_FIXED_POSITIONS=1 使用，实现固定起点训练
-export WARMUP_RANDOM_INIT=${WARMUP_RANDOM_INIT:-0}    # 🔧 临时禁用，避免多进程竞态条件
 export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3} # 地形复杂度等级 (1-4) - 默认等级2
 export MOUNTAIN_MIN_DISTANCE=${MOUNTAIN_MIN_DISTANCE:-55}      # 山峰之间的最小距离（单位：地图单位，建议范围20-80）
 export MAP_SIZE=${MAP_SIZE:-200}
+export USE_DYNAMIC_OBSTACLES=${USE_DYNAMIC_OBSTACLES:-1}  # 🔧 障碍物生成模式（1=动态，每次reset重新生成；0=固定，只在首次生成）
+                                                           # 1: 每次reset时重新生成障碍物位置（课程学习解锁后启用，增加训练多样性）
+                                                           # 0: 障碍物位置固定，只在首次生成时创建，后续不再变化（课程学习初始状态）
+                                                           # 🚀 课程学习：初始为0（固定障碍物），满足条件后自动解锁为1（随机障碍物）
+
+# === 🚨 课程学习解锁时的保护机制 ===
+# 当从固定障碍物切换到随机障碍物时，需要防止分布崩溃
+export CURRICULUM_LR_FACTOR=${CURRICULUM_LR_FACTOR:-0.5}  # 🚨 课程学习学习率衰减因子（默认0.5，即降低到原来的50%）
+                                                           # 作用：从固定障碍物切换到随机障碍物时，降低学习率防止分布崩溃
+                                                           # 原因：环境分布剧烈变化时，过高学习率会导致灾难性遗忘
+                                                           # 建议范围：0.3-0.7（0.5是平衡值，既保持学习能力又防止崩溃）
+                                                           # 设置：可通过环境变量 CURRICULUM_LR_FACTOR 调整
+export CURRICULUM_RESET_OPTIMIZER=${CURRICULUM_RESET_OPTIMIZER:-1}  # 🚨 课程学习时是否重置优化器状态（默认启用）
+                                                           # 1: 重置Adam优化器的momentum（m和v），清除旧环境的梯度历史
+                                                           # 0: 保留优化器状态（不推荐，可能导致旧梯度干扰新环境学习）
+                                                           # 原因：优化器内部状态基于固定障碍物环境的梯度历史，会干扰随机障碍物学习
+                                                           # 建议：保持启用（1），确保网络从"干净"状态开始学习新环境
+
+# === 🔧 半随机地形配置（新增）===
+# 问题：完全随机地形导致任务难度差异巨大，智能体无法学习一致的策略
+# 解决：保持起始点-目标点距离固定，只让山峰位置在小范围内波动
+export SEMI_RANDOM_TERRAIN=${SEMI_RANDOM_TERRAIN:-0}          # 🔧 启用半随机地形（0=禁用，1=启用）
+                                                               # 0: 使用SCENARIO_SEED完全固定地形（默认，适合消融实验）
+                                                               # 1: 使用固定基准位置+局部波动（适合泛化训练）
+export TERRAIN_BASE_SEED=${TERRAIN_BASE_SEED:-67}             # 🔧 地形基准种子（默认67，与SCENARIO_SEED保持一致）
+                                                               # 作用：生成固定的基准山峰位置，确保每次训练的地形布局一致
+export PEAK_JITTER_RANGE=${PEAK_JITTER_RANGE:-15.0}           # 🔧 山峰位置波动范围（米，默认15.0）
+                                                               # 作用：每次重置时，山峰在基准位置周围±15m范围内随机偏移
+                                                               # 效果：地形布局稳定，但山峰位置有小幅变化，增强泛化能力
+                                                               # 建议范围：10.0-25.0米（太小无泛化，太大难度波动大）
 export MIN_START_GOAL_DIST=${MIN_START_GOAL_DIST:-75.0}        # 起点与目标的最小水平距离
 export MAX_START_GOAL_DIST=${MAX_START_GOAL_DIST:-120.0}       # 起点与目标的最大水平距离（控制随机幅度）
 export START_POS_MARGIN=${START_POS_MARGIN:-5.0}               # 起点生成的地图边缘安全距离
@@ -294,23 +336,24 @@ export GOAL_ALTITUDE=${GOAL_ALTITUDE:-25.0}                     # 🔧 目标离
                                                                 # 说明：与HEIGHT_IDEAL_MAX(15米)配合，让智能体学习在合理高度完成任务
 export START_POS_MAX_TRIALS=${START_POS_MAX_TRIALS:-2000}      # 起点采样最大尝试次数
 
+# === 🔧 智能体目标分布半径（减少到终点时的组间斥力）===
+export AGENT_GOAL_FORMATION_RADIUS=${AGENT_GOAL_FORMATION_RADIUS:-10.0}  # 各智能体目标绕中央目标的分布半径（米）
+                                                                          # 适当拉开（如10m）可避免到终点时AUV过近触发强组间排斥
+
 # === 分项加权求和奖励权重参数 ===
 # 这些参数控制分项加权求和奖励机制中各项奖励的权重
 # 仅在 USE_WEIGHTED_REWARD=true 时生效
 # 调优建议：权重表示强度，分项本身决定正/负；对返回负值表示惩罚的分项（如停滞/碰撞/低空），权重应为正以保留惩罚方向
 
 # === 🎯 完整加权奖励分项：恢复所有奖励组件 ===
-# 核心奖励1：距离奖励（基础导航）
-export DISTANCE_WEIGHT=${DISTANCE_WEIGHT:-0.6}          # 🔧 降低距离奖励（0.8→0.6），减少奖励波动，让智能体更多学习躲避地形
-                                                          # 原因：距离奖励每步累积，权重过高会导致奖励值波动过大
-                                                          # 新策略：降低目标导向奖励，平衡避障与目标导向
-                                                          # 新值0.6：降低25%，减少每步奖励，使奖励更平滑
-
-# 核心奖励2：接近目标奖励（强化目标导向）
-export APPROACH_WEIGHT=${APPROACH_WEIGHT:-0.8}          # 🔧 降低接近奖励权重（1.0→0.8），减少奖励波动，让智能体更多学习躲避地形
-                                                        # 原因：接近奖励每步都计算，持续接近目标会累积大量奖励，导致奖励值波动大
-                                                        # 新策略：降低目标导向奖励，平衡避障与目标导向
-                                                        # 新值0.8：降低20%，减少奖励波动，让智能体更多关注地形避障
+# 核心奖励1：progress（由 distance + approach 合并）
+# 说明：
+#   - DISTANCE_WEIGHT 与 APPROACH_WEIGHT 不再驱动两个独立通道，
+#   - 而是共同决定 merged progress 通道的内部权重占比。
+export DISTANCE_WEIGHT=${DISTANCE_WEIGHT:-0.60}
+export APPROACH_WEIGHT=${APPROACH_WEIGHT:-0.52}
+export APPROACH_NEAR_GOAL_MAX_MULT=${APPROACH_NEAR_GOAL_MAX_MULT:-1.22}   # 近目标 approach 放大上限（原约2.0→1.22，减轻终点外刷分）
+export APPROACH_NEAR_GOAL_THRESHOLD=${APPROACH_NEAR_GOAL_THRESHOLD:-50.0}  # 距目标小于此米数视为近目标区
 
 # 核心奖励3：停滞惩罚（防止卡住）
 export STATIONARY_WEIGHT=${STATIONARY_WEIGHT:-0.3}      # 🔧 大幅降低停滞惩罚到0.3
@@ -318,35 +361,31 @@ export STATIONARY_WEIGHT=${STATIONARY_WEIGHT:-0.3}      # 🔧 大幅降低停�
                                                         # 建议范围：0.3-2.0（正数增大惩罚强度）
 
 # 核心奖励4：成功奖励（最终目标）
-export SUCCESS_WEIGHT=${SUCCESS_WEIGHT:-2.0}            # 🚨 修复"直冲"问题：降低成功奖励权重（4.0→2.0），平衡安全与成功
-                                                        # 作用：明确的任务完成信号，但不应该让智能体为了成功而忽略安全
-                                                        # 问题：4.0权重导致成功奖励(60000)远大于碰撞惩罚(62.5)，智能体"宁愿碰撞也直冲"
-                                                        # 新值2.0：成功奖励降低到12000-16000，与碰撞惩罚更平衡
-                                                        # 建议范围：1.5-2.5（平衡安全与成功）
+export SUCCESS_WEIGHT=${SUCCESS_WEIGHT:-2.5}            # 提高终局奖励占比，让“完成任务”明显优于“只安全飞”
+                                                        # 建议范围：1.7-2.2（平衡安全与成功）
 
 # 核心奖励5：碰撞惩罚（安全约束）
-export COLLISION_WEIGHT=${COLLISION_WEIGHT:-4.0}        # 🚨🚨🚨 加强碰撞避免：提高碰撞权重（2.0→4.0），确保无碰撞回合奖励更高
-                                                        # 问题诊断：2.0权重导致碰撞惩罚不够强，有碰撞的回合仍可能获得高奖励
-                                                        # 修复后效果：4.0权重 × 80惩罚值 = 单次碰撞-320
-                                                        #           即使500次碰撞，总惩罚也有-16万，足以让有碰撞的回合奖励低于无碰撞回合
-                                                        # 策略：让碰撞有足够代价，确保团队成功（无碰撞）的回合奖励最高
-                                                        # 建议范围：3.5-5.0（确保碰撞惩罚足够强）
-export COLLISION_WEIGHT_START_FACTOR=${COLLISION_WEIGHT_START_FACTOR:-0.75}   # 初期碰撞权重倍率
-export COLLISION_WEIGHT_FULL_PCT=${COLLISION_WEIGHT_FULL_PCT:-1.0}           # 线性提升到完整权重的训练进度
+# 🚨 紧急修复：大幅降低碰撞惩罚，解决训练不收敛问题
+# 问题：碰撞惩罚过高（5.0 × 80.0 = 400.0），导致任何轻微碰撞都会产生巨额负奖励
+# 结果：智能体无法学习，奖励值持续在极低负值，Loss不收敛
+# 修复：降低到合理水平，让智能体能够学习
+export COLLISION_WEIGHT=${COLLISION_WEIGHT:-4.8}        # 保守调整：2.5→3.0，强化碰撞惩罚在总奖励中的占比
+                                                        # 碰撞惩罚 = 2.0 × 150.0 = 300.0/步（配合累进系数，重复碰撞更重）
+                                                        #   1. 提高碰撞权重到5.0（配合惩罚值80 = -400/次）
+                                                        #   2. 碰撞40次差异 = 40 × 400 = 16,000（显著差异）
+                                                        #   3. 配合降低的引导奖励（DISTANCE_WEIGHT 0.35, APPROACH_WEIGHT 0.45）
+                                                        #   4. 让Fusion的"少碰撞优势"在总奖励中占主导地位
+                                                        # 建议范围：4.5-6.0
+export COLLISION_WEIGHT_START_FACTOR=${COLLISION_WEIGHT_START_FACTOR:-1.0}    # 初期碰撞权重倍率：0.8（训练开始即80%惩罚力度）
+export COLLISION_WEIGHT_FULL_PCT=${COLLISION_WEIGHT_FULL_PCT:-0.1}           # 30%训练进度时达到100%碰撞惩罚
                                                         # 建议范围：0.3-1.0
 
-# 🔧 新增：碰撞次数减少奖励（鼓励减少碰撞）
-export COLLISION_REDUCTION_WEIGHT=${COLLISION_REDUCTION_WEIGHT:-0.8}  # 碰撞次数减少奖励权重
-                                                        # 作用：如果当前回合碰撞次数比上一回合少，给予奖励
-                                                        # 奖励值 = (上一回合碰撞数 - 当前回合碰撞数) / 上一回合碰撞数
-                                                        # 建议范围：0.3-1.0（正值奖励减少碰撞）
+# 已归档：collision_reduction 不再参与默认主 reward，保留变量仅为兼容历史脚本
+export COLLISION_REDUCTION_WEIGHT=${COLLISION_REDUCTION_WEIGHT:-0.0}
 
 # === 探索与导航相关奖励 ===
-export EXPLORATION_WEIGHT=${EXPLORATION_WEIGHT:-1.0}     # 🔧 修复局部最优：提高到1.0（0.6→1.0），激励探索新路径
-                                                        # 作用：鼓励智能体探索环境，避免重复路径和原地悬停
-                                                        # 问题：0.6的权重导致探索奖励(+3.0)无法抵消碰撞恐惧(-377.0)，智能体选择"安全绕圈"而非"探索接近"
-                                                        # 新值1.0：让新格子奖励达到约5.0，提供足够的探索动力
-                                                        # 建议范围：0.8-1.5
+# 已归档：以下 shaping 默认不再参与主 reward，保留变量仅为兼容历史脚本/消融恢复
+export EXPLORATION_WEIGHT=${EXPLORATION_WEIGHT:-0.0}
 
 export DIRECTION_WEIGHT=${DIRECTION_WEIGHT:-0.3}         # 🔧🔧 降低方向奖励（0.8→0.3），避免诱导"直线冲刺"行为
                                                         # 作用：方向奖励过高会让智能体只关注"朝向目标"而忽略"绕路避障"
@@ -355,18 +394,14 @@ export DIRECTION_WEIGHT=${DIRECTION_WEIGHT:-0.3}         # 🔧🔧 降低方向
                                                         # 新值0.8：配合增强的方向奖励计算，提供更强的方向引导
                                                         # 建议范围：0.8-1.2
 
-export DEVIATION_WEIGHT=${DEVIATION_WEIGHT:-0.35}         # 偏离奖励：奖励贴近起点-目标直线
-                                                        # 作用：鼓励直线路径，减少侧向偏离
-                                                        # 建议范围：0.5-2.0
+export DEVIATION_WEIGHT=${DEVIATION_WEIGHT:-0.0}
 
 # === 轨迹平滑/最小拐弯角奖励 ===
 # 通过约束相邻两步速度方向的夹角，鼓励更平滑的轨迹，抑制“过山车式”剧烈转向
 export TURN_SMOOTH_WEIGHT=${TURN_SMOOTH_WEIGHT:-0.3}     # 高度平滑奖励权重（0=关闭；建议0.1-0.8）- 奖励高度（Z坐标）的平滑变化
 
 # === 区域与行为奖励 ===
-export START_AREA_WEIGHT=${START_AREA_WEIGHT:-0.3}       # 起始区域奖励：鼓励快速离开起点
-                                                        # 作用：避免在起点徘徊
-                                                        # 建议范围：0.2-0.8
+export START_AREA_WEIGHT=${START_AREA_WEIGHT:-0.0}
 
 export ENERGY_WEIGHT=${ENERGY_WEIGHT:-0.2}               # 能量效率奖励：提高权重以强化能量项影响
                                                         # 作用：鼓励平滑运动，减少不必要的加速
@@ -374,13 +409,13 @@ export ENERGY_WEIGHT=${ENERGY_WEIGHT:-0.2}               # 能量效率奖励：
 
 # === 高度控制奖励 ===
 # 🔧 修复：降低高度奖励权重，避免过度惩罚导致奖励信号混乱
-export HEIGHT_WEIGHT=${HEIGHT_WEIGHT:-3.5}               # 🚨🚨🚨 大幅提高高度奖励（1.50→3.5），引导安全飞行高度
+export HEIGHT_WEIGHT=${HEIGHT_WEIGHT:-2.0}               # 再降：减弱高度项相对到达信号
                                                         # 问题诊断：APF让智能体贴地飞行（距地形1-3m），频繁碰撞
                                                         # 根本原因：高度奖励太弱(1.5)，无法对抗APF的"贴地引导"
                                                         # 解决策略：提高高度奖励权重，鼓励飞行在15-75m理想区间
                                                         # 建议范围：3.0-5.0（必须强到能引导飞行高度）
 export HEIGHT_REWARD_ENABLED=${HEIGHT_REWARD_ENABLED:-1} # 1=启用高度奖励，0=完全关闭
-export HEIGHT_IDEAL_MIN=${HEIGHT_IDEAL_MIN:-15.0}         # 🔧 理想高度下限（默认5.0m）
+export HEIGHT_IDEAL_MIN=${HEIGHT_IDEAL_MIN:-20.0}         # 🔧 理想高度下限（默认5.0m）
                                                           # 说明：允许智能体在地形起伏处飞行
 export HEIGHT_IDEAL_MAX=${HEIGHT_IDEAL_MAX:-75.0}        # 🚨 扩大理想高度上限（35→60m），允许爬升到山峰高度
                                                           # 原因：当前35米限制导致智能体不敢飞高，但目标可能在50+米处
@@ -391,7 +426,7 @@ export LATERAL_WEIGHT=${LATERAL_WEIGHT:-1.0}             # 侧向绕行奖励：
                                                         # 作用：在保持目标导向的同时绕过障碍
                                                         # 建议范围：0.3-1.0
 
-export CLEARANCE_WEIGHT=${CLEARANCE_WEIGHT:-8.0}          # 🚨 保持净空奖励权重（不降低），但改变计算方式
+export CLEARANCE_WEIGHT=${CLEARANCE_WEIGHT:-3.5}           # 再降净空主权重
                                                         # 问题诊断：基于绝对距离的sigmoid函数导致"保持安全距离但不接近目标"刷分
                                                         # 根本原因：只要距离>安全距离就给正奖励，无论距离是否变化
                                                         # 解决策略：改为基于距离变化的计算方式
@@ -402,20 +437,23 @@ export CLEARANCE_WEIGHT=${CLEARANCE_WEIGHT:-8.0}          # 🚨 保持净空奖
                                                         # 注意：实际权重会根据距离目标的距离动态调整（见下方条件化参数）
 
 # === 🔧 条件化净空奖励参数（解决"仅有动作"刷分问题） ===
-export CLEARANCE_FAR_THRESHOLD=${CLEARANCE_FAR_THRESHOLD:-100.0}  # 远距离阈值（米）：距离目标>此值时使用低权重
-export CLEARANCE_NEAR_THRESHOLD=${CLEARANCE_NEAR_THRESHOLD:-20.0}  # 近距离阈值（米）：距离目标<此值时使用高权重
-export CLEARANCE_WEIGHT_FAR=${CLEARANCE_WEIGHT_FAR:-0.2}  # 远距离权重：防止"仅有动作"方法在远离目标时刷分
-export CLEARANCE_WEIGHT_NEAR=${CLEARANCE_WEIGHT_NEAR:-6.0}  # 🔧 提高净空奖励权重（5.5→6.0），让智能体更多学习躲避地形
-                                                             # 作用：增强地形避障引导，减少奖励波动
+export CLEARANCE_FAR_THRESHOLD=${CLEARANCE_FAR_THRESHOLD:-80.0}  # 远距离阈值（米）：距离目标>此值时使用低权重
+export CLEARANCE_NEAR_THRESHOLD=${CLEARANCE_NEAR_THRESHOLD:-15.0}  # 近距离阈值（米）：距离目标<此值时使用高权重
+export CLEARANCE_WEIGHT_FAR=${CLEARANCE_WEIGHT_FAR:-0.15}   # 远离目标时进一步压低安全刷分空间
+export CLEARANCE_WEIGHT_NEAR=${CLEARANCE_WEIGHT_NEAR:-5.5} # 近目标净空权重下调，避免终点圈外强刷安全项
+
+                                                             # 作用：在接近目标时（<20米）大幅增强净空奖励，鼓励保持安全距离
+                                                             # 效果：智能体在接近目标时更加谨慎，避免轻微碰撞
+                                                             # 建议范围：10.0-15.0（默认12.0，平衡安全与目标导向）
                                                              # 调整：提高9%，与降低的目标导向奖励形成更好平衡
                                                              # 原因：当前训练回合存在奖励值波动过大的问题，提高净空奖励有助于稳定训练
-export CLEARANCE_PENALTY_WEIGHT=${CLEARANCE_PENALTY_WEIGHT:-4.0}  # 🔧 避障惩罚权重：降低到2.5（之前4.5过高）
+export CLEARANCE_PENALTY_WEIGHT=${CLEARANCE_PENALTY_WEIGHT:-5.0}  # 🔧 避障惩罚权重：降低到2.5（之前4.5过高）
                                                                   # 作用：当距离<安全距离时，无论距离目标多远都使用此权重
                                                                   # 建议范围：2.0-3.0（过小无法引导避障，过大导致过度保守）
 
-export CLEARANCE_D_MAX=${CLEARANCE_D_MAX:-80.0}          # 净空检测最大距离（米）
+export CLEARANCE_D_MAX=${CLEARANCE_D_MAX:-60.0}          # 净空检测最大距离（米）
 
-export OBSTACLE_SAFE_DISTANCE=${OBSTACLE_SAFE_DISTANCE:-8.0}  # 🚨 障碍物安全距离（米）
+export OBSTACLE_SAFE_DISTANCE=${OBSTACLE_SAFE_DISTANCE:-7.5}  # 🚨 障碍物安全距离（米）
                                                                # 作用：定义"安全距离"，智能体应保持与障碍物的最小距离
                                                                # 建议范围：10.0-20.0米
                                                                # 当有效距离小于此值时，给予负奖励；大于此值时，给予正奖励
@@ -437,15 +475,13 @@ export REWARD_CLIP_MIN=${REWARD_CLIP_MIN:--8000.0}       # 🔧 进一步放宽�
 export REWARD_CLIP_MAX=${REWARD_CLIP_MAX:-4000.0}         # 🔧 进一步放宽奖励范围（2500→4000），保留完整奖励信号
 
 # === 团队协作与势场塑形 ===
-export GLOBAL_WEIGHT=${GLOBAL_WEIGHT:-5.0}               # 🚨 优化团队协作：大幅提高全局奖励权重（2.5→5.0），强化团队协作信号
-                                                        # 作用：促进团队协作，鼓励所有智能体都到达目标
-                                                        # 问题：2.5的权重仍然不足以鼓励所有智能体都到达目标（团队成功率仅0.05）
-                                                        # 新值5.0：提供更强的团队协作信号，确保所有智能体都完成任务
-                                                        # 建议范围：3.0-8.0（根据训练效果调整）
+export GLOBAL_WEIGHT=${GLOBAL_WEIGHT:-3.0}               # 团队同步/团队成功通道权重
+                                                        # 当前同时作用于：
+                                                        #   1. dense 团队同步过程奖励（occupancy + bottleneck + waiting）
+                                                        #   2. 团队终局成功语义相关通道
+                                                        # 目的：让 reward 主轴更直接对齐严格 TeamSuccess
 
-export SHAPING_WEIGHT=${SHAPING_WEIGHT:-0.3}             # 潜势函数shaping：基于势场的奖励塑形
-                                                        # 作用：提供额外的梯度信号，加速学习
-                                                        # 建议范围：0.2-0.6
+export SHAPING_WEIGHT=${SHAPING_WEIGHT:-0.0}             # 已归档：默认不再参与主 reward
 
 # === Z轴动作映射偏置 ===
 # 🔧 新实验：给予轻微向上偏置，引导智能体更偏向空中轨迹，而不是贴地飞行
@@ -461,19 +497,19 @@ export Z_ACTION_BIAS=${Z_ACTION_BIAS:-0.0}
 # 作用时机：各分项加权求和后的第一次裁剪
 # 后续还会在 environment.py 中进行缩放（负值×1.1，正值×1.3）
 
-export MAX_REWARD=${MAX_REWARD:-800.0}                    # 🔧 提高到300，给予更多正奖励空间
-                                                        # 作用：防止奖励过大导致Q值爆炸
-                                                        # 建议范围：30-100
+export MAX_REWARD=${MAX_REWARD:-8000.0}                   # 提高正向裁剪上限，避免真正成功/团队成功奖励被过早压平
+                                                        # 作用：保留“真正到达”相对“只是接近但未到达”的终局差距
+                                                        # 注意：只提高正向上限，负向裁剪仍保持保守
 
-export MIN_REWARD=${MIN_REWARD:--800.0}                   # 🚨 增强穿透惩罚：扩大到-450，匹配更严厉的穿透惩罚（-400→-450）
+export MIN_REWARD=${MIN_REWARD:--1500.0}                  # 奖励裁剪下限：-1500（容纳高累进碰撞惩罚-1200不被截断）
                                                         # 作用：防止惩罚过大导致Q值爆炸，同时保留完整的穿透惩罚信号
-export REWARD_CLIP_VALUE=${REWARD_CLIP_VALUE:--650.0} # 🚨 增强穿透惩罚：扩大到-400，匹配更严厉的穿透惩罚（-350→-400）
+export REWARD_CLIP_VALUE=${REWARD_CLIP_VALUE:--1500.0} # TD目标奖励裁剪下限：-1500（匹配场景MIN_REWARD，保留完整碰撞惩罚信号）
                                                         # 作用：防止极端负奖励淹没正常奖励信号，同时保留有效的穿透惩罚
                                                         # 注意：单步奖励范围扩大到-150到-200，需要更大的裁剪阈值
                                                         # 建议范围：-300到-500（根据实际奖励分布调整）
 
 # === 新增分项参数 ===
-export SUCCESS_REWARD_VALUE=${SUCCESS_REWARD_VALUE:-3000.0}  # 🚨🚨🚨 成功奖励基础值（会被无碰撞比例削弱）
+export SUCCESS_REWARD_VALUE=${SUCCESS_REWARD_VALUE:-2200.0}   # 成功奖励基础值：400（配合safe 1.5x/unsafe 0.4x倍率和clip范围[-1500,1500]）
                                                            # 🚨 关键修改：成功奖励 = 成功奖励 × 无碰撞比例
                                                            #   无碰撞比例 = 1 - (总碰撞次数 / 回合总步数)
                                                            #   回合总步数：2800步（从--episode-length获取）
@@ -481,39 +517,43 @@ export SUCCESS_REWARD_VALUE=${SUCCESS_REWARD_VALUE:-3000.0}  # 🚨🚨🚨 成�
                                                            # 非线性映射（确保"碰了一半及以上就小于0.2"）：
                                                            #   - 如果碰撞比例 < 0.5：无碰撞比例 = 1 - 碰撞比例（线性）
                                                            #   - 如果碰撞比例 >= 0.5：无碰撞比例 = 0.2 × (1 - (碰撞比例-0.5)/0.5)（非线性）
-                                                           # 示例计算（回合总步数=2800）：
-                                                           #   - 没有碰撞（0次）: 比例 = 1.0，成功奖励 = 3000 × 1.0 × 2.0 = 6000
-                                                           #   - 只碰了几次（50次）: 比例 = (1-50/2800)^4.5 ≈ 0.920，成功奖励 = 3000 × 0.920 × 2.0 = 5520
-                                                           #   - 碰了一半（1400次）: 比例 = 0.2（非线性映射），成功奖励 = 3000 × 0.2 × 2.0 = 1200
-                                                           #   - 碰了全部（2800次）: 比例 = 0.0，成功奖励 = 3000 × 0.0 × 2.0 = 0
+                                                           # 🔧 新增精确到达鼓励：成功奖励会根据到达精度获得额外加成（在reward_calculator中实现）
+                                                           #   精确加成 = 1.0 + max(0, 1.0 - dist/threshold)
+                                                           #   - 到达目标中心（dist=0）：加成 = 2.0倍 ✅ 最高奖励
+                                                           #   - 刚好达到阈值（dist=threshold）：加成 = 1.0倍（基础奖励）
+                                                           # 示例计算（回合总步数=2800，threshold=2.0米）：
+                                                           #   - 精确到达中心（dist=0，无碰撞）: 2000 × 1.0 × 2.0 × 2.0 = 8000 ✅
+                                                           #   - 刚好达到阈值（dist=2.0米，无碰撞）: 2000 × 1.0 × 1.0 × 2.0 = 4000
+                                                           #   - 只碰了几次（50次，dist=0.5米）: 2000 × 0.920 × 1.75 × 2.0 = 6440
                                                            # 注意：少量碰撞时使用指数惩罚（^4.5），显著降低奖励，形成更明显的梯度信号
-                                                           #   无碰撞奖励: 20000 × 2.0 = 40000（仅当总碰撞次数=0时）
                                                            #   合计正向奖励（无碰撞）: (3000+20000) × 2.0 = 46000
                                                            #   vs 碰撞惩罚: 100/次（可承受一定碰撞）
                                                            # 建议范围：2000-5000（与碰撞惩罚协调）
 
-export NO_COLLISION_REWARD_VALUE=${NO_COLLISION_REWARD_VALUE:-20000.0}  # 🚨🚨🚨 加强碰撞避免：大幅提高无碰撞奖励（12000→20000），更强烈地鼓励无碰撞行为
+export NO_COLLISION_REWARD_VALUE=${NO_COLLISION_REWARD_VALUE:-8000.0}  # 🚨🚨🚨 加强碰撞避免：大幅提高无碰撞奖励（12000→20000），更强烈地鼓励无碰撞行为
                                                                          # 奖励体系重构（修复后）：
                                                                          #   成功+无碰撞: (3000+20000) × 2.0 = 46000
                                                                          #   成功+少量碰撞(500次): 3000 - 500×320 = -157000
                                                                          #   结论：无碰撞回合奖励远高于有碰撞回合，确保团队成功（无碰撞）成为最佳回合
                                                                          # 建议范围：15000-25000（确保无碰撞回合奖励足够高，强烈鼓励无碰撞策略）
 
-export SUCCESS_DISTANCE_THRESHOLD=${SUCCESS_DISTANCE_THRESHOLD:-5.0} # 🔧 进一步放宽成功判定阈值（4.0→5.0），让所有智能体更容易成功
-                                                                     # 实际判断阈值 = 1.2 * SUCCESS_DISTANCE_THRESHOLD = 4.8米
-                                                                     # 问题：3.6米对某些智能体来说太严格，导致只有部分智能体到达
-                                                                     # 新值4.8米：在保持精确性的同时，提高所有智能体到达的可能性
-                                                                     # 建议范围：3.0-5.0
+export SUCCESS_DISTANCE_THRESHOLD=${SUCCESS_DISTANCE_THRESHOLD:-2.0} # 🔧 修复1/3：收紧成功判定阈值（5.0→2.0），鼓励精确到达
+                                                                     # 实际判断阈值 = 1.2 * SUCCESS_DISTANCE_THRESHOLD = 2.4米
+                                                                     # 问题诊断：5.0米太宽松，APF方法只需将智能体推到目标附近就触发高额成功奖励
+                                                                     # 导致虚假的高奖励（+100,000），但Team Success Rate = 0%（实际未全部到达）
+                                                                     # 新值2.4米：只有真正进入目标核心才算成功，确保奖励与实际完成任务对齐
+                                                                     # 建议范围：1.5-3.0米（确保精确到达）
 
-export COLLISION_PENALTY_VALUE=${COLLISION_PENALTY_VALUE:-60.0}     # 🚨🚨🚨 加强碰撞避免：提高碰撞惩罚（50→80），配合权重4.0确保碰撞有足够代价
-                                                                     # 问题诊断：50×2.0=100/次，即使2000次碰撞也只有-20万，不足以区分有碰撞和无碰撞回合
+export COLLISION_PENALTY_VALUE=${COLLISION_PENALTY_VALUE:-120.0}   # 保守调整：80→90，略增单次碰撞惩罚
+                                                                     # 配合COLLISION_WEIGHT=2.0，基础碰撞代价=300.0/步
+                                                                     # 让智能体能够学习，而不是被巨额惩罚压垮
                                                                      # 修复策略：
-                                                                     #   1. 提高惩罚值到80（配合权重4.0 = -320/次）
-                                                                     #   2. 确保有碰撞的回合（如500次碰撞=-16万）奖励低于无碰撞回合
-                                                                     #   3. 让团队成功（无碰撞）的回合成为最佳回合
-                                                                     # 建议范围：70-100（确保碰撞惩罚足够强，但不至于完全淹没奖励）
+                                                                     #   1. 提高惩罚值到80（配合权重5.0 = -400/次）
+                                                                     #   2. 碰撞40次差异 = 40 × 400 = 16,000惩罚差异（更显著）
+                                                                     #   3. 配合降低的引导奖励，让"少碰撞"成为高奖励的关键因素
+                                                                     # 建议范围：70-100
 
-export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.5}  # 🚨🚨🚨 紧急修复：大幅降低碰撞阈值（1.5→0.5）
+export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.4}  # 🚨🚨🚨 紧急修复：大幅降低碰撞阈值（1.5→0.5）
                                                                          # 问题诊断：1.5m阈值导致智能体在复杂地形中"无处不碰撞"
                                                                          #          Episode 6有2444次碰撞，意味着几乎每步都在"碰撞"
                                                                          # 根本原因：1.5m太大了！智能体半径通常<0.5m，1.5m等于"3倍体积"
@@ -542,9 +582,14 @@ export PENETRATION_BASE_PENALTY=${PENETRATION_BASE_PENALTY:-120.0}   # 🔧 基�
                                                                       # 穿透惩罚公式：-BASE_PENALTY - penetration_depth * ALPHA
                                                                       # 示例：穿透1米 = -120 - 5.0 = -125（适度惩罚，不会过度抑制）
                                                                       # 建议范围：BASE_PENALTY=100-150, ALPHA=4.0-6.0
-export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}            # 🔧 地形接触阈值：降低到0.3米，更早触发穿透早停
-                                                                  # 作用：更早检测地形穿透，提前终止回合
-                                                                  # 建议范围：0.1-0.5米（更严格的穿透检测）
+# 🚨 关键修复：区分"真实碰撞"和"净空不足"两个概念
+export TERRAIN_COLLISION_EPS=${TERRAIN_COLLISION_EPS:-0.3}       # ✅ 真实碰撞阈值（用于统计碰撞次数）- 缩小到0.2米，更严格
+                                                                  # 只有 z <= terrain_h + 0.2m 才算真正碰撞
+                                                                  # 会增加 total_penetration_count，影响成功判定
+export TERRAIN_CLEARANCE_EPS=${TERRAIN_CLEARANCE_EPS:-2.5}       # ✅ 净空监测阈值（用于净空不足惩罚）
+                                                                  # z <= terrain_h + 1.5m 会受到净空不足惩罚
+                                                                  # 但不增加碰撞计数，不影响成功判定
+export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}           # 🔧 兼容旧代码：指向 COLLISION_EPS
                                                                      # 问题：2.5米阈值过大，导致智能体在安全高度（12米）时被误判为接触地形
                                                                      # 影响：每回合产生1500-2900次误报碰撞，导致奖励波动极大（-216k到+70k）
                                                                      # 修复：0.75米是合理的接触阈值，只在实际接近地形时触发
@@ -552,6 +597,23 @@ export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}            # 🔧 地形�
 
 export EXPL_REWARD_STRICT=${EXPL_REWARD_STRICT:-0}                   # 探索奖励严格模式
                                                                      # 作用：1=严格模式（新格奖励1.0，禁用随机奖励），0=宽松模式（新格奖励5.0，含随机奖励）
+
+# === 终点附近局部最优修复 ===
+export DISTANCE_REWARD_NEAR_GOAL_RADIUS=${DISTANCE_REWARD_NEAR_GOAL_RADIUS:-12.0}   # 目标外12米内衰减distance状态奖励
+export DISTANCE_REWARD_NEAR_GOAL_FACTOR=${DISTANCE_REWARD_NEAR_GOAL_FACTOR:-0.20}   # 刚出成功圈时distance奖励缩到20%
+export DISTANCE_REWARD_PROGRESS_ONLY_NEAR_GOAL=${DISTANCE_REWARD_PROGRESS_ONLY_NEAR_GOAL:-0}  # 0=近目标保留弱引导，1=彻底切成progress-only
+export HEIGHT_PENALTY_ONLY_NEAR_GOAL_RADIUS=${HEIGHT_PENALTY_ONLY_NEAR_GOAL_RADIUS:-10.0}    # 目标外10米内height正奖励降为弱引导
+export HEIGHT_NEAR_GOAL_POSITIVE_FACTOR=${HEIGHT_NEAR_GOAL_POSITIVE_FACTOR:-0.08}             # 近目标区 height 正奖励再削弱
+export CLEARANCE_PENALTY_ONLY_NEAR_GOAL_RADIUS=${CLEARANCE_PENALTY_ONLY_NEAR_GOAL_RADIUS:-12.0}  # 目标外12米内clearance正奖励降为弱引导
+export CLEARANCE_NEAR_GOAL_POSITIVE_FACTOR=${CLEARANCE_NEAR_GOAL_POSITIVE_FACTOR:-0.06}       # 近目标区 clearance 正奖励再削弱
+export STATIONARY_NEAR_GOAL_RADIUS=${STATIONARY_NEAR_GOAL_RADIUS:-8.0}              # 目标外8米内加强停滞惩罚
+export STATIONARY_NEAR_GOAL_THRESHOLD=${STATIONARY_NEAR_GOAL_THRESHOLD:-0.02}       # 近目标区域更敏感的停滞阈值（每步位移<2cm）
+export STATIONARY_NEAR_GOAL_MIN_PENALTY=${STATIONARY_NEAR_GOAL_MIN_PENALTY:-6.0}    # 近目标外圈停滞基础惩罚
+export STATIONARY_NEAR_GOAL_MAX_PENALTY=${STATIONARY_NEAR_GOAL_MAX_PENALTY:-16.0}   # 紧贴成功圈但未进入时的最大停滞惩罚
+export GOAL_RING_REWARD_SCHEDULE=${GOAL_RING_REWARD_SCHEDULE:-18:20,10:35,6:55,3.5:80}       # 一次性阶段奖励：首次进入若干目标半径时给小额bonus
+export TERMINAL_FAILURE_PENALTY_BASE=${TERMINAL_FAILURE_PENALTY_BASE:-30.0}          # 回合结束仍未到达目标时的基础失败惩罚
+export TERMINAL_FAILURE_PENALTY_PER_METER=${TERMINAL_FAILURE_PENALTY_PER_METER:-120.0}  # 实际按“剩余距离比例”追加惩罚
+export TERMINAL_FAILURE_PENALTY_MAX=${TERMINAL_FAILURE_PENALTY_MAX:-180.0}           # 失败惩罚上限，避免早期训练被终局负值淹没
                                                                      # 建议：训练初期用0，中后期用1避免探索奖励盖过负向信号
 
 # === 向量化优化参数 ===
@@ -580,40 +642,6 @@ export VECTORIZED_SCENARIO=${VECTORIZED_SCENARIO:-1}       # 是否使用向量�
 #   - 这些差经验会污染回放缓冲区，导致网络学习到不好的模式
 #   - 预热阶段不写入RB，但预热完成后立即写入的经验仍然是初期差经验
 # 替代方案：
-#   - 直接开始训练，让网络从少量经验中学习（PER会优先采样高质量经验）
-#   - 使用势场引导（ACTION_FORCE_RATIO）提供初始引导，产生更好的初始经验
-#   - 提高初始探索噪声（NOISE_SCALE）和随机动作概率（RANDOM_ACTION_PROB）来平衡探索
-export LEARNING_WARMUP_ENABLED=${LEARNING_WARMUP_ENABLED:-0}              # 🔧 禁用预热，立即开始学习
-export LEARNING_WARMUP_RATIO=${LEARNING_WARMUP_RATIO:-0.15}               # 预热比例25%
-export LEARNING_WARMUP_MIN_STEPS=${LEARNING_WARMUP_MIN_STEPS:-8000}        # 🔧 大幅降低到3000步，快速开始学习
-export LEARNING_WARMUP_MAX_STEPS=${LEARNING_WARMUP_MAX_STEPS:-15000}       # 🔧 降低到5000步
-# 🔧 新增：完全随机预热（PF引导）配置
-export WARMUP_RANDOM_POLICY=${WARMUP_RANDOM_POLICY:-0}          # 1=启用PF引导的完全随机预热（仅在预热阶段生效）
-export WARMUP_RANDOM_SCALE=${WARMUP_RANDOM_SCALE:-1.0}          # 随机动作幅度（0-1），1.0表示覆盖全部动作范围
-export WARMUP_FORCE_RATIO=${WARMUP_FORCE_RATIO:-0.75}            # 🔧 提高到0.75，预热阶段势场主导，防止向下飞
-# 预热阶段势场base参数元优化开关：1=启用（在预热期轮换少量候选base，并在预热结束时固定最优base），0=禁用
-export PF_META_WARMUP_ENABLED=${PF_META_WARMUP_ENABLED:-1}
-export PF_META_GA_MIN=${PF_META_GA_MIN:-1.5}                      # 势场目标吸引力最小值
-export PF_META_GA_MAX=${PF_META_GA_MAX:-5.5}                      # 势场目标吸引力最大值
-export PF_META_TR_MIN=${PF_META_TR_MIN:-20.0}                     # 地形排斥力最小值
-export PF_META_TR_MAX=${PF_META_TR_MAX:-80.0}                    # 地形排斥力最大值
-export PF_META_RANGE_MIN=${PF_META_RANGE_MIN:-18.0}               # 影响范围最小值
-export PF_META_RANGE_MAX=${PF_META_RANGE_MAX:-36.0}               # 影响范围最大值
-export PF_META_GA_SAMPLES=${PF_META_GA_SAMPLES:-6}                # GA 采样数量
-export PF_META_TR_SAMPLES=${PF_META_TR_SAMPLES:-6}                # TR 采样数量
-export PF_META_RANGE_SAMPLES=${PF_META_RANGE_SAMPLES:-4}          # 影响范围采样数量
-export PF_META_MAX_CANDIDATES=${PF_META_MAX_CANDIDATES:-12}        # 候选最大数量
-export PF_META_MIN_EPISODES=${PF_META_MIN_EPISODES:-2}            # 每个候选至少评估的回合数
-export PF_META_DISTANCE_WEIGHT=${PF_META_DISTANCE_WEIGHT:-0.8}    # 元优化评分：目标距离权重（越小越好）
-export PF_META_OBSTACLE_WEIGHT=${PF_META_OBSTACLE_WEIGHT:-0.7}    # 元优化评分：障碍碰撞惩罚权重
-export PF_META_PENETRATION_WEIGHT=${PF_META_PENETRATION_WEIGHT:-1.2} # 元优化评分：地形穿透惩罚权重
-export PF_META_ENERGY_WEIGHT=${PF_META_ENERGY_WEIGHT:-0.3}        # 元优化评分：能量消耗惩罚权重
-export PF_META_METHOD=${PF_META_METHOD:-bayes}                    # 元优化搜索方式：grid|bayes
-export PF_META_BO_INIT_RANDOM=${PF_META_BO_INIT_RANDOM:-5}        # BO初始随机采样次数
-export PF_META_BO_ACQ_SAMPLES=${PF_META_BO_ACQ_SAMPLES:-64}       # BO采集函数随机采样数
-export PF_META_BO_NOISE=${PF_META_BO_NOISE:-0.12}                  # BO GP噪声项
-export PF_META_BO_LENGTH_SCALE=${PF_META_BO_LENGTH_SCALE:-0.5}    # BO核函数长度尺度
-export PF_META_BO_XI=${PF_META_BO_XI:-0.01}                       # BO EI探索系数
 # === 起飞前重力补偿阈值（物理层） ===
 export PRE_TAKEOFF_START_RADIUS=${PRE_TAKEOFF_START_RADIUS:-8.0}         # 起始XY半径
 export PRE_TAKEOFF_AIRBORNE_THRESHOLD=${PRE_TAKEOFF_AIRBORNE_THRESHOLD:-1.0}  # 🔧 起飞前保护：确保智能体在地形上方至少0.5米（防止初始穿透）
@@ -682,13 +710,13 @@ export ENABLE_COLLISION_AUTORESET=${ENABLE_COLLISION_AUTORESET:-0}  # 1=开启�
 
 # === 🔧 delta+base 模式基准参数和绝对变化量（用于 TensorFlow 版本的势场参数调整） ===
 # 基准值参数
-export GOAL_ATTRACTION=${GOAL_ATTRACTION:-6.0}                                               # 🚨 适度降低目标吸引力（8.0→6.0），平衡目标导向和地形避障
+export GOAL_ATTRACTION=${GOAL_ATTRACTION:-26.0}                                              # 🚨 大幅提高目标吸引力（10.0→20.0），解决训练失败问题
                                                                                                  # 作用：目标吸引力的基准强度
-                                                                                                 # 问题：目标吸引力过强（8.0）可能抵消地形排斥力，导致难以躲避地形
-                                                                                                 # 解决策略：降低目标吸引力25%，让地形排斥力更容易占主导
-                                                                                                 # 效果：目标吸引力从8.0降低到6.0，但仍保持足够的目标导向
+                                                                                                 # 问题：目标吸引力过弱（10.0），无法对抗地形排斥力（5000.0），比例仍达250-620倍
+                                                                                                 # 解决策略：大幅提高目标吸引力100%，让吸引力能够对抗排斥力
+                                                                                                 # 效果：目标吸引力从10.0提高到20.0，排斥力/吸引力比例从166-413倍降低到50-130倍
                                                                                                  # 调优：增大增强目标导向，减小降低目标依赖
-                                                                                                 # 建议：5.0-8.0（默认6.0，平衡目标导向和地形避障）
+                                                                                                 # 建议：15.0-25.0（默认20.0，平衡目标导向和地形避障）
 export LAMBDA_1_BASE=${LAMBDA_1_BASE:-8.5}                                                   # lambda_1基准值（目标吸引力分段距离阈值d0）
                                                                                                  # 🔧 关键参数：控制吸引力从何时开始产生作用
                                                                                                  # 作用：目标吸引力从常数切换到线性的分段点基准值（单位：米）
@@ -698,12 +726,12 @@ export LAMBDA_1_BASE=${LAMBDA_1_BASE:-8.5}                                      
                                                                                                  #   - 注意：吸引力没有最大作用距离限制，从任意距离（>0）都会产生
                                                                                                  # 调优：增大延迟分段切换（远距离才增强），减小提前分段切换（近距离就增强）
                                                                                                  # 建议：3.0-15.0（默认6.5米，适合中等距离开始增强吸引力）
-export TERRAIN_REPULSION=${TERRAIN_REPULSION:-8000.0}                                         # 🚨🚨🚨 进一步增强地形排斥力（6000→8000），防止贴地飞行
-                                                                                                # 问题诊断：势场引导让智能体容易到达目标，但难以躲避地形
-                                                                                                # 根本原因：目标吸引力过强，可能抵消地形排斥力
-                                                                                                # 解决策略：进一步提高k_rep到8000，确保地形排斥力足够强
-                                                                                                # 效果：地形斥力强度增加33%，即使在远距离也能有效避障
-                                                                                                # 建议范围：7000-10000（必须强到对抗目标吸引力）
+export TERRAIN_REPULSION=${TERRAIN_REPULSION:-1600.0}                                        # 🚨 大幅降低地形排斥力（5000.0→2000.0），解决训练失败问题
+                                                                                                # 问题诊断：地形排斥力过强（5000.0），压倒目标吸引力（10.0），比例仍达250-620倍
+                                                                                                # 根本原因：排斥力/吸引力比例过大，导致Actor输出饱和，无法学习有效策略
+                                                                                                # 解决策略：大幅降低地形排斥力60%，配合提高目标吸引力，平衡两者
+                                                                                                # 效果：地形斥力从5000.0降低到2000.0，排斥力/吸引力比例从166-413倍降低到50-130倍
+                                                                                                # 建议范围：1500-2500（保持强排斥力但不过度）
                                                                                                 # 调优：增大增强避障能力，减小降低地形敏感度
 export AGENT_INFLUENCE_RANGE=${AGENT_INFLUENCE_RANGE:-150.0}                                  # 🔧 扩大检测范围（120→150），让地形排斥力更早生效
                                                                                                 # 作用：检测半径基准值，影响地形排斥力的作用范围
@@ -727,11 +755,11 @@ export DELTA_LAMBDA_1=${DELTA_LAMBDA_1:-2.2}                                    
                                                                                                  # 计算公式：lambda_1 = 8.5 + output * 0.75
                                                                                                  # 范围：8.5 ± 0.75 = [7.75, 9.25]（微调）
                                                                                                  
-export DELTA_K_REP=${DELTA_K_REP:-1200.0}                                                      # 🚨 增大变化范围（1000→1200），配合tanh允许k_rep在[2300, 4700]调整
+export DELTA_K_REP=${DELTA_K_REP:-600.0}                                                       # 🚨 降低变化范围（1200→600），减少排斥力变化幅度
                                                                                                 # 作用：控制地形排斥力的调整范围
-                                                                                                # 计算公式：k_rep = 1200 + output * 75
-                                                                                                # 范围：1200 ± 75 = [1125, 1275]（±6.25%变化，保持强排斥）
-                                                                                                # 🎯 关键：即使Actor输出-1.0，k_rep仍有1125，足够强的排斥力！
+                                                                                                # 计算公式：k_rep = 2000 + output * 600
+                                                                                                # 范围：2000 ± 600 = [1400, 2600]（配合降低的base值）
+                                                                                                # 🎯 关键：降低变化范围，让Actor有更多学习空间，避免输出饱和
                                                                                                 
 export DELTA_RADIUS=${DELTA_RADIUS:-80.0}                                                     # 🔧 扩大检测半径调整范围（60→80），让radius范围更大
                                                                                                  # 作用：控制检测半径的调整范围
@@ -769,10 +797,9 @@ if [ -z "${ACTION_FORCE_RATIO_SCHEDULE_PCT:-}" ]; then
     #   - 中期（20-60%）：FR=0.80-0.50，逐渐降低，平衡势场和网络学习
     #   - 后期（60-100%）：FR=0.50-0.30，网络主导，势场仅提供安全修正
     # 这样既能保证初期有好的初始解，又能让网络在后期有足够的学习空间
-    export ACTION_FORCE_RATIO_SCHEDULE_PCT="0%:0.50,10%:0.40,20%:0.30,40%:0.20,60%:0.15,100%:0.10"  # 🔧 修复：大幅提高初期PF比例，防止随机策略导致坠毁
-                                                                                                    # 问题诊断：30%的FR仍导致智能体过度依赖APF贴地飞行
-                                                                                                    # 修复策略：初期30%→后期2%，让Actor尽早主导
-                                                                                                    # 目标：让智能体学习自主避障，而不是依赖APF0%:0.50,10%:0.40,20%:0.30,40%:0.20,60%:0.15,100%:0.10
+    # 🔧 规划改进：减缓FR衰减、末期FR提高到0.18，保证不碰撞还能到达
+    # 策略：前50%保持较高FR(0.50-0.46)，50-85%缓慢过渡(0.46→0.32)，85-100%稳定在0.25-0.18（势场持续兜底）
+    export ACTION_FORCE_RATIO_SCHEDULE_PCT="0%:0.50,25%:0.48,50%:0.45,70%:0.40,85%:0.35,100%:0.32"  #0%:0.50,25%:0.46,50%:0.38,70%:0.32,85%:0.24,100%:0.20
 fi
 # 如果设置为"DISABLED"，则设为空字符串（禁用schedule）
 if [ "${ACTION_FORCE_RATIO_SCHEDULE_PCT:-}" = "DISABLED" ]; then
@@ -782,18 +809,19 @@ if [ "${ACTION_FORCE_RATIO_SCHEDULE_PCT:-}" = "DISABLED" ]; then
 fi
 export MAX_FORCE_MAGNITUDE=${MAX_FORCE_MAGNITUDE:-80.0}               # 🚨 关键修复：大幅提高（28.5→80），避免强斥力被过早裁剪（k_rep*factor可达3000+）
 # 动作-势场混合模式已固定为 pre_tanh（未饱和空间叠加），不再通过环境变量配置
-export SUCCESS_COUNT_MODE=${SUCCESS_COUNT_MODE:-any}                  # 并行环境成功计数聚合：any|all|majority（默认any）
+export SUCCESS_COUNT_MODE=${SUCCESS_COUNT_MODE:-all}                  # 并行环境成功计数聚合：any|all|majority（默认any）
 
 # FR条件化与Q安全参数
 export USE_FR_FEATURE=${USE_FR_FEATURE:-1}            # ✅ 启用FR特征（作为独立条件输入传递给网络）
 export USE_PF_FEATURE=${USE_PF_FEATURE:-1}            # ✅ 启用势场矢量特征（训练脚本会在保存经验时追加到obs）
-export Q_CLIP_VALUE=${Q_CLIP_VALUE:-300.0}          # 🚨 关键修复：降低Q裁剪值以匹配新的奖励缩放（1/2000）
-                                                      # 原因：APF方法5M奖励→500，Action Only 45k→4.5，Q值在[-1000,1000]范围内
+export ENABLE_ACTOR_OUTPUT_COLLECTION=${ENABLE_ACTOR_OUTPUT_COLLECTION:-1}  # 训练期Actor原始7维输出采样（默认开启；可手动关闭以做纯性能对比）
+export Q_CLIP_VALUE=${Q_CLIP_VALUE:-2000.0}         # 🔧 修复：大幅提高Q裁剪值（500→2000），确保正确传递梯队和Reward
+                                                      # 原因：Q值过大会导致Bellman更新时出现数值溢出，引发NaN
 export CRITIC_Q_REG=${CRITIC_Q_REG:-0.005}           # 🔧 进一步降低Q正则（0.01→0.005），稍微放开critic的学习能力
                                                       # 作用：降低正则化约束，允许critic网络有更强的学习能力
                                                       # 调整：降低50%，减少对Q值的正则化惩罚，让critic能够更好地学习Q值估计
                                                       # 建议范围：0.003-0.01（过小可能导致Q值不稳定，过大可能限制学习能力）
-export ACTION_REG_COEF=${ACTION_REG_COEF:-0.00014}    # 🔧 大幅降低动作正则（0.002→0.0005），让Actor敢于输出更大的加速度值
+export ACTION_REG_COEF=${ACTION_REG_COEF:-0.00014}    # 好效果：0.00014
                                                                                                  # 问题：网络输出范围依然不大，无法直接给出较大的加速度效果
                                                                                                  # 修复：进一步降低正则化，允许Actor输出更大的动作幅值
                                                                                                  # 新值0.0005：降低75%，大幅减少对大幅动作的惩罚
@@ -826,7 +854,8 @@ export USE_TF_POTENTIAL_FIELD=${USE_TF_POTENTIAL_FIELD:-1}           # 势场修
                                                                      # 
                                                                      # 注意：NumPy版本已移除（梯度无法回传，训练效果差）
 
-export MEM_TRIM=${MEM_TRIM:-1}                      # 每回合末执行malloc_trim
+export MEM_TRIM=${MEM_TRIM:-1}                      # 是否启用回合末内存修剪
+export MEM_TRIM_INTERVAL=${MEM_TRIM_INTERVAL:-10}   # 每N回合执行一次malloc_trim；1表示每回合都执行
 export GPU_CACHE_CLEAR_INTERVAL=${GPU_CACHE_CLEAR_INTERVAL:-0}   # 🔧 XLA友好修复：完全禁用GPU缓存清理
                                                                    # 原因：清理函数中的.numpy()调用会触发GPU→CPU同步，打断XLA编译
                                                                    # 导致CUDA_ERROR_MISALIGNED_ADDRESS（内存对齐问题）
@@ -947,6 +976,7 @@ echo "  - TF32: $([ "${TF_ENABLE_CUBLAS_TF32}" = "1" ] && echo '✅ ON' || echo 
 echo "  - train_step JIT: $([ "${JIT_COMPILE}" = "1" ] && echo '✅' || echo '❌')"
 echo "  - XLA: $([ "${XLA_GLOBAL:-0}" = "1" ] && echo '✅ 启用（Global）' || echo '❌ 禁用')"
 echo "  - XLA Global: $([ "${XLA_GLOBAL:-0}" = "1" ] && echo '✅ 启用' || echo '❌ 禁用')"
+echo "  - Actor输出采样: $([ "${ENABLE_ACTOR_OUTPUT_COLLECTION:-0}" = "1" ] && echo '✅ 启用' || echo '❌ 禁用')"
 echo "  - Triton GEMM: ⚠️  使用默认配置（当前TF版本不支持手动控制）"
 echo ""
 echo "执行配置:"
@@ -959,6 +989,24 @@ fi
 echo "  - cuDNN调优: 启用（自动选择最快算法）"
 echo "  - 显存分配: 动态增长"
 echo "  - GPU缓存清理: 每${GPU_CACHE_CLEAR_INTERVAL:-10}回合自动清理（防止长时间运行后内存累积和CUDA错误）"
+echo "  - 内存修剪: $([ "${MEM_TRIM:-1}" = "1" ] && echo \"每${MEM_TRIM_INTERVAL:-10}回合\" || echo '禁用')"
+echo ""
+echo "性能监控:"
+echo "  - 计时汇总: $([ "${TIMING_SUMMARY:-0}" = "1" ] && echo '✅ 启用' || echo '❌ 禁用')"
+if [ "${TIMING_SUMMARY:-0}" = "1" ]; then
+    echo "     - 计时级别(TIMING_LEVEL): ${TIMING_LEVEL:-1}"
+    echo "     - 细分开关(TIMING_DETAIL): $([ "${TIMING_DETAIL:-0}" = "1" ] && echo '✅ 启用' || echo '❌ 禁用')"
+    if [ "${TIMING_LEVEL:-1}" -ge 2 ] || [ "${TIMING_DETAIL:-0}" = "1" ]; then
+        echo "     - 二级计时(TIMING2): 启用"
+    else
+        echo "     - 二级计时(TIMING2): 禁用"
+    fi
+    if [ "${TIMING_INTERVAL_STEPS:-0}" -gt 0 ]; then
+        echo "     - 步间隔汇总: 每${TIMING_INTERVAL_STEPS}步输出一次"
+    else
+        echo "     - 步间隔汇总: 仅回合汇总"
+    fi
+fi
 echo ""
 echo "训练参数:"
 echo "  - GPU: ${GPU_ID}"
@@ -1022,29 +1070,18 @@ ARGS=(
     --lr-min-actor "$LR_MIN_ACTOR"                   # Actor最小学习率
     --lr-min-critic "$LR_MIN_CRITIC"                 # Critic最小学习率
     
-    --gamma 0.95                          # 🔧 保持0.95，平衡短期和长期奖励
-    --tau 0.015                       # 🚨 关键修复：大幅提高tau值（0.0002→0.015），加快目标网络更新
-                                       # 问题：tau=0.0002太小，目标网络几乎不更新（需要5000次更新才能改变1%）
-                                       # 影响：Q值估计严重滞后，学习效率极低，训练1000回合仍然失败
-                                       # 修复：提高到0.015（75倍），是更标准的tau值，目标网络可以及时更新
-                                       # 说明：目标网络每步都进行软更新（与Actor延迟更新无关），确保Q值估计稳定
-                                       # 预期：提高学习效率，加快收敛速度
-    --huber-delta "$HUBER_DELTA"         # 🔧 修复：Huber Loss的delta参数（降低delta让loss对中等误差更敏感）
-    --grad-clip-norm 10.0                 # 🚨 关键修复：提高梯度裁剪阈值（5.0→10.0），允许更大的梯度
-                                         # 问题：代码中存在双重裁剪（先clip_by_norm到1.0，再clip_by_global_norm到10.0）
-                                         #       第一次裁剪已经将梯度限制到1.0，第二次裁剪几乎无效，导致梯度被过度限制
-                                         # 影响：网络学习能力严重受损，训练效果差
-                                         # 修复：需要在Python代码中移除逐层裁剪（clip_by_norm），只保留全局裁剪（clip_by_global_norm）
-                                         #       当前配置10.0是合理的全局裁剪阈值，但需要配合代码修复才能生效
-                                         # 预期：移除双重裁剪后，网络可以正常学习，训练效果显著改善
+    --gamma 0.95                          # 好效果：0.95
+    --tau 0.015                           # 好效果：0.015（目标网络软更新）
+    --huber-delta "$HUBER_DELTA"         # 好效果：1.0
+    --grad-clip-norm 10.0                 # 好效果：10.0
     --action-reg-coef "$ACTION_REG_COEF"              # Actor 动作正则系数（惩罚大幅动作）
     --neg-z-reg-coef "$NEG_Z_REG_COEF"                # 负向Z轴专用正则系数（仅惩罚az<0，防止整体偏向负半轴）
     # 探索噪声：作用于Actor输出（训练与评估时如需关闭，可将NOISE_SCALE设为0）
     --noise-scale "$NOISE_SCALE"          # 初始噪声幅度：↑ 探索↑ 但轨迹更抖；↓ 更平滑但易早收敛
     --noise-decay  "$NOISE_DECAY"         # 回合级衰减：接近1表示衰减很慢；过小会过早失去探索
     --noise-min    "$NOISE_MIN"           # 噪声下限：保持少量探索，避免策略陷入局部最优
-    --random-action-prob "$RANDOM_ACTION_PROB"  # 随机动作概率（预热阶段）：epsilon-greedy探索
-    --random-action-prob-training "$RANDOM_ACTION_PROB_TRAINING"  # 🔧 随机动作概率（训练阶段）：epsilon-greedy探索
+    --random-action-prob "$RANDOM_ACTION_PROB"  # 统一随机动作概率：主训练路径与旧回退路径共用
+    --random-action-prob-training "$RANDOM_ACTION_PROB_TRAINING"  # 兼容旧参数名：保持与 RANDOM_ACTION_PROB 一致
     --lite-buffer true                    # 启用轻量缓冲区（预分配连续内存，峰值更低）
     --buffer-size "$BUFFER_SIZE"          # 覆盖缓冲区大小
     --per-enabled "$PER_ENABLED"         # 是否启用PER
@@ -1081,10 +1118,15 @@ ARGS=(
     # Actor/Critic 更新频率控制
     --actor-update-delay "${ACTOR_UPDATE_DELAY}" # Actor延迟更新频率
     
-    # MATD3特有参数（仅在ALGORITHM=matd3时生效）
-    --policy-noise "${POLICY_NOISE:-0.28}"        # 目标策略平滑噪声标准差
-    --noise-clip "${NOISE_CLIP:-0.35}"           # 目标策略噪声裁剪幅度
-    --policy-freq "${POLICY_FREQ:-1}"            # 🔧 修复：传递MATD3的Actor更新频率（每N次Critic更新后更新1次Actor）
+    # MATD3特有参数（好效果复现）
+    --policy-noise "${POLICY_NOISE:-0.28}"        # 好效果：0.28
+    --noise-clip "${NOISE_CLIP:-0.32}"           # 好效果：0.32
+    --policy-freq "${POLICY_FREQ}"                # TD3策略更新频率：默认2
+    --fairness-reweight-enabled "${FAIRNESS_REWEIGHT_ENABLED}"  # 启用agent级反向补偿loss加权
+    --fairness-window "${FAIRNESS_WINDOW}"                      # 公平权重统计窗口（最近N回合）
+    --fairness-beta "${FAIRNESS_BETA}"                          # 公平权重强度
+    --fairness-min-weight "${FAIRNESS_MIN_WEIGHT}"              # 公平权重下限
+    --fairness-max-weight "${FAIRNESS_MAX_WEIGHT}"              # 公平权重上限
     
     # 势场力参数已改用delta+base模式（见下方配置）
     
@@ -1120,25 +1162,27 @@ ARGS=(
     --max-weight-threshold "$MAX_WEIGHT_THRESHOLD"
     --weight-scaling-factor "$WEIGHT_SCALING_FACTOR"
     
-    --agent-accel "4.6"                # 智能体基础加速度
+    --agent-accel "${AGENT_ACCEL:-5.2}"          # 智能体加速度系数（与 ACTION_RANGE/CONTROL_ACCEL_GAIN 共同决定机动能力）
     --agent-max-speed "42.5"              # 智能体最大速度
     
-    # 动态地图切换参数（基于连续成功和奖励停滞）- 🔧 修复：提高开启门槛，避免过早切换到随机地形
+    # 动态障碍物切换参数（基于连续成功和奖励停滞）- 🚀 修改：从解锁随机地形改为解锁随机障碍物
     # 🚨 注意：如果不想启用课程学习，请将这两个参数都设置为0
-    # 当前配置：满足条件后会自动切换到随机地形模式（即使RANDOM_TERRAIN=0）
+    # 当前配置：满足条件后会自动切换到随机障碍物模式（即使USE_DYNAMIC_OBSTACLES初始为0）
     # 🔧 关键修复：优先从环境变量读取，允许消融实验等场景覆盖默认值
     # 如果环境变量未设置，则使用默认值（启用课程学习）
     # 🚨 提高课程学习开启门槛：需要更多连续成功或更长的奖励停滞期
-    --unlock-env-on-success "${UNLOCK_ENV_ON_SUCCESS:-100}"           # 🔧 提高连续成功要求（20→50），确保智能体在固定地形上充分学习
-                                                                     # 作用：需要连续50个回合成功才能解锁随机地形
-                                                                     # 影响：提高门槛，避免过早切换到随机地形，让智能体在固定地形上充分训练
-    --unlock-env-on-plateau "${UNLOCK_ENV_ON_PLATEAU:-200}"         # 🔧 提高奖励停滞要求（25→60），确保智能体真正达到性能瓶颈
-                                                                     # 作用：需要连续60个回合奖励无提升才能解锁随机地形
+    --unlock-env-on-success "${UNLOCK_ENV_ON_SUCCESS:-80}"           # 🚀 修改：解锁随机障碍物而非随机地形
+                                                                     # 作用：需要连续100个回合成功才能解锁随机障碍物生成
+                                                                     # 影响：提高门槛，避免过早切换到随机障碍物，让智能体在固定障碍物上充分训练
+                                                                     # 课程学习流程：固定障碍物（初始）→ 随机障碍物（解锁后）
+    --unlock-env-on-plateau "${UNLOCK_ENV_ON_PLATEAU:-100}"         # 🚀 修改：解锁随机障碍物而非随机地形
+                                                                     # 作用：需要连续200个回合奖励无提升才能解锁随机障碍物生成
                                                                      # 影响：提高门槛，避免因短期波动而误判为性能停滞
+                                                                     # 课程学习流程：固定障碍物（初始）→ 随机障碍物（解锁后）
     # 🔧 禁用课程学习：将环境变量设置为0，例如：
     # export UNLOCK_ENV_ON_SUCCESS=0
     # export UNLOCK_ENV_ON_PLATEAU=0
-    # 或者直接修改上面的默认值（50→0, 60→0）
+    # 或者直接修改上面的默认值（100→0, 200→0）
     
     
     # 向量化优化参数
@@ -1155,6 +1199,16 @@ ARGS=(
     --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
     --map-size "$MAP_SIZE"
 )
+
+# 🔧 传递 MATD3/MADDPG 双Q与分离梯度参数
+# 直接运行本脚本时未设置则默认 MATD3 Separated（dual Q + separated gradient）；
+# 消融实验通过环境变量 MATD3_USE_DUAL_Q / MATD3_USE_SEPARATED_GRADIENT 区分 Single Q / Dual Q / Separated
+if [ "$ALGORITHM" = "matd3" ]; then
+    ARGS+=(--matd3-use-dual-q "${MATD3_USE_DUAL_Q:-true}" --matd3-use-separated-gradient "${MATD3_USE_SEPARATED_GRADIENT:-true}")
+fi
+if [ "$ALGORITHM" = "maddpg" ]; then
+    ARGS+=(--maddpg-use-dual-q "${MADDPG_USE_DUAL_Q:-false}" --maddpg-use-separated-gradient "${MADDPG_USE_SEPARATED_GRADIENT:-true}")
+fi
 
 # 若提供了分段日程，则将其追加到参数中
 # 🔧 修复：如果 ACTION_FORCE_RATIO_SCHEDULE_PCT 为 "DISABLED" 或空字符串，则不传递给训练脚本
@@ -1331,7 +1385,104 @@ if [ ! -f "$PYTHON_SCRIPT" ]; then
     echo "❌ 错误: 找不到训练脚本 $PYTHON_SCRIPT" >&2
     exit 1
 fi
-python3 "$PYTHON_SCRIPT" "${ARGS[@]}"
+PYTHON_BIN=${TRAIN_PYTHON_BIN:-python3}
+if [[ "$PYTHON_BIN" == */* ]]; then
+    if [ ! -x "$PYTHON_BIN" ]; then
+        echo "❌ 错误: TRAIN_PYTHON_BIN 不可执行: $PYTHON_BIN" >&2
+        exit 3
+    fi
+else
+    if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+        echo "❌ 错误: 找不到训练解释器: $PYTHON_BIN" >&2
+        exit 3
+    fi
+fi
+
+# 🔧 消融专用：导出最终解析后的训练配置清单，不启动训练
+if [ "${ABLATION_RESOLVE_ONLY}" = "1" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "true" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "yes" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "on" ]; then
+    if [ -z "$ABLATION_MANIFEST_PATH" ]; then
+        echo "❌ 错误: ABLATION_RESOLVE_ONLY=1 时必须提供 ABLATION_MANIFEST_PATH" >&2
+        exit 2
+    fi
+
+    mkdir -p "$(dirname "$ABLATION_MANIFEST_PATH")"
+
+    "$PYTHON_BIN" - "$ABLATION_MANIFEST_PATH" "$PYTHON_SCRIPT" "$SCRIPT_DIR" "$EPISODES" "$BATCH_SIZE" "$USE_WEIGHTED_REWARD" "$ALGORITHM" "$EXP_NAME" "$EXP_NAME_WITH_TIMESTAMP" "${ARGS[@]}" <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+
+manifest_path = pathlib.Path(sys.argv[1]).resolve()
+python_script = str(pathlib.Path(sys.argv[2]).resolve())
+cwd = str(pathlib.Path(sys.argv[3]).resolve())
+episodes = int(sys.argv[4])
+batch_size = int(sys.argv[5])
+use_weighted_reward = str(sys.argv[6])
+algorithm = str(sys.argv[7])
+exp_name = str(sys.argv[8])
+exp_name_with_timestamp = str(sys.argv[9])
+argv = sys.argv[10:]
+
+exec_env = {}
+for key, value in os.environ.items():
+    if key.startswith("ABLATION_") or key.startswith("BASH_FUNC_"):
+        continue
+    exec_env[key] = value
+
+ignore_exact = {
+    "PATH", "HOME", "PWD", "OLDPWD", "SHLVL", "_", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "USER", "LOGNAME", "SHELL", "MAIL", "HOSTNAME", "HOSTTYPE",
+    "OSTYPE", "MACHTYPE",
+}
+ignore_prefixes = (
+    "CONDA", "VIRTUAL_ENV", "XDG_", "SSH_", "DBUS_", "LS_COLORS",
+    "GREP_", "LESS", "PROMPT", "PS1", "BASH_", "PWD", "OLDPWD",
+)
+
+audit_env = {}
+for key, value in exec_env.items():
+    if not re.fullmatch(r"[A-Z0-9_]+", key):
+        continue
+    if key in ignore_exact:
+        continue
+    if any(key.startswith(prefix) for prefix in ignore_prefixes):
+        continue
+    audit_env[key] = value
+
+manifest = {
+    "version": 1,
+    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "resolve_only": True,
+    "cwd": cwd,
+    "python_script": python_script,
+    "python_executable": str(pathlib.Path(sys.executable).resolve()),
+    "argv": argv,
+    "exec_env": exec_env,
+    "audit_env": audit_env,
+    "meta": {
+        "episodes": episodes,
+        "batch_size": batch_size,
+        "use_weighted_reward": use_weighted_reward,
+        "algorithm": algorithm,
+        "exp_name": exp_name,
+        "exp_name_with_timestamp": exp_name_with_timestamp,
+        "seed": exec_env.get("SEED"),
+    },
+}
+
+manifest_path.parent.mkdir(parents=True, exist_ok=True)
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+PY
+
+    echo "🧪 [消融解析] 已导出最终训练配置: $ABLATION_MANIFEST_PATH"
+    exit 0
+fi
+
+"$PYTHON_BIN" "$PYTHON_SCRIPT" "${ARGS[@]}"
 STATUS=$?
 
 if [ $STATUS -ne 0 ]; then
@@ -1505,7 +1656,6 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
         EVAL_ENV+=("RANDOM_ACTION_PROB=0.0")  # 评估时禁用随机动作
         EVAL_ENV+=("RANDOM_ACTION_PROB_TRAINING=0.0")  # 评估时禁用训练随机动作
         EVAL_ENV+=("PER_ENABLED=0")  # 评估时禁用PER（不需要经验回放）
-        EVAL_ENV+=("LEARNING_WARMUP_ENABLED=0")  # 评估时禁用预热
         EVAL_ENV+=("SAVE_MODEL=0")  # 评估时禁用模型保存
         EVAL_ENV+=("ADAPTIVE_PATIENCE=999999")  # 评估时禁用自适应学习（设置极大值）
         
@@ -1517,9 +1667,11 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
         # 禁用提前终止，确保完整轨迹
         EVAL_ENV+=("DISABLE_EARLY_TERMINATION=true")
         
-        # 🔧 启用交互式HTML和动作时序图（与训练时的最佳回合图效果一致）
+        # 评估侧仅保留训练同类结果：交互式HTML与动作时序图
         EVAL_ENV+=("SAVE_INTERACTIVE_TRAJ=1")  # 确保启用交互式轨迹图
-        EVAL_ENV+=("ENABLE_OVERLAY=1")  # 启用overlay图片生成
+        EVAL_ENV+=("SAVE_EVAL_ALL_EPISODES=1")  # 每个回合都保存交互式HTML/动作图
+        EVAL_ENV+=("ENABLE_OVERLAY=0")  # 默认不生成overlay图片
+        EVAL_ENV+=("DISABLE_GIF=1")  # 默认不生成GIF
         
         # 安静输出（减少评估时的日志）
         EVAL_ENV+=("QUIET_OUTPUT=1")
@@ -1678,9 +1830,7 @@ PYTHON_EOF
                 echo "    - 回合 $((ep_idx + 1)) (FR=${CURRENT_FR}): $EPISODE_DIR"
                 echo "      - 评估统计: $EPISODE_DIR/evaluation_results.json"
                 echo "      - 轨迹图片: $EPISODE_DIR/trajectory_*.png"
-                echo "      - 轨迹动画: $EPISODE_DIR/trajectory_*.gif"
                 echo "      - 交互式HTML: $EPISODE_DIR/trajectory_*_interactive.html"
-                echo "      - Overlay图片: $EPISODE_DIR/trajectory_*_overlay.png"
             done
             if [ -f "$EVAL_SAVE_PATH/evaluation_results.json" ]; then
                 echo ""

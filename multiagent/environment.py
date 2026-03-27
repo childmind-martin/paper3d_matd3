@@ -17,6 +17,7 @@ import copy
 import pygame
 import sys
 import os  # 🚀 性能优化：用于QUIET_OUTPUT检查
+import time
 # 为3D渲染添加必要的导入
 from pygame.locals import *
 try:
@@ -115,6 +116,112 @@ class MultiAgentEnv(gym.Env):
         # 记录每个智能体的完成状态，避免重复判定/重复打印（使用name作为键）
         self._agent_done_flags = {}
         self._agent_done_steps = {}  # 记录智能体完成的步数
+        self._timing_detail_enabled_cache = None
+        self._last_step_timing = None
+        self._refresh_runtime_flags()
+
+    def _refresh_runtime_flags(self):
+        """缓存热路径中会频繁读取的运行时标志。"""
+        try:
+            self._quiet_output_enabled = os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self._quiet_output_enabled = True
+        try:
+            self._disable_trajectory_recording = os.getenv('DISABLE_TRAJECTORY_RECORDING', '0').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self._disable_trajectory_recording = False
+        try:
+            self._debug_episode_summary_enabled = os.getenv('DEBUG_EPISODE_SUMMARY', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self._debug_episode_summary_enabled = True
+        try:
+            self._debug_collision_summary_enabled = os.getenv('DEBUG_COLLISION_SUMMARY', '1').lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self._debug_collision_summary_enabled = True
+
+    def _timing_detail_enabled(self):
+        cached = self._timing_detail_enabled_cache
+        if cached is None:
+            try:
+                level = int(os.getenv('TIMING_LEVEL', '1'))
+            except Exception:
+                level = 1
+            try:
+                detail_flag = os.getenv('TIMING_DETAIL', '0').lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                detail_flag = False
+            cached = bool(level >= 2 or detail_flag)
+            self._timing_detail_enabled_cache = cached
+        return bool(cached)
+
+    def _policy_episode_collision_reasons(self, agent):
+        """与训练侧 Safe_i 判定一致的真实碰撞/穿透原因列表（空表示安全）。"""
+        reasons = []
+        try:
+            if getattr(agent, '_episode_has_collision', False):
+                reasons.append("_episode_has_collision")
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                penetration_count = agent.debug_info.get('total_penetration_count', 0)
+                try:
+                    penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
+                except (ValueError, TypeError, OverflowError):
+                    penetration_count = 0
+                if penetration_count > 0:
+                    reasons.append(f"穿透计数={penetration_count}")
+        except Exception:
+            pass
+        try:
+            if getattr(agent, '_had_obstacle_collision', False):
+                reasons.append("_had_obstacle_collision")
+        except Exception:
+            pass
+        try:
+            if getattr(agent, '_had_terrain_contact_or_penetration', False):
+                reasons.append("_had_terrain_contact_or_penetration")
+        except Exception:
+            pass
+        return reasons
+
+    def _policy_agent_unsafe_for_episode_success(self, agent):
+        return len(self._policy_episode_collision_reasons(agent)) > 0
+
+    def _sync_world_team_success_snapshot(self):
+        """每步末更新 world 上团队成功权威快照（仅 policy_agents，与回合层判定同源），供训练侧日志读取。"""
+        w = self.world
+        agents = list(self.agents) if self.agents is not None else []
+        scn = getattr(self, 'scenario', None)
+        thr = float(getattr(scn, 'success_distance_threshold', 2.0)) if scn is not None else 2.0
+        reach = []
+        safe = []
+        succ = []
+        for idx, agent in enumerate(agents):
+            goal_pos = None
+            if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and agent.goal_a.state.p_pos is not None:
+                goal_pos = agent.goal_a.state.p_pos
+            elif scn is not None and getattr(scn, 'goal_pos', None) is not None:
+                goal_pos = scn.goal_pos
+            if goal_pos is None:
+                raise RuntimeError(f"success snapshot同步失败: agent[{idx}] 缺少goal_pos")
+            pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
+            if pos is None or len(pos) < 3:
+                raise RuntimeError(f"success snapshot同步失败: agent[{idx}] 缺少有效位置")
+            dist = float(np.linalg.norm(pos - goal_pos))
+            r_flag = 1 if dist <= thr else 0
+            reach.append(r_flag)
+            s_flag = 0 if self._policy_agent_unsafe_for_episode_success(agent) else 1
+            safe.append(s_flag)
+            succ.append(1 if (r_flag and s_flag) else 0)
+        team = 1 if (succ and all(v == 1 for v in succ)) else 0
+        w._episode_agent_reach_flags = reach
+        w._episode_agent_safe_flags = safe
+        w._episode_agent_success_flags = succ
+        w._episode_team_success_flag = team
+        w._episode_all_reached = bool(reach and all(v == 1 for v in reach))
+        w._episode_success = bool(team == 1)
+        w._episode_success_thr_snapshot = thr
 
     def step(self, action_n):
         # 修改签名以符合gym标准
@@ -123,8 +230,27 @@ class MultiAgentEnv(gym.Env):
         done_n = []
         info_n = {'n': []}
         self.agents = self.world.policy_agents
+        timing_detail_enabled = self._timing_detail_enabled()
+        _perf_counter = time.perf_counter if timing_detail_enabled else None
+        step_timing = None
+        if timing_detail_enabled:
+            step_timing = {
+                'env_set': 0.0,
+                'env_world': 0.0,
+                'env_pre': 0.0,
+                'env_traj': 0.0,
+                'env_obs': 0.0,
+                'env_reward': 0.0,
+                'env_done': 0.0,
+                'env_info': 0.0,
+                'env_post': 0.0,
+                'env_outer': 0.0,
+            }
+        self._last_step_timing = None
         
         # 设置动作（对已完成的智能体，强制零动作，避免无意义动态与重复碰撞）
+        if timing_detail_enabled:
+            _t_env_seg = _perf_counter()
         for i, agent in enumerate(self.agents):
             # 避免索引越界
             if i < len(action_n):
@@ -153,11 +279,19 @@ class MultiAgentEnv(gym.Env):
                         action_shape = self.action_space[i].shape[0]
                 default_action = np.zeros(action_shape) if action_shape > 0 else 0
                 self._set_action(default_action, agent, self.action_space[i])
+        if timing_detail_enabled:
+            step_timing['env_set'] += _perf_counter() - _t_env_seg
                 
         # 执行世界动态更新
+        if timing_detail_enabled:
+            _t_env_seg = _perf_counter()
         self.world.step()
+        if timing_detail_enabled:
+            step_timing['env_world'] += _perf_counter() - _t_env_seg
         
         # 立即更新步数计数器（在is_done检查之前）
+        if timing_detail_enabled:
+            _t_env_seg = _perf_counter()
         try:
             if hasattr(self, '_current_step'):
                 self._current_step += 1
@@ -187,16 +321,13 @@ class MultiAgentEnv(gym.Env):
                     pass
         except Exception:
             pass
-        
-        # 🔧 性能优化：检查是否禁用轨迹记录（评估时可通过环境变量禁用）
-        try:
-            import os
-            disable_trajectory_recording = os.getenv('DISABLE_TRAJECTORY_RECORDING', '0').lower() in ('1', 'true', 'yes', 'on')
-        except Exception:
-            disable_trajectory_recording = False
+        if timing_detail_enabled:
+            step_timing['env_pre'] += _perf_counter() - _t_env_seg
         
         # 记录智能体位置到轨迹属性中（可通过环境变量禁用以提升性能）
-        if not disable_trajectory_recording:
+        if timing_detail_enabled:
+            _t_env_seg = _perf_counter()
+        if not self._disable_trajectory_recording:
             for i, agent in enumerate(self.agents):
                 if hasattr(agent, 'state') and hasattr(agent.state, 'p_pos'):
                     # 🔧 修复：如果智能体已经done，不再记录轨迹（避免记录下落帧）
@@ -223,11 +354,24 @@ class MultiAgentEnv(gym.Env):
                     #     trajectory_id = id(agent._trajectory)  # 获取轨迹对象的唯一ID
                     #     position_id = id(position_copy)  # 获取位置对象的唯一ID
                     #    # print(f"DEBUG: 步骤轨迹 - 智能体{i}位置: {position_copy}, 轨迹点数: {len(agent._trajectory)}, 轨迹ID: {trajectory_id}, 位置对象ID: {position_id}")
+        if timing_detail_enabled:
+            step_timing['env_traj'] += _perf_counter() - _t_env_seg
         
         # 记录最新的观察、奖励、是否完成和信息
         # 使用异常处理确保即使某个智能体的回调失败，也能返回完整数据
         agent_count = len(self.agents)
-        
+
+        # observation 在当前主场景里本来就是 step 级批量计算 + cache，
+        # 这里直接一次性取整批，避免再为每个 agent 走一遍回调包装。
+        if timing_detail_enabled:
+            _t_obs_batch_seg = _perf_counter()
+        try:
+            obs_batch = self._get_obs_batch(self.agents)
+        except Exception:
+            obs_batch = [np.zeros(self._get_default_obs_dim(), dtype=np.float32) for _ in range(agent_count)]
+        if timing_detail_enabled:
+            step_timing['env_obs'] += _perf_counter() - _t_obs_batch_seg
+
         # 🚀 性能优化：批量处理智能体数据，减少循环开销
         # 使用try-except确保总是返回与智能体数量匹配的值
         try:
@@ -246,20 +390,21 @@ class MultiAgentEnv(gym.Env):
             
             # 批量处理所有智能体
             for i, agent in enumerate(self.agents):
-                # 观察值
+                # 观察值（已由 batch helper 预取）
                 try:
-                    obs = self._get_obs(agent)
-                    # 🚨 关键修复：使用副本，确保每个智能体的观察值完全独立
-                    # 避免观察值中的引用共享问题（特别是goal_info中的normalized_goal_pos）
-                    if isinstance(obs, np.ndarray):
-                        obs = obs.copy()
+                    if i < len(obs_batch):
+                        obs = obs_batch[i]
+                    else:
+                        obs = np.zeros(default_obs_dim, dtype=np.float32)
                     obs_list.append(obs)
                 except Exception as e:
-                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                    if not self._quiet_output_enabled:
                         print(f"智能体 {i} 观察值计算错误: {e}")
-                    obs_list.append(np.zeros(default_obs_dim))
+                    obs_list.append(np.zeros(default_obs_dim, dtype=np.float32))
                 
                 # 奖励值
+                if timing_detail_enabled:
+                    _t_reward_seg = _perf_counter()
                 try:
                     r = self._get_reward(agent)
                     # 应用正负奖励缩放（使用预获取的值）
@@ -269,11 +414,15 @@ class MultiAgentEnv(gym.Env):
                         r = r * reward_neg_scale
                     reward_list.append(r)
                 except Exception as e:
-                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                    if not self._quiet_output_enabled:
                         print(f"智能体 {i} 奖励计算错误: {e}")
                     reward_list.append(0.0)
+                if timing_detail_enabled:
+                    step_timing['env_reward'] += _perf_counter() - _t_reward_seg
                 
                 # Done状态
+                if timing_detail_enabled:
+                    _t_done_seg = _perf_counter()
                 try:
                     agent_key = getattr(agent, 'name', f'agent_{i}')
                     if self._agent_done_flags.get(agent_key, False):
@@ -295,10 +444,10 @@ class MultiAgentEnv(gym.Env):
                                             corrected_pos = agent.state.p_pos.copy()
                                             corrected_pos[2] = terrain_h
                                             agent._trajectory[-1] = corrected_pos
-                                            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                                            if not self._quiet_output_enabled:
                                                 print(f"[轨迹修正] {agent_key}: 修正终点 Z={agent.state.p_pos[2]:.2f} -> {terrain_h:.2f}")
                                     except Exception as e:
-                                        if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                                        if not self._quiet_output_enabled:
                                             print(f"[轨迹修正失败] {agent_key}: {e}")
                             # 统一惩罚：早停触发时确保奖励中包含碰撞惩罚
                             try:
@@ -332,11 +481,15 @@ class MultiAgentEnv(gym.Env):
                                 pass
                         done_list.append(d)
                 except Exception as e:
-                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                    if not self._quiet_output_enabled:
                         print(f"智能体 {i} 完成状态计算错误: {e}")
                     done_list.append(False)
+                if timing_detail_enabled:
+                    step_timing['env_done'] += _perf_counter() - _t_done_seg
                 
                 # 信息
+                if timing_detail_enabled:
+                    _t_info_seg = _perf_counter()
                 try:
                     base_info = self._get_info(agent)
                     if not isinstance(base_info, dict):
@@ -354,15 +507,31 @@ class MultiAgentEnv(gym.Env):
                         pass
                     info_list.append(base_info)
                 except Exception as e:
-                    if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                    if not self._quiet_output_enabled:
                         print(f"智能体 {i} 信息计算错误: {e}")
                     info_list.append({})
+                if timing_detail_enabled:
+                    step_timing['env_info'] += _perf_counter() - _t_info_seg
+
+            if timing_detail_enabled and hasattr(self.scenario, 'get_last_reward_timing'):
+                try:
+                    reward_detail = self.scenario.get_last_reward_timing(self.world)
+                    if isinstance(reward_detail, dict):
+                        for key, value in reward_detail.items():
+                            try:
+                                step_timing[key] = float(value)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             
             # 批量赋值（减少append开销）
             obs_n = obs_list
             reward_n = reward_list
             done_n = done_list
             info_n['n'] = info_list
+            if timing_detail_enabled:
+                _t_env_post_seg = _perf_counter()
             
             # 验证长度与智能体数量是否一致
             if len(obs_n) != agent_count:
@@ -401,9 +570,8 @@ class MultiAgentEnv(gym.Env):
             try:
                 if hasattr(self, 'scenario') and hasattr(self.scenario, 'success_distance_threshold'):
                     thr_succ = getattr(self.scenario, 'success_distance_threshold', 2.0)
-                    # 🔧 关键修复：使用与成功奖励判断一致的阈值（1.2倍，与其他地方保持一致）
-                    # 注意：其他地方使用 1.2 * success_distance_threshold 作为实际判断阈值
-                    thr_succ_actual = thr_succ * 1.2  # 与实际成功判断保持一致
+                    # 统一阈值：回合层不再额外放宽到 1.2 倍，保持与 reward/训练一致
+                    thr_succ_actual = thr_succ
                     all_reached = True
                     reached_agents = []
                     agent_distances = []  # 用于调试输出
@@ -421,9 +589,13 @@ class MultiAgentEnv(gym.Env):
                             if goal_pos is not None:
                                 dist_to_goal = np.linalg.norm(pos - goal_pos)
                                 agent_distances.append((i, dist_to_goal, thr_succ_actual))
-                                # 🔧 关键修复：使用1.2倍阈值，与实际成功判断保持一致
                                 if dist_to_goal <= thr_succ_actual:
                                     reached_agents.append(i)
+                                    # 记录“本回合曾到达”，供训练侧在回合末按 ∃t 语义统计 Reach_i
+                                    try:
+                                        agent._ever_reached_goal = True
+                                    except Exception:
+                                        pass
                                 else:
                                     all_reached = False
                             else:
@@ -433,9 +605,25 @@ class MultiAgentEnv(gym.Env):
                             all_reached = False
                             agent_distances.append((i, None, f"Error: {e}"))
                     
-                    # 🚨 关键修改：如果所有智能体都到达目标，立即终止回合（不管是否有碰撞）
-                    # 如果只有部分智能体到达，继续运行并保持悬停奖励
+                    # 🚨 关键修复：统一成功判断逻辑，明确成功定义
+                    # 成功定义：所有智能体都到达目标 AND 所有智能体都无碰撞
+                    # 到达目标定义：所有智能体都到达目标（距离 <= 阈值），不管是否有碰撞
+                    # 修复：区分"到达目标"和"成功"，使用与训练脚本一致的碰撞检查逻辑
                     if all_reached and len(reached_agents) == agent_count:
+                        # 🚨 关键修复：检查所有智能体是否都无碰撞（与训练脚本逻辑一致）
+                        all_no_collision = True
+                        collision_info = []
+                        try:
+                            for i, agent in enumerate(self.agents):
+                                collision_reasons = self._policy_episode_collision_reasons(agent)
+                                if collision_reasons:
+                                    all_no_collision = False
+                                    collision_info.append(f"Agent{i}: {', '.join(collision_reasons)}")
+                        except Exception as e:
+                            # 如果检查失败，保守地认为有碰撞
+                            all_no_collision = False
+                            collision_info.append(f"碰撞检查失败: {e}")
+                        
                         # 只在首次达到时打印一次
                         if not hasattr(self.world, '_all_agents_reached_logged'):
                             self.world._all_agents_reached_logged = False
@@ -443,19 +631,38 @@ class MultiAgentEnv(gym.Env):
                         if not self.world._all_agents_reached_logged:
                             self.world._all_agents_reached_logged = True
                             try:
-                                step_idx = int(getattr(self.world, 'current_step', -1))
-                                ep_len = int(getattr(self.world, 'episode_length', -1))
-                                # 🔧 添加详细调试信息
-                                dist_info = ", ".join([f"Agent{i}: {d:.2f}m" if d is not None else f"Agent{i}: N/A" for i, d, _ in agent_distances])
-                                print(f"[成功] 所有智能体都到达目标 | step={step_idx}/{ep_len} | 立即终止回合进入下一回合")
-                                print(f"  [调试] 到达的智能体: {reached_agents}, 阈值={thr_succ_actual:.2f}m, 距离信息: {dist_info}")
+                                if self._debug_episode_summary_enabled:
+                                    step_idx = int(getattr(self.world, 'current_step', -1))
+                                    ep_len = int(getattr(self.world, 'episode_length', -1))
+                                    # 🔧 添加详细调试信息
+                                    dist_info = ", ".join([f"Agent{i}: {d:.2f}m" if d is not None else f"Agent{i}: N/A" for i, d, _ in agent_distances])
+                                    
+                                    # 🚨 关键修复：明确区分"到达目标"和"成功"
+                                    if all_no_collision:
+                                        # 成功：所有智能体都到达目标且无碰撞
+                                        print(f"[成功] 所有智能体都到达目标且无碰撞 | step={step_idx}/{ep_len} | 立即终止回合进入下一回合")
+                                        print(f"  [调试] 到达的智能体: {reached_agents}, 阈值={thr_succ_actual:.2f}m, 距离信息: {dist_info}")
+                                    else:
+                                        # 到达目标但可能有碰撞：只说明到达目标，不说明成功
+                                        print(f"[到达目标] 所有智能体都到达目标（但可能有碰撞） | step={step_idx}/{ep_len} | 立即终止回合进入下一回合")
+                                        print(f"  [调试] 到达的智能体: {reached_agents}, 阈值={thr_succ_actual:.2f}m, 距离信息: {dist_info}")
+                                        if collision_info:
+                                            print(f"  [碰撞信息] {', '.join(collision_info)}")
                             except Exception as e:
-                                print(f"[成功] 所有智能体都到达目标，但调试输出失败: {e}")
+                                if self._debug_episode_summary_enabled:
+                                    print(f"[到达目标] 所有智能体都到达目标，但调试输出失败: {e}")
                         
-                        # 在world中记录成功状态，供后续统计使用
+                        # 🚨 关键修复：在world中记录成功状态（只有无碰撞才算成功）
+                        # 原因：统一成功定义，确保与训练脚本一致
                         if not hasattr(self.world, '_episode_success'):
                             self.world._episode_success = False
-                        self.world._episode_success = True
+                        # 只有所有智能体都到达目标且无碰撞时，才记录为成功
+                        self.world._episode_success = all_no_collision
+                        # 全员到达标志（与安全成功解耦）：用于终局 unsafe_arrival_penalty 与日志分析
+                        try:
+                            self.world._episode_all_reached = True
+                        except Exception:
+                            pass
                         
                         # 🚨 关键：设置所有智能体的done为True，立即终止回合
                         # 确保数据记录正确（episode_rewards等会正确记录）
@@ -473,7 +680,7 @@ class MultiAgentEnv(gym.Env):
                         # 🔧 添加调试输出（每500步输出一次，降低输出频率）
                         try:
                             step_idx = int(getattr(self.world, 'current_step', -1))
-                            if step_idx % 500 == 0:  # 每500步输出一次
+                            if step_idx % 500 == 0 and not self._quiet_output_enabled:  # 每500步输出一次
                                 dist_info = ", ".join([f"Agent{i}: {d:.2f}m" if d is not None else f"Agent{i}: N/A" for i, d, _ in agent_distances])
                                 print(f"[部分到达] step={step_idx} | 到达的智能体: {reached_agents}/{agent_count} | 阈值={thr_succ_actual:.2f}m | 距离: {dist_info}")
                         except Exception:
@@ -482,7 +689,7 @@ class MultiAgentEnv(gym.Env):
                         # 没有智能体到达：每500步输出一次调试信息（降低输出频率）
                         try:
                             step_idx = int(getattr(self.world, 'current_step', -1))
-                            if step_idx % 500 == 0:  # 每500步输出一次
+                            if step_idx % 500 == 0 and not self._quiet_output_enabled:  # 每500步输出一次
                                 dist_info = ", ".join([f"Agent{i}: {d:.2f}m" if d is not None else f"Agent{i}: N/A" for i, d, _ in agent_distances])
                                 print(f"[未到达] step={step_idx} | 到达的智能体: {reached_agents}/{agent_count} | 阈值={thr_succ_actual:.2f}m | 距离: {dist_info}")
                         except Exception:
@@ -491,7 +698,7 @@ class MultiAgentEnv(gym.Env):
                 # 🔧 关键修复：输出异常信息，帮助诊断问题
                 import traceback
                 print(f"[错误] 检查所有智能体到达目标时发生异常: {e}")
-                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                if not self._quiet_output_enabled:
                     traceback.print_exc()
                 pass
                 
@@ -503,9 +710,22 @@ class MultiAgentEnv(gym.Env):
             reward_n = [0.0 for _ in range(agent_count)]
             done_n = [False for _ in range(agent_count)]
             info_n = {'n': [{} for _ in range(agent_count)]}
+            if timing_detail_enabled:
+                _t_env_post_seg = _perf_counter()
             
+        # 权威团队成功快照（policy_agents + scenario 成功阈值），与 [成功记录] 同源
+        self._sync_world_team_success_snapshot()
+
         # 更新3D视图中的实体位置（如果正在使用3D渲染）
+        if timing_detail_enabled and '_t_env_post_seg' not in locals():
+            _t_env_post_seg = _perf_counter()
         self._update_3d_objects()
+        if timing_detail_enabled:
+            step_timing['env_post'] += _perf_counter() - _t_env_post_seg
+            if not isinstance(info_n, dict):
+                info_n = {'n': [{} for _ in range(len(done_n) if hasattr(done_n, '__len__') else 0)]}
+            info_n['_timing'] = step_timing
+            self._last_step_timing = step_timing
         
         # 检查是否使用的是 gymnasium (通过检查是否有 step 方法的特定参数)
         if hasattr(gym.Env, 'step') and gym.Env.step.__code__.co_varnames.count('truncated') > 0:
@@ -537,6 +757,7 @@ class MultiAgentEnv(gym.Env):
         # reset world
         if self.reset_callback is not None:
             self.reset_callback(self.world)
+        self._refresh_runtime_flags()
         # reset renderer
         self._reset_render()
         # 清空完成标记和步数记录
@@ -556,12 +777,35 @@ class MultiAgentEnv(gym.Env):
             self.world._all_agents_reached_logged = False
         if hasattr(self.world, '_episode_success'):
             self.world._episode_success = False
+        # 终局结算辅助标志：全员到达（不要求安全）与 episode 级最小安全距离
+        try:
+            self.world._episode_all_reached = False
+        except Exception:
+            pass
+        try:
+            self.world._episode_dmin_min = float('inf')
+        except Exception:
+            pass
+        try:
+            self.world._episode_agent_reach_flags = []
+            self.world._episode_agent_safe_flags = []
+            self.world._episode_agent_success_flags = []
+            self.world._episode_team_success_flag = 0
+            if hasattr(self.world, '_episode_success_thr_snapshot'):
+                delattr(self.world, '_episode_success_thr_snapshot')
+        except Exception:
+            pass
         
         # 保存智能体引用
         self.agents = self.world.policy_agents
         
         # 初始化智能体轨迹
         for i, agent in enumerate(self.agents):
+            # 重置“本回合曾到达目标”标志，避免跨回合污染
+            try:
+                agent._ever_reached_goal = False
+            except Exception:
+                pass
             if hasattr(agent, 'state') and hasattr(agent.state, 'p_pos'):
                 # 重置轨迹
                 agent._trajectory = [agent.state.p_pos.copy()]
@@ -572,78 +816,23 @@ class MultiAgentEnv(gym.Env):
         
         # record observations for each agent
         obs_n = []
-        
+
         try:
-            # 为每个智能体单独获取观察值，并加入更多错误处理
-            for i, agent in enumerate(self.agents):
-                try:
-                    # 获取智能体的观察值
-                    # print(f"为智能体 {i}/{len(self.agents)-1} 获取观察值")
-                    obs = self._get_obs(agent)
-                    
-                    # 确保观察值是numpy数组
-                    if not isinstance(obs, np.ndarray):
-                        try:
-                            if isinstance(obs, list) and len(obs) > 0:
-                                if isinstance(obs[0], np.ndarray):
-                                    obs = obs[0]  # 取第一个数组
-                                else:
-                                    obs = np.array(obs)
-                            else:
-                                obs = np.array(obs)
-                        except Exception as e:
-                            # print(f"转换观察值出错: {e}")
-                            # 创建默认观察值
-                            obs = np.zeros(self._get_default_obs_dim())
-                    
-                    # 形状验证
-                    expected_obs_dim = self._get_default_obs_dim()
-                    if len(obs.shape) > 1 or obs.shape[0] != expected_obs_dim:
-                        # print(f"观察值形状不正确: {obs.shape}，尝试调整")
-                        if len(obs.shape) > 1:
-                            try:
-                                obs = obs.flatten()[:expected_obs_dim]  # 展平并截断
-                            except:
-                                obs = np.zeros(expected_obs_dim)
-                        
-                        # 填充或截断到标准维度
-                        if len(obs) < expected_obs_dim:
-                            obs = np.pad(obs, (0, expected_obs_dim - len(obs)), 'constant')
-                        elif len(obs) > expected_obs_dim:
-                            obs = obs[:expected_obs_dim]
-                    
-                    # 🚨 关键修复：使用副本，确保每个智能体的观察值完全独立
-                    # 避免观察值中的引用共享问题（特别是goal_info中的normalized_goal_pos）
-                    if isinstance(obs, np.ndarray):
-                        obs = obs.copy()
-                    # 添加到观察值列表
-                    obs_n.append(obs)
-                    # print(f"智能体 {i} 观察值获取成功，形状={obs.shape}")
-                except Exception as e:
-                    # print(f"获取智能体 {i} 的观察值时出错: {e}")
-                    # 添加默认的零向量
-                    obs_n.append(np.zeros(self._get_default_obs_dim()))
-            
+            obs_n = self._get_obs_batch(self.agents)
+
             # 最终验证：确保观察值数量与智能体数量匹配
             if len(obs_n) != len(self.agents):
-                # print(f"警告: 最终观察值数量 ({len(obs_n)}) 与智能体数量 ({len(self.agents)}) 不匹配!")
-                
-                # 调整观察值数量以匹配智能体数量
                 if len(obs_n) > len(self.agents):
-                    # print(f"裁剪多余的观察值: {len(obs_n)} -> {len(self.agents)}")
                     obs_n = obs_n[:len(self.agents)]
                 else:
-                    # print(f"添加缺失的观察值: {len(obs_n)} -> {len(self.agents)}")
+                    default_obs_dim = self._get_default_obs_dim()
                     while len(obs_n) < len(self.agents):
-                        obs_n.append(np.zeros(self._get_default_obs_dim()))
-            else:
-                # print(f"观察值数量验证通过: {len(obs_n)} 个，与智能体数量匹配")
-                pass
+                        obs_n.append(np.zeros(default_obs_dim, dtype=np.float32))
         except Exception as e:
             print(f"重置环境期间发生错误: {e}")
             # 确保始终返回与智能体数量匹配的观察值
             default_obs_dim = self._get_default_obs_dim()
-            obs_n = [np.zeros(default_obs_dim) for _ in range(len(self.agents))]
+            obs_n = [np.zeros(default_obs_dim, dtype=np.float32) for _ in range(len(self.agents))]
         
         # 添加调试信息（已禁用以减少输出）
         # print(f"DEBUG: environment.py reset() - 准备返回观察值")
@@ -669,35 +858,117 @@ class MultiAgentEnv(gym.Env):
             return {}
         return self.info_callback(agent, self.world)
 
+    def _normalize_obs_value(self, obs):
+        """统一 observation 的形状与副本语义，供单 agent 与 batch 路径复用。"""
+        default_obs_dim = self._get_default_obs_dim()
+
+        if not isinstance(obs, np.ndarray):
+            try:
+                if isinstance(obs, list) and len(obs) > 0:
+                    if isinstance(obs[0], np.ndarray):
+                        obs = obs[0]
+                    else:
+                        obs = np.array(obs)
+                else:
+                    obs = np.array(obs)
+            except Exception:
+                return np.zeros(default_obs_dim, dtype=np.float32)
+
+        try:
+            obs = np.asarray(obs)
+            if obs.ndim == 0:
+                obs = obs.reshape(1)
+            elif obs.ndim > 1:
+                obs = obs.flatten()
+        except Exception:
+            return np.zeros(default_obs_dim, dtype=np.float32)
+
+        actual_dim = int(obs.size)
+        if hasattr(self, 'obs_dim') and self.obs_dim is not None:
+            expected_dim = int(self.obs_dim)
+        else:
+            expected_dim = actual_dim
+            self.obs_dim = actual_dim
+
+        if actual_dim != expected_dim:
+            if actual_dim > expected_dim:
+                obs = obs[:expected_dim].copy()
+            else:
+                padded_obs = np.zeros(expected_dim, dtype=np.float32)
+                padded_obs[:actual_dim] = obs
+                obs = padded_obs
+        else:
+            obs = obs.copy()
+
+        return obs
+
+    def _get_obs_batch(self, agents=None):
+        """优先命中场景已有的批量 observation 语义，失败时回退到逐 agent。"""
+        if agents is None:
+            agents = self.agents
+        if self.observation_callback is None:
+            return [np.zeros(0, dtype=np.float32) for _ in agents]
+
+        callback_owner = getattr(self.observation_callback, '__self__', None)
+        if callback_owner is not None and hasattr(callback_owner, '_compute_observations_batch_uncached'):
+            try:
+                cache_key = (id(self.world), int(getattr(self.world, 'current_step', -1)))
+            except Exception:
+                cache_key = None
+
+            try:
+                if cache_key is not None and getattr(callback_owner, '_obs_step_cache_key', None) == cache_key:
+                    cache = getattr(callback_owner, '_obs_step_cache', None)
+                    if isinstance(cache, dict):
+                        obs_n = []
+                        complete = True
+                        for agent in agents:
+                            cached_obs = cache.get(id(agent))
+                            if cached_obs is None:
+                                complete = False
+                                break
+                            obs_n.append(self._normalize_obs_value(cached_obs))
+                        if complete and len(obs_n) == len(agents):
+                            return obs_n
+
+                batch_obs = callback_owner._compute_observations_batch_uncached(self.world)
+                if isinstance(batch_obs, dict) and batch_obs:
+                    if cache_key is not None:
+                        callback_owner._obs_step_cache_key = cache_key
+                        callback_owner._obs_step_cache = dict(batch_obs)
+
+                    obs_n = []
+                    complete = True
+                    for agent in agents:
+                        obs = batch_obs.get(id(agent))
+                        if obs is None:
+                            complete = False
+                            break
+                        obs_n.append(self._normalize_obs_value(obs))
+                    if complete and len(obs_n) == len(agents):
+                        return obs_n
+            except Exception:
+                try:
+                    callback_owner._obs_step_cache_key = None
+                    callback_owner._obs_step_cache = {}
+                except Exception:
+                    pass
+
+        obs_n = []
+        default_obs_dim = self._get_default_obs_dim()
+        for agent in agents:
+            try:
+                obs_n.append(self._get_obs(agent))
+            except Exception:
+                obs_n.append(np.zeros(default_obs_dim, dtype=np.float32))
+        return obs_n
+
     # get observation for a particular agent
     def _get_obs(self, agent):
         if self.observation_callback is None:
-            return np.zeros(0)
+            return np.zeros(0, dtype=np.float32)
         obs = self.observation_callback(agent, self.world)
-        # 🔧 修复：优先使用实际观察值的维度，而不是硬编码的后备值
-        # 如果obs_dim已初始化，使用它；否则使用实际观察值的维度
-        if isinstance(obs, np.ndarray):
-            # 🚨 关键修复：立即创建副本，避免后续操作修改原始观察值
-            obs = obs.copy()
-            actual_dim = obs.size
-            if hasattr(self, 'obs_dim') and self.obs_dim is not None:
-                expected_dim = self.obs_dim
-            else:
-                # 如果obs_dim未初始化，使用实际观察值的维度（不截断）
-                expected_dim = actual_dim
-                # 同时更新obs_dim，确保后续一致性
-                self.obs_dim = actual_dim
-            
-            if actual_dim != expected_dim:
-                if actual_dim > expected_dim:
-                    # 截断到标准维度（仅在obs_dim已设置时）
-                    obs = obs[:expected_dim].copy()  # 截断后也创建副本
-                else:
-                    # 填充到标准维度
-                    padded_obs = np.zeros(expected_dim, dtype=np.float32)
-                    padded_obs[:actual_dim] = obs
-                    obs = padded_obs  # padded_obs已经是新数组，不需要copy
-        return obs
+        return self._normalize_obs_value(obs)
 
     def _get_default_obs_dim(self):
         """获取默认观察维度，确保系统一致性"""
@@ -709,6 +980,11 @@ class MultiAgentEnv(gym.Env):
             if hasattr(self, 'observation_space') and len(self.observation_space) > 0:
                 # 使用第一个智能体的观察空间维度
                 return self.observation_space[0].shape[0]
+            elif hasattr(self, 'scenario') and hasattr(self.scenario, 'observation_dim'):
+                try:
+                    return int(self.scenario.observation_dim)
+                except Exception:
+                    pass
             else:
                 # 最终后备值：使用92维（当前场景的实际维度）
                 return 92
@@ -775,13 +1051,12 @@ class MultiAgentEnv(gym.Env):
                     if hasattr(self.scenario, 'get_terrain_height'):
                         try:
                             import os
-                            eps = float(os.getenv('TERRAIN_CONTACT_EPS', '0.3'))  # 🔧 使用与is_done相同的阈值
+                            eps = float(os.getenv('TERRAIN_COLLISION_EPS', '0.3'))  # 使用真实碰撞阈值，与is_done保持一致
                         except Exception:
                             eps = 0.3
                         try:
                             terrain_h = self.scenario.get_terrain_height(agent.state.p_pos[0], agent.state.p_pos[1])
-                            # 🔧 关键修复：使用与is_done相同的穿透判断逻辑（z < terrain_h - eps）
-                            if agent.state.p_pos[2] < terrain_h - eps:
+                            if agent.state.p_pos[2] <= terrain_h + eps:
                                 termination_reasons.append("地形穿透")
                         except Exception:
                             pass
@@ -798,20 +1073,7 @@ class MultiAgentEnv(gym.Env):
                             d = float(np.linalg.norm(pos - lp) - r)
                             dmin = d if dmin is None else min(dmin, d)
                         
-                        # 🔧 关键修复：使用与is_done相同的碰撞阈值
-                        # is_done中使用: getattr(self, 'collision_distance_threshold', 0.5)
-                        # 优先从scenario获取，如果没有则使用环境变量，最后使用默认值
-                        thr_coll = 0.5  # 默认值（与is_done保持一致）
-                        try:
-                            if hasattr(self.scenario, 'collision_distance_threshold'):
-                                thr_coll = float(getattr(self.scenario, 'collision_distance_threshold', thr_coll))
-                            else:
-                                import os
-                                thr_coll = float(os.getenv('COLLISION_DISTANCE_THRESHOLD', str(thr_coll)))
-                        except Exception:
-                            pass
-                        
-                        if dmin is not None and dmin <= thr_coll:
+                        if dmin is not None and dmin <= 0.0:
                             termination_reasons.append("实体碰撞")
                 
                 # 存储终止原因

@@ -1,50 +1,47 @@
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 .Python
-*.egg-info/
-dist/
-build/
+.pytest_cache/
+.mypy_cache/
 
-# Virtual Environment
-.venv/
-venv/
-maddpg_venv/
-ENV/
-env/
-
-# IDE
-.vscode/
-.cursor/
-.idea/
 *.swp
 *.swo
-*~
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
 
-# OS
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
+.venv/
+venv/
+env/
+.env
+
 logs/
-
-# Model checkpoints and data (uncomment if you don't want to upload these)
-# *.pth
-# *.pt
-# *.ckpt
-# data/
-# checkpoints/
-weights/
-evaluation_results/
 models/
+evaluation_results/
 terrain_sensing_experiments/
-/apf_demo.gif
+ablation_experiments/
+ablation_action_pf_outputs/
+ablation_fixed_fr_outputs/
+results/
+seed_sweeps/
 
-# Temporary files
-*.tmp
-*.bak
-*.backup
-*backup*
+*.log
+*.weights.h5
+*.h5
+*.ckpt
+*.pth
+*.pt
+
+Miniconda3-latest-Linux-x86_64.sh
+tempCodeRunnerFile.sh
+2024 TD3基础改进的强化学习算法.pdf
+自适应旋转势场.pdf
+.rot_pf_paper.txt
+.td3_paper.txt
+.td3_paper_clean.txt
