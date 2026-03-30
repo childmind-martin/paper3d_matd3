@@ -165,6 +165,8 @@ class Scenario(BaseScenario):
         self.fixed_positions = None
         # 缓存固定位置验证签名，避免每回合对同一套位置/地形重复校验
         self._fixed_positions_validation_signature = None
+        # 障碍物布局签名：仅当起点/目标/地形/seed 对应的布局一致时才复用固定障碍
+        self._obstacle_layout_signature = None
 
         # 🚨 关键修复：DYNAMIC_FIRST_TIME 模式下，在初始化时就删除旧的位置文件
         # 这样可以确保每次新运行都会重新生成初始位置
@@ -579,6 +581,7 @@ class Scenario(BaseScenario):
         # 清空旧数据
         self.terrain = None
         self.obstacles = []
+        self._obstacle_layout_signature = None
         self.terrain_complexity = {}
         
         # 重新生成地形
@@ -1285,9 +1288,11 @@ class Scenario(BaseScenario):
             
             self.generate_terrain()
             
-        # 生成障碍物（如果还没有）
-        if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
-            self.generate_obstacles()
+        # 注意：不要在 make_world() 阶段生成障碍物。
+        # 正确顺序必须是：
+        #   1. reset_world() 先确定起点与目标
+        #   2. 再按当前布局生成障碍物
+        # 否则固定障碍物模式会把“无起点/目标 keep-out”的旧障碍物错误复用到正式训练中。
         
         # 基本位置初始化，避免None值导致的错误
         # 注意：这里只做最基本的初始化，具体状态由reset_world设置
@@ -1658,57 +1663,19 @@ class Scenario(BaseScenario):
             # 同地形/同起点/同目标基础上，为每个并行环境引入独立的初始朝向/速度微扰
             self._apply_per_env_randomization(world)
             
-            # 🚨 关键修复：在固定位置模式下也要生成障碍物（根据USE_DYNAMIC_OBSTACLES决定是否重新生成）
-            # 问题：原代码在_apply_fixed_positions后直接return，导致障碍物生成逻辑（1792-1818行）永远不会被执行
-            # 解决：在return之前添加障碍物生成逻辑，确保即使使用固定位置，障碍物也能正确生成
-            # 🔧 障碍物生成：根据 USE_DYNAMIC_OBSTACLES 环境变量决定是否重新生成
-            # USE_DYNAMIC_OBSTACLES=1: 每次reset时重新生成障碍物（增加训练多样性）
-            # USE_DYNAMIC_OBSTACLES=0: 障碍物位置固定，只在首次生成时创建
-            if getattr(self, 'use_dynamic_obstacles', True):  # 默认启用动态障碍物（向后兼容）
-                # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
-                # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
-                # 每次reset时使用不同的随机种子，但基于原始种子确保可重复性（如果需要）
-                try:
-                    agent_positions_now = [agent.state.p_pos for agent in world.agents]
-                    agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
-                    if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
-                        # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
-                        # 初始化reset计数器（如果不存在）
-                        if not hasattr(self, '_obstacle_reset_count'):
-                            self._obstacle_reset_count = 0
-                        self._obstacle_reset_count += 1
-                        
-                        # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
-                        base_seed = int(self.seed) if self.seed is not None else 42
-                        obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
-                        self.rng = np.random.RandomState(obstacle_seed)
-                        
-                        self.generate_obstacles(start_positions=agent_positions_now,
-                                                goal_position=self.goal_pos,
-                                                agent_goal_positions=agent_goals_now)
-                except Exception:
-                    pass
-            else:
-                # 固定障碍物模式：只在首次生成时创建障碍物，后续不再重新生成
-                # 如果障碍物尚未生成，则生成一次
-                if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
-                    try:
-                        agent_positions_now = [agent.state.p_pos for agent in world.agents]
-                        agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
-                        if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
-                            # 使用固定种子生成障碍物，确保每次运行位置一致
-                            base_seed = int(self.seed) if self.seed is not None else 42
-                            obstacle_seed = base_seed + 10000  # 固定种子，不使用reset计数器
-                            self.rng = np.random.RandomState(obstacle_seed)
-                            
-                            self.generate_obstacles(start_positions=agent_positions_now,
-                                                    goal_position=self.goal_pos,
-                                                    agent_goal_positions=agent_goals_now)
-                    except Exception:
-                        pass
-            
-            # 设置障碍物到world
-            self._place_obstacles(world)
+            # 固定位置模式下也必须按“当前固定起点/目标”刷新障碍物。
+            # 这里统一走布局签名判断，避免复用 make_world() 或旧回合残留的错误障碍物。
+            try:
+                agent_positions_now = [agent.state.p_pos for agent in world.agents]
+                agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
+                self._refresh_obstacles_for_current_layout(
+                    world,
+                    start_positions=agent_positions_now,
+                    goal_position=self.goal_pos,
+                    agent_goal_positions=agent_goals_now,
+                )
+            except Exception:
+                pass
             
             # 🚀 插入角色随机化 (固定位置重置时)
             self._apply_role_randomization(world)
@@ -2030,53 +1997,18 @@ class Scenario(BaseScenario):
             # 完全动态模式：_apply_fixed_positions不会被调用，需要在这里设置独立目标
             self._set_agent_goals(world)
         # 固定位置模式：_apply_fixed_positions中已调用_set_agent_goals，这里无需操作
-        # 🔧 障碍物生成：根据 USE_DYNAMIC_OBSTACLES 环境变量决定是否重新生成
-        # USE_DYNAMIC_OBSTACLES=1: 每次reset时重新生成障碍物（增加训练多样性）
-        # USE_DYNAMIC_OBSTACLES=0: 障碍物位置固定，只在首次生成时创建
-        if getattr(self, 'use_dynamic_obstacles', True):  # 默认启用动态障碍物（向后兼容）
-            # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
-            # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
-            # 每次reset时使用不同的随机种子，但基于原始种子确保可重复性（如果需要）
-            try:
-                agent_positions_now = [agent.state.p_pos for agent in world.agents]
-                agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
-                if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
-                    # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
-                    # 初始化reset计数器（如果不存在）
-                    if not hasattr(self, '_obstacle_reset_count'):
-                        self._obstacle_reset_count = 0
-                    self._obstacle_reset_count += 1
-                    
-                    # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
-                    base_seed = int(self.seed) if self.seed is not None else 42
-                    obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
-                    self.rng = np.random.RandomState(obstacle_seed)
-                    
-                    self.generate_obstacles(start_positions=agent_positions_now,
-                                            goal_position=self.goal_pos,
-                                            agent_goal_positions=agent_goals_now)
-            except Exception:
-                pass
-        else:
-            # 固定障碍物模式：只在首次生成时创建障碍物，后续不再重新生成
-            # 如果障碍物尚未生成，则生成一次
-            if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
-                try:
-                    agent_positions_now = [agent.state.p_pos for agent in world.agents]
-                    agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
-                    if isinstance(agent_positions_now, list) and len(agent_positions_now) > 0 and self.goal_pos is not None:
-                        # 使用固定种子生成障碍物，确保每次运行位置一致
-                        base_seed = int(self.seed) if self.seed is not None else 42
-                        obstacle_seed = base_seed + 10000  # 固定种子，不使用reset计数器
-                        self.rng = np.random.RandomState(obstacle_seed)
-                        
-                        self.generate_obstacles(start_positions=agent_positions_now,
-                                                goal_position=self.goal_pos,
-                                                agent_goal_positions=agent_goals_now)
-                except Exception:
-                    pass
-        # 设置障碍物位置，确保它们在地形表面
-        self._place_obstacles(world)
+        # 障碍物刷新统一延后到起点/目标完全确定之后执行，避免复用错误布局。
+        try:
+            agent_positions_now = [agent.state.p_pos for agent in world.agents]
+            agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents] if hasattr(world, 'agents') else None
+            self._refresh_obstacles_for_current_layout(
+                world,
+                start_positions=agent_positions_now,
+                goal_position=self.goal_pos,
+                agent_goal_positions=agent_goals_now,
+            )
+        except Exception:
+            pass
 
         # 初始化或更新到目标距离
         for agent in world.agents:
@@ -2211,6 +2143,103 @@ class Scenario(BaseScenario):
             else:
                 # 如果障碍物数据不足，放置在安全位置
                 obstacle.state.p_pos = self.get_safe_position()
+
+    def _normalize_obstacle_layout_points(self, points):
+        """将位置集合归一化为可哈希签名，避免浮点噪声导致的误判。"""
+        if points is None:
+            return ()
+        normalized = []
+        try:
+            iterable = list(points)
+        except Exception:
+            iterable = [points]
+        for point in iterable:
+            try:
+                arr = np.asarray(point, dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+            if arr.size == 0:
+                continue
+            normalized.append(tuple(round(float(x), 4) for x in arr[:3]))
+        return tuple(normalized)
+
+    def _build_obstacle_layout_signature(self, start_positions, goal_position, agent_goal_positions, obstacle_seed):
+        """构造障碍物布局签名，用于判断固定障碍是否还能安全复用。"""
+        try:
+            terrain_seed = int(
+                getattr(
+                    self,
+                    'current_terrain_seed',
+                    self.seed if self.seed is not None else -1,
+                )
+            )
+        except Exception:
+            terrain_seed = -1
+        return (
+            bool(getattr(self, 'use_dynamic_obstacles', True)),
+            int(obstacle_seed),
+            int(getattr(self, 'num_obstacles', 0)),
+            int(round(float(getattr(self, 'map_size', 0.0)))),
+            terrain_seed,
+            self._normalize_obstacle_layout_points(start_positions),
+            self._normalize_obstacle_layout_points([goal_position] if goal_position is not None else []),
+            self._normalize_obstacle_layout_points(agent_goal_positions),
+        )
+
+    def _refresh_obstacles_for_current_layout(self, world, start_positions, goal_position, agent_goal_positions=None, force_regenerate=False):
+        """
+        统一的障碍物刷新入口。
+
+        规则：
+        - 动态障碍物：每次 reset 都重生成；
+        - 固定障碍物：仅当布局签名变化或当前尚未生成时才重生成；
+        - 无论哪种模式，都只在“已知当前起点/目标”之后执行。
+        """
+        if start_positions is None or goal_position is None:
+            return
+        try:
+            start_positions = [np.asarray(p, dtype=np.float64) for p in list(start_positions)]
+        except Exception:
+            return
+        if len(start_positions) == 0:
+            return
+
+        dynamic_obstacles = bool(getattr(self, 'use_dynamic_obstacles', True))
+        base_seed = int(self.seed) if self.seed is not None else 42
+        if dynamic_obstacles:
+            if not hasattr(self, '_obstacle_reset_count'):
+                self._obstacle_reset_count = 0
+            self._obstacle_reset_count += 1
+            obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
+        else:
+            obstacle_seed = base_seed + 10000
+
+        target_signature = self._build_obstacle_layout_signature(
+            start_positions=start_positions,
+            goal_position=goal_position,
+            agent_goal_positions=agent_goal_positions,
+            obstacle_seed=obstacle_seed,
+        )
+        current_signature = getattr(self, '_obstacle_layout_signature', None)
+        need_regenerate = bool(force_regenerate or current_signature != target_signature)
+        if not need_regenerate:
+            if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
+                need_regenerate = True
+
+        if need_regenerate:
+            self.rng = np.random.RandomState(obstacle_seed)
+            self.generate_obstacles(
+                start_positions=start_positions,
+                goal_position=goal_position,
+                agent_goal_positions=agent_goal_positions,
+            )
+            self._obstacle_layout_signature = target_signature
+
+        self._place_obstacles(world)
+        try:
+            self._refresh_observation_static_cache(num_agents=len(world.agents))
+        except Exception:
+            self._refresh_observation_static_cache()
     
     def _dynamic_reset_world(self, world):
         """动态设置世界位置的原始实现"""
@@ -2523,29 +2552,15 @@ class Scenario(BaseScenario):
         
         # 在生成障碍前，先设置每个智能体的独立目标
         self._set_agent_goals(world)
-        # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
-        # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
-        # 🎯 重新生成障碍物，基于起点→各自目标/中央目标
         agent_positions = [agent.state.p_pos for agent in world.agents]
         agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
-        
-        # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
-        # 初始化reset计数器（如果不存在）
-        if not hasattr(self, '_obstacle_reset_count'):
-            self._obstacle_reset_count = 0
-        self._obstacle_reset_count += 1
-        
-        # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
-        base_seed = int(self.seed) if self.seed is not None else 42
-        obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
-        self.rng = np.random.RandomState(obstacle_seed)
-        
-        self.generate_obstacles(start_positions=agent_positions,
-                                goal_position=self.goal_pos,
-                                agent_goal_positions=agent_goals_now)
-        
-        # 设置障碍物位置
-        self._place_obstacles(world)
+        self._refresh_obstacles_for_current_layout(
+            world,
+            start_positions=agent_positions,
+            goal_position=self.goal_pos,
+            agent_goal_positions=agent_goals_now,
+            force_regenerate=True,
+        )
         
         # 输出各智能体的初始位置坐标信息
         print(f"[智能体位置] 智能体初始位置坐标:")
@@ -2598,50 +2613,17 @@ class Scenario(BaseScenario):
             if hasattr(agent, 'action') and hasattr(agent.action, 'u'):
                 agent.action.u = np.zeros(world.dim_p)
         
-        # 先设置包围目标，再生成障碍
+        # 先设置包围目标，再按当前布局刷新障碍物
         self._set_agent_goals(world)
-        # 🔧 障碍物生成：根据 USE_DYNAMIC_OBSTACLES 环境变量决定是否重新生成
-        if getattr(self, 'use_dynamic_obstacles', True):  # 默认启用动态障碍物（向后兼容）
-            # 🔧 修改：让障碍物每次reset时都随机重新生成，在起点和目标连线附近生成
-            # 原因：增加训练多样性，让智能体学习应对不同的障碍物分布
-            # 🎯 重新生成障碍物，基于起点→各自目标/中央目标
-            agent_positions = [agent.state.p_pos for agent in world.agents]
-            agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
-            
-            # 🎲 使用随机种子 + reset计数器生成不同的障碍物布局
-            # 初始化reset计数器（如果不存在）
-            if not hasattr(self, '_obstacle_reset_count'):
-                self._obstacle_reset_count = 0
-            self._obstacle_reset_count += 1
-            
-            # 生成基于reset次数的障碍物种子，确保每次reset障碍物位置不同
-            base_seed = int(self.seed) if self.seed is not None else 42
-            obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
-            self.rng = np.random.RandomState(obstacle_seed)
-            
-            self.generate_obstacles(start_positions=agent_positions,
-                                    goal_position=self.goal_pos,
-                                    agent_goal_positions=agent_goals_now)
-        else:
-            # 固定障碍物模式：只在首次生成时创建障碍物，后续不再重新生成
-            if not hasattr(self, 'obstacles') or self.obstacles is None or len(self.obstacles) == 0:
-                try:
-                    agent_positions = [agent.state.p_pos for agent in world.agents]
-                    agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
-                    if isinstance(agent_positions, list) and len(agent_positions) > 0 and self.goal_pos is not None:
-                        # 使用固定种子生成障碍物，确保每次运行位置一致
-                        base_seed = int(self.seed) if self.seed is not None else 42
-                        obstacle_seed = base_seed + 10000  # 固定种子，不使用reset计数器
-                        self.rng = np.random.RandomState(obstacle_seed)
-                        
-                        self.generate_obstacles(start_positions=agent_positions,
-                                                goal_position=self.goal_pos,
-                                                agent_goal_positions=agent_goals_now)
-                except Exception:
-                    pass
-        
-        # 设置障碍物
-        self._place_obstacles(world)
+        agent_positions = [agent.state.p_pos for agent in world.agents]
+        agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
+        self._refresh_obstacles_for_current_layout(
+            world,
+            start_positions=agent_positions,
+            goal_position=self.goal_pos,
+            agent_goal_positions=agent_goals_now,
+            force_regenerate=True,
+        )
     
     def find_flat_area(self, min_height=0, max_height=20, min_area_size=5):
         """寻找地形中的平坦区域（高度在指定范围内，特别是0-20cm区域）"""
@@ -4664,6 +4646,7 @@ class Scenario(BaseScenario):
                 self.seed = terrain_data.get('seed', self.seed)
                 self.terrain_complexity = terrain_data.get('complexity', {})
                 self.obstacles = terrain_data.get('obstacles', [])
+                self._obstacle_layout_signature = None
                 self.map_size = terrain_data.get('map_size', self.map_size)
                 self._refresh_observation_static_cache()
                 

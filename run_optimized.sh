@@ -53,7 +53,7 @@ echo "MADDPG 优化版训练启动器 (已修复)"
 echo "======================================"
 
 # 设置默认参数
-EPISODES=${1:-200}    
+EPISODES=${1:-300}    
 BATCH_SIZE=${2:-1024}  # 🔧 好效果复现：与 result.json 一致（1024）
 EXP_NAME=${3:-"变FR到0.1、公平权重补偿、静态障碍物、课程学习、随机角色、高球形障碍apf、复杂4_exp"}
 USE_WEIGHTED_REWARD=${4:-1}  # 新增：是否使用分项加权求和奖励机制（1=启用，0=禁用）
@@ -150,7 +150,7 @@ export WEIGHT_SCALING_FACTOR=${WEIGHT_SCALING_FACTOR:-0.999}  # 从0.6提高到0
 
 # === 🚀 加速配置（默认：仅保留 PF_JIT，禁用通用 JIT_COMPILE）===
 export AMP_MODE=off
-export JIT_COMPILE=${JIT_COMPILE:-0}            # 当前 MATD3 separated-gradient 热路径下不稳定，默认关闭
+export JIT_COMPILE=${JIT_COMPILE:-1}            # 当前 MATD3 separated-gradient 热路径下不稳定，默认关闭
 export PF_JIT=${PF_JIT:-1}                      # 势场热内核 JIT，当前已验证有效
 
 # === 🔧 XLA Global 配置（默认启用，异步执行模式）===
@@ -1171,11 +1171,11 @@ ARGS=(
     # 🔧 关键修复：优先从环境变量读取，允许消融实验等场景覆盖默认值
     # 如果环境变量未设置，则使用默认值（启用课程学习）
     # 🚨 提高课程学习开启门槛：需要更多连续成功或更长的奖励停滞期
-    --unlock-env-on-success "${UNLOCK_ENV_ON_SUCCESS:-80}"           # 🚀 修改：解锁随机障碍物而非随机地形
+    --unlock-env-on-success "${UNLOCK_ENV_ON_SUCCESS:-0}"           # 🚀 修改：解锁随机障碍物而非随机地形
                                                                      # 作用：需要连续100个回合成功才能解锁随机障碍物生成
                                                                      # 影响：提高门槛，避免过早切换到随机障碍物，让智能体在固定障碍物上充分训练
                                                                      # 课程学习流程：固定障碍物（初始）→ 随机障碍物（解锁后）
-    --unlock-env-on-plateau "${UNLOCK_ENV_ON_PLATEAU:-100}"         # 🚀 修改：解锁随机障碍物而非随机地形
+    --unlock-env-on-plateau "${UNLOCK_ENV_ON_PLATEAU:-0}"         # 🚀 修改：解锁随机障碍物而非随机地形
                                                                      # 作用：需要连续200个回合奖励无提升才能解锁随机障碍物生成
                                                                      # 影响：提高门槛，避免因短期波动而误判为性能停滞
                                                                      # 课程学习流程：固定障碍物（初始）→ 随机障碍物（解锁后）

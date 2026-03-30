@@ -387,6 +387,34 @@ class MultiAgentEnv(gym.Env):
             reward_neg_scale = float(getattr(self.world, 'reward_neg_scale', 1.0))
             enable_collision_autoreset = getattr(self.world, 'enable_collision_autoreset', False)
             default_obs_dim = self._get_default_obs_dim()
+            reward_batch_values = None
+
+            reward_owner = getattr(self.reward_callback, '__self__', None) if self.reward_callback is not None else None
+            if reward_owner is not None and hasattr(reward_owner, '_compute_batch_rewards'):
+                if timing_detail_enabled:
+                    _t_reward_batch_seg = _perf_counter()
+                try:
+                    current_step = int(getattr(self.world, 'current_step', -1))
+                    world_id = id(self.world)
+                    cache_key = (world_id, current_step)
+                    if hasattr(reward_owner, '_ensure_world_reward_initialized'):
+                        reward_owner._ensure_world_reward_initialized(self.world)
+                    reward_batch = reward_owner._compute_batch_rewards(
+                        [self.agents],
+                        [self.world],
+                        cache_key=cache_key,
+                    )
+                    if (
+                        isinstance(reward_batch, np.ndarray)
+                        and reward_batch.ndim == 2
+                        and reward_batch.shape[0] >= 1
+                        and reward_batch.shape[1] >= agent_count
+                    ):
+                        reward_batch_values = np.asarray(reward_batch[0], dtype=np.float32)
+                except Exception:
+                    reward_batch_values = None
+                if timing_detail_enabled:
+                    step_timing['env_reward'] += _perf_counter() - _t_reward_batch_seg
             
             # 批量处理所有智能体
             for i, agent in enumerate(self.agents):
@@ -403,10 +431,13 @@ class MultiAgentEnv(gym.Env):
                     obs_list.append(np.zeros(default_obs_dim, dtype=np.float32))
                 
                 # 奖励值
-                if timing_detail_enabled:
+                if reward_batch_values is None and timing_detail_enabled:
                     _t_reward_seg = _perf_counter()
                 try:
-                    r = self._get_reward(agent)
+                    if reward_batch_values is not None and i < reward_batch_values.shape[0]:
+                        r = float(reward_batch_values[i])
+                    else:
+                        r = self._get_reward(agent)
                     # 应用正负奖励缩放（使用预获取的值）
                     if r >= 0:
                         r = r * reward_pos_scale
@@ -417,7 +448,7 @@ class MultiAgentEnv(gym.Env):
                     if not self._quiet_output_enabled:
                         print(f"智能体 {i} 奖励计算错误: {e}")
                     reward_list.append(0.0)
-                if timing_detail_enabled:
+                if reward_batch_values is None and timing_detail_enabled:
                     step_timing['env_reward'] += _perf_counter() - _t_reward_seg
                 
                 # Done状态
@@ -858,6 +889,18 @@ class MultiAgentEnv(gym.Env):
             return {}
         return self.info_callback(agent, self.world)
 
+    def _try_fast_obs_value(self, obs, expected_dim=None):
+        """批量 observation 热路径的零拷贝快路径。"""
+        if not isinstance(obs, np.ndarray):
+            return None
+        if obs.dtype != np.float32 or obs.ndim != 1:
+            return None
+        if expected_dim is not None and int(obs.size) != int(expected_dim):
+            return None
+        if obs.flags['C_CONTIGUOUS']:
+            return obs
+        return np.ascontiguousarray(obs, dtype=np.float32)
+
     def _normalize_obs_value(self, obs):
         """统一 observation 的形状与副本语义，供单 agent 与 batch 路径复用。"""
         default_obs_dim = self._get_default_obs_dim()
@@ -890,15 +933,22 @@ class MultiAgentEnv(gym.Env):
             expected_dim = actual_dim
             self.obs_dim = actual_dim
 
+        fast_obs = self._try_fast_obs_value(obs, expected_dim)
+        if fast_obs is not None:
+            return fast_obs
+
         if actual_dim != expected_dim:
             if actual_dim > expected_dim:
-                obs = obs[:expected_dim].copy()
+                obs = np.ascontiguousarray(obs[:expected_dim], dtype=np.float32)
             else:
                 padded_obs = np.zeros(expected_dim, dtype=np.float32)
                 padded_obs[:actual_dim] = obs
                 obs = padded_obs
         else:
-            obs = obs.copy()
+            if obs.dtype != np.float32:
+                obs = obs.astype(np.float32, copy=False)
+            if not obs.flags['C_CONTIGUOUS']:
+                obs = np.ascontiguousarray(obs, dtype=np.float32)
 
         return obs
 
@@ -908,6 +958,7 @@ class MultiAgentEnv(gym.Env):
             agents = self.agents
         if self.observation_callback is None:
             return [np.zeros(0, dtype=np.float32) for _ in agents]
+        default_obs_dim = self._get_default_obs_dim()
 
         callback_owner = getattr(self.observation_callback, '__self__', None)
         if callback_owner is not None and hasattr(callback_owner, '_compute_observations_batch_uncached'):
@@ -927,7 +978,8 @@ class MultiAgentEnv(gym.Env):
                             if cached_obs is None:
                                 complete = False
                                 break
-                            obs_n.append(self._normalize_obs_value(cached_obs))
+                            fast_obs = self._try_fast_obs_value(cached_obs, default_obs_dim)
+                            obs_n.append(fast_obs if fast_obs is not None else self._normalize_obs_value(cached_obs))
                         if complete and len(obs_n) == len(agents):
                             return obs_n
 
@@ -944,7 +996,8 @@ class MultiAgentEnv(gym.Env):
                         if obs is None:
                             complete = False
                             break
-                        obs_n.append(self._normalize_obs_value(obs))
+                        fast_obs = self._try_fast_obs_value(obs, default_obs_dim)
+                        obs_n.append(fast_obs if fast_obs is not None else self._normalize_obs_value(obs))
                     if complete and len(obs_n) == len(agents):
                         return obs_n
             except Exception:
@@ -955,7 +1008,6 @@ class MultiAgentEnv(gym.Env):
                     pass
 
         obs_n = []
-        default_obs_dim = self._get_default_obs_dim()
         for agent in agents:
             try:
                 obs_n.append(self._get_obs(agent))

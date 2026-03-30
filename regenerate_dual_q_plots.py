@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import List, Dict
 
+from algorithm_ablation_colors import get_algorithm_ablation_color
+
 # 设置字体
 def setup_fonts():
     """设置matplotlib字体"""
@@ -23,16 +25,6 @@ def setup_fonts():
     plt.rcParams['axes.unicode_minus'] = False
 
 setup_fonts()
-
-# 🎨 定义6种高对比度的不同颜色
-COLORS_6 = [
-    '#0066CC',  # 深蓝 - MADDPG Baseline
-    '#9900CC',  # 深紫 - MATD3 Separated Gradient  
-    '#00AA00',  # 深绿 - MADDPG Dual Q
-    '#CC0000',  # 深红 - MADDPG Separated Gradient
-    '#FF6600',  # 橙色 - MATD3 Single Q (新增)
-    '#00CCCC',  # 青色 - MATD3 Dual Q (新增)
-]
 
 def smooth_curve(data, method='moving_average', window=10):
     """平滑曲线"""
@@ -68,7 +60,7 @@ def plot_rewards(series: List[Dict], title: str, output_path: Path,
         episodes = range(1, len(rewards) + 1)
         rewards_array = np.array(rewards)
         
-        color = COLORS_6[idx % len(COLORS_6)]
+        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         
         # 原始曲线（半透明）
@@ -139,7 +131,7 @@ def plot_losses(series: List[Dict], title: str, output_path: Path):
         valid_actor = [(s, a) for s, a in zip(steps, actor) 
                       if a is not None and not (isinstance(a, float) and np.isnan(a)) and abs(a) < 1000]
         
-        color = COLORS_6[idx % len(COLORS_6)]
+        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         
         if valid_critic:
@@ -196,7 +188,7 @@ def plot_success_collision(series: List[Dict], title: str, output_path: Path,
         collision_counts = metrics.get("episode_collision_counts", [])
         clearances = metrics.get("episode_min_clearances", [])
         
-        color = COLORS_6[idx % len(COLORS_6)]
+        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         
         if success_rates:

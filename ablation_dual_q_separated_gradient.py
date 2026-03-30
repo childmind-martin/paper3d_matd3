@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-围绕 MATD3 主线方法的模块消融实验。
+围绕 MATD3 当前主线骨架的 separated-skeleton / actor-objective 消融实验。
 
 默认严格实验只运行 3 组 MATD3 主线相关配置：
-1. MATD3 Mainline (Separated)
-2. MATD3 Ablation - Unified Actor Loss
-3. MATD3 Ablation - Single Q
+1. MATD3 Mainline - Separated Skeleton + Separated Actor Objective
+2. MATD3 Ablation - Separated Skeleton + Unified Actor Objective
+3. MATD3 Baseline
 
 可选参考实验默认不参与主线模块归因：
-1. MADDPG Separated Gradient
-2. MADDPG Dual Q
+1. MADDPG Reference - Separated Skeleton + Separated Actor Objective
+2. MADDPG Reference - Separated Skeleton + Unified Actor Objective
 3. MADDPG Baseline
 
 严格版默认策略：
-- 保持主线 MATD3 separated-gradient 不动
+- 保持主线 MATD3 separated skeleton + separated actor objective 不动
 - 其他 MATD3 实验共享同一个外层 update skeleton，只关闭少数模块
 - 默认禁用课程学习（UNLOCK_ENV_ON_SUCCESS=0, UNLOCK_ENV_ON_PLATEAU=0）
 - 默认预生成固定位置文件，不依赖 dynamic_first_time
@@ -39,6 +39,11 @@ from typing import Any, Dict, List, Optional
 import random
 import numpy as np
 import time
+
+from algorithm_ablation_colors import (
+    ALGORITHM_ABLATION_COLOR_BY_LABEL,
+    get_algorithm_ablation_color,
+)
 
 # 🔧 新增：导入批次管理器
 try:
@@ -84,15 +89,8 @@ from ablation_action_pf_comparison import (
     generate_interactive_comparison,
 )
 
-# 固定颜色映射，避免实验顺序变化时图例颜色漂移。
-EXPERIMENT_COLOR_MAP = {
-    "matd3_separated_gradient": "#9900CC",  # 深紫 - MATD3 Mainline
-    "matd3_dual_q": "#00CCCC",              # 青色 - Unified-Loss Ablation
-    "matd3_single_q": "#FF6600",            # 橙色 - Single-Q Ablation
-    "maddpg_separated_gradient": "#CC0000", # 深红 - MADDPG Separated
-    "maddpg_dual_q": "#00AA00",             # 深绿 - MADDPG Dual Q
-    "maddpg_baseline": "#0066CC",           # 深蓝 - MADDPG Baseline
-}
+# Shared palette: keep the same algorithm label on the same color in every figure.
+EXPERIMENT_COLOR_MAP = dict(ALGORITHM_ABLATION_COLOR_BY_LABEL)
 
 STRICT_CORE_EXPERIMENT_LABELS = [
     "matd3_separated_gradient",
@@ -556,7 +554,7 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
             "rhs": "matd3_separated_gradient",
             "required": True,
             "confounded": False,
-            "description": "MATD3 主线中 separated actor loss 模块增益",
+            "description": "在相同 separated update skeleton 下，MATD3 的 separated actor objective 相对 unified actor objective 的增益",
         },
         {
             "name": "matd3_dual_head_gain",
@@ -564,7 +562,7 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
             "rhs": "matd3_dual_q",
             "required": True,
             "confounded": False,
-            "description": "MATD3 主线中 dual-Q head 模块增益",
+            "description": "MATD3 主线中的 separated skeleton 相对 MATD3 baseline 的增益",
         },
         {
             "name": "mainline_vs_maddpg_separated_reference",
@@ -572,7 +570,7 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
             "rhs": "matd3_separated_gradient",
             "required": False,
             "confounded": False,
-            "description": "跨家族参考：MATD3 主线 vs MADDPG separated",
+            "description": "跨家族参考：MATD3 mainline vs MADDPG 对应的 separated skeleton + separated actor objective 版本",
         },
         {
             "name": "mainline_vs_maddpg_dual_reference",
@@ -580,7 +578,7 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
             "rhs": "matd3_separated_gradient",
             "required": False,
             "confounded": False,
-            "description": "跨家族参考：MATD3 主线 vs MADDPG dual-Q",
+            "description": "跨家族参考：MATD3 主线 vs MADDPG separated skeleton + unified actor objective",
         },
         {
             "name": "mainline_vs_maddpg_baseline_reference",
@@ -661,7 +659,7 @@ def plot_comparison_rewards_dualq(series, title, output_path, smooth_window=10, 
         episodes = range(1, len(rewards) + 1)
         rewards_array = np.array(rewards)
         
-        color = EXPERIMENT_COLOR_MAP.get(item.get("label"), '#444444')
+        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         
         # 原始曲线
@@ -723,7 +721,7 @@ def plot_comparison_losses_dualq(series, title, output_path):
         valid_actor = [(s, a) for s, a in zip(steps, actor) 
                       if a is not None and not (isinstance(a, float) and np.isnan(a)) and abs(a) < 1000]
         
-        color = EXPERIMENT_COLOR_MAP.get(item.get("label"), '#444444')
+        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         
         if valid_critic:
@@ -770,17 +768,17 @@ from ablation_action_pf_comparison import (
 
 # ============================================================================
 # 实验配置
-# 主线：MATD3 separated-gradient（run_optimized 当前默认主方法）
-# 默认严格实验：围绕主线做模块消融
+# 主线：MATD3 separated skeleton + separated actor objective（run_optimized 当前默认主方法）
+# 默认严格实验：围绕 separated skeleton / actor-objective 做模块消融
 # 可选参考实验：MADDPG 家族对照，不参与主线模块归因
 # ============================================================================
 
 EXPERIMENT_CONFIGS = [
     {
         "label": "matd3_separated_gradient",
-        "name": "MATD3 Mainline (Separated)",
-        "name_en": "MATD3 Mainline (Separated)",
-        "description": "Current mainline method: twin critic, dual Q heads, separated actor loss, shared MATD3 update skeleton",
+        "name": "MATD3 Mainline - Separated Skeleton + Separated Actor Objective",
+        "name_en": "MATD3 Mainline - Separated Skeleton + Separated Actor Objective",
+        "description": "Current mainline method: separated update skeleton with raw/corrected split action semantics and separated actor objective",
         "env": {
             "ALGORITHM": "matd3",
             "MATD3_USE_DUAL_Q": "1",
@@ -790,9 +788,9 @@ EXPERIMENT_CONFIGS = [
     },
     {
         "label": "matd3_dual_q",
-        "name": "MATD3 Ablation - Unified Actor Loss",
-        "name_en": "MATD3 Ablation - Unified Actor Loss",
-        "description": "Ablation on mainline skeleton: keep dual-Q head, replace separated actor loss with unified total-Q actor loss",
+        "name": "MATD3 Ablation - Separated Skeleton + Unified Actor Objective",
+        "name_en": "MATD3 Ablation - Separated Skeleton + Unified Actor Objective",
+        "description": "Ablation on the same separated update skeleton: replace the separated actor objective with a unified total-Q actor objective",
         "env": {
             "ALGORITHM": "matd3",
             "MATD3_USE_DUAL_Q": "1",
@@ -802,9 +800,9 @@ EXPERIMENT_CONFIGS = [
     },
     {
         "label": "matd3_single_q",
-        "name": "MATD3 Ablation - Single Q",
-        "name_en": "MATD3 Ablation - Single Q",
-        "description": "Ablation on mainline skeleton: remove dual-Q head, keep shared MATD3 update skeleton",
+        "name": "MATD3 Baseline",
+        "name_en": "MATD3 Baseline",
+        "description": "Baseline experiment: standard MATD3-style twin critics with a single total-Q output per critic and a joint actor update on executed corrected actions",
         "env": {
             "ALGORITHM": "matd3",
             "MATD3_USE_DUAL_Q": "0",
@@ -814,9 +812,9 @@ EXPERIMENT_CONFIGS = [
     },
     {
         "label": "maddpg_separated_gradient",
-        "name": "MADDPG Separated Gradient",
-        "name_en": "MADDPG Separated Gradient",
-        "description": "Reference only: single critic, dual Q heads, separated gradient",
+        "name": "MADDPG Reference - Separated Skeleton + Separated Actor Objective",
+        "name_en": "MADDPG Reference - Separated Skeleton + Separated Actor Objective",
+        "description": "Reference only: MADDPG framework with the same separated update skeleton and separated actor objective for 7D actions",
         "env": {
             "ALGORITHM": "maddpg",
             "MADDPG_USE_DUAL_Q": "1",
@@ -826,9 +824,9 @@ EXPERIMENT_CONFIGS = [
     },
     {
         "label": "maddpg_dual_q",
-        "name": "MADDPG Dual Q",
-        "name_en": "MADDPG Dual Q",
-        "description": "Reference only: single critic, dual Q heads, unified gradient",
+        "name": "MADDPG Reference - Separated Skeleton + Unified Actor Objective",
+        "name_en": "MADDPG Reference - Separated Skeleton + Unified Actor Objective",
+        "description": "Reference only: MADDPG framework with the same separated update skeleton and unified total-Q actor objective for 7D actions",
         "env": {
             "ALGORITHM": "maddpg",
             "MADDPG_USE_DUAL_Q": "1",
@@ -840,7 +838,7 @@ EXPERIMENT_CONFIGS = [
         "label": "maddpg_baseline",
         "name": "MADDPG Baseline",
         "name_en": "MADDPG Baseline",
-        "description": "Reference only: single critic, single Q head, unified gradient",
+        "description": "Baseline reference: MADDPG framework with a single total-Q critic output and a joint actor update on executed corrected actions",
         "env": {
             "ALGORITHM": "maddpg",
             "MADDPG_USE_DUAL_Q": "0",
@@ -852,7 +850,7 @@ EXPERIMENT_CONFIGS = [
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="围绕 MATD3 主线方法的模块消融实验")
+    parser = argparse.ArgumentParser(description="围绕 MATD3 separated-skeleton / actor-objective 主线的模块消融实验")
     parser.add_argument("--episodes", type=int, default=500, help="训练回合数")
     parser.add_argument("--batch-size", type=int, default=1024, help="训练批次大小")
     parser.add_argument("--script", type=str, default="./run_optimized.sh", help="训练脚本路径")
@@ -909,13 +907,13 @@ def parse_args():
     parser.add_argument("--generate-interactive", action="store_true", help="生成交互式轨迹图（需要plotly）")
     parser.add_argument("--experiments", type=str, nargs="+", default=None,
                         choices=[cfg["label"] for cfg in EXPERIMENT_CONFIGS],
-                        help="选择要运行的实验；默认只运行 MATD3 主线模块消融")
+                        help="选择要运行的实验；默认只运行 MATD3 核心 separated-skeleton / actor-objective 消融")
     parser.add_argument(
         "--include-reference-experiments",
         "--include-exploratory-experiments",
         dest="include_reference_experiments",
         action="store_true",
-        help="默认只运行 MATD3 主线模块消融；显式开启后再纳入 MADDPG 参考实验",
+        help="默认只运行 MATD3 核心 separated-skeleton / actor-objective 消融；显式开启后再纳入 MADDPG 参考实验",
     )
     parser.add_argument(
         "--disable-strict-validity",
@@ -1386,7 +1384,7 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     print(f"[运行-{label}] 加载指标: {log_dir!r}, episode数={n_ep}", file=sys.stderr)
     if n_ep == 0:
         raise RuntimeError(
-            f"[运行-{label}] 本次运行未生成有效 episode_rewards.json: {log_dir}. "
+            f"[运行-{label}] 本次运行未生成可恢复的 episode reward 数据: {log_dir}. "
             f"为避免使用历史数据污染消融结论，已中止。"
         )
     validation_errors = _validate_loaded_result(
@@ -1519,7 +1517,7 @@ def main():
             "unlock_env_on_plateau": int(args.resolved_unlock_env_on_plateau),
             "positions_file": str(positions_file),
             "notes": (
-                f"MATD3 mainline module ablation: "
+                f"MATD3 separated-skeleton / actor-objective ablation: "
                 f"default core experiments={STRICT_CORE_EXPERIMENT_LABELS}, "
                 f"optional reference experiments={OPTIONAL_REFERENCE_EXPERIMENT_LABELS}, "
                 f"Group {experiment_group} ({group_desc}), mode={args.config_mode}"
@@ -1557,14 +1555,14 @@ def main():
     cache: Dict[str, Dict] = {}
 
     print(f"\n{'='*70}")
-    print("MATD3 Mainline Module Ablation")
+    print("MATD3 Separated-Skeleton / Actor-Objective Ablation")
     print(f"Group: {experiment_group} ({group_desc})")
     print("  Group A = Fixed Map (curriculum disabled, USE_DYNAMIC_OBSTACLES=0)")
     print("  Group B = Random Obstacles (curriculum disabled, USE_DYNAMIC_OBSTACLES=1)")
     print(f"实验数量: {len(configs_to_run)}")
     for cfg in configs_to_run:
         print(f"  - {cfg['name']}: {cfg['description']}")
-    print(f"主线模块消融: {STRICT_CORE_EXPERIMENT_LABELS}")
+    print(f"核心实验标签: {STRICT_CORE_EXPERIMENT_LABELS}")
     if args.include_reference_experiments:
         print(f"可选参考实验: {OPTIONAL_REFERENCE_EXPERIMENT_LABELS}")
     print("模式: 串行")
@@ -1606,7 +1604,7 @@ def main():
         delta_str = f"{delta:.2f}" if isinstance(delta, (int, float)) else "N/A"
         print(f"  - {row['name']}: {row['status']} (tail100 Δ={delta_str})")
     if claims_report["required_pass"]:
-        print("[有效性检查] 主线模块声明检查通过（Unified Actor Loss / Single-Q 消融）。")
+        print("[有效性检查] 主线模块声明检查通过（Unified Actor Objective / Baseline 消融）。")
     else:
         print("[有效性检查] 核心声明检查失败：")
         for item in claims_report["required_failed"]:
@@ -1620,7 +1618,7 @@ def main():
     print(f"✅ 找到 {len(series)} 个实验的数据，开始生成对比图...")
     print(f"{'='*70}\n")
 
-    title = f"MATD3 Mainline Module Ablation - Group {experiment_group} ({group_desc})"
+    title = f"MATD3 Separated-Skeleton / Actor-Objective Ablation - Group {experiment_group} ({group_desc})"
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
     reward_png = output_dir / f"reward_comparison_{timestamp}.png"
@@ -1663,6 +1661,8 @@ def main():
                 "final_reward": item["metrics"].get("episode_rewards", [])[-1] if item["metrics"].get("episode_rewards") else None,
                 "avg_reward": np.mean(item["metrics"].get("episode_rewards", [])) if item["metrics"].get("episode_rewards") else None,
                 "max_reward": np.max(item["metrics"].get("episode_rewards", [])) if item["metrics"].get("episode_rewards") else None,
+                "collision_distance_threshold": item["metrics"].get("collision_distance_threshold"),
+                "collision_threshold_source": item["metrics"].get("collision_threshold_source", "unknown"),
             }
             for item in series
         ],

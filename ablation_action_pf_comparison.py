@@ -25,10 +25,11 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -36,6 +37,7 @@ import time
 
 # 🔧 新增：导入批次管理器
 from ablation_batch_manager import AblationBatchManager
+from algorithm_ablation_colors import get_algorithm_ablation_color
 
 try:
     import matplotlib
@@ -81,6 +83,7 @@ MOUNTAIN_MIN_DISTANCE = 55
 SCENARIO_SEED = 67
 # 训练随机种子（用于网络初始化，确保训练过程一致性）
 TRAINING_SEED = 252488
+DEFAULT_COLLISION_DISTANCE_THRESHOLD = 0.4
 
 
 # 实验配置
@@ -325,6 +328,206 @@ def parse_args():
     parser.add_argument("--config-file", type=str, default=None,
                         help="从文件加载实验配置（JSON格式，由 reproduce_from_results.py 生成）")
     return parser.parse_args()
+
+
+def _safe_float(value) -> Optional[float]:
+    """Best-effort float parsing with finite-value guard."""
+    try:
+        if value is None:
+            return None
+        parsed = float(value)
+        if np.isfinite(parsed):
+            return parsed
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def resolve_current_collision_threshold(script_path: Optional[str] = None) -> float:
+    """
+    Resolve the currently configured collision threshold.
+
+    Priority:
+    1. Environment variable COLLISION_DISTANCE_THRESHOLD
+    2. Default value defined in the launch script (run_optimized.sh by default)
+    3. Repository fallback constant (aligned with current run_optimized default)
+    """
+    env_value = _safe_float(os.getenv("COLLISION_DISTANCE_THRESHOLD"))
+    if env_value is not None:
+        return env_value
+
+    candidate_paths = []
+    if script_path:
+        candidate_paths.append(Path(script_path).resolve())
+    candidate_paths.append((Path(__file__).parent / "run_optimized.sh").resolve())
+
+    seen = set()
+    pattern = re.compile(r"COLLISION_DISTANCE_THRESHOLD=\$\{COLLISION_DISTANCE_THRESHOLD:-([0-9.]+)\}")
+    for candidate in candidate_paths:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        try:
+            if candidate.exists() and candidate.is_file():
+                match = pattern.search(candidate.read_text(encoding="utf-8"))
+                if match:
+                    parsed = _safe_float(match.group(1))
+                    if parsed is not None:
+                        return parsed
+        except OSError:
+            continue
+
+    return DEFAULT_COLLISION_DISTANCE_THRESHOLD
+
+
+def resolve_metric_file(log_dir: str, filename: str) -> Optional[Path]:
+    """Resolve a metrics file from a direct log dir or its latest timestamp subdir."""
+    log_path = Path(log_dir)
+    direct_path = log_path / filename
+    if direct_path.exists():
+        return direct_path
+
+    if not log_path.exists() or not log_path.is_dir():
+        return None
+
+    try:
+        subdirs = sorted(
+            [d for d in log_path.iterdir() if d.is_dir() and d.name != 'evaluation'],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    for subdir in subdirs:
+        candidate = subdir / filename
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _results_has_reward_series(results_path: Path) -> bool:
+    """Return True when results.json contains a usable per-episode reward list."""
+    if not results_path.exists():
+        return False
+    try:
+        with open(results_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        rewards = payload.get("rewards", [])
+        return isinstance(rewards, list) and len(rewards) > 0
+    except Exception:
+        return False
+
+
+def extract_collision_threshold_from_payload(payload: Dict) -> Tuple[Optional[float], str]:
+    """Extract collision threshold from a saved payload and report the source key."""
+    if not isinstance(payload, dict):
+        return None, ""
+
+    candidates = [
+        ("collision_distance_threshold", payload.get("collision_distance_threshold")),
+        ("args.collision_distance_threshold", payload.get("args", {}).get("collision_distance_threshold") if isinstance(payload.get("args"), dict) else None),
+        ("config.collision_distance_threshold", payload.get("config", {}).get("collision_distance_threshold") if isinstance(payload.get("config"), dict) else None),
+        ("env.COLLISION_DISTANCE_THRESHOLD", payload.get("env", {}).get("COLLISION_DISTANCE_THRESHOLD") if isinstance(payload.get("env"), dict) else None),
+    ]
+
+    for source, value in candidates:
+        parsed = _safe_float(value)
+        if parsed is not None:
+            return parsed, source
+    return None, ""
+
+
+def get_display_name(item: Dict) -> str:
+    """Return an English-safe display name for plots."""
+    name_en = item.get('name_en') or item.get('label', 'Unknown')
+    if name_en and any('\u4e00' <= char <= '\u9fff' for char in str(name_en)):
+        name_en = item.get('label', 'Unknown')
+    return name_en
+
+
+def get_series_color(item: Dict, idx: int) -> str:
+    return get_algorithm_ablation_color(item.get("label"), idx=idx)
+
+
+def build_collision_threshold_specs(series: List[Dict]) -> List[Dict]:
+    """Build threshold line specs for plots, collapsing to a single red line when shared."""
+    item_specs = []
+    for idx, item in enumerate(series):
+        threshold = _safe_float(item.get("metrics", {}).get("collision_distance_threshold"))
+        if threshold is None:
+            continue
+        item_specs.append({
+            "value": threshold,
+            "label": get_display_name(item),
+            "color": get_series_color(item, idx),
+        })
+
+    if not item_specs:
+        return []
+
+    unique_values = {}
+    for spec in item_specs:
+        unique_values.setdefault(round(spec["value"], 8), []).append(spec)
+
+    if len(unique_values) == 1:
+        threshold = item_specs[0]["value"]
+        return [{
+            "value": threshold,
+            "label": f"Collision Threshold ({threshold:.2f}m)",
+            "color": "red",
+            "alpha": 0.7,
+        }]
+
+    threshold_specs = []
+    for grouped_specs in unique_values.values():
+        threshold = grouped_specs[0]["value"]
+        if len(grouped_specs) == 1:
+            spec = grouped_specs[0]
+            label = f"{spec['label']} Threshold ({threshold:.2f}m)"
+            color = spec["color"]
+        else:
+            label = f"Collision Threshold ({threshold:.2f}m)"
+            color = "red"
+        threshold_specs.append({
+            "value": threshold,
+            "label": label,
+            "color": color,
+            "alpha": 0.8,
+        })
+
+    threshold_specs.sort(key=lambda item: item["value"])
+    return threshold_specs
+
+
+def add_threshold_reference_lines(ax, threshold_specs: List[Dict], orientation: str = "h", add_zero_line: bool = False):
+    """Add one or more threshold reference lines to an axis."""
+    for spec in threshold_specs:
+        if orientation == "h":
+            ax.axhline(
+                y=spec["value"],
+                color=spec["color"],
+                linestyle='--',
+                linewidth=1.5,
+                alpha=spec.get("alpha", 0.7),
+                label=spec["label"],
+            )
+        else:
+            ax.axvline(
+                x=spec["value"],
+                color=spec["color"],
+                linestyle='--',
+                linewidth=1.5,
+                alpha=spec.get("alpha", 0.7),
+                label=spec["label"],
+            )
+
+    if add_zero_line:
+        if orientation == "h":
+            ax.axhline(y=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+        else:
+            ax.axvline(x=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
 
 
 def ensure_fixed_positions(positions_file: Path, args, exp_name_prefix: str) -> Path:
@@ -589,21 +792,24 @@ def find_latest_log_dir(exp_name: str, logs_root: str) -> str:
     if not matching_dirs:
         raise FileNotFoundError(f"未找到以 '{exp_name}' 开头的日志目录: {logs_path}")
 
-    # 🚨 仅保留完整训练结果目录（必须包含 episode_rewards.json）
-    # 避免误选到中断运行目录（仅有 heartbeat/nan_state 等），导致曲线空白或误判。
+    # 🚨 仅保留可恢复的训练结果目录：
+    # 优先使用 episode_rewards.json；若缺失，则允许回退到包含 rewards 列表的 results.json。
+    # 这样可以避免少数训练末尾只写出 results.json 时被误判为“0 episodes”。
     complete_dirs = []
     for name, inner in matching_dirs:
         inner_path = Path(inner) if not isinstance(inner, Path) else inner
-        if (inner_path / "episode_rewards.json").exists():
+        if (inner_path / "episode_rewards.json").exists() or _results_has_reward_series(inner_path / "results.json"):
             complete_dirs.append((name, inner_path))
     if complete_dirs:
         matching_dirs = complete_dirs
     else:
         raise FileNotFoundError(
-            f"找到实验目录但均无 episode_rewards.json（可能训练中断）: exp_name={exp_name}, logs_root={logs_path}"
+            f"找到实验目录但均无可恢复的 episode reward 数据（缺少 episode_rewards.json 且 results.json 无 rewards）: "
+            f"exp_name={exp_name}, logs_root={logs_path}"
         )
     
-    # 🔧 消融实验修复：按 episode_rewards.json 的修改时间取最新一次运行，避免取到历史批次数据导致「有的上升有的完全不变」
+    # 🔧 消融实验修复：按 episode_rewards.json / results.json 的修改时间取最新一次运行，
+    # 避免取到历史批次数据导致「有的上升有的完全不变」
     def _mtime_for(pair):
         name, inner = pair
         inner_path = Path(inner) if not isinstance(inner, Path) else inner
@@ -613,6 +819,12 @@ def find_latest_log_dir(exp_name: str, logs_root: str) -> str:
                 return json_path.stat().st_mtime
             except OSError:
                 return inner_path.stat().st_mtime
+        results_path = inner_path / "results.json"
+        if _results_has_reward_series(results_path):
+            try:
+                return results_path.stat().st_mtime
+            except OSError:
+                pass
         try:
             return inner_path.stat().st_mtime
         except OSError:
@@ -622,13 +834,25 @@ def find_latest_log_dir(exp_name: str, logs_root: str) -> str:
     return str(latest_dir)
 
 
-def load_metrics(log_dir: str) -> Dict:
+def load_metrics(log_dir: str, fallback_collision_threshold: Optional[float] = None) -> Dict:
     """加载训练指标（需要在worker函数之前定义）"""
-    metrics = {}
+    metrics = {
+        "episode_rewards": [],
+        "success_flags": [],
+        "collision_counts": [],
+        "min_distances_to_obstacle": [],
+        "agent_success_flags": [],
+        "team_success_flags": [],
+        "agent_success_rates": [],
+        "team_success_rate": 0.0,
+        "loss_history": [],
+        "collision_distance_threshold": fallback_collision_threshold,
+        "collision_threshold_source": "fallback_current" if fallback_collision_threshold is not None else "unknown",
+    }
     
     # 加载奖励数据
-    ep_path = Path(log_dir) / "episode_rewards.json"
-    if ep_path.exists():
+    ep_path = resolve_metric_file(log_dir, "episode_rewards.json")
+    if ep_path and ep_path.exists():
         with open(ep_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
@@ -642,32 +866,40 @@ def load_metrics(log_dir: str) -> Dict:
             metrics["team_success_flags"] = data.get("team_success_flags", [])
             metrics["agent_success_rates"] = data.get("agent_success_rates", [])
             metrics["team_success_rate"] = data.get("team_success_rate", 0.0)
+            threshold, source = extract_collision_threshold_from_payload(data)
+            if threshold is not None:
+                metrics["collision_distance_threshold"] = threshold
+                metrics["collision_threshold_source"] = f"episode_rewards.{source}"
         else:
             metrics["episode_rewards"] = data
-            metrics["success_flags"] = []
-            metrics["collision_counts"] = []
-            metrics["min_distances_to_obstacle"] = []
-            metrics["agent_success_flags"] = []
-            metrics["team_success_flags"] = []
-            metrics["agent_success_rates"] = []
-            metrics["team_success_rate"] = 0.0
-    else:
-        metrics["episode_rewards"] = []
-        metrics["success_flags"] = []
-        metrics["collision_counts"] = []
-        metrics["min_distances_to_obstacle"] = []
-        metrics["agent_success_flags"] = []
-        metrics["team_success_flags"] = []
-        metrics["agent_success_rates"] = []
-        metrics["team_success_rate"] = 0.0
     
     # 加载损失数据
-    loss_path = Path(log_dir) / "loss_history.json"
-    if loss_path.exists():
+    loss_path = resolve_metric_file(log_dir, "loss_history.json")
+    if loss_path and loss_path.exists():
         with open(loss_path, "r", encoding="utf-8") as f:
             metrics["loss_history"] = json.load(f)
-    else:
-        metrics["loss_history"] = []
+
+    # 加载 results.json，用于恢复训练时真实阈值等配置
+    results_path = resolve_metric_file(log_dir, "results.json")
+    if results_path and results_path.exists():
+        try:
+            with open(results_path, "r", encoding="utf-8") as f:
+                results_data = json.load(f)
+            if not metrics["episode_rewards"]:
+                rewards = results_data.get("rewards", [])
+                if isinstance(rewards, list) and rewards:
+                    metrics["episode_rewards"] = rewards
+            team_sr = results_data.get("team_success_rate", None)
+            if team_sr is not None:
+                parsed_team_sr = _safe_float(team_sr)
+                if parsed_team_sr is not None:
+                    metrics["team_success_rate"] = parsed_team_sr
+            threshold, source = extract_collision_threshold_from_payload(results_data)
+            if threshold is not None:
+                metrics["collision_distance_threshold"] = threshold
+                metrics["collision_threshold_source"] = f"results.{source}"
+        except Exception:
+            pass
     
     return metrics
 
@@ -790,7 +1022,10 @@ def run_experiment_worker(args_tuple):
         estimated_timeout = max(3600, episodes * 100)  # 至少1小时，或每回合100秒
         result = subprocess.run(cmd, check=True, env=env, capture_output=False, timeout=estimated_timeout)
         log_dir = find_latest_log_dir(label, logs_root)
-        metrics = load_metrics(log_dir)
+        metrics = load_metrics(
+            log_dir,
+            fallback_collision_threshold=resolve_current_collision_threshold(script),
+        )
         print(f"[并行训练-{label}] 完成: {cfg.get('name', label)}")
         return {
             "label": label,
@@ -939,7 +1174,10 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     try:
         subprocess.run(cmd, check=True, env=env)
         log_dir = find_latest_log_dir(label, args.logs_root)
-        metrics = load_metrics(log_dir)
+        metrics = load_metrics(
+            log_dir,
+            fallback_collision_threshold=resolve_current_collision_threshold(args.script),
+        )
         result = {
             "label": label,
             "name": cfg.get("name", label),
@@ -1010,8 +1248,6 @@ def plot_comparison_rewards(series: List[Dict], title: str, output_path: Path,
     
     # 🔧 使用高对比度颜色，所有拟合曲线使用实线，确保对比明显
     # 颜色方案：深蓝、深红、深绿、深紫（高对比度，与损失图保持一致）
-    colors = ['#0066CC', '#CC0000', '#00AA00', '#9900CC']  # 深蓝、深红、深绿、深紫
-    
     has_data = False
     
     for idx, item in enumerate(series):
@@ -1023,7 +1259,7 @@ def plot_comparison_rewards(series: List[Dict], title: str, output_path: Path,
         rewards_array = np.array(rewards)
         
         # 原始曲线（半透明，细线）
-        color = colors[idx % len(colors)]
+        color = get_series_color(item, idx)
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         # 如果name_en仍然是中文（包含中文字符），使用label作为回退
@@ -1078,8 +1314,6 @@ def plot_comparison_success_collision_clearance(series: List[Dict], title: str, 
     has_data = False
     
     # 🔧 使用高对比度颜色，所有曲线使用实线，确保对比明显
-    colors = ['#0066CC', '#CC0000', '#00AA00', '#9900CC']  # 深蓝、深红、深绿、深紫
-    
     for idx, item in enumerate(series):
         metrics = item["metrics"]
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
@@ -1087,7 +1321,7 @@ def plot_comparison_success_collision_clearance(series: List[Dict], title: str, 
         # 如果name_en仍然是中文（包含中文字符），使用label作为回退
         if name_en and any('\u4e00' <= char <= '\u9fff' for char in str(name_en)):
             name_en = item.get('label', 'Unknown')
-        color = colors[idx % len(colors)]
+        color = get_series_color(item, idx)
         linestyle = '-'  # 🔧 所有曲线使用实线
         
         # 1. 成功率（滑动窗口平均）
@@ -1232,26 +1466,22 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     has_data = False
     
     # 🔧 Use high contrast colors
-    colors = ['#0066CC', '#CC0000', '#00AA00', '#9900CC']  # Deep blue, deep red, deep green, deep purple
-    
-    # Get collision threshold (for violation probability calculation)
-    collision_threshold = 1.5  # Default value, can be read from environment variables or config
+    # Restore the real collision threshold from saved results whenever available.
+    threshold_specs = build_collision_threshold_specs(series)
+    if threshold_specs:
+        threshold_text = ", ".join(f"{spec['value']:.2f}m" for spec in threshold_specs)
+        print(f"[Info] Using collision threshold(s) for clearance plots: {threshold_text}")
     
     # 🔧 修复：在循环外定义quantiles，避免UnboundLocalError
     quantiles = [5, 10, 25, 50, 75, 90, 95]  # 默认分位数列表
     
-    # 🔧 标记是否已经设置了阈值线（避免重复绘制）
-    threshold_line_added_ax2 = False
-    threshold_line_added_ax4 = False
+    # 🔧 在循环外创建 twin axis，避免重复创建多个右侧y轴
+    ax5_twin = ax5.twinx()
     
     for idx, item in enumerate(series):
         metrics = item["metrics"]
-        # 🔧 关键修复：确保使用英文标签，避免回退到中文name
-        name_en = item.get('name_en') or item.get('label', 'Unknown')
-        # 如果name_en仍然是中文（包含中文字符），使用label作为回退
-        if name_en and any('\u4e00' <= char <= '\u9fff' for char in str(name_en)):
-            name_en = item.get('label', 'Unknown')
-        color = colors[idx % len(colors)]
+        name_en = get_display_name(item)
+        color = get_series_color(item, idx)
         linestyle = '-'
         
         # === 1. Team Success Rate (SR_team) only ===
@@ -1318,12 +1548,6 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
                            linewidth=2.5, 
                            alpha=0.9, 
                            linestyle=linestyle)
-                    
-                    # Add collision threshold line (only once)
-                    if not threshold_line_added_ax2:
-                        ax2.axhline(y=collision_threshold, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label='Collision Threshold')
-                        ax2.axhline(y=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
-                        threshold_line_added_ax2 = True
                 
                 # 2.2 Minimum clearance distribution (histogram)
                 # Filter outliers
@@ -1335,10 +1559,6 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
                     median_val = np.median(valid_clearances)
                     ax3.axvline(x=mean_val, color=color, linestyle='--', linewidth=2, alpha=0.8, label=f'{name_en} Mean')
                     ax3.axvline(x=median_val, color=color, linestyle=':', linewidth=2, alpha=0.8, label=f'{name_en} Median')
-                    # Add threshold lines (only once, after first histogram)
-                    if idx == 0:
-                        ax3.axvline(x=collision_threshold, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
-                        ax3.axvline(x=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
                 
                 # 2.3 CDF curve (according to image definition: Pr(D_min ≤ δ))
                 if len(valid_clearances) > 0:
@@ -1349,12 +1569,6 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
                     ax4.plot(sorted_clearances, cdf_values, 
                            color=color, linewidth=2.5, alpha=0.9, 
                            label=f'{name_en} CDF', linestyle=linestyle)
-                    
-                    # Add threshold lines (only once)
-                    if not threshold_line_added_ax4:
-                        ax4.axvline(x=collision_threshold, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label='Collision Threshold')
-                        ax4.axvline(x=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
-                        threshold_line_added_ax4 = True
                 
                 # 2.4 Quantiles and violation probability
                 if len(valid_clearances) > 0:
@@ -1370,7 +1584,6 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
                         violation_probs.append(prob)
                     
                     # Plot quantiles (bar chart) - use offset for multiple experiments
-                    ax5_twin = ax5.twinx()
                     # 🔧 修复：为每个实验使用不同的x位置，避免条形图重叠
                     x_positions = np.arange(len(quantiles))
                     width = 0.25  # 条形宽度
@@ -1399,6 +1612,7 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     ax2.set_xlabel("Episode", fontsize=12, fontfamily='DejaVu Sans')
     ax2.set_ylabel("Minimum Clearance (m)", fontsize=12, fontfamily='DejaVu Sans')
     ax2.grid(True, alpha=0.3, linestyle='--')
+    add_threshold_reference_lines(ax2, threshold_specs, orientation="h", add_zero_line=True)
     legend2 = ax2.legend(loc='upper right', fontsize=10, prop={'family': 'DejaVu Sans'})
     if legend2:
         for text in legend2.get_texts():
@@ -1409,6 +1623,7 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     ax3.set_xlabel("Minimum Clearance (m)", fontsize=12, fontfamily='DejaVu Sans')
     ax3.set_ylabel("Frequency", fontsize=12, fontfamily='DejaVu Sans')
     ax3.grid(True, alpha=0.3, linestyle='--')
+    add_threshold_reference_lines(ax3, threshold_specs, orientation="v", add_zero_line=True)
     legend3 = ax3.legend(loc='upper right', fontsize=9, prop={'family': 'DejaVu Sans'})
     if legend3:
         for text in legend3.get_texts():
@@ -1419,6 +1634,7 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     ax4.set_xlabel("Minimum Clearance (m)", fontsize=12, fontfamily='DejaVu Sans')
     ax4.set_ylabel("Cumulative Probability", fontsize=12, fontfamily='DejaVu Sans')
     ax4.grid(True, alpha=0.3, linestyle='--')
+    add_threshold_reference_lines(ax4, threshold_specs, orientation="v", add_zero_line=True)
     legend4 = ax4.legend(loc='upper right', fontsize=10, prop={'family': 'DejaVu Sans'})
     if legend4:
         for text in legend4.get_texts():
@@ -1428,7 +1644,6 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
                  fontsize=14, fontweight='bold', fontfamily='DejaVu Sans')
     ax5.set_xlabel("Quantile / Threshold (m)", fontsize=12, fontfamily='DejaVu Sans')
     ax5.set_ylabel("Clearance (m)", fontsize=12, fontfamily='DejaVu Sans')
-    ax5_twin = ax5.twinx()
     ax5_twin.set_ylabel("Violation Probability", fontsize=12, fontfamily='DejaVu Sans')
     # 🔧 修复：设置分位数x轴标签（quantiles已在循环外定义）
     if has_data:
@@ -1463,7 +1678,6 @@ def plot_comparison_losses(series: List[Dict], title: str, output_path: Path):
     
     # 🔧 使用高对比度颜色，所有曲线使用实线，确保对比明显
     # 颜色方案：蓝色、红色、绿色、紫色（高对比度）
-    colors = ['#0066CC', '#CC0000', '#00AA00', '#9900CC']  # 深蓝、深红、深绿、深紫
     markers = ['', '', '', '']  # 不使用标记点，保持线条清晰
     
     for idx, item in enumerate(series):
@@ -1474,7 +1688,7 @@ def plot_comparison_losses(series: List[Dict], title: str, output_path: Path):
         steps = [entry.get("step", idx) for idx, entry in enumerate(history)]
         critic = [entry.get("critic_loss", 0) for entry in history]
         actor = [entry.get("actor_loss", 0) for entry in history]
-        color = colors[idx % len(colors)]
+        color = get_series_color(item, idx)
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         # 如果name_en仍然是中文（包含中文字符），使用label作为回退
@@ -1527,7 +1741,6 @@ def generate_interactive_comparison(series: List[Dict], title: str, output_path:
     fig = go.Figure()
     
     # 🔧 使用高对比度颜色，与静态图保持一致
-    colors = ['#0066CC', '#CC0000', '#00AA00', '#9900CC']  # 深蓝、深红、深绿、深紫
     has_data = False
     
     for idx, item in enumerate(series):
@@ -1537,7 +1750,7 @@ def generate_interactive_comparison(series: List[Dict], title: str, output_path:
         has_data = True
         episodes = list(range(1, len(rewards) + 1))
         rewards_array = np.array(rewards)
-        color = colors[idx % len(colors)]
+        color = get_series_color(item, idx)
         
         # 原始数据（半透明）
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
@@ -1902,12 +2115,16 @@ def main():
                 "final_reward": item["metrics"].get("episode_rewards", [])[-1] if item["metrics"].get("episode_rewards") else None,
                 "avg_reward": np.mean(item["metrics"].get("episode_rewards", [])) if item["metrics"].get("episode_rewards") else None,
                 "max_reward": np.max(item["metrics"].get("episode_rewards", [])) if item["metrics"].get("episode_rewards") else None,
+                "collision_distance_threshold": item["metrics"].get("collision_distance_threshold"),
+                "collision_threshold_source": item["metrics"].get("collision_threshold_source", "unknown"),
             }
             for item in series
         ],
         "output_files": {  # 🔧 新增：记录输出文件路径
             "reward_comparison": str(reward_png.name),
             "loss_comparison": str(loss_png.name),
+            "success_collision_clearance_comparison": str(success_collision_png.name),
+            "success_rate_and_clearance_comparison": str(success_clearance_png.name),
         }
     }
     if args.generate_interactive:
