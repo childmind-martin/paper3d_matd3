@@ -225,6 +225,8 @@ TRAINING_COLLISION_DISTANCE_THRESHOLD=""
 TRAINING_TERRAIN_CONTACT_EPS=""
 TRAINING_USE_FIXED_POSITIONS=""
 TRAINING_POSITIONS_FILE=""
+EVAL_RESPECT_INPUT_POSITIONS=${EVAL_RESPECT_INPUT_POSITIONS:-0}
+EVAL_PYTHON_BIN=${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-python3}}
 
 # 检查GPU
 if command -v nvidia-smi &> /dev/null; then
@@ -661,7 +663,9 @@ fi
 if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
     if [ "${TRAINING_USE_FIXED_POSITIONS,,}" = "true" ] || [ "$TRAINING_USE_FIXED_POSITIONS" = "1" ]; then
         USE_FIXED_POSITIONS=true
-        if [ -n "$TRAINING_POSITIONS_FILE" ]; then
+        if [ "$EVAL_RESPECT_INPUT_POSITIONS" = "1" ] || [ "${EVAL_RESPECT_INPUT_POSITIONS,,}" = "true" ] || [ "${EVAL_RESPECT_INPUT_POSITIONS,,}" = "yes" ] || [ "${EVAL_RESPECT_INPUT_POSITIONS,,}" = "on" ]; then
+            echo "ℹ️  严格模式下保留调用方传入的位置文件: $POSITIONS_FILE"
+        elif [ -n "$TRAINING_POSITIONS_FILE" ]; then
             POSITIONS_FILE="$TRAINING_POSITIONS_FILE"
         fi
     fi
@@ -937,8 +941,8 @@ fi
 
 # 运行评估
 # 🔧 关键修复：使用eval正确展开CMD_ARGS中的引号，确保路径中的特殊字符被正确处理
-echo "正在执行: python3 evaluate_optimized.py $CMD_ARGS"
-eval "python3 evaluate_optimized.py $CMD_ARGS"
+echo "正在执行: $EVAL_PYTHON_BIN evaluate_optimized.py $CMD_ARGS"
+eval "\"$EVAL_PYTHON_BIN\" evaluate_optimized.py $CMD_ARGS"
 
 EVAL_EXIT_CODE=$?
 

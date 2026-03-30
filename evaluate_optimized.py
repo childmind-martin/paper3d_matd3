@@ -44,6 +44,240 @@ from utils.observation_processor import ObservationProcessor
 # 导入环境
 from multiagent.environment import MultiAgentEnv
 
+
+def _finite_float_or_none(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _safe_mean(values):
+    cleaned = [_finite_float_or_none(v) for v in values]
+    cleaned = [v for v in cleaned if v is not None]
+    if not cleaned:
+        return None
+    return float(np.mean(cleaned))
+
+
+def _safe_std(values):
+    cleaned = [_finite_float_or_none(v) for v in values]
+    cleaned = [v for v in cleaned if v is not None]
+    if not cleaned:
+        return None
+    return float(np.std(cleaned))
+
+
+def _normalize_vec3(vec):
+    if vec is None:
+        return None
+    try:
+        arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if arr.size < 3:
+        return None
+    arr = arr[:3]
+    if not np.all(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def _distance_3d(a, b):
+    va = _normalize_vec3(a)
+    vb = _normalize_vec3(b)
+    if va is None or vb is None:
+        return None
+    return float(np.linalg.norm(va - vb))
+
+
+def _capture_agent_positions(agents):
+    positions = []
+    for agent in agents:
+        pos = _normalize_vec3(getattr(getattr(agent, "state", None), "p_pos", None))
+        positions.append(pos)
+    return positions
+
+
+def _extract_agent_goal_positions(world, scenario):
+    goal_positions = []
+    scenario_goal = getattr(scenario, "goal_pos", None)
+    for agent in getattr(world, "agents", []):
+        agent_goal = None
+        try:
+            if hasattr(agent, "goal_a") and hasattr(agent.goal_a, "state"):
+                agent_goal = getattr(agent.goal_a.state, "p_pos", None)
+        except Exception:
+            agent_goal = None
+        goal_positions.append(_normalize_vec3(agent_goal if agent_goal is not None else scenario_goal))
+    return goal_positions
+
+
+def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance_threshold=None):
+    summary = {
+        "episodes": int(len(all_episodes_data)),
+        "avg_reward": _safe_mean(all_rewards),
+        "std_reward": _safe_std(all_rewards),
+        "max_reward": _finite_float_or_none(np.max(all_rewards)) if len(all_rewards) > 0 else None,
+        "min_reward": _finite_float_or_none(np.min(all_rewards)) if len(all_rewards) > 0 else None,
+        "team_success_rate": None,
+        "agent_success_rates": [],
+        "avg_steps": None,
+        "std_steps": None,
+        "avg_collision_count": None,
+        "std_collision_count": None,
+        "collision_free_rate": None,
+        "avg_min_clearance_mean": None,
+        "avg_min_clearance_min": None,
+        "clearance_violation_rate": None,
+        "clearance_violation_threshold": _finite_float_or_none(collision_distance_threshold),
+        "avg_arrival_step_success_only": None,
+        "avg_arrival_time_success_only": None,
+        "avg_first_reach_step": None,
+        "avg_first_reach_time": None,
+        "avg_team_total_path_length": None,
+        "std_team_total_path_length": None,
+        "avg_agent_path_length": None,
+        "avg_team_path_efficiency": None,
+        "avg_agent_path_efficiency": None,
+        "avg_penetration_count": None,
+        "penetration_episode_rate": None,
+        "max_penetration_depth": None,
+        "mean_penetration_depth": None,
+    }
+
+    if not all_episodes_data:
+        return summary
+
+    success_flags = [int(ep.get("success", 0)) for ep in all_episodes_data]
+    team_success_flags = [int(ep.get("team_success", ep.get("success", 0))) for ep in all_episodes_data]
+    step_values = [ep.get("steps") for ep in all_episodes_data]
+    collision_counts = [ep.get("collision_count", 0) for ep in all_episodes_data]
+    team_path_lengths = [ep.get("path_length") for ep in all_episodes_data]
+    team_path_efficiencies = [ep.get("path_efficiency") for ep in all_episodes_data]
+    first_reach_steps = [ep.get("first_reach_step") for ep in all_episodes_data]
+    first_reach_times = [ep.get("first_reach_time") for ep in all_episodes_data]
+    arrival_steps_success = [ep.get("arrival_step") for ep in all_episodes_data if ep.get("success", 0)]
+    arrival_times_success = [ep.get("arrival_time") for ep in all_episodes_data if ep.get("success", 0)]
+
+    min_distance_means = []
+    min_distance_mins = []
+    penetration_counts = []
+    penetration_depths = []
+    collision_free_count = 0
+    violation_count = 0
+
+    agent_success_lists = []
+    agent_path_length_lists = []
+    agent_path_efficiency_lists = []
+
+    for ep in all_episodes_data:
+        min_distance = ep.get("min_distance")
+        if isinstance(min_distance, dict):
+            mean_clearance = _finite_float_or_none(min_distance.get("mean"))
+            min_clearance = _finite_float_or_none(min_distance.get("min"))
+            if mean_clearance is not None:
+                min_distance_means.append(mean_clearance)
+            if min_clearance is not None:
+                min_distance_mins.append(min_clearance)
+                if collision_distance_threshold is not None and min_clearance <= float(collision_distance_threshold):
+                    violation_count += 1
+
+        collision_count = ep.get("collision_count", 0)
+        try:
+            if int(collision_count) <= 0:
+                collision_free_count += 1
+        except Exception:
+            pass
+
+        penetration_stat = ep.get("penetration_stat")
+        if isinstance(penetration_stat, dict):
+            count = penetration_stat.get("count", 0)
+            try:
+                count = int(count)
+            except Exception:
+                count = 0
+            penetration_counts.append(count)
+            if count > 0:
+                depth = _finite_float_or_none(penetration_stat.get("max_depth"))
+                if depth is not None:
+                    penetration_depths.append(depth)
+        else:
+            penetration_counts.append(0)
+
+        agent_success_flags = ep.get("agent_success_flags", [])
+        if isinstance(agent_success_flags, list):
+            for idx, flag in enumerate(agent_success_flags):
+                while len(agent_success_lists) <= idx:
+                    agent_success_lists.append([])
+                try:
+                    agent_success_lists[idx].append(int(flag))
+                except Exception:
+                    agent_success_lists[idx].append(0)
+
+        agent_path_lengths = ep.get("agent_path_lengths", [])
+        if isinstance(agent_path_lengths, list):
+            for idx, value in enumerate(agent_path_lengths):
+                while len(agent_path_length_lists) <= idx:
+                    agent_path_length_lists.append([])
+                numeric = _finite_float_or_none(value)
+                if numeric is not None:
+                    agent_path_length_lists[idx].append(numeric)
+
+        agent_path_efficiencies = ep.get("agent_path_efficiencies", [])
+        if isinstance(agent_path_efficiencies, list):
+            for idx, value in enumerate(agent_path_efficiencies):
+                while len(agent_path_efficiency_lists) <= idx:
+                    agent_path_efficiency_lists.append([])
+                numeric = _finite_float_or_none(value)
+                if numeric is not None:
+                    agent_path_efficiency_lists[idx].append(numeric)
+
+    summary.update(
+        {
+            "team_success_rate": _safe_mean(team_success_flags),
+            "agent_success_rates": [_safe_mean(flags) for flags in agent_success_lists],
+            "avg_steps": _safe_mean(step_values),
+            "std_steps": _safe_std(step_values),
+            "avg_collision_count": _safe_mean(collision_counts),
+            "std_collision_count": _safe_std(collision_counts),
+            "collision_free_rate": (
+                float(collision_free_count / len(all_episodes_data)) if all_episodes_data else None
+            ),
+            "avg_min_clearance_mean": _safe_mean(min_distance_means),
+            "avg_min_clearance_min": _safe_mean(min_distance_mins),
+            "clearance_violation_rate": (
+                float(violation_count / len(min_distance_mins)) if min_distance_mins else None
+            ),
+            "avg_arrival_step_success_only": _safe_mean(arrival_steps_success),
+            "avg_arrival_time_success_only": _safe_mean(arrival_times_success),
+            "avg_first_reach_step": _safe_mean(first_reach_steps),
+            "avg_first_reach_time": _safe_mean(first_reach_times),
+            "avg_team_total_path_length": _safe_mean(team_path_lengths),
+            "std_team_total_path_length": _safe_std(team_path_lengths),
+            "avg_team_path_efficiency": _safe_mean(team_path_efficiencies),
+            "avg_penetration_count": _safe_mean(penetration_counts),
+            "penetration_episode_rate": (
+                float(sum(1 for count in penetration_counts if count > 0) / len(penetration_counts))
+                if penetration_counts else None
+            ),
+            "max_penetration_depth": (
+                float(np.max(penetration_depths)) if penetration_depths else None
+            ),
+            "mean_penetration_depth": _safe_mean(penetration_depths),
+        }
+    )
+
+    flattened_path_lengths = [value for values in agent_path_length_lists for value in values]
+    flattened_path_efficiencies = [value for values in agent_path_efficiency_lists for value in values]
+    summary["avg_agent_path_length"] = _safe_mean(flattened_path_lengths)
+    summary["avg_agent_path_efficiency"] = _safe_mean(flattened_path_efficiencies)
+
+    return summary
+
 class ModelEvaluator:
     """模型评估器，仿照1.0版本的评估逻辑"""
     
@@ -1295,6 +1529,34 @@ class ModelEvaluator:
                 actual_start_positions.append(agent.state.p_pos.copy())
                 if i < 3:  # 只打印前3个智能体
                     print(f"   实际智能体{i}起点: [{agent.state.p_pos[0]:.2f}, {agent.state.p_pos[1]:.2f}, {agent.state.p_pos[2]:.2f}]")
+
+        initial_positions = _capture_agent_positions(self.world.agents)
+        agent_goal_positions = _extract_agent_goal_positions(self.world, self.scenario)
+        prev_positions = [pos.copy() if pos is not None else None for pos in initial_positions]
+        agent_path_lengths = [0.0 for _ in initial_positions]
+        direct_goal_distances = [
+            _distance_3d(pos, goal) for pos, goal in zip(initial_positions, agent_goal_positions)
+        ]
+        try:
+            success_threshold = float(getattr(self.args, 'success_distance_threshold', 4.0))
+        except Exception:
+            success_threshold = 4.0
+        try:
+            simulation_dt = float(
+                getattr(getattr(self.env, 'world', None), 'dt', os.getenv('SIMULATION_DT', '0.08'))
+            )
+        except Exception:
+            simulation_dt = 0.08
+        agent_first_reach_steps = []
+        for pos, goal in zip(initial_positions, agent_goal_positions):
+            dist_to_goal = _distance_3d(pos, goal)
+            if dist_to_goal is not None and dist_to_goal <= success_threshold:
+                agent_first_reach_steps.append(0)
+            else:
+                agent_first_reach_steps.append(None)
+        team_first_reach_step = (
+            0 if agent_first_reach_steps and all(step == 0 for step in agent_first_reach_steps) else None
+        )
             
         episode_reward = 0
         try:
@@ -1561,6 +1823,38 @@ class ModelEvaluator:
                     step_increment = float(sum(rew_n)) if rew_n is not None else 0.0
             episode_reward += step_increment
             step_count += 1
+
+            current_positions = _capture_agent_positions(self.env.agents)
+            for agent_idx in range(min(len(agent_path_lengths), len(current_positions))):
+                prev_pos = prev_positions[agent_idx]
+                curr_pos = current_positions[agent_idx]
+                if prev_pos is None or curr_pos is None:
+                    continue
+                step_distance = float(np.linalg.norm(curr_pos - prev_pos))
+                if np.isfinite(step_distance):
+                    agent_path_lengths[agent_idx] += step_distance
+            prev_positions = [pos.copy() if pos is not None else None for pos in current_positions]
+
+            if agent_goal_positions and current_positions:
+                team_reached_now = True
+                valid_reach_checks = 0
+                for agent_idx in range(min(len(current_positions), len(agent_goal_positions))):
+                    curr_pos = current_positions[agent_idx]
+                    goal_pos = agent_goal_positions[agent_idx]
+                    dist_to_goal = _distance_3d(curr_pos, goal_pos)
+                    if dist_to_goal is None:
+                        team_reached_now = False
+                        continue
+                    valid_reach_checks += 1
+                    reached = dist_to_goal <= success_threshold
+                    if reached and agent_first_reach_steps[agent_idx] is None:
+                        agent_first_reach_steps[agent_idx] = step_count
+                    if not reached:
+                        team_reached_now = False
+                if valid_reach_checks == 0:
+                    team_reached_now = False
+                if team_reached_now and team_first_reach_step is None:
+                    team_first_reach_step = step_count
             
             # 更新观察
             processed_obs = self.maddpg.obs_processor.batch_process_observations(next_obs_n)
@@ -1771,10 +2065,30 @@ class ModelEvaluator:
         
         episode_success = (team_success_flag == 1)
         success_flag = 1 if episode_success else 0
-        
-        # 🔧 新增：计算到达时间/步数（如果成功）
-        arrival_step = step_count if success_flag == 1 else None
-        arrival_time = episode_duration if success_flag == 1 else None
+
+        agent_path_efficiencies = []
+        for direct_dist, path_len in zip(direct_goal_distances, agent_path_lengths):
+            if direct_dist is None or path_len is None or path_len <= 1e-9:
+                agent_path_efficiencies.append(None)
+                continue
+            efficiency = direct_dist / max(path_len, 1e-9)
+            agent_path_efficiencies.append(float(np.clip(efficiency, 0.0, 1.0)))
+
+        valid_direct_dists = [dist for dist in direct_goal_distances if dist is not None]
+        team_direct_distance = float(np.sum(valid_direct_dists)) if valid_direct_dists else None
+        team_total_path_length = float(np.sum(agent_path_lengths)) if agent_path_lengths else 0.0
+        path_efficiency = None
+        if team_direct_distance is not None and team_total_path_length > 1e-9:
+            path_efficiency = float(np.clip(team_direct_distance / team_total_path_length, 0.0, 1.0))
+
+        first_reach_step = team_first_reach_step
+        first_reach_time = (
+            float(team_first_reach_step * simulation_dt) if team_first_reach_step is not None else None
+        )
+
+        # 到达时间/步数按“首次团队到达”记录；arrival_* 保持与 success 绑定，便于 success-only 汇总
+        arrival_step = first_reach_step if success_flag == 1 else None
+        arrival_time = first_reach_time if success_flag == 1 else None
         
         # 🔧 新增：计算穿透深度统计（从min_distance中的负值提取）
         penetration_depths = []
@@ -1803,7 +2117,12 @@ class ModelEvaluator:
         print(f"   - 碰撞次数: {total_collisions} (智能体: {episode_collision_counts})")
         print(f"   - 成功率: 团队={success_flag}, 智能体={agent_success_flags}")
         if arrival_step is not None:
-            print(f"   - 到达步数: {arrival_step}")
+            print(f"   - 成功首达步数: {arrival_step}")
+        elif first_reach_step is not None:
+            print(f"   - 首次到达步数(未计为成功): {first_reach_step}")
+        print(f"   - 路径长度: 团队={team_total_path_length:.2f}, 智能体={['{:.2f}'.format(v) for v in agent_path_lengths]}")
+        if path_efficiency is not None:
+            print(f"   - 路径效率: 团队={path_efficiency:.3f}")
         if min_distance_stat is not None:
             print(f"   - 最小净空距离: 均值={min_distance_stat['mean']:.2f}, 最小值={min_distance_stat['min']:.2f}")
         if penetration_stat is not None:
@@ -1828,6 +2147,14 @@ class ModelEvaluator:
             # 🔧 新增：到达时间/步数
             'arrival_step': arrival_step,
             'arrival_time': arrival_time,
+            'first_reach_step': first_reach_step,
+            'first_reach_time': first_reach_time,
+            'path_length': team_total_path_length,
+            'agent_path_lengths': [float(v) for v in agent_path_lengths],
+            'direct_distance': team_direct_distance,
+            'agent_direct_distances': [float(v) if v is not None else None for v in direct_goal_distances],
+            'path_efficiency': path_efficiency,
+            'agent_path_efficiencies': agent_path_efficiencies,
             # 🔧 新增：穿透深度统计
             'penetration_stat': penetration_stat
         }
@@ -2140,7 +2467,9 @@ class ModelEvaluator:
                 'max_reward': None,
                 'min_reward': None,
                 'all_rewards': [],
+                'summary': _build_evaluation_summary([], [], getattr(self.args, 'collision_distance_threshold', None)),
                 'episode_details': [],
+                'terrain_seed_sequence': terrain_seed_sequence or [],
                 'evaluation_time': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'error': 'No episodes completed successfully'
             }
@@ -2155,11 +2484,24 @@ class ModelEvaluator:
         std_reward = np.std(all_rewards)
         max_reward = np.max(all_rewards)
         min_reward = np.min(all_rewards)
+        summary = _build_evaluation_summary(
+            all_rewards,
+            all_episodes_data,
+            collision_distance_threshold=getattr(self.args, 'collision_distance_threshold', None),
+        )
         
         print(f"平均奖励: {avg_reward:.2f} ± {std_reward:.2f}")
         print(f"最高奖励: {max_reward:.2f}")
         print(f"最低奖励: {min_reward:.2f}")
         print(f"总回合数: {len(all_rewards)}")
+        if summary.get('team_success_rate') is not None:
+            print(f"团队成功率: {summary['team_success_rate']:.3f}")
+        if summary.get('avg_team_total_path_length') is not None:
+            print(f"平均团队路径长度: {summary['avg_team_total_path_length']:.2f}")
+        if summary.get('avg_arrival_step_success_only') is not None:
+            print(f"成功回合平均首达步数: {summary['avg_arrival_step_success_only']:.1f}")
+        if summary.get('avg_collision_count') is not None:
+            print(f"平均碰撞次数: {summary['avg_collision_count']:.2f}")
         
         # 保存评估结果
         results = {
@@ -2171,6 +2513,8 @@ class ModelEvaluator:
             'max_reward': float(max_reward),
             'min_reward': float(min_reward),
             'all_rewards': [float(r) for r in all_rewards],
+            'summary': summary,
+            'terrain_seed_sequence': terrain_seed_sequence or [],
             'episode_details': [
                 {
                     'episode': ep['episode'],
@@ -2191,6 +2535,14 @@ class ModelEvaluator:
                     # 🔧 新增：到达时间/步数
                     'arrival_step': ep.get('arrival_step', None),
                     'arrival_time': ep.get('arrival_time', None),
+                    'first_reach_step': ep.get('first_reach_step', None),
+                    'first_reach_time': ep.get('first_reach_time', None),
+                    'path_length': ep.get('path_length', None),
+                    'agent_path_lengths': ep.get('agent_path_lengths', []),
+                    'direct_distance': ep.get('direct_distance', None),
+                    'agent_direct_distances': ep.get('agent_direct_distances', []),
+                    'path_efficiency': ep.get('path_efficiency', None),
+                    'agent_path_efficiencies': ep.get('agent_path_efficiencies', []),
                     # 🔧 新增：穿透深度统计
                     'penetration_stat': ep.get('penetration_stat', None)
                 } for ep in all_episodes_data
