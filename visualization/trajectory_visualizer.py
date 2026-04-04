@@ -191,7 +191,7 @@ class TrajectoryVisualizer:
                                  episode_num, reward, episode_type='current',
                                  correction_type=None, elev=30, azim=45,
                                  goal_positions=None, env_instance=None, actor_outputs_history=None,
-                                 env_idx=0):
+                                 env_idx=0, title_step_note=None):
         """生成轨迹静态图像
         
         参数:
@@ -249,8 +249,16 @@ class TrajectoryVisualizer:
             total_steps = len(trajectories) if trajectories else 0
             
             # 设置标签和标题
-            self._set_labels_and_title(ax, episode_type, episode_num, reward, correction_type, 
-                                     total_steps=total_steps, effective_steps=eff_steps)
+            self._set_labels_and_title(
+                ax,
+                episode_type,
+                episode_num,
+                reward,
+                correction_type,
+                total_steps=total_steps,
+                effective_steps=eff_steps,
+                title_step_note=title_step_note,
+            )
             
             # 新增：如果有Actor输出历史数据，生成包含Actor输出分析的图像
             if actor_outputs_history is not None and len(actor_outputs_history) > 0:
@@ -932,14 +940,17 @@ class TrajectoryVisualizer:
                 ax.text(xs[-1], ys[-1], zs[-1]+3, f"End{i}", color='black', fontsize=10,
                        fontweight='bold')
     
-    def _set_labels_and_title(self, ax, episode_type, episode_num, reward, correction_type, total_steps=None, effective_steps=None):
+    def _set_labels_and_title(self, ax, episode_type, episode_num, reward, correction_type,
+                              total_steps=None, effective_steps=None, title_step_note=None):
         """设置标签和标题"""
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
         
         title = f'{episode_type.capitalize()} Episode {episode_num} - Reward: {reward:.2f}'
-        if total_steps is not None and effective_steps is not None:
+        if title_step_note:
+            title += f'\n{title_step_note}'
+        elif total_steps is not None and effective_steps is not None:
             title += f'\nSteps: {effective_steps}/{total_steps} (effective/total)'
         elif total_steps is not None:
             title += f'\nTotal Steps: {total_steps}'

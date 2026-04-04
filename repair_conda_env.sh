@@ -62,12 +62,20 @@ pip install --upgrade --force-reinstall \
     matplotlib==3.10.1 \
     plotly==5.22.0 \
     tqdm==4.67.1
+pip install --upgrade --force-reinstall \
+    imageio \
+    imageio-ffmpeg \
+    opencv-python \
+    pygame \
+    psutil \
+    PyOpenGL \
+    pyglet
 
 echo ""
-echo "安装 TensorFlow 2.12 所需 GPU 运行库 (CUDA 11.8 + cuDNN 8.6)..."
-conda install -y -n "$ENV_NAME" -c conda-forge \
+echo "安装 TensorFlow 2.12 所需 GPU 运行库 (CUDA 11.8 + cuDNN 8.x)..."
+conda install -y -n "$ENV_NAME" --override-channels -c conda-forge -c nvidia \
     cudatoolkit=11.8 \
-    cudnn=8.6
+    "cudnn>=8.6,<9"
 
 echo ""
 echo "安装项目 multiagent 包..."
@@ -76,6 +84,9 @@ pip install -e "$SCRIPT_DIR/src/multiagent"
 echo ""
 echo "验证 TensorFlow 运行时..."
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ -f "$SCRIPT_DIR/tools/setup_conda_ld_path.sh" ]; then
+    bash "$SCRIPT_DIR/tools/setup_conda_ld_path.sh"
+fi
 python "$SCRIPT_DIR/tools/check_tf_env.py" --label "TensorFlow Environment Repair Check"
 
 echo ""

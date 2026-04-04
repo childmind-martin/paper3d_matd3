@@ -73,7 +73,10 @@ def print_remediation(env_name: str) -> None:
     print(f"  - bash repair_conda_env.sh")
     print("Manual alternative:")
     print(f"  - conda activate {env_name}")
-    print("  - conda install -y -c conda-forge cudatoolkit=11.8 cudnn=8.6")
+    print(
+        "  - conda install -y --override-channels -c conda-forge -c nvidia "
+        "cudatoolkit=11.8 'cudnn>=8.6,<9'"
+    )
     print("  - export LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"")
     print(
         "  - pip uninstall -y tensorflow-directml-plugin tensorflow-cpu "

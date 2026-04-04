@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import time
 
 # 🔧 新增：导入批次管理器
@@ -149,13 +149,12 @@ EXPERIMENT_CONFIGS = [
             "DELTA_LAMBDA_1": "0.0",
             "DELTA_K_REP": "0.0",
             "DELTA_RADIUS": "0.0",
-            # 🚨 关键修复：显式设置base值，确保Traditional APF使用正确的参数（而不是随机初始化的网络参数）
-            # 这些base值必须与run_optimized.sh的默认值完全一致
-            # run_optimized.sh默认base值（第685-708行）：
-            "GOAL_ATTRACTION": "6.0",                    # ✅ 与run_optimized.sh一致（默认6.0）
-            "LAMBDA_1_BASE": "8.5",                      # ✅ 与run_optimized.sh一致（默认8.5）
-            "TERRAIN_REPULSION": "8000.0",               # ✅ 与run_optimized.sh一致（默认8000.0）
-            "AGENT_INFLUENCE_RANGE": "150.0",           # ✅ 与run_optimized.sh一致（默认150.0）
+            # 🚨 注意：这些显式值会在模块加载后再次与当前 run_optimized.sh 默认值同步，
+            # 这里保留一份当前标准值，方便直接阅读配置。
+            "GOAL_ATTRACTION": "26.0",
+            "LAMBDA_1_BASE": "8.5",
+            "TERRAIN_REPULSION": "1600.0",
+            "AGENT_INFLUENCE_RANGE": "150.0",
             # 实际使用的势场参数（因为DELTA=0.0，所以参数=base值）：
             #   k_att = 6.0（固定）
             #   lambda_1 = 8.5（固定）
@@ -189,9 +188,9 @@ EXPERIMENT_CONFIGS = [
             # 原问题：k_rep只有±15%范围（6800-9200），改善空间太小
             # 新设计：大幅扩大关键参数的可学习范围，尤其是k_rep
             # 
-            # run_optimized.sh base值（第685-708行）：
-            #   GOAL_ATTRACTION=6.0, LAMBDA_1_BASE=8.5, 
-            #   TERRAIN_REPULSION=8000.0, AGENT_INFLUENCE_RANGE=150.0
+            # 当前标准 base 值会在模块加载后与 run_optimized.sh 再同步一次：
+            #   GOAL_ATTRACTION=26.0, LAMBDA_1_BASE=8.5,
+            #   TERRAIN_REPULSION=1600.0, AGENT_INFLUENCE_RANGE=150.0
             # 
             # 🔧 新的可学习范围（扩大3-5倍）：
             #   k_att = 6.0 ± 10.0 = [-4.0, 16.0] → 裁剪到[0.5, 16.0]（±167%）
@@ -205,10 +204,10 @@ EXPERIMENT_CONFIGS = [
             # 🚨 关键修复：显式设置base值，确保与apf_traditional和action_apf_fusion使用相同的base值
             # 原因：虽然run_optimized.sh有默认值，但显式设置可以确保所有实验组使用完全相同的base值
             # 这样对比才公平：apf_learnable和action_apf_fusion使用相同的base值，只是DELTA不同
-            "GOAL_ATTRACTION": "6.0",                    # ✅ 与run_optimized.sh一致（默认6.0）
-            "LAMBDA_1_BASE": "8.5",                      # ✅ 与run_optimized.sh一致（默认8.5）
-            "TERRAIN_REPULSION": "8000.0",               # ✅ 与run_optimized.sh一致（默认8000.0）
-            "AGENT_INFLUENCE_RANGE": "150.0",           # ✅ 与run_optimized.sh一致（默认150.0）
+            "GOAL_ATTRACTION": "26.0",
+            "LAMBDA_1_BASE": "8.5",
+            "TERRAIN_REPULSION": "1600.0",
+            "AGENT_INFLUENCE_RANGE": "150.0",
             # 🚨 关键修复：网络初始化一致性
             # 所有算法（apf_traditional、apf_learnable、action_apf_fusion）都使用相同的SEED
             # 训练脚本会在创建网络之前设置随机种子（paper3d_train_optimized.py 第12069-12072行）
@@ -223,14 +222,8 @@ EXPERIMENT_CONFIGS = [
         "name_en": "Action+APF Fusion",
         "description": "Network action + learnable APF correction (default config)",
         "env": {
-            # 🔧 关键修复：action_apf_fusion 使用完整的 run_optimized.sh 默认配置
-            # 包括动态 FR schedule，让智能体逐渐学会减少对势场的依赖
-            # 注意：不设置 ACTION_FORCE_RATIO，让它使用 run_optimized.sh 的默认值 0.50
-            # 🚨 关键修复：使用与 run_optimized.sh 完全一致的 FR schedule，确保融合APF完全执行 run_optimized.sh 的要求
-            # run_optimized.sh 默认 schedule（第684行）："0%:0.55,10%:0.5,20%:0.5,35%:0.5,50%:0.5,70%:0.5,85%:0.5,100%:0.5"
-            # 原因：action_apf_fusion 应该完全使用 run_optimized.sh 的默认配置，包括 FR schedule
-            # 这样消融实验才能真正反映"融合APF"在标准训练配置下的表现
-            "ACTION_FORCE_RATIO_SCHEDULE_PCT": "0%:0.50,10%:0.45,20%:0.40,40%:0.35,60%:0.30,80%:0.25,100%:0.20",  # 🔧 修复3/3：与run_optimized.sh同步（减缓FR衰减）
+            # 融合APF使用当前标准 FR schedule；模块加载后会再次与 run_optimized.sh 同步。
+            "ACTION_FORCE_RATIO_SCHEDULE_PCT": "0%:0.50,25%:0.48,50%:0.45,70%:0.40,85%:0.35,100%:0.32",
             "USE_TF_POTENTIAL_FIELD": "1",  # 确保使用TF版本
             # 🔧 同步更新：与apf_learnable使用完全相同的扩大的可学习范围，确保公平对比
             # 这样对比才公平：apf_learnable（100%势场）vs action_apf_fusion（混合模式）
@@ -292,9 +285,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="动作与势场修正消融对比实验、地形复杂度3、无随机动作判断穿透原因是否是随机动作导致的")
     parser.add_argument("--script", type=str, default="./run_optimized.sh",
                         help="训练启动脚本路径 (默认 ./run_optimized.sh)")
-    parser.add_argument("--episodes", type=int, default=400,
+    parser.add_argument("--episodes", type=int, default=450,
                         help="每个实验的训练回合数（默认5）")
-    parser.add_argument("--batch-size", type=int, default=2048,
+    parser.add_argument("--batch-size", type=int, default=1024,
                         help="训练批次大小")
     parser.add_argument("--use-weighted-reward", type=int, default=1, choices=[0, 1],
                         help="是否使用分项加权奖励")
@@ -327,6 +320,22 @@ def parse_args():
                         help="快速对比模式：运行 apf_traditional、apf_learnable 和 action_apf_fusion 三个实验")
     parser.add_argument("--config-file", type=str, default=None,
                         help="从文件加载实验配置（JSON格式，由 reproduce_from_results.py 生成）")
+    parser.add_argument("--eval-script", type=str, default="./run_evaluation.sh",
+                        help="训练后标准化测试脚本路径 (默认 ./run_evaluation.sh)")
+    parser.add_argument("--eval-episodes", type=int, default=20,
+                        help="每个实验训练后标准化测试回合数（默认20，设为0则跳过）")
+    parser.add_argument("--skip-eval", action="store_true",
+                        help="跳过训练后标准化测试，仅生成训练曲线")
+    parser.add_argument("--parallel-eval", action="store_true",
+                        help="并行执行标准化测试；默认串行，避免单卡自动过度抢占资源")
+    parser.add_argument("--eval-max-workers", type=int, default=0,
+                        help="标准化测试最大并发数；0表示自动（优先按评估GPU数量决定）")
+    parser.add_argument("--eval-gpu-ids", type=str, default=None,
+                        help="标准化测试使用的GPU ID列表（逗号分隔，如'0,1'）；未设置时自动检测")
+    parser.add_argument("--eval-cpu-threads", type=int, default=4,
+                        help="每个标准化测试子进程的CPU线程上限，默认4")
+    parser.add_argument("--eval-launch-stagger-seconds", type=float, default=1.5,
+                        help="并行标准化测试时相邻任务的错峰启动秒数，默认1.5")
     return parser.parse_args()
 
 
@@ -341,6 +350,431 @@ def _safe_float(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def _safe_int(value) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        parsed = int(value)
+        return parsed
+    except (TypeError, ValueError):
+        parsed_float = _safe_float(value)
+        if parsed_float is None:
+            return None
+        try:
+            return int(parsed_float)
+        except Exception:
+            return None
+
+
+def resolve_launch_env_default(var_name: str, fallback: str, script_path: Optional[str] = None) -> str:
+    """Resolve the current default value from run_optimized.sh, with env override support."""
+    env_value = os.getenv(var_name)
+    if env_value not in (None, ""):
+        return str(env_value)
+
+    candidate_paths = []
+    if script_path:
+        candidate_paths.append(Path(script_path).resolve())
+    candidate_paths.append((Path(__file__).parent / "run_optimized.sh").resolve())
+
+    seen = set()
+    escaped_name = re.escape(var_name)
+    patterns = (
+        re.compile(rf"(?m)^\s*export\s+{escaped_name}=\$\{{{escaped_name}:-([^}}]+)\}}"),
+        re.compile(rf'(?m)^\s*export\s+{escaped_name}="([^"]*)"'),
+        re.compile(rf"(?m)^\s*export\s+{escaped_name}='([^']*)'"),
+        re.compile(rf"(?m)^\s*export\s+{escaped_name}=([^\s#]+)"),
+    )
+
+    for candidate in candidate_paths:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        try:
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            content = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        for pattern in patterns:
+            match = pattern.search(content)
+            if not match:
+                continue
+            parsed = match.group(1).strip().strip('"').strip("'")
+            if parsed != "":
+                return parsed
+
+    return str(fallback)
+
+
+def build_standard_runtime_env(script_path: Optional[str] = None) -> Dict[str, str]:
+    """Centralize the current run_optimized defaults used by APF ablation."""
+    fallback_map = {
+        "START_ALTITUDE_OFFSET": "12.0",
+        "GOAL_ALTITUDE": "25.0",
+        "AGENT_GOAL_FORMATION_RADIUS": "10.0",
+        "TERRAIN_COLLISION_EPS": "0.3",
+        "TERRAIN_CLEARANCE_EPS": "2.5",
+        "GOAL_ATTRACTION": "26.0",
+        "LAMBDA_1_BASE": "8.5",
+        "TERRAIN_REPULSION": "1600.0",
+        "AGENT_INFLUENCE_RANGE": "150.0",
+        "ACTION_FORCE_RATIO_SCHEDULE_PCT": "0%:0.50,25%:0.48,50%:0.45,70%:0.40,85%:0.35,100%:0.32",
+    }
+    return {
+        key: resolve_launch_env_default(key, fallback, script_path=script_path)
+        for key, fallback in fallback_map.items()
+    }
+
+
+STANDARD_RUNTIME_ENV = build_standard_runtime_env()
+
+
+def sync_experiment_configs_with_standard_defaults():
+    """Keep APF ablation configs aligned with the current standard launch defaults."""
+    apf_base_keys = ("GOAL_ATTRACTION", "LAMBDA_1_BASE", "TERRAIN_REPULSION", "AGENT_INFLUENCE_RANGE")
+    for cfg in EXPERIMENT_CONFIGS:
+        env = cfg.setdefault("env", {})
+        label = cfg.get("label")
+        if label in {"apf_traditional", "apf_learnable", "action_apf_fusion"}:
+            for key in apf_base_keys:
+                env[key] = STANDARD_RUNTIME_ENV[key]
+        if label == "action_apf_fusion":
+            env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = STANDARD_RUNTIME_ENV["ACTION_FORCE_RATIO_SCHEDULE_PCT"]
+
+
+def build_runtime_env_overrides(env: Dict[str, str]) -> Dict[str, str]:
+    """Persist runtime-only env keys so post-training evaluation uses the same setup."""
+    keys = (
+        "START_ALTITUDE_OFFSET",
+        "GOAL_ALTITUDE",
+        "AGENT_GOAL_FORMATION_RADIUS",
+        "TERRAIN_COLLISION_EPS",
+        "TERRAIN_CLEARANCE_EPS",
+        "GOAL_ATTRACTION",
+        "LAMBDA_1_BASE",
+        "TERRAIN_REPULSION",
+        "AGENT_INFLUENCE_RANGE",
+        "ACTION_FORCE_RATIO_SCHEDULE_PCT",
+    )
+    overrides = {}
+    for key in keys:
+        value = env.get(key)
+        if value not in (None, ""):
+            overrides[key] = str(value)
+    return overrides
+
+
+sync_experiment_configs_with_standard_defaults()
+
+
+def _is_timestamp_token(value: str) -> bool:
+    value = str(value).strip()
+    return len(value) >= 15 and value[8] == "_" and value[:8].isdigit() and value[9:15].isdigit()
+
+
+def _has_model_weights(model_root: Path) -> bool:
+    try:
+        if any(model_root.glob("actor_*.weights.h5")):
+            return True
+        for child_name in ("best_by_team_sr", "best", "final"):
+            child = model_root / child_name
+            if child.is_dir() and any(child.glob("actor_*.weights.h5")):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def find_latest_model_root(exp_name: str, models_root: str = "models") -> Optional[str]:
+    models_path = Path(models_root)
+    if not models_path.exists() or not models_path.is_dir():
+        return None
+
+    matching_dirs = []
+    for item in models_path.iterdir():
+        if not item.is_dir():
+            continue
+        if item.name == exp_name:
+            matching_dirs.append(item)
+            continue
+        if item.name.startswith(exp_name + "_"):
+            suffix = item.name[len(exp_name) + 1:]
+            if _is_timestamp_token(suffix):
+                matching_dirs.append(item)
+
+    weighted_dirs = []
+    for candidate in matching_dirs:
+        if not _has_model_weights(candidate):
+            continue
+        try:
+            weighted_dirs.append((candidate.stat().st_mtime, candidate))
+        except OSError:
+            weighted_dirs.append((0.0, candidate))
+
+    if not weighted_dirs:
+        return None
+
+    weighted_dirs.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    return str(weighted_dirs[0][1])
+
+
+def load_evaluation_metrics(eval_results_path: Path) -> Dict:
+    metrics = {
+        "episodes": 0,
+        "success_episode_count": None,
+        "team_success_rate": None,
+        "collision_free_rate": None,
+        "avg_arrival_step_success_only": None,
+        "avg_first_reach_step": None,
+        "avg_team_total_path_length": None,
+        "avg_team_total_path_length_success_only": None,
+        "avg_team_path_efficiency": None,
+        "avg_team_path_efficiency_success_only": None,
+        "avg_team_final_goal_distance": None,
+        "avg_team_min_goal_distance": None,
+        "avg_min_clearance_mean": None,
+        "clearance_violation_rate": None,
+        "avg_penetration_count": None,
+        "penetration_episode_rate": None,
+        "mean_penetration_depth": None,
+        "results_path": str(eval_results_path),
+    }
+
+    try:
+        with open(eval_results_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return metrics
+
+    summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    episode_details = payload.get("episode_details", []) if isinstance(payload.get("episode_details"), list) else []
+
+    metrics["episodes"] = _safe_int(payload.get("episodes")) or len(episode_details)
+    success_episode_count = _safe_int(summary.get("success_episode_count"))
+    if success_episode_count is None and episode_details:
+        success_episode_count = 0
+        for ep in episode_details:
+            if isinstance(ep, dict):
+                success_episode_count += int(ep.get("success", 0) or 0)
+    metrics["success_episode_count"] = success_episode_count
+
+    summary_keys = (
+        "team_success_rate",
+        "collision_free_rate",
+        "avg_arrival_step_success_only",
+        "avg_first_reach_step",
+        "avg_team_total_path_length",
+        "avg_team_total_path_length_success_only",
+        "avg_team_path_efficiency",
+        "avg_team_path_efficiency_success_only",
+        "avg_team_final_goal_distance",
+        "avg_team_min_goal_distance",
+        "avg_min_clearance_mean",
+        "clearance_violation_rate",
+        "avg_penetration_count",
+        "penetration_episode_rate",
+        "mean_penetration_depth",
+    )
+    for key in summary_keys:
+        metrics[key] = _safe_float(summary.get(key))
+
+    return metrics
+
+
+def run_standardized_evaluation(
+    item: Dict,
+    positions_file: Path,
+    args,
+    batch_dir: Path,
+    eval_gpu_id: Optional[int] = None,
+) -> Dict:
+    label = item.get("label", "unknown")
+    eval_script = Path(args.eval_script).resolve()
+    eval_dir = Path(batch_dir) / "evaluation" / label
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    eval_results_path = eval_dir / "evaluation_results.json"
+
+    if args.reuse and eval_results_path.exists():
+        return {
+            "success": True,
+            "reused": True,
+            "eval_dir": str(eval_dir),
+            "results_path": str(eval_results_path),
+            "metrics": load_evaluation_metrics(eval_results_path),
+        }
+
+    if not eval_script.is_file():
+        return {
+            "success": False,
+            "reused": False,
+            "eval_dir": str(eval_dir),
+            "results_path": str(eval_results_path),
+            "metrics": {},
+            "error": f"找不到评估脚本: {eval_script}",
+        }
+
+    model_root = item.get("model_root") or find_latest_model_root(label)
+    if not model_root:
+        return {
+            "success": False,
+            "reused": False,
+            "eval_dir": str(eval_dir),
+            "results_path": str(eval_results_path),
+            "metrics": {},
+            "error": f"未找到可用于标准化测试的模型目录: label={label}",
+        }
+
+    env = _build_standardized_eval_env(item, eval_dir, args, eval_gpu_id=eval_gpu_id)
+
+    cmd = [
+        str(eval_script),
+        str(model_root),
+        str(int(args.eval_episodes)),
+        str(eval_dir),
+        str(positions_file),
+        "true",
+        "false",
+    ]
+
+    subprocess.run(cmd, check=True, env=env)
+
+    if not eval_results_path.exists():
+        raise FileNotFoundError(f"标准化测试完成后缺少结果文件: {eval_results_path}")
+
+    return {
+        "success": True,
+        "reused": False,
+        "eval_dir": str(eval_dir),
+        "results_path": str(eval_results_path),
+        "metrics": load_evaluation_metrics(eval_results_path),
+    }
+
+
+def _parse_gpu_id_list(raw_value: Optional[str]) -> List[int]:
+    if raw_value in (None, ""):
+        return []
+    gpu_ids = []
+    for token in str(raw_value).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            gpu_ids.append(int(token))
+        except Exception:
+            continue
+    return gpu_ids
+
+
+def _detect_available_gpu_ids() -> List[int]:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    gpu_ids = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("GPU "):
+            continue
+        try:
+            gpu_ids.append(int(line.split(":", 1)[0].split()[1]))
+        except Exception:
+            continue
+    return gpu_ids
+
+
+def _resolve_eval_gpu_ids(args, task_count: int) -> List[int]:
+    requested = _parse_gpu_id_list(getattr(args, "eval_gpu_ids", None))
+    if requested:
+        return requested
+    if not bool(getattr(args, "parallel_eval", False)):
+        return []
+    detected = _detect_available_gpu_ids()
+    if not detected:
+        return []
+    return detected[: max(1, min(len(detected), int(task_count)))]
+
+
+def _resolve_eval_worker_count(args, task_count: int, eval_gpu_ids: List[int]) -> int:
+    if task_count <= 1:
+        return 1
+    explicit_workers = _safe_int(getattr(args, "eval_max_workers", 0)) or 0
+    if explicit_workers > 0:
+        return max(1, min(int(task_count), explicit_workers))
+    if eval_gpu_ids:
+        return max(1, min(int(task_count), len(eval_gpu_ids)))
+    return 1
+
+
+def _build_standardized_eval_env(
+    item: Dict,
+    eval_dir: Path,
+    args,
+    eval_gpu_id: Optional[int] = None,
+) -> Dict[str, str]:
+    env = os.environ.copy()
+    runtime_env_overrides = item.get("runtime_env_overrides", {})
+    if isinstance(runtime_env_overrides, dict):
+        for key, value in runtime_env_overrides.items():
+            if value not in (None, ""):
+                env[str(key)] = str(value)
+
+    cpu_threads = max(1, int(_safe_int(getattr(args, "eval_cpu_threads", 4)) or 4))
+    env["MODEL_VARIANT"] = "best_by_team_sr"
+    env["STRICT_EVAL_MATCH"] = env.get("STRICT_EVAL_MATCH", "1")
+    env["SAVE_EVAL_ALL_EPISODES"] = env.get("SAVE_EVAL_ALL_EPISODES", "0")
+    env["SAVE_BEST_TRAJ"] = env.get("SAVE_BEST_TRAJ", "1")
+    env["SAVE_TEAM_SUCCESS_HTML"] = env.get("SAVE_TEAM_SUCCESS_HTML", "1")
+    env["SAVE_EVAL_TRAJECTORY_JSON"] = env.get("SAVE_EVAL_TRAJECTORY_JSON", "0")
+    env["SAVE_EVAL_TRAJECTORY_PNG"] = env.get("SAVE_EVAL_TRAJECTORY_PNG", "0")
+    env["SAVE_EVAL_ACTOR_SEQUENCE"] = env.get("SAVE_EVAL_ACTOR_SEQUENCE", "1")
+    env["SAVE_EVAL_CONTROL_DIAGNOSTICS"] = env.get("SAVE_EVAL_CONTROL_DIAGNOSTICS", "0")
+    env["QUIET_OUTPUT"] = env.get("QUIET_OUTPUT", "1")
+    env["TQDM_DISABLE"] = env.get("TQDM_DISABLE", "1")
+    env["SUPPRESS_TERRAIN_OUTPUT"] = env.get("SUPPRESS_TERRAIN_OUTPUT", "1")
+    env["SUPPRESS_MA_PROMPT"] = env.get("SUPPRESS_MA_PROMPT", "1")
+    env["MPLCONFIGDIR"] = str((eval_dir / ".mplconfig").resolve())
+    env["CPU_THREADS"] = str(cpu_threads)
+    env["OMP_NUM_THREADS"] = str(cpu_threads)
+    env["MKL_NUM_THREADS"] = str(cpu_threads)
+    env["OPENBLAS_NUM_THREADS"] = str(cpu_threads)
+    env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
+    env["TF_NUM_INTRAOP_THREADS"] = str(cpu_threads)
+    env["TF_NUM_INTEROP_THREADS"] = "1"
+    env["TF_GPU_ALLOCATOR"] = ""
+    env["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    env.setdefault("PF_JIT", "1")
+    need_trajectory_artifacts = any(
+        env.get(flag, default).lower() in ("1", "true", "yes", "on")
+        for flag, default in (
+            ("SAVE_EVAL_ALL_EPISODES", "0"),
+            ("SAVE_BEST_TRAJ", "1"),
+            ("SAVE_TEAM_SUCCESS_HTML", "1"),
+            ("SAVE_EVAL_TRAJECTORY_JSON", "0"),
+            ("SAVE_EVAL_TRAJECTORY_PNG", "0"),
+            ("SAVE_INTERACTIVE_TRAJ", "1"),
+        )
+    )
+    env["DISABLE_TRAJECTORY_RECORDING"] = "0" if need_trajectory_artifacts else "1"
+    if eval_gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(eval_gpu_id)
+        env["GPU_ID"] = str(eval_gpu_id)
+    else:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+        env.setdefault("GPU_ID", "0")
+    return env
 
 
 def resolve_current_collision_threshold(script_path: Optional[str] = None) -> float:
@@ -566,6 +1000,9 @@ def ensure_fixed_positions(positions_file: Path, args, exp_name_prefix: str) -> 
             "TERRAIN_COMPLEXITY_LEVEL": str(TERRAIN_COMPLEXITY_LEVEL),  # 使用统一常量
             "MAP_SIZE": str(MAP_SIZE),  # 使用统一常量
             "MOUNTAIN_MIN_DISTANCE": str(MOUNTAIN_MIN_DISTANCE),  # 使用统一常量
+            "START_ALTITUDE_OFFSET": STANDARD_RUNTIME_ENV["START_ALTITUDE_OFFSET"],
+            "GOAL_ALTITUDE": STANDARD_RUNTIME_ENV["GOAL_ALTITUDE"],
+            "AGENT_GOAL_FORMATION_RADIUS": STANDARD_RUNTIME_ENV["AGENT_GOAL_FORMATION_RADIUS"],
             "RANDOM_TERRAIN": "0",
             "PER_ENV_TERRAIN": "0",
             "PER_EPISODE_TERRAIN": "0",
@@ -706,6 +1143,18 @@ def setup_base_env_vars(positions_file: Path, gpu_id: int = None) -> dict:
     env.setdefault("QUIET_OUTPUT", "0")  # 🔧 关键：启用详细输出，确保数据记录正确（0=详细，1=安静）
     env.setdefault("SUPPRESS_MA_PROMPT", "1")  # 抑制多智能体环境交互式提示
     env.setdefault("SUPPRESS_TERRAIN_OUTPUT", "1")  # 抑制地形生成冗余输出
+    for key in (
+        "START_ALTITUDE_OFFSET",
+        "GOAL_ALTITUDE",
+        "AGENT_GOAL_FORMATION_RADIUS",
+        "TERRAIN_COLLISION_EPS",
+        "TERRAIN_CLEARANCE_EPS",
+        "GOAL_ATTRACTION",
+        "LAMBDA_1_BASE",
+        "TERRAIN_REPULSION",
+        "AGENT_INFLUENCE_RANGE",
+    ):
+        env.setdefault(key, STANDARD_RUNTIME_ENV[key])
     
     # === 确保使用固定位置和地形（消融实验要求）===
     env["USE_FIXED_POSITIONS"] = "1"
@@ -729,18 +1178,6 @@ def setup_base_env_vars(positions_file: Path, gpu_id: int = None) -> dict:
     env["TERRAIN_COMPLEXITY_LEVEL"] = str(TERRAIN_COMPLEXITY_LEVEL)  # 使用统一常量
     env["MAP_SIZE"] = str(MAP_SIZE)  # 使用统一常量
     env["MOUNTAIN_MIN_DISTANCE"] = str(MOUNTAIN_MIN_DISTANCE)  # 使用统一常量
-    
-    # 🚨 关键修复：区分"真实碰撞"和"净空不足"两个概念
-    # TERRAIN_COLLISION_EPS（0.2米）：真实碰撞阈值，用于统计碰撞次数，影响成功判定
-    #   - 只有智能体在地形+0.2米以内才算真正碰撞（更严格）
-    #   - 会增加 total_penetration_count，影响团队成功判定
-    # TERRAIN_CLEARANCE_EPS（1.5米）：净空监测阈值，用于净空不足惩罚
-    #   - 智能体在地形+1.5米以内会受到净空不足的惩罚
-    #   - 但不会增加碰撞计数，不影响成功判定
-    # 原问题：之前用1.5米作为碰撞阈值，导致智能体在0.5-1.0米高度飞行也被误报为"碰撞"
-    #        这使得APF Fusion（保持0.5-1.0米净空）被误报大量碰撞，奖励值低于APF Learnable
-    env["TERRAIN_COLLISION_EPS"] = "0.2"   # ✅ 真实碰撞阈值：缩小到0.2米，更严格的碰撞判定
-    env["TERRAIN_CLEARANCE_EPS"] = "1.5"   # ✅ 净空监测阈值：鼓励保持安全距离，但不影响碰撞统计
     
     # 🚨 关键修复：清除所有DELTA相关环境变量，确保每个实验从干净状态开始
     # 这样可以避免父进程环境变量影响实验结果，确保传统APF和可学习APF的真正区别
@@ -965,7 +1402,8 @@ def run_experiment_worker(args_tuple):
     if is_traditional_apf:
         # 🔧 传统APF评估模式：禁用网络训练相关功能，只进行环境交互
         env["PER_ENABLED"] = "0"  # 禁用经验回放（不需要存储经验）
-        env["SAVE_MODEL"] = "0"  # 禁用模型保存（网络不会被使用）
+        # 保留模型目录与权重快照，便于后续走统一测试链；不会改变传统APF本身的控制逻辑。
+        env["SAVE_MODEL"] = "1"
         env["ADAPTIVE_PATIENCE"] = "999999"  # 禁用自适应学习（设置极大值）
         env["NOISE_SCALE"] = "0.0"  # 禁用OU噪声（评估模式）
         env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"  # 禁用随机动作（评估模式）
@@ -1026,6 +1464,7 @@ def run_experiment_worker(args_tuple):
             log_dir,
             fallback_collision_threshold=resolve_current_collision_threshold(script),
         )
+        model_root = find_latest_model_root(label)
         print(f"[并行训练-{label}] 完成: {cfg.get('name', label)}")
         return {
             "label": label,
@@ -1033,6 +1472,8 @@ def run_experiment_worker(args_tuple):
             "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
             "log_dir": log_dir,
+            "model_root": model_root,
+            "runtime_env_overrides": build_runtime_env_overrides(env),
             "metrics": metrics,
             "success": True
         }
@@ -1129,7 +1570,8 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     if is_traditional_apf:
         # 🔧 传统APF评估模式：禁用网络训练相关功能，只进行环境交互
         env["PER_ENABLED"] = "0"  # 禁用经验回放（不需要存储经验）
-        env["SAVE_MODEL"] = "0"  # 禁用模型保存（网络不会被使用）
+        # 保留模型目录与权重快照，便于后续走统一测试链；不会改变传统APF本身的控制逻辑。
+        env["SAVE_MODEL"] = "1"
         env["ADAPTIVE_PATIENCE"] = "999999"  # 禁用自适应学习（设置极大值）
         env["NOISE_SCALE"] = "0.0"  # 禁用OU噪声（评估模式）
         env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"  # 禁用随机动作（评估模式）
@@ -1178,11 +1620,15 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
             log_dir,
             fallback_collision_threshold=resolve_current_collision_threshold(args.script),
         )
+        model_root = find_latest_model_root(label)
         result = {
             "label": label,
             "name": cfg.get("name", label),
+            "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
             "log_dir": log_dir,
+            "model_root": model_root,
+            "runtime_env_overrides": build_runtime_env_overrides(env),
             "metrics": metrics,
             "success": True
         }
@@ -1668,6 +2114,80 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     plt.close(fig)
 
 
+def plot_evaluation_metrics_dashboard(series: List[Dict], title: str, output_path: Path):
+    """Plot standardized test metrics for APF ablation (English only)."""
+    setup_english_fonts()
+
+    metric_specs = [
+        ("team_success_rate", "Eval Team Success Rate", True),
+        ("success_episode_count", "Eval Success Episode Count", False),
+        ("avg_team_total_path_length_success_only", "Eval Success-Only Team Path Length", False),
+        ("avg_first_reach_step", "Eval Avg First Reach Step", False),
+        ("collision_free_rate", "Eval Collision-Free Rate", True),
+        ("avg_team_final_goal_distance", "Eval Avg Final Goal Distance", False),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.flatten()
+    has_data = False
+
+    display_names = [get_display_name(item) for item in series]
+    x_positions = np.arange(len(series))
+    colors = [get_series_color(item, idx) for idx, item in enumerate(series)]
+
+    for ax, (metric_key, metric_title, is_rate) in zip(axes, metric_specs):
+        values = []
+        missing_indices = []
+        for idx, item in enumerate(series):
+            eval_metrics = item.get("evaluation_metrics", {}) if isinstance(item.get("evaluation_metrics"), dict) else {}
+            if metric_key == "success_episode_count":
+                value = _safe_int(eval_metrics.get(metric_key))
+            else:
+                value = _safe_float(eval_metrics.get(metric_key))
+            if value is None:
+                values.append(0.0)
+                missing_indices.append(idx)
+            else:
+                values.append(float(value))
+                has_data = True
+
+        bars = ax.bar(x_positions, values, color=colors, alpha=0.85, edgecolor="black", linewidth=0.6)
+        for idx in missing_indices:
+            bars[idx].set_hatch("//")
+            bars[idx].set_alpha(0.35)
+
+        if is_rate:
+            ax.set_ylim(0.0, 1.05)
+        else:
+            upper = max(values) if values else 0.0
+            if upper <= 0.0:
+                upper = 1.0
+            ax.set_ylim(0.0, upper * 1.18)
+
+        for idx, value in enumerate(values):
+            if idx in missing_indices:
+                ax.text(idx, ax.get_ylim()[1] * 0.04, "N/A", ha="center", va="bottom", fontsize=9, rotation=90)
+            else:
+                label_text = f"{value:.3f}" if is_rate else f"{value:.1f}"
+                ax.text(idx, value + ax.get_ylim()[1] * 0.02, label_text, ha="center", va="bottom", fontsize=9)
+
+        ax.set_title(metric_title, fontsize=12, fontweight="bold", fontfamily="DejaVu Sans")
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(display_names, rotation=20, ha="right", fontsize=10, fontfamily="DejaVu Sans")
+        ax.grid(True, axis="y", alpha=0.3, linestyle="--")
+        ax.set_axisbelow(True)
+
+    fig.suptitle(f"{title} - Standardized Test Metrics", fontsize=16, fontweight="bold", fontfamily="DejaVu Sans")
+    plt.tight_layout()
+
+    if has_data:
+        plt.savefig(output_path, dpi=200, bbox_inches="tight")
+        print(f"[Complete] Evaluation metrics dashboard: {output_path}")
+    else:
+        print(f"[Warning] {title} has no standardized evaluation data, skipping plot: {output_path}")
+    plt.close(fig)
+
+
 def plot_comparison_losses(series: List[Dict], title: str, output_path: Path):
     """Plot comparison loss curves (English only)"""
     # 🔧 关键修复：确保使用英文字体
@@ -2054,6 +2574,92 @@ def main():
     print(f"\n{'='*70}")
     print(f"✅ 找到 {len(series)} 个实验的数据，开始生成对比图...")
     print(f"{'='*70}\n")
+
+    if not args.skip_eval and int(args.eval_episodes) > 0:
+        print(f"{'='*70}")
+        print(f"🔬 开始标准化测试汇总（每个实验 {int(args.eval_episodes)} 个测试回合）")
+        print(f"{'='*70}")
+        eval_gpu_ids = _resolve_eval_gpu_ids(args, len(series))
+        eval_workers = _resolve_eval_worker_count(args, len(series), eval_gpu_ids)
+        if args.parallel_eval and eval_workers > 1:
+            gpu_text = ",".join(str(gid) for gid in eval_gpu_ids) if eval_gpu_ids else "shared/auto"
+            print(
+                f"[标准化测试] 并行模式: workers={eval_workers}, "
+                f"gpu_ids={gpu_text}, cpu_threads/worker={max(1, int(_safe_int(args.eval_cpu_threads) or 4))}"
+            )
+            eval_futures = {}
+            launch_stagger = max(0.0, float(getattr(args, "eval_launch_stagger_seconds", 0.0) or 0.0))
+            with ThreadPoolExecutor(max_workers=eval_workers) as executor:
+                for idx, item in enumerate(series):
+                    eval_gpu_id = eval_gpu_ids[idx % len(eval_gpu_ids)] if eval_gpu_ids else None
+                    future = executor.submit(
+                        run_standardized_evaluation,
+                        item,
+                        positions_file,
+                        args,
+                        batch_dir,
+                        eval_gpu_id,
+                    )
+                    eval_futures[future] = (item, eval_gpu_id)
+                    if launch_stagger > 0.0 and idx + 1 < len(series) and idx + 1 < eval_workers:
+                        time.sleep(launch_stagger)
+
+                for future in as_completed(eval_futures):
+                    item, eval_gpu_id = eval_futures[future]
+                    label = item.get("label", "unknown")
+                    gpu_suffix = f" | GPU={eval_gpu_id}" if eval_gpu_id is not None else ""
+                    try:
+                        eval_payload = future.result()
+                        item["evaluation"] = eval_payload
+                        item["evaluation_metrics"] = eval_payload.get("metrics", {})
+                        item["evaluation_results_path"] = eval_payload.get("results_path")
+                        if eval_payload.get("success", False):
+                            reuse_text = "复用" if eval_payload.get("reused", False) else "完成"
+                            eval_metrics = item.get("evaluation_metrics", {})
+                            print(
+                                f"[标准化测试] {label}: {reuse_text}{gpu_suffix} | "
+                                f"SR_team={eval_metrics.get('team_success_rate')} | "
+                                f"成功回合路径长度={eval_metrics.get('avg_team_total_path_length_success_only')}"
+                            )
+                        else:
+                            print(f"[标准化测试] {label}: 失败{gpu_suffix} | {eval_payload.get('error', 'unknown error')}")
+                    except Exception as e:
+                        item["evaluation"] = {
+                            "success": False,
+                            "error": str(e),
+                        }
+                        item["evaluation_metrics"] = {}
+                        print(f"[标准化测试] {label}: 异常{gpu_suffix} | {e}")
+        else:
+            if args.parallel_eval and len(series) > 1:
+                print("[标准化测试] 并行已请求，但自动规划结果为1个worker，回退串行执行。")
+            for item in series:
+                label = item.get("label", "unknown")
+                try:
+                    eval_payload = run_standardized_evaluation(item, positions_file, args, batch_dir)
+                    item["evaluation"] = eval_payload
+                    item["evaluation_metrics"] = eval_payload.get("metrics", {})
+                    item["evaluation_results_path"] = eval_payload.get("results_path")
+                    if eval_payload.get("success", False):
+                        reuse_text = "复用" if eval_payload.get("reused", False) else "完成"
+                        eval_metrics = item.get("evaluation_metrics", {})
+                        print(
+                            f"[标准化测试] {label}: {reuse_text} | "
+                            f"SR_team={eval_metrics.get('team_success_rate')} | "
+                            f"成功回合路径长度={eval_metrics.get('avg_team_total_path_length_success_only')}"
+                        )
+                    else:
+                        print(f"[标准化测试] {label}: 失败 | {eval_payload.get('error', 'unknown error')}")
+                except Exception as e:
+                    item["evaluation"] = {
+                        "success": False,
+                        "error": str(e),
+                    }
+                    item["evaluation_metrics"] = {}
+                    print(f"[标准化测试] {label}: 异常 | {e}")
+        print("")
+    else:
+        print("[信息] 已跳过标准化测试汇总（--skip-eval 或 --eval-episodes=0）\n")
     
     # 生成图表
     title = "Action vs APF Correction Ablation Comparison"
@@ -2090,6 +2696,9 @@ def main():
         smooth_window=args.smooth_window,
         fit_method=args.fit_method
     )
+
+    evaluation_metrics_png = output_dir / f"evaluation_metrics_dashboard_{timestamp}.png"
+    plot_evaluation_metrics_dashboard(series, title, evaluation_metrics_png)
     
     # 交互式对比图
     if args.generate_interactive:
@@ -2112,11 +2721,36 @@ def main():
                 "name_en": item.get("name_en", item.get("label", "Unknown")),  # 🔧 关键修复：确保包含name_en字段
                 "description": item.get("description", ""),
                 "log_dir": item.get("log_dir", ""),
+                "model_root": item.get("model_root"),
+                "runtime_env_overrides": item.get("runtime_env_overrides", {}),
                 "final_reward": item["metrics"].get("episode_rewards", [])[-1] if item["metrics"].get("episode_rewards") else None,
                 "avg_reward": np.mean(item["metrics"].get("episode_rewards", [])) if item["metrics"].get("episode_rewards") else None,
                 "max_reward": np.max(item["metrics"].get("episode_rewards", [])) if item["metrics"].get("episode_rewards") else None,
+                "train_team_success_rate": _safe_float(item["metrics"].get("team_success_rate")),
                 "collision_distance_threshold": item["metrics"].get("collision_distance_threshold"),
                 "collision_threshold_source": item["metrics"].get("collision_threshold_source", "unknown"),
+                "evaluation_results_path": item.get("evaluation_results_path"),
+                "eval_team_success_rate": _safe_float(item.get("evaluation_metrics", {}).get("team_success_rate")),
+                "eval_success_episode_count": _safe_int(item.get("evaluation_metrics", {}).get("success_episode_count")),
+                "eval_collision_free_rate": _safe_float(item.get("evaluation_metrics", {}).get("collision_free_rate")),
+                "eval_avg_first_reach_step": _safe_float(item.get("evaluation_metrics", {}).get("avg_first_reach_step")),
+                "eval_avg_team_total_path_length": _safe_float(item.get("evaluation_metrics", {}).get("avg_team_total_path_length")),
+                "eval_avg_team_total_path_length_success_only": _safe_float(item.get("evaluation_metrics", {}).get("avg_team_total_path_length_success_only")),
+                "eval_avg_team_path_efficiency": _safe_float(item.get("evaluation_metrics", {}).get("avg_team_path_efficiency")),
+                "eval_avg_team_path_efficiency_success_only": _safe_float(item.get("evaluation_metrics", {}).get("avg_team_path_efficiency_success_only")),
+                "eval_avg_team_final_goal_distance": _safe_float(item.get("evaluation_metrics", {}).get("avg_team_final_goal_distance")),
+                "eval_avg_team_min_goal_distance": _safe_float(item.get("evaluation_metrics", {}).get("avg_team_min_goal_distance")),
+                "eval_avg_min_clearance_mean": _safe_float(item.get("evaluation_metrics", {}).get("avg_min_clearance_mean")),
+                "eval_clearance_violation_rate": _safe_float(item.get("evaluation_metrics", {}).get("clearance_violation_rate")),
+                "eval_avg_penetration_count": _safe_float(item.get("evaluation_metrics", {}).get("avg_penetration_count")),
+                "eval_penetration_episode_rate": _safe_float(item.get("evaluation_metrics", {}).get("penetration_episode_rate")),
+                "eval_mean_penetration_depth": _safe_float(item.get("evaluation_metrics", {}).get("mean_penetration_depth")),
+                "train_eval_team_success_gap": (
+                    _safe_float(item.get("evaluation_metrics", {}).get("team_success_rate")) - _safe_float(item["metrics"].get("team_success_rate"))
+                    if _safe_float(item.get("evaluation_metrics", {}).get("team_success_rate")) is not None
+                    and _safe_float(item["metrics"].get("team_success_rate")) is not None
+                    else None
+                ),
             }
             for item in series
         ],
@@ -2125,8 +2759,11 @@ def main():
             "loss_comparison": str(loss_png.name),
             "success_collision_clearance_comparison": str(success_collision_png.name),
             "success_rate_and_clearance_comparison": str(success_clearance_png.name),
-        }
+        },
+        "standard_runtime_env": STANDARD_RUNTIME_ENV,
     }
+    if evaluation_metrics_png.exists():
+        summary["output_files"]["evaluation_metrics_dashboard"] = str(evaluation_metrics_png.name)
     if args.generate_interactive:
         summary["output_files"]["interactive_comparison"] = str(interactive_html.name)
     

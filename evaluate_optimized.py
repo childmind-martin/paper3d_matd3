@@ -15,6 +15,7 @@ import traceback
 import json
 import time
 import math
+import shutil
 
 # 设置环境变量抑制多智能体环境警告
 os.environ['SUPPRESS_MA_PROMPT'] = '1'
@@ -71,6 +72,354 @@ def _safe_std(values):
     return float(np.std(cleaned))
 
 
+def _safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _env_flag(name, default=False):
+    try:
+        return os.getenv(name, "1" if default else "0").lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return bool(default)
+
+
+def _env_int(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+    return value if value > 0 else int(default)
+
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _coerce_optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    return bool(value)
+
+
+def _coerce_optional_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+
+def _coerce_optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _iter_results_json_paths(model_path):
+    if not model_path:
+        return
+    model_leaf = os.path.basename(os.path.normpath(model_path))
+    if model_leaf in ('final', 'best', 'best_by_team_sr', 'best_by_strict_success') or model_leaf.startswith('ep'):
+        model_base_dir = os.path.dirname(model_path)
+    else:
+        model_base_dir = model_path
+    exp_name = os.path.basename(model_base_dir)
+    potential_log_dirs = [
+        os.path.join("logs", exp_name),
+        model_base_dir,
+        os.path.dirname(model_base_dir),
+    ]
+    seen = set()
+    for log_dir in potential_log_dirs:
+        if not os.path.isdir(log_dir):
+            continue
+        for root, dirs, files in os.walk(log_dir):
+            if 'results.json' not in files:
+                continue
+            results_path = os.path.join(root, 'results.json')
+            if results_path in seen:
+                continue
+            seen.add(results_path)
+            yield results_path
+
+
+def _load_training_alignment_snapshot(model_path):
+    for results_path in _iter_results_json_paths(model_path):
+        try:
+            with open(results_path, 'r', encoding='utf-8') as f:
+                results = json.load(f)
+        except Exception:
+            continue
+
+        training_args = results.get('args') if isinstance(results.get('args'), dict) else results
+        if not isinstance(training_args, dict):
+            continue
+
+        scenario_name = (
+            training_args.get('scenario_name')
+            or training_args.get('scenario')
+            or results.get('scenario_name')
+            or results.get('scenario')
+        )
+        algorithm = (
+            training_args.get('algorithm')
+            or training_args.get('algo')
+            or results.get('algorithm')
+            or results.get('algo')
+        )
+        terrain_seed = training_args.get('terrain_seed')
+        if terrain_seed is None:
+            terrain_seed = training_args.get('scenario_seed', results.get('terrain_seed', results.get('scenario_seed')))
+
+        snapshot = {
+            'results_path': results_path,
+            'scenario_name': scenario_name,
+            'algorithm': algorithm,
+            'random_terrain': _coerce_optional_bool(training_args.get('random_terrain', results.get('random_terrain'))),
+            'terrain_seed': _coerce_optional_int(terrain_seed),
+            'per_episode_terrain': _coerce_optional_bool(training_args.get('per_episode_terrain', results.get('per_episode_terrain'))),
+            'per_env_terrain': _coerce_optional_bool(training_args.get('per_env_terrain', results.get('per_env_terrain'))),
+            'semi_random_terrain': _coerce_optional_bool(training_args.get('semi_random_terrain', results.get('semi_random_terrain'))),
+            'terrain_base_seed': _coerce_optional_int(training_args.get('terrain_base_seed', results.get('terrain_base_seed'))),
+            'terrain_complexity_level': _coerce_optional_int(training_args.get('terrain_complexity_level', results.get('terrain_complexity_level'))),
+            'map_size': _coerce_optional_float(training_args.get('map_size', results.get('map_size'))),
+            'mountain_min_distance': _coerce_optional_float(training_args.get('mountain_min_distance', results.get('mountain_min_distance'))),
+        }
+        if snapshot['terrain_base_seed'] is None and snapshot['terrain_seed'] is not None:
+            snapshot['terrain_base_seed'] = snapshot['terrain_seed']
+        return snapshot
+    return None
+
+
+def _apply_training_alignment_to_args(args, snapshot, quiet=False):
+    if args is None or not snapshot:
+        return {}
+
+    applied = {}
+
+    def _apply(attr_name, value):
+        if value is None:
+            return
+        setattr(args, attr_name, value)
+        applied[attr_name] = value
+
+    _apply('scenario_name', snapshot.get('scenario_name'))
+    _apply('algorithm', snapshot.get('algorithm'))
+    _apply('random_terrain', snapshot.get('random_terrain'))
+    _apply('terrain_seed', snapshot.get('terrain_seed'))
+    _apply('per_episode_terrain', snapshot.get('per_episode_terrain'))
+    _apply('per_env_terrain', snapshot.get('per_env_terrain'))
+    _apply('semi_random_terrain', snapshot.get('semi_random_terrain'))
+    _apply('terrain_base_seed', snapshot.get('terrain_base_seed'))
+    _apply('terrain_complexity_level', snapshot.get('terrain_complexity_level'))
+    _apply('map_size', snapshot.get('map_size'))
+    _apply('mountain_min_distance', snapshot.get('mountain_min_distance'))
+
+    if applied and not quiet:
+        pretty = ", ".join(f"{k}={applied[k]}" for k in sorted(applied.keys()))
+        print(f"✅ 评估前按训练配置对齐环境参数: {pretty}")
+        print(f"   来源: {snapshot.get('results_path')}")
+    return applied
+
+
+def _apply_runtime_env_overrides_from_args(args):
+    """将依赖环境变量的隐藏运行时参数与args保持同步。"""
+    runtime_pairs = (
+        ("simulation_dt", "SIMULATION_DT"),
+        ("z_action_bias", "Z_ACTION_BIAS"),
+        ("quadrotor_attitude_response_time", "QUADROTOR_ATTITUDE_RESPONSE_TIME"),
+        ("quadrotor_psi_cmd", "QUADROTOR_PSI_CMD"),
+    )
+    for attr_name, env_name in runtime_pairs:
+        try:
+            value = getattr(args, attr_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        os.environ[env_name] = str(value)
+    try:
+        use_quadrotor_dynamics = getattr(args, "use_quadrotor_dynamics", None)
+    except Exception:
+        use_quadrotor_dynamics = None
+    if use_quadrotor_dynamics is not None:
+        os.environ["USE_QUADROTOR_DYNAMICS"] = "1" if bool(use_quadrotor_dynamics) else "0"
+
+    terrain_bool_pairs = (
+        ("random_terrain", "RANDOM_TERRAIN"),
+        ("per_episode_terrain", "PER_EPISODE_TERRAIN"),
+        ("per_env_terrain", "PER_ENV_TERRAIN"),
+        ("semi_random_terrain", "SEMI_RANDOM_TERRAIN"),
+    )
+    for attr_name, env_name in terrain_bool_pairs:
+        try:
+            value = getattr(args, attr_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        os.environ[env_name] = "1" if bool(value) else "0"
+
+    try:
+        terrain_seed = getattr(args, "terrain_seed", None)
+    except Exception:
+        terrain_seed = None
+    if terrain_seed is not None:
+        os.environ["USE_SCENARIO_SEED"] = "1"
+        os.environ["SCENARIO_SEED"] = str(int(terrain_seed))
+        os.environ.setdefault("TERRAIN_BASE_SEED", str(int(terrain_seed)))
+
+    try:
+        terrain_base_seed = getattr(args, "terrain_base_seed", None)
+    except Exception:
+        terrain_base_seed = None
+    if terrain_base_seed is not None:
+        os.environ["TERRAIN_BASE_SEED"] = str(int(terrain_base_seed))
+
+    numeric_env_pairs = (
+        ("terrain_complexity_level", "TERRAIN_COMPLEXITY_LEVEL", int),
+        ("map_size", "MAP_SIZE", float),
+        ("mountain_min_distance", "MOUNTAIN_MIN_DISTANCE", float),
+    )
+    for attr_name, env_name, caster in numeric_env_pairs:
+        try:
+            value = getattr(args, attr_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            os.environ[env_name] = str(caster(value))
+        except Exception:
+            continue
+
+
+def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
+    """将地形关键参数显式下发到scenario/world，确保重建环境时真正生效。"""
+    if scenario is None or args is None:
+        return
+
+    scalar_mappings = (
+        ('random_terrain', bool, 'random_terrain'),
+        ('per_episode_terrain', bool, 'per_episode_terrain'),
+        ('per_env_terrain', bool, 'per_env_terrain'),
+        ('semi_random_terrain', bool, 'use_semi_random_terrain'),
+        ('terrain_complexity_level', int, 'terrain_complexity_level'),
+        ('map_size', float, 'map_size'),
+    )
+    for arg_name, caster, scenario_attr in scalar_mappings:
+        try:
+            value = getattr(args, arg_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            setattr(scenario, scenario_attr, caster(value))
+        except Exception:
+            continue
+
+    try:
+        terrain_seed = getattr(args, 'terrain_seed', None)
+    except Exception:
+        terrain_seed = None
+    if terrain_seed is not None:
+        try:
+            terrain_seed_int = int(terrain_seed)
+            scenario.seed = terrain_seed_int
+            setattr(scenario, 'terrain_seed', terrain_seed_int)
+            setattr(scenario, 'current_terrain_seed', terrain_seed_int)
+            try:
+                scenario.rng = np.random.RandomState(terrain_seed_int)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    try:
+        terrain_base_seed = getattr(args, 'terrain_base_seed', None)
+    except Exception:
+        terrain_base_seed = None
+    if terrain_base_seed is not None:
+        try:
+            scenario.terrain_base_seed = int(terrain_base_seed)
+        except Exception:
+            pass
+    elif terrain_seed is not None:
+        try:
+            scenario.terrain_base_seed = int(terrain_seed)
+        except Exception:
+            pass
+
+    if world is None:
+        return
+    if terrain_seed is not None and hasattr(world, 'terrain_seed'):
+        try:
+            world.terrain_seed = int(terrain_seed)
+        except Exception:
+            pass
+    try:
+        map_size = getattr(args, 'map_size', None)
+    except Exception:
+        map_size = None
+    if map_size is not None and hasattr(world, 'map_size'):
+        try:
+            world.map_size = float(map_size)
+        except Exception:
+            pass
+
+
+def _apply_hidden_runtime_params_to_world(world, args, quiet_output=False):
+    """将训练期的隐藏运行时参数显式下发到world，避免只改日志不改仿真。"""
+    if world is None:
+        return
+    applied = []
+    mapping = (
+        ("simulation_dt", "dt"),
+        ("z_action_bias", "z_action_bias"),
+        ("quadrotor_attitude_response_time", "quadrotor_attitude_response_time"),
+        ("quadrotor_psi_cmd", "quadrotor_psi_cmd"),
+    )
+    for arg_name, world_attr in mapping:
+        try:
+            value = getattr(args, arg_name, None)
+        except Exception:
+            value = None
+        if value is None or not hasattr(world, world_attr):
+            continue
+        try:
+            setattr(world, world_attr, float(value))
+            applied.append((world_attr, float(value)))
+        except Exception:
+            continue
+    if applied and not quiet_output:
+        pretty = ", ".join(f"{name}={value}" for name, value in applied)
+        print(f"✅ 已同步隐藏运行时参数到world: {pretty}")
+
+
 def _normalize_vec3(vec):
     if vec is None:
         return None
@@ -123,6 +472,7 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
         "std_reward": _safe_std(all_rewards),
         "max_reward": _finite_float_or_none(np.max(all_rewards)) if len(all_rewards) > 0 else None,
         "min_reward": _finite_float_or_none(np.min(all_rewards)) if len(all_rewards) > 0 else None,
+        "success_episode_count": None,
         "team_success_rate": None,
         "agent_success_rates": [],
         "avg_steps": None,
@@ -138,11 +488,19 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
         "avg_arrival_time_success_only": None,
         "avg_first_reach_step": None,
         "avg_first_reach_time": None,
+        "avg_team_final_goal_distance": None,
+        "avg_agent_final_goal_distance": None,
+        "avg_team_min_goal_distance": None,
+        "avg_agent_min_goal_distance": None,
         "avg_team_total_path_length": None,
+        "avg_team_total_path_length_success_only": None,
         "std_team_total_path_length": None,
         "avg_agent_path_length": None,
+        "avg_agent_path_length_success_only": None,
         "avg_team_path_efficiency": None,
+        "avg_team_path_efficiency_success_only": None,
         "avg_agent_path_efficiency": None,
+        "avg_agent_path_efficiency_success_only": None,
         "avg_penetration_count": None,
         "penetration_episode_rate": None,
         "max_penetration_depth": None,
@@ -157,9 +515,13 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
     step_values = [ep.get("steps") for ep in all_episodes_data]
     collision_counts = [ep.get("collision_count", 0) for ep in all_episodes_data]
     team_path_lengths = [ep.get("path_length") for ep in all_episodes_data]
+    team_path_lengths_success = [ep.get("path_length") for ep in all_episodes_data if ep.get("success", 0)]
     team_path_efficiencies = [ep.get("path_efficiency") for ep in all_episodes_data]
+    team_path_efficiencies_success = [ep.get("path_efficiency") for ep in all_episodes_data if ep.get("success", 0)]
     first_reach_steps = [ep.get("first_reach_step") for ep in all_episodes_data]
     first_reach_times = [ep.get("first_reach_time") for ep in all_episodes_data]
+    team_final_goal_distances = [ep.get("final_goal_distance") for ep in all_episodes_data]
+    team_min_goal_distances = [ep.get("min_goal_distance") for ep in all_episodes_data]
     arrival_steps_success = [ep.get("arrival_step") for ep in all_episodes_data if ep.get("success", 0)]
     arrival_times_success = [ep.get("arrival_time") for ep in all_episodes_data if ep.get("success", 0)]
 
@@ -172,7 +534,11 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
 
     agent_success_lists = []
     agent_path_length_lists = []
+    agent_path_length_success_lists = []
     agent_path_efficiency_lists = []
+    agent_path_efficiency_success_lists = []
+    agent_final_goal_distance_lists = []
+    agent_min_goal_distance_lists = []
 
     for ep in all_episodes_data:
         min_distance = ep.get("min_distance")
@@ -223,21 +589,48 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
             for idx, value in enumerate(agent_path_lengths):
                 while len(agent_path_length_lists) <= idx:
                     agent_path_length_lists.append([])
+                while len(agent_path_length_success_lists) <= idx:
+                    agent_path_length_success_lists.append([])
                 numeric = _finite_float_or_none(value)
                 if numeric is not None:
                     agent_path_length_lists[idx].append(numeric)
+                    if ep.get("success", 0):
+                        agent_path_length_success_lists[idx].append(numeric)
 
         agent_path_efficiencies = ep.get("agent_path_efficiencies", [])
         if isinstance(agent_path_efficiencies, list):
             for idx, value in enumerate(agent_path_efficiencies):
                 while len(agent_path_efficiency_lists) <= idx:
                     agent_path_efficiency_lists.append([])
+                while len(agent_path_efficiency_success_lists) <= idx:
+                    agent_path_efficiency_success_lists.append([])
                 numeric = _finite_float_or_none(value)
                 if numeric is not None:
                     agent_path_efficiency_lists[idx].append(numeric)
+                    if ep.get("success", 0):
+                        agent_path_efficiency_success_lists[idx].append(numeric)
+
+        agent_final_goal_distances = ep.get("agent_final_goal_distances", [])
+        if isinstance(agent_final_goal_distances, list):
+            for idx, value in enumerate(agent_final_goal_distances):
+                while len(agent_final_goal_distance_lists) <= idx:
+                    agent_final_goal_distance_lists.append([])
+                numeric = _finite_float_or_none(value)
+                if numeric is not None:
+                    agent_final_goal_distance_lists[idx].append(numeric)
+
+        agent_min_goal_distances = ep.get("agent_min_goal_distances", [])
+        if isinstance(agent_min_goal_distances, list):
+            for idx, value in enumerate(agent_min_goal_distances):
+                while len(agent_min_goal_distance_lists) <= idx:
+                    agent_min_goal_distance_lists.append([])
+                numeric = _finite_float_or_none(value)
+                if numeric is not None:
+                    agent_min_goal_distance_lists[idx].append(numeric)
 
     summary.update(
         {
+            "success_episode_count": int(sum(success_flags)),
             "team_success_rate": _safe_mean(team_success_flags),
             "agent_success_rates": [_safe_mean(flags) for flags in agent_success_lists],
             "avg_steps": _safe_mean(step_values),
@@ -256,9 +649,13 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
             "avg_arrival_time_success_only": _safe_mean(arrival_times_success),
             "avg_first_reach_step": _safe_mean(first_reach_steps),
             "avg_first_reach_time": _safe_mean(first_reach_times),
+            "avg_team_final_goal_distance": _safe_mean(team_final_goal_distances),
+            "avg_team_min_goal_distance": _safe_mean(team_min_goal_distances),
             "avg_team_total_path_length": _safe_mean(team_path_lengths),
+            "avg_team_total_path_length_success_only": _safe_mean(team_path_lengths_success),
             "std_team_total_path_length": _safe_std(team_path_lengths),
             "avg_team_path_efficiency": _safe_mean(team_path_efficiencies),
+            "avg_team_path_efficiency_success_only": _safe_mean(team_path_efficiencies_success),
             "avg_penetration_count": _safe_mean(penetration_counts),
             "penetration_episode_rate": (
                 float(sum(1 for count in penetration_counts if count > 0) / len(penetration_counts))
@@ -272,9 +669,17 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
     )
 
     flattened_path_lengths = [value for values in agent_path_length_lists for value in values]
+    flattened_path_lengths_success = [value for values in agent_path_length_success_lists for value in values]
     flattened_path_efficiencies = [value for values in agent_path_efficiency_lists for value in values]
+    flattened_path_efficiencies_success = [value for values in agent_path_efficiency_success_lists for value in values]
+    flattened_final_goal_distances = [value for values in agent_final_goal_distance_lists for value in values]
+    flattened_min_goal_distances = [value for values in agent_min_goal_distance_lists for value in values]
     summary["avg_agent_path_length"] = _safe_mean(flattened_path_lengths)
+    summary["avg_agent_path_length_success_only"] = _safe_mean(flattened_path_lengths_success)
     summary["avg_agent_path_efficiency"] = _safe_mean(flattened_path_efficiencies)
+    summary["avg_agent_path_efficiency_success_only"] = _safe_mean(flattened_path_efficiencies_success)
+    summary["avg_agent_final_goal_distance"] = _safe_mean(flattened_final_goal_distances)
+    summary["avg_agent_min_goal_distance"] = _safe_mean(flattened_min_goal_distances)
 
     return summary
 
@@ -283,6 +688,10 @@ class ModelEvaluator:
     
     def __init__(self, args):
         self.args = args
+        self.training_alignment = _load_training_alignment_snapshot(getattr(args, 'load_model_path', None))
+        if self.training_alignment:
+            _apply_training_alignment_to_args(self.args, self.training_alignment)
+            _apply_runtime_env_overrides_from_args(self.args)
         self.setup_environment()
         self.setup_visualizer()
         
@@ -291,7 +700,26 @@ class ModelEvaluator:
         print("初始化评估环境...")
         
         # 配置GPU
-        configure_gpu()
+        gpu_configured = configure_gpu()
+        try:
+            physical_gpus = tf.config.list_physical_devices('GPU')
+        except Exception:
+            physical_gpus = []
+        try:
+            logical_gpus = tf.config.list_logical_devices('GPU')
+        except Exception:
+            logical_gpus = []
+        cuda_visible = os.getenv('CUDA_VISIBLE_DEVICES', '<unset>')
+        print(
+            "[Eval Device] "
+            f"python={sys.executable} | "
+            f"CUDA_VISIBLE_DEVICES={cuda_visible} | "
+            f"physical_gpus={len(physical_gpus)} | "
+            f"logical_gpus={len(logical_gpus)} | "
+            f"configure_gpu={'ok' if gpu_configured else 'fallback_cpu'}"
+        )
+        if not physical_gpus:
+            print("⚠️  TensorFlow 当前未检测到可用 GPU，评估会回退到 CPU。")
         
         # 根据场景名称选择场景，支持新的场景选择逻辑
         scenario_name = self.args.scenario_name
@@ -301,7 +729,10 @@ class ModelEvaluator:
         self.scenario = load_scenario_module(scenario_name, self.args)
         if self.scenario is None:
             raise RuntimeError(f"无法加载场景: {scenario_name}")
+        _apply_runtime_env_overrides_from_args(self.args)
+        _apply_terrain_runtime_params_to_scenario(self.scenario, None, self.args)
         self.world = self.scenario.make_world()
+        _apply_terrain_runtime_params_to_scenario(self.scenario, self.world, self.args)
         # 应用重力、控制增益与奖励缩放（仅在显式提供时覆盖）
         try:
             if hasattr(self.world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
@@ -314,6 +745,9 @@ class ModelEvaluator:
                 self.world.reward_pos_scale = float(self.args.reward_pos_scale)
             if hasattr(self.world, 'reward_neg_scale') and getattr(self.args, 'reward_neg_scale', None) is not None:
                 self.world.reward_neg_scale = float(self.args.reward_neg_scale)
+            if hasattr(self.world, 'damping') and getattr(self.args, 'damping', None) is not None:
+                self.world.damping = float(self.args.damping)
+                print(f"已设置评估环境阻尼: damping={self.world.damping}")
         except Exception as _e:
             print(f"评估环境设置物理/奖励缩放失败: {_e}")
 
@@ -327,6 +761,11 @@ class ModelEvaluator:
                         ag.accel = float(self.args.agent_accel)
         except Exception as _e:
             print(f"评估环境应用速度/加速度失败: {_e}")
+
+        try:
+            _apply_hidden_runtime_params_to_world(self.world, self.args, quiet_output=False)
+        except Exception as _e:
+            print(f"评估环境应用隐藏运行时参数失败: {_e}")
 
         # 将可能影响避障/检测的参数尽量下发到场景/世界（若存在对应属性）
         try:
@@ -354,6 +793,7 @@ class ModelEvaluator:
             self.scenario.reset_world,
             self.scenario.reward,
             self.scenario.observation,
+            done_callback=getattr(self.scenario, 'is_done', None),
             info_callback=None,
             shared_viewer=False
         )
@@ -472,7 +912,10 @@ class ModelEvaluator:
 
     def _rebuild_environment(self):
         """在场景被重新生成后重建world/env，并重新应用关键运行时参数。"""
+        _apply_runtime_env_overrides_from_args(self.args)
+        _apply_terrain_runtime_params_to_scenario(self.scenario, None, self.args)
         self.world = self.scenario.make_world()
+        _apply_terrain_runtime_params_to_scenario(self.scenario, self.world, self.args)
 
         try:
             if hasattr(self.world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
@@ -483,6 +926,17 @@ class ModelEvaluator:
                 self.world.reward_pos_scale = float(self.args.reward_pos_scale)
             if hasattr(self.world, 'reward_neg_scale') and getattr(self.args, 'reward_neg_scale', None) is not None:
                 self.world.reward_neg_scale = float(self.args.reward_neg_scale)
+            if hasattr(self.world, 'damping') and getattr(self.args, 'damping', None) is not None:
+                self.world.damping = float(self.args.damping)
+        except Exception:
+            pass
+
+        try:
+            quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            quiet_output = False
+        try:
+            _apply_hidden_runtime_params_to_world(self.world, self.args, quiet_output=quiet_output)
         except Exception:
             pass
 
@@ -602,6 +1056,10 @@ class ModelEvaluator:
 
     def _prepare_episode_terrain(self, episode_idx, terrain_seed_sequence=None):
         """为当前评估回合显式准备地形，确保每回合地形可控且不会被reset再次改写。"""
+        try:
+            quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            quiet_output = True
         use_random_terrain = bool(getattr(self.args, 'random_terrain', False)) or bool(terrain_seed_sequence)
         if not use_random_terrain:
             try:
@@ -612,10 +1070,12 @@ class ModelEvaluator:
 
         if terrain_seed_sequence and episode_idx < len(terrain_seed_sequence):
             terrain_seed = int(terrain_seed_sequence[episode_idx])
-            print(f"🔧 使用预定义地形种子: {terrain_seed} (回合 {episode_idx + 1})")
+            if not quiet_output:
+                print(f"🔧 使用预定义地形种子: {terrain_seed} (回合 {episode_idx + 1})")
         else:
             terrain_seed = int(np.random.randint(0, 1000000))
-            print(f"🎲 为回合 {episode_idx + 1} 生成新地形种子: {terrain_seed}")
+            if not quiet_output:
+                print(f"🎲 为回合 {episode_idx + 1} 生成新地形种子: {terrain_seed}")
 
         if hasattr(self.scenario, 'regenerate_terrain'):
             self.scenario.regenerate_terrain(new_seed=terrain_seed)
@@ -654,7 +1114,109 @@ class ModelEvaluator:
         """
         # 🔧 性能优化：使用tf.function装饰器加速（与训练代码一致）
         return self._select_actions_eval_tf(processed_obs, use_fr, use_pf)
-    
+
+    def _process_observations_for_eval(self, obs_n):
+        """评估侧优先复用训练主线的向量化观测预处理，避免逐智能体 Python 循环。"""
+        processor = getattr(getattr(self, 'maddpg', None), 'obs_processor', None)
+        if processor is None:
+            return np.asarray(obs_n, dtype=np.float32)
+
+        processed = None
+        try:
+            if hasattr(processor, 'batch_process_observations_vectorized'):
+                processed = processor.batch_process_observations_vectorized(obs_n)
+            elif hasattr(processor, 'batch_process_observations_parallel'):
+                processed = processor.batch_process_observations_parallel(obs_n)
+            else:
+                processed = processor.batch_process_observations(obs_n)
+        except Exception:
+            processed = processor.batch_process_observations(obs_n)
+
+        processed = np.asarray(processed, dtype=np.float32)
+        if processed.ndim == 3 and processed.shape[0] == 1:
+            processed = processed[0]
+        return processed
+
+    def _get_base_obs_dim(self):
+        """返回训练时的基础观测维度（PF 作为独立输入时不计入 obs）。"""
+        try:
+            if getattr(self, 'obs_shapes', None):
+                obs_dims = [int(dim) for dim in self.obs_shapes if dim is not None]
+                if obs_dims:
+                    return max(obs_dims)
+        except Exception:
+            pass
+        return 81
+
+    def _get_pf_feature_dim(self):
+        """返回 PF 特征维度，默认与训练配置保持 3 维。"""
+        try:
+            maddpg_args = getattr(getattr(self, 'maddpg', None), 'args', None)
+            if maddpg_args is not None:
+                pf_dim = int(getattr(maddpg_args, 'pf_feature_dim', 3))
+                if pf_dim > 0:
+                    return pf_dim
+        except Exception:
+            pass
+        try:
+            pf_dim = int(getattr(self.args, 'pf_feature_dim', 3))
+            if pf_dim > 0:
+                return pf_dim
+        except Exception:
+            pass
+        return 3
+
+    def _build_eval_actor_obs(self, processed_obs, use_pf, use_tf_potential_field, action_force_ratio):
+        """
+        生成评估时喂给 Actor 的输入底座：
+        - 基础观测始终保持训练时的 base obs 维度
+        - 若启用 PF 特征，则复用训练期的 base PF 特征定义并追加到 obs 尾部，
+          供 Actor 单独切片使用
+        """
+        processed_obs = np.asarray(processed_obs, dtype=np.float32)
+        if processed_obs.ndim != 2:
+            return processed_obs
+
+        base_obs_dim = self._get_base_obs_dim()
+        base_obs = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
+
+        if not use_pf:
+            return base_obs
+
+        pf_feature_dim = self._get_pf_feature_dim()
+        pf_features = np.zeros((base_obs.shape[0], pf_feature_dim), dtype=np.float32)
+
+        if use_tf_potential_field and action_force_ratio > 0.0:
+            try:
+                pf_forces = None
+
+                # 与训练主线 batch_select_actions_vectorized 保持一致：
+                # pf_input 应来自当前状态的 base PF 特征，而不是临时拼接出的其他语义。
+                if hasattr(self.maddpg, 'compute_base_pf_forces_batch_numpy'):
+                    pf_force_batch = self.maddpg.compute_base_pf_forces_batch_numpy(
+                        np.expand_dims(base_obs, axis=0),
+                        float(action_force_ratio),
+                    )
+                    if isinstance(pf_force_batch, np.ndarray) and pf_force_batch.ndim == 3 and pf_force_batch.shape[0] == 1:
+                        pf_forces = np.asarray(pf_force_batch[0], dtype=np.float32)
+
+                # 兼容旧模型/旧实现：若缺少统一 helper，则回退到 dummy_action 路径。
+                if pf_forces is None:
+                    dummy_actions_tf = tf.zeros((base_obs.shape[0], 7), dtype=tf.float32)
+                    base_obs_tf = tf.convert_to_tensor(base_obs, dtype=tf.float32)
+                    _, pf_forces_tf = self.maddpg._apply_potential_field_correction(
+                        dummy_actions_tf, base_obs_tf, action_force_ratio
+                    )
+                    pf_forces = np.asarray(pf_forces_tf.numpy(), dtype=np.float32)
+
+                if pf_forces.ndim == 2 and pf_forces.shape[0] == base_obs.shape[0]:
+                    copy_dim = min(pf_feature_dim, pf_forces.shape[1])
+                    pf_features[:, :copy_dim] = pf_forces[:, :copy_dim]
+            except Exception:
+                pass
+
+        return np.concatenate([base_obs, pf_features], axis=1)
+
     @tf.function(reduce_retracing=True)
     def _select_actions_eval_tf(self, processed_obs, use_fr, use_pf):
         """
@@ -686,8 +1248,8 @@ class ModelEvaluator:
         batch_size = tf.shape(processed_obs)[0]
         actions_list = []
         
-        # 🔧 获取PF特征维度（从训练配置或网络结构推断）
-        pf_feature_dim = 3  # 固定为3（PF力是3维向量）
+        # 🔧 获取PF特征维度（与训练配置保持一致）
+        pf_feature_dim = self._get_pf_feature_dim()
         
         # 🔧 关键修复：计算真实的FR值（action_force_ratio），而不是使用零向量
         # 训练时FR值会随时间变化（schedule），评估时应该使用固定的FR值
@@ -710,13 +1272,14 @@ class ModelEvaluator:
                 fr_input = tf.fill([batch_size, 1], fr_value)  # (batch_size, 1)
                 actor_inputs.append(fr_input)
             if use_pf:
-                # 🔧 关键修复：计算真实的PF特征（从势场力中提取）
-                # 注意：这里我们需要先计算势场力，然后提取PF特征
-                # 为了简化，我们先使用零向量，但应该从实际的势场力计算中提取
-                # TODO: 从实际的势场力计算中提取PF特征
-                # 临时方案：使用零向量（与训练时PF特征的计算方式一致）
-                pf_placeholder = tf.zeros([batch_size, pf_feature_dim], dtype=tf.float32)
-                actor_inputs.append(pf_placeholder)
+                # 评估侧的 processed_obs 已由 _build_eval_actor_obs 追加真实 PF 特征。
+                # 若上游未追加完整维度，则在这里补零而不是错误地改变 obs 结构。
+                pf_input = processed_obs[:, i, obs_dim:obs_dim + pf_feature_dim]
+                pf_dim = tf.shape(pf_input)[1]
+                pad_dim = tf.maximum(0, pf_feature_dim - pf_dim)
+                pf_input = tf.pad(pf_input, [[0, 0], [0, pad_dim]])
+                pf_input = pf_input[:, :pf_feature_dim]
+                actor_inputs.append(pf_input)
             
             # 调用actor
             if len(actor_inputs) == 1:
@@ -760,8 +1323,10 @@ class ModelEvaluator:
         training_use_fr = None
         training_use_pf = None
         training_pf_feature_dim = None
-        best_episode_force_ratio = None  # 🔧 关键：只读取最佳回合的FR值，不进行任何回退
-        best_episode_num = None  # 🔧 新增：保存最佳回合编号
+        selected_force_ratio = None
+        selected_force_ratio_label = None
+        selected_force_ratio_episode = None
+        episode_force_ratios = None
         training_action_range_x = None
         training_action_range_y = None
         training_action_range_z = None
@@ -774,9 +1339,16 @@ class ModelEvaluator:
         training_maddpg_use_separated_gradient = None
         training_gravity = None  # 🔧 新增：读取训练时的gravity
         training_damping = None  # 🔧 新增：读取训练时的damping
+        training_reward_pos_scale = None
+        training_reward_neg_scale = None
         training_agent_max_speed = None  # 🔧 新增：读取训练时的agent_max_speed
         training_agent_accel = None  # 🔧 新增：读取训练时的agent_accel
         training_control_accel_gain = None  # 🔧 新增：读取训练时的control_accel_gain
+        training_simulation_dt = None
+        training_z_action_bias = None
+        training_quadrotor_attitude_response_time = None
+        training_quadrotor_psi_cmd = None
+        training_use_quadrotor_dynamics = None
         for log_dir in potential_log_dirs:
             # 查找results.json（可能在子目录中）
             results_files = []
@@ -791,23 +1363,69 @@ class ModelEvaluator:
                     with open(results_file, 'r', encoding='utf-8') as f:
                         results = json.load(f)
                     
-                    # 🔧 关键修复：优先从顶层读取最佳回合的FR值（无论是否有args，都应该先检查顶层）
-                    # best_episode_force_ratio 保存在 results.json 的顶层，与 best_episode 同级
+                    if isinstance(results.get('episode_force_ratios'), list):
+                        try:
+                            episode_force_ratios = [float(v) for v in results['episode_force_ratios']]
+                        except Exception:
+                            episode_force_ratios = None
+
+                    # 关键：FR 必须与实际评估的权重变体一致。
+                    # - final -> 最后回合 FR
+                    # - best_by_team_sr -> Team SR 最佳回合 FR
+                    # - best_by_strict_success -> 严格成功最佳回合 FR
+                    # - best -> reward 最佳回合 FR
+                    # - epXXX/latest_ep -> 对应回合 FR（找不到则回退到最后回合 FR）
                     if model_leaf_dir == 'best_by_team_sr' and 'best_team_sr_force_ratio' in results:
-                        best_episode_force_ratio = float(results['best_team_sr_force_ratio'])
+                        selected_force_ratio = float(results['best_team_sr_force_ratio'])
                         if 'best_team_sr_episode' in results:
-                            best_episode_num = int(results['best_team_sr_episode']) + 1
-                        print(f"✅ 从训练配置读取 Team SR 最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
+                            selected_force_ratio_episode = int(results['best_team_sr_episode']) + 1
+                        selected_force_ratio_label = 'Team SR 最佳回合'
+                        print(
+                            f"✅ 从训练配置读取 Team SR 最佳回合的FR值: "
+                            f"{selected_force_ratio} (回合 {selected_force_ratio_episode if selected_force_ratio_episode is not None else '?'})"
+                        )
                     elif model_leaf_dir == 'best_by_strict_success' and 'best_strict_episode_force_ratio' in results:
-                        best_episode_force_ratio = float(results['best_strict_episode_force_ratio'])
+                        selected_force_ratio = float(results['best_strict_episode_force_ratio'])
                         if 'best_strict_episode' in results:
-                            best_episode_num = int(results['best_strict_episode']) + 1
-                        print(f"✅ 从训练配置读取严格最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
-                    elif 'best_episode_force_ratio' in results:
-                        best_episode_force_ratio = float(results['best_episode_force_ratio'])
+                            selected_force_ratio_episode = int(results['best_strict_episode']) + 1
+                        selected_force_ratio_label = '严格评估最佳回合'
+                        print(
+                            f"✅ 从训练配置读取严格最佳回合的FR值: "
+                            f"{selected_force_ratio} (回合 {selected_force_ratio_episode if selected_force_ratio_episode is not None else '?'})"
+                        )
+                    elif model_leaf_dir == 'final':
+                        if 'last_episode_force_ratio' in results:
+                            selected_force_ratio = float(results['last_episode_force_ratio'])
+                        elif 'args' in results and isinstance(results['args'], dict) and 'action_force_ratio' in results['args']:
+                            selected_force_ratio = float(results['args']['action_force_ratio'])
+                        elif 'action_force_ratio' in results:
+                            selected_force_ratio = float(results['action_force_ratio'])
+                        selected_force_ratio_label = '最终回合'
+                        print(f"✅ 从训练配置读取最终回合的FR值: {selected_force_ratio}")
+                    elif model_leaf_dir == 'best' and 'best_episode_force_ratio' in results:
+                        selected_force_ratio = float(results['best_episode_force_ratio'])
                         if 'best_episode' in results:
-                            best_episode_num = int(results['best_episode']) + 1
-                        print(f"✅ 从训练配置读取最佳回合的FR值: {best_episode_force_ratio} (回合 {best_episode_num if best_episode_num is not None else '?'})")
+                            selected_force_ratio_episode = int(results['best_episode']) + 1
+                        selected_force_ratio_label = '奖励最佳回合'
+                        print(
+                            f"✅ 从训练配置读取奖励最佳回合的FR值: "
+                            f"{selected_force_ratio} (回合 {selected_force_ratio_episode if selected_force_ratio_episode is not None else '?'})"
+                        )
+                    elif model_leaf_dir.startswith('ep'):
+                        ep_idx = None
+                        try:
+                            ep_idx = max(int(''.join(ch for ch in model_leaf_dir if ch.isdigit())) - 1, 0)
+                        except Exception:
+                            ep_idx = None
+                        if ep_idx is not None and episode_force_ratios is not None and ep_idx < len(episode_force_ratios):
+                            selected_force_ratio = float(episode_force_ratios[ep_idx])
+                            selected_force_ratio_episode = ep_idx + 1
+                            selected_force_ratio_label = '指定回合'
+                            print(f"✅ 从训练配置读取第 {selected_force_ratio_episode} 回合的FR值: {selected_force_ratio}")
+                        elif 'last_episode_force_ratio' in results:
+                            selected_force_ratio = float(results['last_episode_force_ratio'])
+                            selected_force_ratio_label = '最终回合(回退)'
+                            print(f"⚠️  未找到 {model_leaf_dir} 对应FR，回退到最终回合FR: {selected_force_ratio}")
                     
                     # 读取训练时的特征标志
                     if 'args' in results and isinstance(results['args'], dict):
@@ -849,6 +1467,12 @@ class ModelEvaluator:
                         if 'damping' in results['args']:
                             val = results['args']['damping']
                             training_damping = float(val) if val is not None else None
+                        if 'reward_pos_scale' in results['args']:
+                            val = results['args']['reward_pos_scale']
+                            training_reward_pos_scale = float(val) if val is not None else None
+                        if 'reward_neg_scale' in results['args']:
+                            val = results['args']['reward_neg_scale']
+                            training_reward_neg_scale = float(val) if val is not None else None
                         if 'agent_max_speed' in results['args']:
                             val = results['args']['agent_max_speed']
                             training_agent_max_speed = float(val) if val is not None else None
@@ -858,6 +1482,21 @@ class ModelEvaluator:
                         if 'control_accel_gain' in results['args']:
                             val = results['args']['control_accel_gain']
                             training_control_accel_gain = float(val) if val is not None else None
+                        if 'simulation_dt' in results['args']:
+                            val = results['args']['simulation_dt']
+                            training_simulation_dt = float(val) if val is not None else None
+                        if 'z_action_bias' in results['args']:
+                            val = results['args']['z_action_bias']
+                            training_z_action_bias = float(val) if val is not None else None
+                        if 'quadrotor_attitude_response_time' in results['args']:
+                            val = results['args']['quadrotor_attitude_response_time']
+                            training_quadrotor_attitude_response_time = float(val) if val is not None else None
+                        if 'quadrotor_psi_cmd' in results['args']:
+                            val = results['args']['quadrotor_psi_cmd']
+                            training_quadrotor_psi_cmd = float(val) if val is not None else None
+                        if 'use_quadrotor_dynamics' in results['args']:
+                            val = results['args']['use_quadrotor_dynamics']
+                            training_use_quadrotor_dynamics = bool(val) if val is not None else None
                     else:
                         # 从顶层读取（向后兼容）
                         if 'use_fr_feature' in results:
@@ -893,6 +1532,12 @@ class ModelEvaluator:
                         if 'damping' in results:
                             val = results['damping']
                             training_damping = float(val) if val is not None else None
+                        if 'reward_pos_scale' in results:
+                            val = results['reward_pos_scale']
+                            training_reward_pos_scale = float(val) if val is not None else None
+                        if 'reward_neg_scale' in results:
+                            val = results['reward_neg_scale']
+                            training_reward_neg_scale = float(val) if val is not None else None
                         if 'agent_max_speed' in results:
                             val = results['agent_max_speed']
                             training_agent_max_speed = float(val) if val is not None else None
@@ -902,6 +1547,21 @@ class ModelEvaluator:
                         if 'control_accel_gain' in results:
                             val = results['control_accel_gain']
                             training_control_accel_gain = float(val) if val is not None else None
+                        if 'simulation_dt' in results:
+                            val = results['simulation_dt']
+                            training_simulation_dt = float(val) if val is not None else None
+                        if 'z_action_bias' in results:
+                            val = results['z_action_bias']
+                            training_z_action_bias = float(val) if val is not None else None
+                        if 'quadrotor_attitude_response_time' in results:
+                            val = results['quadrotor_attitude_response_time']
+                            training_quadrotor_attitude_response_time = float(val) if val is not None else None
+                        if 'quadrotor_psi_cmd' in results:
+                            val = results['quadrotor_psi_cmd']
+                            training_quadrotor_psi_cmd = float(val) if val is not None else None
+                        if 'use_quadrotor_dynamics' in results:
+                            val = results['use_quadrotor_dynamics']
+                            training_use_quadrotor_dynamics = bool(val) if val is not None else None
                     
                     if training_use_fr is not None and training_use_pf is not None:
                         print(f"✅ 从训练配置读取特征标志: use_fr_feature={training_use_fr}, use_pf_feature={training_use_pf}")
@@ -921,30 +1581,24 @@ class ModelEvaluator:
         use_fr_feature = training_use_fr if training_use_fr is not None else int(os.getenv('USE_FR_FEATURE', getattr(self.args, 'use_fr_feature', 1))) > 0
         use_pf_feature = training_use_pf if training_use_pf is not None else int(os.getenv('USE_PF_FEATURE', getattr(self.args, 'use_pf_feature', 1))) > 0
         
-        # 🔧 关键修复：只使用最佳回合的FR值，不进行任何回退
-        # 测试时应该使用对应训练留下的最佳回合的FR值，而不是使用默认值（即使能运行也毫无意义）
-        if best_episode_force_ratio is not None:
-            # 使用最佳回合的FR值
-            eval_action_force_ratio = best_episode_force_ratio
-            if model_leaf_dir == 'best_by_team_sr':
-                label = "Team SR 最佳回合"
-            elif model_leaf_dir == 'best_by_strict_success':
-                label = "严格评估最佳回合"
-            else:
-                label = "最佳回合"
-            ep_str = f"回合 {best_episode_num}" if best_episode_num is not None else label
+        if selected_force_ratio is not None:
+            eval_action_force_ratio = selected_force_ratio
+            label = selected_force_ratio_label or "对应回合"
+            ep_str = (
+                f"回合 {selected_force_ratio_episode}"
+                if selected_force_ratio_episode is not None
+                else label
+            )
             print(f"✅ 使用{label}的ACTION_FORCE_RATIO: {eval_action_force_ratio} ({ep_str})")
         else:
-            # 🚨 关键修复：如果找不到最佳回合的FR值，报错并退出
-            # 因为测试应该使用对应训练留下的最佳回合的FR值，使用默认值即使能运行也毫无意义
             error_msg = (
                 "❌ 错误：无法找到与当前模型目录对应的FR值\n"
-                "   测试时必须使用训练时记录下来的对应回合FR值，而不是使用默认值\n"
-                "   请检查训练配置文件 (results.json) 是否包含 best_episode_force_ratio、best_team_sr_force_ratio 或 best_strict_episode_force_ratio 字段\n"
+                "   测试时必须使用与当前模型变体一致的FR值，而不是使用默认值\n"
+                "   final 应读取 last_episode_force_ratio；best_by_team_sr 应读取 best_team_sr_force_ratio；best 应读取 best_episode_force_ratio\n"
                 "   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
             )
             print(error_msg)
-            raise ValueError("无法找到对应模型的FR值，评估无法继续。请确保训练配置文件包含正确的 FR 字段。")
+            raise ValueError("无法找到与当前模型变体一致的FR值，评估无法继续。请确保训练配置文件包含正确的 FR 字段。")
         
         # 更新args中的action_force_ratio，确保后续使用
         self.args.action_force_ratio = eval_action_force_ratio
@@ -1041,6 +1695,13 @@ class ModelEvaluator:
         else:
             self.args.control_accel_gain = training_control_accel_gain
             print(f"✅ 使用训练时的CONTROL_ACCEL_GAIN: {training_control_accel_gain}")
+
+        if training_reward_pos_scale is not None:
+            self.args.reward_pos_scale = training_reward_pos_scale
+            print(f"✅ 使用训练时的REWARD_POS_SCALE: {training_reward_pos_scale}")
+        if training_reward_neg_scale is not None:
+            self.args.reward_neg_scale = training_reward_neg_scale
+            print(f"✅ 使用训练时的REWARD_NEG_SCALE: {training_reward_neg_scale}")
         
         # 🚨 如果缺少任何必需的物理参数，报错并退出
         if missing_params:
@@ -1052,7 +1713,27 @@ class ModelEvaluator:
             )
             print(error_msg)
             raise ValueError(f"无法找到训练配置中的物理参数: {', '.join(missing_params)}，评估无法继续。")
-        
+
+        hidden_runtime_params = (
+            ("simulation_dt", training_simulation_dt, "SIMULATION_DT"),
+            ("z_action_bias", training_z_action_bias, "Z_ACTION_BIAS"),
+            ("quadrotor_attitude_response_time", training_quadrotor_attitude_response_time, "QUADROTOR_ATTITUDE_RESPONSE_TIME"),
+            ("quadrotor_psi_cmd", training_quadrotor_psi_cmd, "QUADROTOR_PSI_CMD"),
+        )
+        for attr_name, value, label in hidden_runtime_params:
+            if value is None:
+                continue
+            setattr(self.args, attr_name, value)
+            print(f"✅ 使用训练时的{label}: {value}")
+        if training_use_quadrotor_dynamics is not None:
+            self.args.use_quadrotor_dynamics = bool(training_use_quadrotor_dynamics)
+            print(f"✅ 使用训练时的USE_QUADROTOR_DYNAMICS: {self.args.use_quadrotor_dynamics}")
+        if self.training_alignment:
+            _apply_training_alignment_to_args(self.args, self.training_alignment, quiet=True)
+        _apply_runtime_env_overrides_from_args(self.args)
+        self._rebuild_environment()
+        print("✅ 已按训练配置重建评估环境")
+
         if training_use_fr is not None or training_use_pf is not None:
             print(f"✅ 使用特征标志: use_fr_feature={use_fr_feature}, use_pf_feature={use_pf_feature}")
         else:
@@ -1126,6 +1807,7 @@ class ModelEvaluator:
             self.scenario.reset_world,
             self.scenario.reward,
             self.scenario.observation,
+            done_callback=getattr(self.scenario, 'is_done', None),
             info_callback=None,
             shared_viewer=False
         )
@@ -1498,21 +2180,26 @@ class ModelEvaluator:
         
     def evaluate_single_episode(self, episode_idx):
         """评估单个回合，仿照1.0版本的逻辑"""
-        print(f"\n🚀 开始评估回合 {episode_idx + 1}")
+        try:
+            quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            quiet_output = True
+        if not quiet_output:
+            print(f"\n🚀 开始评估回合 {episode_idx + 1}")
         
         # 🔧 关键修复：在reset前记录固定位置信息，确保所有评估模式使用相同的起点
         if hasattr(self.scenario, 'use_fixed_positions') and self.scenario.use_fixed_positions:
             if hasattr(self.scenario, 'fixed_positions') and self.scenario.fixed_positions:
                 agents_pos = self.scenario.fixed_positions.get('agents', [])
                 goal_pos = self.scenario.fixed_positions.get('goal', None)
-                if episode_idx == 0:  # 只在第一个回合打印
+                if episode_idx == 0 and not quiet_output:  # 只在第一个回合打印
                     print(f"🔧 固定位置验证: 使用固定位置，{len(agents_pos)}个智能体")
                     if len(agents_pos) > 0:
                         print(f"   智能体0起点: [{agents_pos[0][0]:.2f}, {agents_pos[0][1]:.2f}, {agents_pos[0][2]:.2f}]")
                     if goal_pos:
                         print(f"   目标位置: [{goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f}]")
             else:
-                if episode_idx == 0:
+                if episode_idx == 0 and not quiet_output:
                     print(f"⚠️  警告: use_fixed_positions=True但fixed_positions为None，可能未正确加载位置文件")
         
         # 环境重置
@@ -1523,7 +2210,7 @@ class ModelEvaluator:
             obs_n = reset_result
         
         # 🔧 关键修复：在reset后验证实际起点位置，确保所有评估模式使用相同的起点
-        if episode_idx == 0:  # 只在第一个回合打印
+        if episode_idx == 0 and not quiet_output:  # 只在第一个回合打印
             actual_start_positions = []
             for i, agent in enumerate(self.world.agents):
                 actual_start_positions.append(agent.state.p_pos.copy())
@@ -1536,6 +2223,9 @@ class ModelEvaluator:
         agent_path_lengths = [0.0 for _ in initial_positions]
         direct_goal_distances = [
             _distance_3d(pos, goal) for pos, goal in zip(initial_positions, agent_goal_positions)
+        ]
+        agent_min_goal_distances = [
+            float(dist) if dist is not None else None for dist in direct_goal_distances
         ]
         try:
             success_threshold = float(getattr(self.args, 'success_distance_threshold', 4.0))
@@ -1563,40 +2253,44 @@ class ModelEvaluator:
             light_mode = os.getenv("EVAL_LIGHT_MODE", "0").lower() in ("1", "true", "yes", "on")
         except Exception:
             light_mode = False
-        # 🔧 修复：默认记录轨迹和动作历史（用于生成交互图）
-        # 评估时默认需要记录轨迹，因为交互图生成需要轨迹数据
-        # 可以通过EVAL_LIGHT_MODE=1禁用（如果不需要可视化）
-        record_trajectory = not light_mode  # 默认记录轨迹（用于可视化）
-        record_actions = not light_mode  # 默认记录动作历史（用于可视化）
+        save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
+        save_interactive_traj = _env_flag("SAVE_INTERACTIVE_TRAJ", True)
+        save_all_episode_visualizations = _env_flag("SAVE_EVAL_ALL_EPISODES", False)
+        save_best_traj = _env_flag("SAVE_BEST_TRAJ", True)
+        save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", False)
+        save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
+        save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", False)
+        trajectory_sample_interval = _env_int("EVAL_TRAJECTORY_SAMPLE_INTERVAL", 1)
+        need_trajectory_artifacts = (
+            not getattr(self.args, 'disable_visualization', False)
+            and (
+                save_all_episode_visualizations
+                or save_best_traj
+                or save_trajectory_png
+                or save_interactive_traj
+                or save_team_success_html
+                or (not getattr(self.args, 'disable_gif', False))
+            )
+        )
+        # 轻量模式下允许通过稀疏采样保留评估轨迹；若本轮不生成任何轨迹类产物，则完全跳过轨迹缓存。
+        record_trajectory = bool(need_trajectory_artifacts)
+        # 动作历史只服务于时序图/控制诊断；默认不再在纯HTML评估里额外记录。
+        record_actions = save_actor_sequence or save_control_diagnostics
         episode_trajectory = []
         episode_actions_history = []  # 🔧 新增：记录动作历史（用于生成动作时序图）
+        episode_executed_actions_history = []  # 记录实际送入环境的动作（含PF修正）
+        episode_velocity_history = []  # 记录每步速度向量，判断是否“推不起来”
+        episode_goal_distance_history = []  # 记录每步到目标距离，判断是否持续推进
         step_count = 0
+
+        # 与产物需求对齐：若本轮不生成任何轨迹类文件，则连环境内部轨迹也一起关闭。
+        try:
+            self.env._disable_trajectory_recording = not bool(need_trajectory_artifacts)
+        except Exception:
+            pass
         
         # 处理观察数据
-        processed_obs = self.maddpg.obs_processor.batch_process_observations(obs_n)
-        
-        # 🔧 关键修复：如果启用PF特征，计算真实的PF力而不是使用零向量占位符
-        # 🔧 修复：使用训练配置的特征标志，确保与训练时一致
-        use_pf = getattr(self.maddpg.args, 'use_pf_feature', False) if hasattr(self, 'maddpg') and hasattr(self.maddpg, 'args') else getattr(self.args, 'use_pf_feature', False)
-        use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
-        action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
-        
-        if use_pf and use_tf_potential_field and action_force_ratio > 0.0 and len(processed_obs.shape) == 2:
-            # 🔧 关键修复：计算真实的PF力（与训练时一致）- 批量化以提升速度
-            n_agents_eval = processed_obs.shape[0]
-            dummy_actions_tf = tf.zeros((n_agents_eval, 7), dtype=tf.float32)  # (n_agents, action_dim)
-            base_obs_tf = tf.convert_to_tensor(processed_obs, dtype=tf.float32)  # (n_agents, obs_dim)
-            _, pf_forces_tf = self.maddpg._apply_potential_field_correction(
-                dummy_actions_tf, base_obs_tf, action_force_ratio
-            )
-            pf_forces = pf_forces_tf.numpy()
-            # 将PF力追加到观测中
-            processed_obs = np.concatenate([processed_obs, pf_forces], axis=1)
-        elif use_pf and len(processed_obs.shape) == 2:
-            # 如果启用PF特征但不满足计算条件，使用零向量占位符
-            n_agents_eval = processed_obs.shape[0]
-            pf_placeholder = np.zeros((n_agents_eval, 3), dtype=np.float32)
-            processed_obs = np.concatenate([processed_obs, pf_placeholder], axis=1)
+        processed_obs = self._process_observations_for_eval(obs_n)
         
         # 记录开始时间
         start_time = time.time()
@@ -1605,7 +2299,8 @@ class ModelEvaluator:
         episode_length = getattr(self.args, 'episode_length', 2200)
         if episode_length <= 0:
             episode_length = 2200
-            print(f"⚠️  警告: episode_length无效，使用默认值: {episode_length}")
+            if not quiet_output:
+                print(f"⚠️  警告: episode_length无效，使用默认值: {episode_length}")
         
         # 🔧 新增：打印关键评估参数，便于调试
         action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
@@ -1616,18 +2311,19 @@ class ModelEvaluator:
         action_range_y = getattr(self.args, 'action_range_y', None)
         action_range_z = getattr(self.args, 'action_range_z', None)
         
-        print(f"📊 评估配置:")
-        print(f"   - episode_length={episode_length}")
-        print(f"   - disable_early_termination={getattr(self.args, 'disable_early_termination', False)}")
-        print(f"   - ACTION_FORCE_RATIO={action_force_ratio} {'⚠️ 为0，势场修正将不生效！' if action_force_ratio == 0.0 else ''}")
-        print(f"   - USE_TF_POTENTIAL_FIELD={use_tf_potential_field}")
-        print(f"   - use_fr_feature={use_fr_feature}")
-        print(f"   - use_pf_feature={use_pf_feature}")
-        print(f"   - action_range: X={action_range_x}, Y={action_range_y}, Z={action_range_z}")
-        if use_tf_potential_field and action_force_ratio > 0.0:
-            print(f"   ✅ 势场修正将生效 (FR={action_force_ratio})")
-        else:
-            print(f"   ⚠️  势场修正将不生效 (use_tf_potential_field={use_tf_potential_field}, FR={action_force_ratio})")
+        if not quiet_output:
+            print(f"📊 评估配置:")
+            print(f"   - episode_length={episode_length}")
+            print(f"   - disable_early_termination={getattr(self.args, 'disable_early_termination', False)}")
+            print(f"   - ACTION_FORCE_RATIO={action_force_ratio} {'⚠️ 为0，势场修正将不生效！' if action_force_ratio == 0.0 else ''}")
+            print(f"   - USE_TF_POTENTIAL_FIELD={use_tf_potential_field}")
+            print(f"   - use_fr_feature={use_fr_feature}")
+            print(f"   - use_pf_feature={use_pf_feature}")
+            print(f"   - action_range: X={action_range_x}, Y={action_range_y}, Z={action_range_z}")
+            if use_tf_potential_field and action_force_ratio > 0.0:
+                print(f"   ✅ 势场修正将生效 (FR={action_force_ratio})")
+            else:
+                print(f"   ⚠️  势场修正将不生效 (use_tf_potential_field={use_tf_potential_field}, FR={action_force_ratio})")
         
         # 🔧 新增：添加进度条显示评估进度
         # 🔧 修复：确保进度条正确显示，设置合适的更新频率
@@ -1666,9 +2362,6 @@ class ModelEvaluator:
                    position=0)  # 🔧 修复：设置position=0，确保所有进度条在同一行显示
         
         for step in pbar:
-            # 🔧 关键修复：如果启用PF特征，计算真实的PF力而不是使用零向量占位符
-            # 与训练时保持一致：先计算PF力，然后作为特征传递给Actor
-            use_pf = getattr(self.args, 'use_pf_feature', False)
             use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
             action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
             
@@ -1681,47 +2374,18 @@ class ModelEvaluator:
                 })
                 # 🔧 性能优化：移除pbar.refresh()，让tqdm自动管理刷新频率
             
-            if use_pf and use_tf_potential_field and action_force_ratio > 0.0:
-                # 🔧 关键修复：计算真实的PF力（与训练时一致）
-                # 使用dummy_actions来计算PF力，就像训练时那样
-                if len(processed_obs.shape) == 2:  # (n_agents, obs_dim)
-                    n_agents_eval = processed_obs.shape[0]
-                    # 获取基础观测维度（去除PF特征后的维度）
-                    base_obs_dim = processed_obs.shape[1]
-                    if base_obs_dim > 78:  # 如果已经包含PF特征，先去除
-                        base_obs_dim = 78
-                    
-                    # 提取基础观测（去除可能存在的PF特征）
-                    base_obs = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
-                    
-                    # 🔧 性能优化：批量计算PF力，直接使用批量势场修正
-                    base_obs_tf = tf.convert_to_tensor(base_obs, dtype=tf.float32)  # (n_agents, obs_dim)
-                    dummy_actions_tf = tf.zeros((n_agents_eval, 7), dtype=tf.float32)  # (n_agents, action_dim)
-                    _, pf_forces_tf = self.maddpg._apply_potential_field_correction(
-                        dummy_actions_tf, base_obs_tf, action_force_ratio
-                    )
-                    pf_forces = pf_forces_tf.numpy()  # 一次性转换
-                    
-                    # 将PF力追加到观测中
-                    processed_obs = np.concatenate([base_obs, pf_forces], axis=1)
-                else:
-                    # 如果形状不对，使用零向量作为后备
-                    n_agents_eval = processed_obs.shape[0] if len(processed_obs.shape) >= 2 else 1
-                    pf_placeholder = np.zeros((n_agents_eval, 3), dtype=np.float32)
-                    processed_obs = np.concatenate([processed_obs, pf_placeholder], axis=1)
-            elif use_pf:
-                # 如果启用PF特征但不满足计算条件，使用零向量占位符
-                if len(processed_obs.shape) == 2:  # (n_agents, obs_dim)
-                    n_agents_eval = processed_obs.shape[0]
-                    pf_placeholder = np.zeros((n_agents_eval, 3), dtype=np.float32)
-                    processed_obs = np.concatenate([processed_obs, pf_placeholder], axis=1)
-            
             # 选择动作（评估时不加噪声）
             # 🔧 关键修复：使用训练配置的特征标志，而不是命令行参数
             # 确保与训练时的网络输入结构完全一致
             use_fr = getattr(self.maddpg.args, 'use_fr_feature', False)
             use_pf = getattr(self.maddpg.args, 'use_pf_feature', False)
-            raw_actions_tf = self.select_actions_eval(processed_obs, use_fr=use_fr, use_pf=use_pf)
+            policy_obs = self._build_eval_actor_obs(
+                processed_obs,
+                use_pf=use_pf,
+                use_tf_potential_field=use_tf_potential_field,
+                action_force_ratio=action_force_ratio,
+            )
+            raw_actions_tf = self.select_actions_eval(policy_obs, use_fr=use_fr, use_pf=use_pf)
             # 🔧 性能优化：延迟numpy转换，尽量在tensor空间内操作
             raw_actions = raw_actions_tf.numpy() if isinstance(raw_actions_tf, tf.Tensor) else raw_actions_tf
             
@@ -1744,11 +2408,8 @@ class ModelEvaluator:
                 else:
                     raw_actions_tf_for_correction = tf.convert_to_tensor(raw_actions, dtype=tf.float32)  # (n_agents, action_dim)
                 
-                # 🔧 性能优化：如果processed_obs已经包含PF特征，直接使用；否则需要提取基础观测
-                # 注意：processed_obs此时是numpy数组（从obs_processor返回），需要转换为tensor
-                base_obs_dim = processed_obs.shape[1]
-                if base_obs_dim > 78:  # 如果已经包含PF特征，去除PF特征部分
-                    base_obs_dim = 78
+                # 势场修正始终基于基础观测进行，避免把 PF 特征误当作环境观测再次输入。
+                base_obs_dim = self._get_base_obs_dim()
                 base_obs_for_correction = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
                 processed_obs_tf = tf.convert_to_tensor(base_obs_for_correction, dtype=tf.float32)  # (n_agents, obs_dim)
                     
@@ -1773,10 +2434,17 @@ class ModelEvaluator:
                     actions = raw_actions_tf.numpy()
                 else:
                     actions = raw_actions
+
+            if record_actions:
+                try:
+                    if save_control_diagnostics:
+                        episode_executed_actions_history.append([action.copy() for action in actions])
+                except Exception:
+                    pass
             
             # 🔧 性能优化：记录轨迹（只在需要可视化时记录）
             # 注意：环境中的agent._trajectory记录无法禁用（在environment.py的step方法中），但这里的额外记录可以禁用
-            if record_trajectory:
+            if record_trajectory and (step % trajectory_sample_interval == 0):
                 try:
                     # 🔧 性能优化：使用列表推导式，一次性完成所有操作
                     positions = [agent.state.p_pos.copy() if hasattr(agent.state, 'p_pos') else [0, 0, 0] 
@@ -1825,6 +2493,25 @@ class ModelEvaluator:
             step_count += 1
 
             current_positions = _capture_agent_positions(self.env.agents)
+            if save_control_diagnostics:
+                current_velocities = []
+                for agent in self.env.agents:
+                    try:
+                        vel = _normalize_vec3(getattr(getattr(agent, 'state', None), 'p_vel', None))
+                    except Exception:
+                        vel = None
+                    current_velocities.append(vel)
+                if current_velocities:
+                    episode_velocity_history.append(
+                        [vel.copy() if vel is not None else None for vel in current_velocities]
+                    )
+
+            if save_control_diagnostics and current_positions and agent_goal_positions:
+                current_goal_distances = [
+                    _distance_3d(pos, goal) for pos, goal in zip(current_positions, agent_goal_positions)
+                ]
+                episode_goal_distance_history.append(current_goal_distances)
+
             for agent_idx in range(min(len(agent_path_lengths), len(current_positions))):
                 prev_pos = prev_positions[agent_idx]
                 curr_pos = current_positions[agent_idx]
@@ -1846,6 +2533,9 @@ class ModelEvaluator:
                         team_reached_now = False
                         continue
                     valid_reach_checks += 1
+                    prev_min_goal_dist = agent_min_goal_distances[agent_idx]
+                    if prev_min_goal_dist is None or dist_to_goal < prev_min_goal_dist:
+                        agent_min_goal_distances[agent_idx] = float(dist_to_goal)
                     reached = dist_to_goal <= success_threshold
                     if reached and agent_first_reach_steps[agent_idx] is None:
                         agent_first_reach_steps[agent_idx] = step_count
@@ -1857,7 +2547,7 @@ class ModelEvaluator:
                     team_first_reach_step = step_count
             
             # 更新观察
-            processed_obs = self.maddpg.obs_processor.batch_process_observations(next_obs_n)
+            processed_obs = self._process_observations_for_eval(next_obs_n)
             # 注意：势场力追加会在下一轮循环开始时进行
             
             # 检查结束条件（支持禁用提前终止）
@@ -2081,6 +2771,19 @@ class ModelEvaluator:
         if team_direct_distance is not None and team_total_path_length > 1e-9:
             path_efficiency = float(np.clip(team_direct_distance / team_total_path_length, 0.0, 1.0))
 
+        final_positions_for_stats = _capture_agent_positions(self.env.agents)
+        agent_final_goal_distances = [
+            _distance_3d(pos, goal) for pos, goal in zip(final_positions_for_stats, agent_goal_positions)
+        ]
+        valid_final_goal_distances = [dist for dist in agent_final_goal_distances if dist is not None]
+        final_goal_distance = (
+            float(np.sum(valid_final_goal_distances)) if valid_final_goal_distances else None
+        )
+        valid_min_goal_distances = [dist for dist in agent_min_goal_distances if dist is not None]
+        min_goal_distance = (
+            float(np.sum(valid_min_goal_distances)) if valid_min_goal_distances else None
+        )
+
         first_reach_step = team_first_reach_step
         first_reach_time = (
             float(team_first_reach_step * simulation_dt) if team_first_reach_step is not None else None
@@ -2108,34 +2811,53 @@ class ModelEvaluator:
                 'mean_depth': float(np.mean(penetration_depths)),
                 'min_depth': float(np.min(penetration_depths))
             }
+
+        if record_trajectory:
+            try:
+                final_positions = [
+                    agent.state.p_pos.copy() if hasattr(agent.state, 'p_pos') else [0, 0, 0]
+                    for agent in self.env.agents
+                ]
+                episode_trajectory.append(final_positions)
+            except Exception as e:
+                if not quiet_output:
+                    print(f"⚠️  追加最终轨迹点失败: {e}")
         
-        print(f"✅ 回合 {episode_idx + 1} 完成:")
-        print(f"   - 奖励: {episode_reward:.2f}")
-        print(f"   - 步数: {step_count}/{episode_length} (完成度: {step_count/episode_length*100:.1f}%)")
-        print(f"   - 用时: {episode_duration:.2f}秒")
-        print(f"   - 平均步时: {avg_step_time:.4f}秒/步")
-        print(f"   - 碰撞次数: {total_collisions} (智能体: {episode_collision_counts})")
-        print(f"   - 成功率: 团队={success_flag}, 智能体={agent_success_flags}")
-        if arrival_step is not None:
-            print(f"   - 成功首达步数: {arrival_step}")
-        elif first_reach_step is not None:
-            print(f"   - 首次到达步数(未计为成功): {first_reach_step}")
-        print(f"   - 路径长度: 团队={team_total_path_length:.2f}, 智能体={['{:.2f}'.format(v) for v in agent_path_lengths]}")
-        if path_efficiency is not None:
-            print(f"   - 路径效率: 团队={path_efficiency:.3f}")
-        if min_distance_stat is not None:
-            print(f"   - 最小净空距离: 均值={min_distance_stat['mean']:.2f}, 最小值={min_distance_stat['min']:.2f}")
-        if penetration_stat is not None:
-            print(f"   - 穿透统计: 次数={penetration_stat['count']}, 最大深度={penetration_stat['max_depth']:.2f}, 平均深度={penetration_stat['mean_depth']:.2f}")
-        if step_count < episode_length:
-            print(f"   ⚠️  注意: 回合提前结束（可能由于done=True或提前终止）")
+        if not quiet_output:
+            print(f"✅ 回合 {episode_idx + 1} 完成:")
+            print(f"   - 奖励: {episode_reward:.2f}")
+            print(f"   - 步数: {step_count}/{episode_length} (完成度: {step_count/episode_length*100:.1f}%)")
+            print(f"   - 用时: {episode_duration:.2f}秒")
+            print(f"   - 平均步时: {avg_step_time:.4f}秒/步")
+            print(f"   - 碰撞次数: {total_collisions} (智能体: {episode_collision_counts})")
+            print(f"   - 成功率: 团队={success_flag}, 智能体={agent_success_flags}")
+            if arrival_step is not None:
+                print(f"   - 成功首达步数: {arrival_step}")
+            elif first_reach_step is not None:
+                print(f"   - 首次到达步数(未计为成功): {first_reach_step}")
+            print(f"   - 路径长度: 团队={team_total_path_length:.2f}, 智能体={['{:.2f}'.format(v) for v in agent_path_lengths]}")
+            if path_efficiency is not None:
+                print(f"   - 路径效率: 团队={path_efficiency:.3f}")
+            if final_goal_distance is not None:
+                print(f"   - 终止帧目标距离: 团队={final_goal_distance:.2f}, 智能体={['{:.2f}'.format(v) if v is not None else 'N/A' for v in agent_final_goal_distances]}")
+            if min_goal_distance is not None:
+                print(f"   - 回合最小目标距离: 团队={min_goal_distance:.2f}, 智能体={['{:.2f}'.format(v) if v is not None else 'N/A' for v in agent_min_goal_distances]}")
+            if min_distance_stat is not None:
+                print(f"   - 最小净空距离: 均值={min_distance_stat['mean']:.2f}, 最小值={min_distance_stat['min']:.2f}")
+            if penetration_stat is not None:
+                print(f"   - 穿透统计: 次数={penetration_stat['count']}, 最大深度={penetration_stat['max_depth']:.2f}, 平均深度={penetration_stat['mean_depth']:.2f}")
+            if step_count < episode_length:
+                print(f"   ⚠️  注意: 回合提前结束（可能由于done=True或提前终止）")
         
         return {
             'episode': episode_idx,
             'reward': episode_reward,
             'steps': step_count,
-            'trajectory': episode_trajectory,
-            'actions_history': episode_actions_history,  # 🔧 新增：返回动作历史
+            'trajectory': episode_trajectory if record_trajectory else [],
+            'actions_history': episode_actions_history if record_actions else [],
+            'executed_actions_history': episode_executed_actions_history if save_control_diagnostics else [],
+            'velocity_history': episode_velocity_history if save_control_diagnostics else [],
+            'goal_distance_history': episode_goal_distance_history if save_control_diagnostics else [],
             'duration': episode_duration,
             # 🔧 新增：返回碰撞和成功指标（与训练脚本一致）
             'collision_count': total_collisions,
@@ -2153,6 +2875,11 @@ class ModelEvaluator:
             'agent_path_lengths': [float(v) for v in agent_path_lengths],
             'direct_distance': team_direct_distance,
             'agent_direct_distances': [float(v) if v is not None else None for v in direct_goal_distances],
+            'final_goal_distance': final_goal_distance,
+            'agent_final_goal_distances': [float(v) if v is not None else None for v in agent_final_goal_distances],
+            'min_goal_distance': min_goal_distance,
+            'agent_min_goal_distances': [float(v) if v is not None else None for v in agent_min_goal_distances],
+            'agent_first_reach_steps': [int(v) if v is not None else None for v in agent_first_reach_steps],
             'path_efficiency': path_efficiency,
             'agent_path_efficiencies': agent_path_efficiencies,
             # 🔧 新增：穿透深度统计
@@ -2167,7 +2894,7 @@ class ModelEvaluator:
             is_best: 是否为最佳回合（用于文件名标识）
         """
         if not self.visualizer or not episode_data['trajectory']:
-            return
+            return {}
             
         print("🎨 正在生成可视化结果...")
         
@@ -2182,7 +2909,210 @@ class ModelEvaluator:
             save_dir=self.args.save_viz_path
         )
         
+        generated_files = {}
         try:
+            def _extract_action_head_norms(history):
+                if not history:
+                    return []
+                norms = []
+                for step_actions in history:
+                    step_norms = []
+                    for action in step_actions:
+                        try:
+                            arr = np.asarray(action, dtype=np.float32).reshape(-1)
+                            if arr.size >= 3 and np.all(np.isfinite(arr[:3])):
+                                step_norms.append(float(np.linalg.norm(arr[:3])))
+                            else:
+                                step_norms.append(None)
+                        except Exception:
+                            step_norms.append(None)
+                    norms.append(step_norms)
+                return norms
+
+            def _extract_xy_action_norms(history):
+                if not history:
+                    return []
+                norms = []
+                for step_actions in history:
+                    step_norms = []
+                    for action in step_actions:
+                        try:
+                            arr = np.asarray(action, dtype=np.float32).reshape(-1)
+                            if arr.size >= 2 and np.all(np.isfinite(arr[:2])):
+                                step_norms.append(float(np.linalg.norm(arr[:2])))
+                            else:
+                                step_norms.append(None)
+                        except Exception:
+                            step_norms.append(None)
+                    norms.append(step_norms)
+                return norms
+
+            def _extract_z_component(history):
+                if not history:
+                    return []
+                values = []
+                for step_actions in history:
+                    step_values = []
+                    for action in step_actions:
+                        try:
+                            arr = np.asarray(action, dtype=np.float32).reshape(-1)
+                            step_values.append(float(arr[2]) if arr.size >= 3 and np.isfinite(arr[2]) else None)
+                        except Exception:
+                            step_values.append(None)
+                    values.append(step_values)
+                return values
+
+            def _extract_speed_history(velocity_history):
+                if not velocity_history:
+                    return []
+                speed_history = []
+                for step_velocities in velocity_history:
+                    step_speeds = []
+                    for vel in step_velocities:
+                        try:
+                            arr = np.asarray(vel, dtype=np.float32).reshape(-1)
+                            if arr.size >= 3 and np.all(np.isfinite(arr[:3])):
+                                step_speeds.append(float(np.linalg.norm(arr[:3])))
+                            else:
+                                step_speeds.append(None)
+                        except Exception:
+                            step_speeds.append(None)
+                    speed_history.append(step_speeds)
+                return speed_history
+
+            def _plot_series(ax, history, title, ylabel, *, styles=None, threshold=None):
+                if not history:
+                    ax.set_title(title)
+                    ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+                    ax.axis('off')
+                    return
+                steps = np.arange(len(history), dtype=np.int32)
+                n_agents = max((len(step_values) for step_values in history), default=0)
+                colors = ['tab:blue', 'tab:red', 'tab:green', 'tab:purple', 'tab:orange', 'tab:brown']
+                styles = styles or {}
+                for agent_idx in range(n_agents):
+                    series = []
+                    for step_values in history:
+                        value = step_values[agent_idx] if agent_idx < len(step_values) else None
+                        series.append(np.nan if value is None else float(value))
+                    label = styles.get(agent_idx, {}).get('label', f'Agent {agent_idx}')
+                    linestyle = styles.get(agent_idx, {}).get('linestyle', '-')
+                    alpha = styles.get(agent_idx, {}).get('alpha', 0.9)
+                    color = styles.get(agent_idx, {}).get('color', colors[agent_idx % len(colors)])
+                    ax.plot(steps, series, label=label, linestyle=linestyle, alpha=alpha, color=color, linewidth=1.5)
+                if threshold is not None:
+                    ax.axhline(float(threshold), color='black', linestyle='--', linewidth=1.0, alpha=0.8, label='Threshold')
+                ax.set_title(title, fontsize=12, fontweight='bold')
+                ax.set_xlabel('Step')
+                ax.set_ylabel(ylabel)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8, ncol=2)
+
+            def _generate_control_diagnostics_plot():
+                raw_history = episode_data.get('actions_history') or []
+                executed_history = episode_data.get('executed_actions_history') or []
+                velocity_history = episode_data.get('velocity_history') or []
+                goal_distance_history = episode_data.get('goal_distance_history') or []
+                if not raw_history and not executed_history and not velocity_history and not goal_distance_history:
+                    return None
+
+                diagnostics_path = os.path.join(
+                    self.args.save_viz_path,
+                    f"trajectory_ep{episode_num}_control_diagnostics.png"
+                )
+                fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+                speed_history = _extract_speed_history(velocity_history)
+                _plot_series(
+                    axes[0, 0],
+                    speed_history,
+                    'Speed Magnitude',
+                    'm/s',
+                    threshold=getattr(self.args, 'agent_max_speed', None),
+                )
+
+                _plot_series(
+                    axes[0, 1],
+                    goal_distance_history,
+                    'Distance To Goal',
+                    'm',
+                    threshold=getattr(self.args, 'success_distance_threshold', None),
+                )
+
+                raw_xy_history = _extract_xy_action_norms(raw_history)
+                executed_xy_history = _extract_xy_action_norms(executed_history)
+                xy_history = []
+                for idx in range(max(len(raw_xy_history), len(executed_xy_history))):
+                    step_values = []
+                    raw_step = raw_xy_history[idx] if idx < len(raw_xy_history) else []
+                    exec_step = executed_xy_history[idx] if idx < len(executed_xy_history) else []
+                    n_agents = max(len(raw_step), len(exec_step))
+                    for agent_idx in range(n_agents):
+                        raw_v = raw_step[agent_idx] if agent_idx < len(raw_step) else None
+                        exec_v = exec_step[agent_idx] if agent_idx < len(exec_step) else None
+                        step_values.extend([raw_v, exec_v])
+                    xy_history.append(step_values)
+                xy_styles = {}
+                colors = ['tab:blue', 'tab:red', 'tab:green', 'tab:purple', 'tab:orange', 'tab:brown']
+                n_agents_xy = max(
+                    max((len(step) for step in raw_xy_history), default=0),
+                    max((len(step) for step in executed_xy_history), default=0),
+                )
+                for agent_idx in range(n_agents_xy):
+                    xy_styles[2 * agent_idx] = {
+                        'label': f'Agent {agent_idx} raw XY',
+                        'linestyle': '--',
+                        'alpha': 0.6,
+                        'color': colors[agent_idx % len(colors)],
+                    }
+                    xy_styles[2 * agent_idx + 1] = {
+                        'label': f'Agent {agent_idx} exec XY',
+                        'linestyle': '-',
+                        'alpha': 0.9,
+                        'color': colors[agent_idx % len(colors)],
+                    }
+                _plot_series(axes[1, 0], xy_history, 'XY Action Norm (Raw vs Executed)', 'norm', styles=xy_styles)
+
+                raw_z_history = _extract_z_component(raw_history)
+                executed_z_history = _extract_z_component(executed_history)
+                z_history = []
+                for idx in range(max(len(raw_z_history), len(executed_z_history))):
+                    step_values = []
+                    raw_step = raw_z_history[idx] if idx < len(raw_z_history) else []
+                    exec_step = executed_z_history[idx] if idx < len(executed_z_history) else []
+                    n_agents = max(len(raw_step), len(exec_step))
+                    for agent_idx in range(n_agents):
+                        raw_v = raw_step[agent_idx] if agent_idx < len(raw_step) else None
+                        exec_v = exec_step[agent_idx] if agent_idx < len(exec_step) else None
+                        step_values.extend([raw_v, exec_v])
+                    z_history.append(step_values)
+                z_styles = {}
+                for agent_idx in range(n_agents_xy):
+                    z_styles[2 * agent_idx] = {
+                        'label': f'Agent {agent_idx} raw Z',
+                        'linestyle': '--',
+                        'alpha': 0.6,
+                        'color': colors[agent_idx % len(colors)],
+                    }
+                    z_styles[2 * agent_idx + 1] = {
+                        'label': f'Agent {agent_idx} exec Z',
+                        'linestyle': '-',
+                        'alpha': 0.9,
+                        'color': colors[agent_idx % len(colors)],
+                    }
+                _plot_series(axes[1, 1], z_history, 'Z Action (Raw vs Executed)', 'action', styles=z_styles)
+
+                reward_value = float(episode_data.get('reward', 0.0))
+                fig.suptitle(
+                    f'Episode {episode_num} Control Diagnostics | reward={reward_value:.1f}',
+                    fontsize=15,
+                    fontweight='bold',
+                )
+                plt.tight_layout()
+                plt.savefig(diagnostics_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                return diagnostics_path
+
             # 生成轨迹图像（同时传入场景提取的目标信息，避免空字典提示）
             episode_num = int(episode_data.get('episode', 0)) + 1
             terrain_level = episode_data.get('terrain_complexity_level', 'unknown')
@@ -2196,9 +3126,13 @@ class ModelEvaluator:
             except Exception:
                 goal_positions_img = None
             
-            # 原有轨迹图（如果记录了动作历史，会自动生成动作时序图）
+            save_trajectory_png = _env_flag('SAVE_EVAL_TRAJECTORY_PNG', True)
+            save_actor_sequence = _env_flag('SAVE_EVAL_ACTOR_SEQUENCE', False)
+            save_control_diagnostics = _env_flag('SAVE_EVAL_CONTROL_DIAGNOSTICS', False)
+
+            # 原有轨迹图（只有显式开启调试产物时才生成 actor 时序图）
             actor_outputs_history = None
-            if 'actions_history' in episode_data and episode_data['actions_history']:
+            if save_actor_sequence and 'actions_history' in episode_data and episode_data['actions_history']:
                 try:
                     # 将动作历史转换为numpy数组格式（与训练时一致）
                     # 格式: (steps, n_agents, action_dim)
@@ -2243,17 +3177,44 @@ class ModelEvaluator:
                 except Exception as e:
                     print(f"⚠️  获取目标位置失败: {e}")
             
-            self.visualizer.generate_trajectory_image(
-                    trajectories=episode_data['trajectory'],
-                    scenario=self.scenario,
-                    save_path=image_path,
-                    episode_num=episode_data['episode'],
-                    reward=episode_data['reward'],
-                    episode_type='evaluation',
-                    goal_positions=goal_positions_img,
-                    env_instance=self.env,  # 🔧 关键修复：传递环境实例，用于获取地形和目标数据
-                    actor_outputs_history=actor_outputs_history  # 🔧 传入动作历史（如果存在）
-            )
+            if save_trajectory_png:
+                generated_files['image_path'] = image_path
+                self.visualizer.generate_trajectory_image(
+                        trajectories=episode_data['trajectory'],
+                        scenario=self.scenario,
+                        save_path=image_path,
+                        episode_num=episode_data['episode'],
+                        reward=episode_data['reward'],
+                        episode_type='evaluation',
+                        goal_positions=goal_positions_img,
+                        env_instance=self.env,  # 🔧 关键修复：传递环境实例，用于获取地形和目标数据
+                        actor_outputs_history=actor_outputs_history,  # 🔧 传入动作历史（如果存在）
+                        title_step_note=f"Total Steps: {int(episode_data.get('steps', len(episode_data.get('trajectory', []))))}"
+                )
+            elif save_actor_sequence and actor_outputs_history is not None and len(actor_outputs_history) > 0:
+                try:
+                    # 时序图本质上与静态3D轨迹图是独立分析产物；当用户明确关闭PNG时，仍然保留时序图。
+                    self.visualizer._generate_actor_outputs_sequence_image(
+                        actor_outputs_history=actor_outputs_history,
+                        episode_num=episode_num,
+                        reward=float(episode_data.get('reward', 0.0)),
+                        episode_type='best' if is_best else 'evaluation',
+                        original_save_path=image_path,
+                    )
+                except Exception as actor_seq_err:
+                    print(f"⚠️ 独立Actor时序图生成失败: {actor_seq_err}")
+            else:
+                print("⏭️ 跳过静态PNG轨迹图生成（SAVE_EVAL_TRAJECTORY_PNG=0）")
+
+            actor_sequence_path = f"{os.path.splitext(image_path)[0]}_actor_sequence.png"
+            if save_actor_sequence and os.path.exists(actor_sequence_path):
+                generated_files['actor_sequence_path'] = actor_sequence_path
+
+            diagnostics_path = None
+            if save_control_diagnostics:
+                diagnostics_path = _generate_control_diagnostics_plot()
+                if diagnostics_path and os.path.exists(diagnostics_path):
+                    generated_files['control_diagnostics_path'] = diagnostics_path
 
             # 叠加障碍/地形等信息的增强版图（默认禁用）
             enable_overlay = getattr(self.args, 'enable_overlay', False) and not getattr(self.args, 'disable_overlay', False)
@@ -2263,6 +3224,7 @@ class ModelEvaluator:
                     f"trajectory_ep{episode_num}_level{terrain_level}_overlay.png"
                 )
                 self._generate_overlay_image(episode_data, overlay_path)
+                generated_files['overlay_path'] = overlay_path
                 print(f"✅ Overlay图片已保存: {overlay_path}")
             else:
                 print(f"⏭️ 跳过overlay图片生成（已禁用）")
@@ -2276,6 +3238,7 @@ class ModelEvaluator:
                     self.args.save_viz_path,
                     f"trajectory_ep{episode_num}_interactive.html"
                 )
+                generated_files['html_path'] = html_path
                 # 🚨 关键修复：确保交互式HTML中显示目标点
                 goal_positions_html = None
                 try:
@@ -2317,6 +3280,7 @@ class ModelEvaluator:
                     self.args.save_viz_path,
                     f"best_trajectory_ep{episode_num}_animation.gif"
                 )
+                generated_files['gif_path'] = gif_path
                 self.visualizer.generate_trajectory_gif(
                     trajectories=episode_data['trajectory'],
                     scenario=self.scenario,
@@ -2332,10 +3296,12 @@ class ModelEvaluator:
                 print(f"⏭️ 跳过HTML轨迹图生成（已禁用）")
             
             print(f"✅ 可视化结果已保存到: {self.args.save_viz_path}")
+            return generated_files
             
         except Exception as e:
             print(f"⚠️ 可视化生成失败: {e}")
             traceback.print_exc()
+            return generated_files
             
     def run_evaluation(self):
         """运行完整评估流程"""
@@ -2356,21 +3322,63 @@ class ModelEvaluator:
         best_episode_data = None
         best_trajectory = None
         best_actor_outputs_history = None
+        best_success_reward = -np.inf
+        best_success_episode = None
+        best_success_episode_data = None
+        best_success_trajectory = None
+        best_success_actor_outputs_history = None
         save_all_episode_visualizations = os.getenv('SAVE_EVAL_ALL_EPISODES', '1').lower() in ('1','true','yes','on')
+        episode_visualizations = []
+        try:
+            quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            quiet_output = True
         
         # 🔧 新增：检查是否保存最佳回合可视化（与训练脚本一致）
         enable_best_traj = os.getenv('SAVE_BEST_TRAJ', '1').lower() in ('1','true','yes','on')
         enable_interactive = os.getenv('SAVE_INTERACTIVE_TRAJ', '1').lower() in ('1','true','yes','on')
-        
-        print(f"\n📊 开始评估 {self.args.eval_episodes} 个回合")
-        print(f"🏔️ 地形模式: {'随机地形' if self.args.random_terrain else '固定地形'}")
-        if self.args.terrain_complexity_level is not None:
-            print(f"🏔️ 地形复杂度等级: {self.args.terrain_complexity_level}")
-        else:
-            print(f"🏔️ 地形复杂度等级: 随机选择 (1-4)")
-        print(f"📸 保存每回合可视化: {'是' if save_all_episode_visualizations else '否'}")
-        print(f"🏆 最佳回合单独可视化: {'是' if (enable_best_traj and not save_all_episode_visualizations) else '否'}")
-        print(f"📊 保存交互式HTML: {'是' if enable_interactive else '否'}")
+        save_team_success_html = _env_flag('SAVE_TEAM_SUCCESS_HTML', False)
+        persist_episode_trajectories = _env_flag('SAVE_EVAL_TRAJECTORY_JSON', True)
+        save_actor_sequence = _env_flag('SAVE_EVAL_ACTOR_SEQUENCE', False)
+        save_control_diagnostics = _env_flag('SAVE_EVAL_CONTROL_DIAGNOSTICS', False)
+
+        def _normalize_generated_files(generated_files):
+            if not isinstance(generated_files, dict):
+                return {}
+            normalized = {}
+            for key, value in generated_files.items():
+                if value is None:
+                    continue
+                try:
+                    normalized[key] = os.path.basename(str(value))
+                except Exception:
+                    normalized[key] = str(value)
+            return normalized
+
+        def _copy_alias(source_path, alias_name):
+            if not source_path:
+                return None
+            try:
+                source_str = str(source_path)
+                if not os.path.exists(source_str):
+                    return None
+                alias_path = os.path.join(self.args.save_viz_path, alias_name)
+                shutil.copyfile(source_str, alias_path)
+                return alias_path
+            except Exception as alias_e:
+                print(f"⚠️  复制可视化别名失败 ({alias_name}): {alias_e}")
+                return None
+
+        if not quiet_output:
+            print(f"\n📊 开始评估 {self.args.eval_episodes} 个回合")
+            print(f"🏔️ 地形模式: {'随机地形' if self.args.random_terrain else '固定地形'}")
+            if self.args.terrain_complexity_level is not None:
+                print(f"🏔️ 地形复杂度等级: {self.args.terrain_complexity_level}")
+            else:
+                print(f"🏔️ 地形复杂度等级: 随机选择 (1-4)")
+            print(f"📸 保存每回合可视化: {'是' if save_all_episode_visualizations else '否'}")
+            print(f"🏆 最佳回合单独可视化: {'是' if (enable_best_traj and not save_all_episode_visualizations) else '否'}")
+            print(f"📊 保存交互式HTML: {'是' if enable_interactive else '否'}")
         
         # 🔧 关键修复：从环境变量读取地形种子序列，确保所有评估模式使用相同的地图顺序
         terrain_seed_sequence = None
@@ -2378,26 +3386,74 @@ class ModelEvaluator:
         if terrain_seed_str:
             try:
                 terrain_seed_sequence = [int(s.strip()) for s in terrain_seed_str.split(',') if s.strip()]
-                print(f"🔧 使用预定义地形种子序列（共{len(terrain_seed_sequence)}个）: {terrain_seed_sequence[:5]}... (前5个)")
+                if not quiet_output:
+                    print(f"🔧 使用预定义地形种子序列（共{len(terrain_seed_sequence)}个）: {terrain_seed_sequence[:5]}... (前5个)")
             except Exception as e:
                 print(f"⚠️  解析地形种子序列失败: {e}，将使用随机地形")
                 terrain_seed_sequence = None
+
+        evaluation_setup = {
+            'terrain_family': 'similar_unseen' if _env_flag('SEMI_RANDOM_TERRAIN', False) else (
+                'train_match' if not terrain_seed_sequence and not bool(getattr(self.args, 'random_terrain', False)) else 'random_unseen'
+            ),
+            'semi_random_terrain': _env_flag('SEMI_RANDOM_TERRAIN', False),
+            'terrain_base_seed': _env_int('TERRAIN_BASE_SEED', getattr(self.args, 'terrain_seed', 67) if getattr(self.args, 'terrain_seed', None) is not None else 67),
+            'peak_jitter_range': _env_float('PEAK_JITTER_RANGE', 15.0),
+            'position_family': os.getenv('HELDOUT_POSITION_MODE', 'train_match'),
+            'reference_positions_file': os.getenv('HELDOUT_REFERENCE_POSITIONS_FILE', ''),
+            'start_center_jitter': _env_float('HELDOUT_START_CENTER_JITTER', 12.0),
+            'agent_local_jitter': _env_float('HELDOUT_AGENT_LOCAL_JITTER', 3.0),
+            'goal_region_radius': _env_float('HELDOUT_GOAL_REGION_RADIUS', 18.0),
+            'terrain_complexity': int(getattr(self.args, 'terrain_complexity_level', 0) or 0),
+            'map_size': _env_int('MAP_SIZE', 200),
+            'mountain_min_distance': _env_int('MOUNTAIN_MIN_DISTANCE', 55),
+            'random_terrain': bool(getattr(self.args, 'random_terrain', False)) or bool(terrain_seed_sequence),
+            'use_dynamic_obstacles': _env_flag('USE_DYNAMIC_OBSTACLES', True),
+            'use_quadrotor_dynamics': _env_flag('USE_QUADROTOR_DYNAMICS', False),
+            'gravity': _finite_float_or_none(getattr(self.args, 'gravity', None)),
+            'control_accel_gain': _finite_float_or_none(getattr(self.args, 'control_accel_gain', None)),
+            'damping': _finite_float_or_none(getattr(self.args, 'damping', None)),
+            'agent_max_speed': _finite_float_or_none(getattr(self.args, 'agent_max_speed', None)),
+            'agent_accel': _finite_float_or_none(getattr(self.args, 'agent_accel', None)),
+            'action_range_x': _finite_float_or_none(getattr(self.args, 'action_range_x', None)),
+            'action_range_y': _finite_float_or_none(getattr(self.args, 'action_range_y', None)),
+            'action_range_z': _finite_float_or_none(getattr(self.args, 'action_range_z', None)),
+            'simulation_dt': _env_float('SIMULATION_DT', getattr(self.args, 'simulation_dt', 0.08)),
+            'z_action_bias': _env_float('Z_ACTION_BIAS', getattr(self.args, 'z_action_bias', 0.0)),
+            'quadrotor_attitude_response_time': _env_float(
+                'QUADROTOR_ATTITUDE_RESPONSE_TIME',
+                getattr(self.args, 'quadrotor_attitude_response_time', 0.0),
+            ),
+            'quadrotor_psi_cmd': _env_float(
+                'QUADROTOR_PSI_CMD',
+                getattr(self.args, 'quadrotor_psi_cmd', 0.0),
+            ),
+            'episode_length': _safe_int(getattr(self.args, 'episode_length', None)),
+            'requested_episode_length_multiplier': _env_float(
+                'EVAL_EPISODE_LENGTH_MULTIPLIER',
+                _env_float('POST_EVAL_EPISODE_LENGTH_MULTIPLIER', 1.0),
+            ),
+        }
         
         for episode in range(self.args.eval_episodes):
-            print(f"\n🚀 开始评估回合 {episode + 1}/{self.args.eval_episodes}")
+            if not quiet_output:
+                print(f"\n🚀 开始评估回合 {episode + 1}/{self.args.eval_episodes}")
             
             # 为每个回合随机选择地形复杂度等级（如果未指定）
             if self.args.terrain_complexity_level is None:
                 terrain_level = np.random.randint(1, 5)  # 1-4
-                print(f"🎲 随机选择地形复杂度等级: {terrain_level}")
+                if not quiet_output:
+                    print(f"🎲 随机选择地形复杂度等级: {terrain_level}")
             else:
                 terrain_level = self.args.terrain_complexity_level
-                print(f"🏔️ 使用指定地形复杂度等级: {terrain_level}")
+                if not quiet_output:
+                    print(f"🏔️ 使用指定地形复杂度等级: {terrain_level}")
             self.scenario.terrain_complexity_level = terrain_level
 
             terrain_seed = self._prepare_episode_terrain(episode, terrain_seed_sequence)
             if terrain_seed is not None:
-                print(f"🗺️ 当前回合地形种子: {terrain_seed}")
+                if not quiet_output:
+                    print(f"🗺️ 当前回合地形种子: {terrain_seed}")
             
             # 🔧 关键修复：添加异常处理，确保单个回合失败不会导致整个评估失败
             try:
@@ -2415,7 +3471,6 @@ class ModelEvaluator:
                 episode_data['terrain_complexity_level'] = terrain_level
                 episode_data['terrain_seed'] = terrain_seed
                 all_rewards.append(episode_data['reward'])
-                all_episodes_data.append(episode_data)
                 
                 # 🔧 修改：跟踪最佳回合（与训练脚本逻辑一致）
                 if episode_data['reward'] > best_reward:
@@ -2425,10 +3480,41 @@ class ModelEvaluator:
                     best_trajectory = episode_data.get('trajectory', [])
                     best_actor_outputs_history = episode_data.get('actions_history', None)
                     print(f"✅ 更新最佳回合: Episode {episode + 1}, Reward = {best_reward:.2f}")
+
+                if episode_data.get('team_success', 0) == 1 and episode_data['reward'] > best_success_reward:
+                    best_success_reward = episode_data['reward']
+                    best_success_episode = episode
+                    best_success_episode_data = episode_data.copy()
+                    best_success_trajectory = episode_data.get('trajectory', [])
+                    best_success_actor_outputs_history = episode_data.get('actions_history', None)
+                    print(f"✅ 更新最佳成功回合: Episode {episode + 1}, Reward = {best_success_reward:.2f}")
+
+                # 评估汇总只需要轻量统计字段；较大的轨迹/动作历史仅保留给最佳回合和显式可视化流程。
+                stored_episode_data = dict(episode_data)
+                if not persist_episode_trajectories:
+                    stored_episode_data['trajectory'] = []
+                if not save_actor_sequence:
+                    stored_episode_data['actions_history'] = []
+                if not save_control_diagnostics:
+                    stored_episode_data['executed_actions_history'] = []
+                    stored_episode_data['velocity_history'] = []
+                    stored_episode_data['goal_distance_history'] = []
+                all_episodes_data.append(stored_episode_data)
                 
                 if save_all_episode_visualizations and not self.args.disable_visualization:
                     try:
-                        self.generate_visualization(episode_data, is_best=False)
+                        generated_episode_files = self.generate_visualization(episode_data, is_best=False) or {}
+                        normalized_files = _normalize_generated_files(generated_episode_files)
+                        if normalized_files:
+                            episode_data['visualization_files'] = normalized_files
+                            episode_visualizations.append(
+                                {
+                                    'episode': episode_data.get('episode'),
+                                    'reward': float(episode_data.get('reward', 0.0)),
+                                    'team_success': int(episode_data.get('team_success', episode_data.get('success', 0))),
+                                    'files': normalized_files,
+                                }
+                            )
                     except Exception as viz_e:
                         print(f"⚠️  回合 {episode + 1} 可视化生成失败: {viz_e}")
                         traceback.print_exc()
@@ -2468,7 +3554,9 @@ class ModelEvaluator:
                 'min_reward': None,
                 'all_rewards': [],
                 'summary': _build_evaluation_summary([], [], getattr(self.args, 'collision_distance_threshold', None)),
+                'evaluation_setup': evaluation_setup,
                 'episode_details': [],
+                'visualization_artifacts': {},
                 'terrain_seed_sequence': terrain_seed_sequence or [],
                 'evaluation_time': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'error': 'No episodes completed successfully'
@@ -2498,11 +3586,125 @@ class ModelEvaluator:
             print(f"团队成功率: {summary['team_success_rate']:.3f}")
         if summary.get('avg_team_total_path_length') is not None:
             print(f"平均团队路径长度: {summary['avg_team_total_path_length']:.2f}")
+        if summary.get('avg_team_total_path_length_success_only') is not None:
+            print(f"成功回合平均团队路径长度: {summary['avg_team_total_path_length_success_only']:.2f}")
         if summary.get('avg_arrival_step_success_only') is not None:
             print(f"成功回合平均首达步数: {summary['avg_arrival_step_success_only']:.1f}")
         if summary.get('avg_collision_count') is not None:
             print(f"平均碰撞次数: {summary['avg_collision_count']:.2f}")
-        
+
+        visualization_artifacts = {
+            'episode_visualizations': episode_visualizations,
+        }
+        best_generated_files = {}
+        if best_episode_data is not None and not self.args.disable_visualization and (save_all_episode_visualizations or enable_best_traj):
+            try:
+                best_episode_for_viz = best_episode_data.copy()
+                best_episode_for_viz['trajectory'] = best_trajectory
+                if best_actor_outputs_history is not None:
+                    best_episode_for_viz['actions_history'] = best_actor_outputs_history
+                if save_all_episode_visualizations:
+                    best_episode_num = int(best_episode_for_viz.get('episode', 0)) + 1
+                    best_image_path = os.path.join(
+                        self.args.save_viz_path,
+                        f"trajectory_ep{best_episode_num}_level{best_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_episode_for_viz['reward']:.0f}.png"
+                    )
+                    best_generated_files = {
+                        'image_path': best_image_path,
+                        'html_path': os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_episode_num}_interactive.html"
+                        ),
+                        'actor_sequence_path': os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_episode_num}_level{best_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_episode_for_viz['reward']:.0f}_actor_sequence.png"
+                        ),
+                        'control_diagnostics_path': os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_episode_num}_control_diagnostics.png"
+                        ),
+                    }
+                else:
+                    print(f"\n🎨 正在生成最佳回合可视化 (Episode {best_episode + 1}, Reward = {best_reward:.2f})...")
+                    best_generated_files = self.generate_visualization(best_episode_for_viz, is_best=True) or {}
+                    print(f"✅ 最佳回合可视化已生成")
+            except Exception as viz_e:
+                print(f"⚠️  最佳回合可视化生成失败: {viz_e}")
+                traceback.print_exc()
+                best_generated_files = {}
+
+        best_html_alias = _copy_alias(best_generated_files.get('html_path'), 'best_reward_interactive.html')
+        best_png_alias = _copy_alias(best_generated_files.get('image_path'), 'best_reward.png')
+        best_actor_sequence_alias = _copy_alias(best_generated_files.get('actor_sequence_path'), 'best_reward_actor_sequence.png')
+        best_control_diag_alias = _copy_alias(best_generated_files.get('control_diagnostics_path'), 'best_reward_control_diagnostics.png')
+        if best_html_alias:
+            visualization_artifacts['best_reward_html'] = best_html_alias
+        if best_png_alias:
+            visualization_artifacts['best_reward_png'] = best_png_alias
+        if best_actor_sequence_alias:
+            visualization_artifacts['best_reward_actor_sequence'] = best_actor_sequence_alias
+        if best_control_diag_alias:
+            visualization_artifacts['best_reward_control_diagnostics'] = best_control_diag_alias
+
+        if save_team_success_html and best_success_episode_data is not None and not self.args.disable_visualization:
+            print(
+                f"\n🌐 正在生成最佳团队成功回合HTML "
+                f"(Episode {best_success_episode + 1}, Reward = {best_success_reward:.2f})..."
+            )
+            try:
+                best_success_episode_for_viz = best_success_episode_data.copy()
+                best_success_episode_for_viz['trajectory'] = best_success_trajectory
+                if best_success_actor_outputs_history is not None:
+                    best_success_episode_for_viz['actions_history'] = best_success_actor_outputs_history
+                if save_all_episode_visualizations:
+                    best_success_episode_num = int(best_success_episode_for_viz.get('episode', 0)) + 1
+                    success_image_path = os.path.join(
+                        self.args.save_viz_path,
+                        f"trajectory_ep{best_success_episode_num}_level{best_success_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_success_episode_for_viz['reward']:.0f}.png"
+                    )
+                    generated_success_files = {
+                        'image_path': success_image_path,
+                        'html_path': os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_success_episode_num}_interactive.html"
+                        ),
+                        'actor_sequence_path': os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_success_episode_num}_level{best_success_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_success_episode_for_viz['reward']:.0f}_actor_sequence.png"
+                        ),
+                        'control_diagnostics_path': os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_success_episode_num}_control_diagnostics.png"
+                        ),
+                    }
+                else:
+                    generated_success_files = self.generate_visualization(best_success_episode_for_viz, is_best=False) or {}
+                success_html_path = generated_success_files.get('html_path')
+                success_png_path = generated_success_files.get('image_path')
+                success_actor_sequence_path = generated_success_files.get('actor_sequence_path')
+                success_control_diag_path = generated_success_files.get('control_diagnostics_path')
+                if success_html_path and os.path.exists(success_html_path):
+                    success_html_alias = os.path.join(self.args.save_viz_path, 'team_success_best_interactive.html')
+                    shutil.copyfile(success_html_path, success_html_alias)
+                    visualization_artifacts['team_success_best_html'] = success_html_alias
+                if success_png_path and os.path.exists(success_png_path):
+                    success_png_alias = os.path.join(self.args.save_viz_path, 'team_success_best.png')
+                    shutil.copyfile(success_png_path, success_png_alias)
+                    visualization_artifacts['team_success_best_png'] = success_png_alias
+                if success_actor_sequence_path and os.path.exists(success_actor_sequence_path):
+                    success_actor_alias = os.path.join(self.args.save_viz_path, 'team_success_best_actor_sequence.png')
+                    shutil.copyfile(success_actor_sequence_path, success_actor_alias)
+                    visualization_artifacts['team_success_best_actor_sequence'] = success_actor_alias
+                if success_control_diag_path and os.path.exists(success_control_diag_path):
+                    success_control_alias = os.path.join(self.args.save_viz_path, 'team_success_best_control_diagnostics.png')
+                    shutil.copyfile(success_control_diag_path, success_control_alias)
+                    visualization_artifacts['team_success_best_control_diagnostics'] = success_control_alias
+            except Exception as success_viz_e:
+                print(f"⚠️  团队成功回合HTML生成失败: {success_viz_e}")
+                traceback.print_exc()
+        elif save_team_success_html and best_success_episode_data is None:
+            print("⏭️  未生成团队成功HTML（本次评估没有团队成功回合）")
+
         # 保存评估结果
         results = {
             'model_path': self.args.load_model_path,
@@ -2514,6 +3716,8 @@ class ModelEvaluator:
             'min_reward': float(min_reward),
             'all_rewards': [float(r) for r in all_rewards],
             'summary': summary,
+            'evaluation_setup': evaluation_setup,
+            'visualization_artifacts': visualization_artifacts,
             'terrain_seed_sequence': terrain_seed_sequence or [],
             'episode_details': [
                 {
@@ -2523,8 +3727,7 @@ class ModelEvaluator:
                     'terrain_complexity_level': ep.get('terrain_complexity_level', 'unknown'),
                     'terrain_seed': ep.get('terrain_seed', None),
                     'duration': ep['duration'],
-                    # 🔧 新增：保存轨迹数据（用于生成对比交互图）
-                    'trajectory': ep.get('trajectory', []),  # 保存轨迹数据
+                    'trajectory': ep.get('trajectory', []) if persist_episode_trajectories else [],
                     # 🔧 新增：保存碰撞和成功指标（与训练脚本一致）
                     'collision_count': ep.get('collision_count', 0),
                     'agent_collision_counts': ep.get('agent_collision_counts', []),
@@ -2541,10 +3744,16 @@ class ModelEvaluator:
                     'agent_path_lengths': ep.get('agent_path_lengths', []),
                     'direct_distance': ep.get('direct_distance', None),
                     'agent_direct_distances': ep.get('agent_direct_distances', []),
+                    'final_goal_distance': ep.get('final_goal_distance', None),
+                    'agent_final_goal_distances': ep.get('agent_final_goal_distances', []),
+                    'min_goal_distance': ep.get('min_goal_distance', None),
+                    'agent_min_goal_distances': ep.get('agent_min_goal_distances', []),
+                    'agent_first_reach_steps': ep.get('agent_first_reach_steps', []),
                     'path_efficiency': ep.get('path_efficiency', None),
                     'agent_path_efficiencies': ep.get('agent_path_efficiencies', []),
                     # 🔧 新增：穿透深度统计
-                    'penetration_stat': ep.get('penetration_stat', None)
+                    'penetration_stat': ep.get('penetration_stat', None),
+                    'visualization_files': ep.get('visualization_files', {}),
                 } for ep in all_episodes_data
             ],
             'evaluation_time': time.strftime('%Y-%m-%d %H:%M:%S')
@@ -2585,21 +3794,6 @@ class ModelEvaluator:
         # 如果已经为每个回合保存了可视化，则最佳回合对应文件已包含在内，仅保留best别名文件。
         if save_all_episode_visualizations:
             print("⏭️  跳过额外的最佳回合可视化生成（每回合可视化已保存）")
-        elif enable_best_traj and best_episode_data is not None and not self.args.disable_visualization:
-            print(f"\n🎨 正在生成最佳回合可视化 (Episode {best_episode + 1}, Reward = {best_reward:.2f})...")
-            try:
-                # 准备最佳回合数据
-                best_episode_data_for_viz = best_episode_data.copy()
-                best_episode_data_for_viz['trajectory'] = best_trajectory
-                if best_actor_outputs_history is not None:
-                    best_episode_data_for_viz['actions_history'] = best_actor_outputs_history
-                
-                # 生成可视化（只生成最佳回合）
-                self.generate_visualization(best_episode_data_for_viz, is_best=True)
-                print(f"✅ 最佳回合可视化已生成")
-            except Exception as viz_e:
-                print(f"⚠️  最佳回合可视化生成失败: {viz_e}")
-                traceback.print_exc()
         elif not enable_best_traj:
             print(f"⏭️  跳过最佳回合可视化生成（SAVE_BEST_TRAJ=0）")
         elif self.args.disable_visualization:
@@ -2610,6 +3804,18 @@ class ModelEvaluator:
         print(f"  📊 评估统计: {results_path}")
         if enable_best_traj and best_episode_data is not None:
             print(f"  🏆 最佳回合: Episode {best_episode + 1}, Reward = {best_reward:.2f}")
+        if visualization_artifacts.get('best_reward_html'):
+            print(f"  🌐 最佳奖励HTML: {visualization_artifacts['best_reward_html']}")
+        if visualization_artifacts.get('best_reward_actor_sequence'):
+            print(f"  📈 最佳奖励动作时序图: {visualization_artifacts['best_reward_actor_sequence']}")
+        if visualization_artifacts.get('best_reward_control_diagnostics'):
+            print(f"  📊 最佳奖励控制诊断图: {visualization_artifacts['best_reward_control_diagnostics']}")
+        if visualization_artifacts.get('team_success_best_html'):
+            print(f"  🌐 团队成功HTML: {visualization_artifacts['team_success_best_html']}")
+        if visualization_artifacts.get('team_success_best_actor_sequence'):
+            print(f"  📈 团队成功动作时序图: {visualization_artifacts['team_success_best_actor_sequence']}")
+        if visualization_artifacts.get('team_success_best_control_diagnostics'):
+            print(f"  📊 团队成功控制诊断图: {visualization_artifacts['team_success_best_control_diagnostics']}")
         
         # 列出生成的图片和HTML文件
         if os.path.exists(self.args.save_viz_path):
@@ -2898,6 +4104,17 @@ HTML交互式轨迹图功能:
     parser.add_argument("--action-range-y", type=float, default=3.5, help="动作Y轴映射范围系数（将网络输出乘以该系数），默认3.5")
     parser.add_argument("--action-range-z", type=float, default=3.0, help="动作Z轴映射范围系数（将网络输出乘以该系数），默认3.0")
     parser.add_argument("--damping", type=float, default=0.18, help="速度阻尼系数，默认0.18")
+    parser.add_argument("--simulation-dt", type=float, default=float(os.getenv('SIMULATION_DT', '0.08')),
+                       help="仿真步长dt（秒），默认从SIMULATION_DT读取")
+    parser.add_argument("--z-action-bias", type=float, default=float(os.getenv('Z_ACTION_BIAS', '0.0')),
+                       help="Z轴动作偏置，默认从Z_ACTION_BIAS读取")
+    parser.add_argument("--use-quadrotor-dynamics", type=lambda x: str(x).lower() in ('1', 'true', 'yes', 'on'),
+                       default=os.getenv('USE_QUADROTOR_DYNAMICS', '0').lower() in ('1', 'true', 'yes', 'on'),
+                       help="是否启用四旋翼动力学，默认从USE_QUADROTOR_DYNAMICS读取")
+    parser.add_argument("--quadrotor-attitude-response-time", type=float, default=float(os.getenv('QUADROTOR_ATTITUDE_RESPONSE_TIME', '0.0')),
+                       help="四旋翼姿态响应时间，默认从QUADROTOR_ATTITUDE_RESPONSE_TIME读取")
+    parser.add_argument("--quadrotor-psi-cmd", type=float, default=float(os.getenv('QUADROTOR_PSI_CMD', '0.0')),
+                       help="四旋翼偏航指令，默认从QUADROTOR_PSI_CMD读取")
     
     # 势场/动作修正相关参数
     parser.add_argument("--enable-action-correction", type=lambda x: (str(x).lower() == 'true'), default=True, 
@@ -2919,7 +4136,7 @@ HTML交互式轨迹图功能:
     
     # 网络动作和势场动作混合比例
     parser.add_argument("--action-force-ratio", type=float, default=0.75, 
-                       help="网络动作和势场动作的混合比例 (0.0=完全网络动作, 1.0=完全势场动作, 默认0.75=75%势场+25%网络)")
+                       help="网络动作和势场动作的混合比例 (0.0=完全网络动作, 1.0=完全势场动作, 默认0.75=75%%势场+25%%网络)")
     
     # 势场修正版本选择
     parser.add_argument("--use-tf-potential-field", type=lambda x: (str(x).lower() in ('1','true','yes','on')), default=True,
@@ -3018,18 +4235,21 @@ HTML交互式轨迹图功能:
 def main():
     """主函数"""
     args = parse_args()
-    try:
-        disable_viz_env = os.getenv("EVAL_DISABLE_VISUALIZATION", "0").lower() in ("1", "true", "yes", "on")
-    except Exception:
-        disable_viz_env = False
-    try:
-        light_mode_env = os.getenv("EVAL_LIGHT_MODE", "0").lower() in ("1", "true", "yes", "on")
-    except Exception:
-        light_mode_env = False
-    if disable_viz_env or light_mode_env:
+    disable_viz_env = _env_flag("EVAL_DISABLE_VISUALIZATION", False)
+    light_mode_env = _env_flag("EVAL_LIGHT_MODE", False)
+    save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", True)
+    save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
+    save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
+    save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", False)
+    keep_viz_artifacts_in_light_mode = (
+        save_trajectory_png or save_team_success_html or save_actor_sequence or save_control_diagnostics
+    )
+    if disable_viz_env or (light_mode_env and not keep_viz_artifacts_in_light_mode):
         args.disable_visualization = True
         args.disable_gif = True
         setattr(args, 'disable_html', True)
+    elif light_mode_env:
+        args.disable_gif = True
     # 在任何 TensorFlow 操作之前优先配置GPU，避免已初始化后再设内存增长
     try:
         configure_gpu()

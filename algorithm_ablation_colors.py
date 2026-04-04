@@ -15,6 +15,8 @@ ALGORITHM_ABLATION_COLOR_BY_LABEL = {
     "maddpg_separated_gradient": "#9900CC", # purple
     "maddpg_dual_q": "#00CCCC",             # cyan
     "maddpg_baseline": "#FF8800",           # orange
+    "per_uniform_baseline": "#7F7F7F",      # gray
+    "per_improved_mainline": "#0066CC",     # blue
 }
 
 ALGORITHM_ABLATION_FALLBACK_COLORS = [

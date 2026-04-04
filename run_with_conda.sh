@@ -29,4 +29,4 @@ if ! python "$SCRIPT_DIR/tools/check_tf_env.py" --label "Preflight Check"; then
     exit 1
 fi
 
-exec ./run_optimized.sh "$@"
+exec /bin/bash ./run_optimized.sh "$@"

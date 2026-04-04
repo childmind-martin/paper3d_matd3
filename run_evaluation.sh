@@ -16,9 +16,10 @@ MODEL_PATH=$(echo "$MODEL_PATH" | sed 's|//|/|g' | sed 's|/$||')
 SAVE_PATH=${3:-"evaluation_results/$(basename "$MODEL_PATH")_$(date +%Y%m%d_%H%M%S)"}
 POSITIONS_FILE=${4:-"./saved_positions/default_positions.json"}
 USE_FIXED_POSITIONS=${5:-false}
-DISABLE_EARLY_TERMINATION=${6:-true}  # 新增：是否禁用提前终止
+DISABLE_EARLY_TERMINATION=${6:-false}  # 默认允许提前终止，避免日常测试硬跑满全长
 # 严格验证模式：默认开启。要求评估关键参数必须与训练配置一致，否则退出
 STRICT_EVAL_MATCH=${STRICT_EVAL_MATCH:-1}
+EVAL_EPISODE_LENGTH_MULTIPLIER=${EVAL_EPISODE_LENGTH_MULTIPLIER:-${POST_EVAL_EPISODE_LENGTH_MULTIPLIER:-1}}
 
 echo ""
 echo "评估参数:"
@@ -163,11 +164,11 @@ if [ -d "$MODEL_PATH" ]; then
                 SEARCH_PRIORITY=("ep_latest" "final" "best" "best_by_team_sr")
                 ;;
             auto|"")
-                SEARCH_PRIORITY=("final" "best" "best_by_team_sr" "ep_latest")
+                SEARCH_PRIORITY=("best_by_team_sr" "final" "best" "ep_latest")
                 ;;
             *)
                 echo "⚠️ 未识别的 MODEL_VARIANT=$MODEL_VARIANT，回退为 auto"
-                SEARCH_PRIORITY=("final" "best" "best_by_team_sr" "ep_latest")
+                SEARCH_PRIORITY=("best_by_team_sr" "final" "best" "ep_latest")
                 ;;
         esac
         
@@ -223,8 +224,22 @@ TRAINING_EPISODE_LENGTH=""
 TRAINING_SUCCESS_DISTANCE_THRESHOLD=""
 TRAINING_COLLISION_DISTANCE_THRESHOLD=""
 TRAINING_TERRAIN_CONTACT_EPS=""
+TRAINING_GRAVITY=""
+TRAINING_CONTROL_ACCEL_GAIN=""
+TRAINING_AGENT_MAX_SPEED=""
+TRAINING_AGENT_ACCEL=""
+TRAINING_USE_QUADROTOR_DYNAMICS=""
 TRAINING_USE_FIXED_POSITIONS=""
 TRAINING_POSITIONS_FILE=""
+TRAINING_RANDOM_TERRAIN=""
+TRAINING_TERRAIN_SEED=""
+TRAINING_PER_EPISODE_TERRAIN=""
+TRAINING_PER_ENV_TERRAIN=""
+TRAINING_SEMI_RANDOM_TERRAIN=""
+TRAINING_TERRAIN_BASE_SEED=""
+TRAINING_TERRAIN_COMPLEXITY_LEVEL=""
+TRAINING_MAP_SIZE=""
+TRAINING_MOUNTAIN_MIN_DISTANCE=""
 EVAL_RESPECT_INPUT_POSITIONS=${EVAL_RESPECT_INPUT_POSITIONS:-0}
 EVAL_PYTHON_BIN=${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-python3}}
 
@@ -243,6 +258,8 @@ export SUPPRESS_MA_PROMPT=1
 
 echo "开始模型评估..."
 echo "======================================"
+echo "评估解释器: $EVAL_PYTHON_BIN"
+echo "GPU选择: GPU_ID=${GPU_ID:-<unset>} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 
 # 构造命令参数（关键参数优先由训练配置驱动，确保严格对齐）
 # 场景/算法先设占位默认值，读取训练配置后再覆盖
@@ -252,6 +269,7 @@ export ALGORITHM=${ALGORITHM:-matd3}
 # 🔧 新增：XLA加速配置（与训练脚本保持一致）
 # 默认启用XLA Global加速，提升评估性能
 export XLA_GLOBAL=${XLA_GLOBAL:-1}  # 默认启用XLA加速
+export PF_JIT=${PF_JIT:-1}          # 评估默认保留训练已验证的 PF 小核 JIT
 if [ "${XLA_GLOBAL}" = "1" ]; then
     echo "✅ XLA加速: 启用（Global JIT模式）"
     # 设置TF_XLA_FLAGS（禁用Auto JIT，使用手动控制）
@@ -268,13 +286,7 @@ EPISODE_LENGTH=${EPISODE_LENGTH:-2800}
 # 🔧 使用双引号包裹路径变量，确保特殊字符（中文、空格等）正确处理
 CMD_ARGS="--load-model-path \"$MODEL_PATH\" --eval-episodes $EVAL_EPISODES --save-viz-path \"$SAVE_PATH\" --scenario-name $SCENARIO_NAME --episode-length $EPISODE_LENGTH --algorithm $ALGORITHM"
 
-# 根据RANDOM_TERRAIN参数决定是否使用随机地形
-if [ "$RANDOM_TERRAIN" = "1" ] || [ "$RANDOM_TERRAIN" = "true" ] || [ "$RANDOM_TERRAIN" = "yes" ]; then
-    CMD_ARGS="$CMD_ARGS --random-terrain"
-    echo "🏔️ 使用随机地形模式"
-else
-    echo "🏔️ 使用固定地形模式（与训练环境一致）"
-fi
+# 地形模式在训练配置读取完成后再统一决定，避免默认值覆盖训练环境
 
 # 🔧 修复：设置默认物理参数（与训练脚本完全一致）
 export GRAVITY=${GRAVITY:-0.0}
@@ -313,6 +325,30 @@ elif [ -z "${DAMPING}" ]; then
 export DAMPING=${DAMPING:-0.12}  # 🔧 修复：与训练脚本一致（0.15→0.18）
 fi
 
+if [ -n "$TRAINING_SIMULATION_DT" ]; then
+    export SIMULATION_DT=$TRAINING_SIMULATION_DT
+elif [ -z "${SIMULATION_DT}" ]; then
+export SIMULATION_DT=${SIMULATION_DT:-0.08}
+fi
+
+if [ -n "$TRAINING_Z_ACTION_BIAS" ]; then
+    export Z_ACTION_BIAS=$TRAINING_Z_ACTION_BIAS
+elif [ -z "${Z_ACTION_BIAS}" ]; then
+export Z_ACTION_BIAS=${Z_ACTION_BIAS:-0.0}
+fi
+
+if [ -n "$TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME" ]; then
+    export QUADROTOR_ATTITUDE_RESPONSE_TIME=$TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME
+elif [ -z "${QUADROTOR_ATTITUDE_RESPONSE_TIME}" ]; then
+export QUADROTOR_ATTITUDE_RESPONSE_TIME=${QUADROTOR_ATTITUDE_RESPONSE_TIME:-0.0}
+fi
+
+if [ -n "$TRAINING_QUADROTOR_PSI_CMD" ]; then
+    export QUADROTOR_PSI_CMD=$TRAINING_QUADROTOR_PSI_CMD
+elif [ -z "${QUADROTOR_PSI_CMD}" ]; then
+export QUADROTOR_PSI_CMD=${QUADROTOR_PSI_CMD:-0.0}
+fi
+
 if [ -n "$TRAINING_REWARD_POS_SCALE" ]; then
     export REWARD_POS_SCALE=$TRAINING_REWARD_POS_SCALE
 elif [ -z "${REWARD_POS_SCALE}" ]; then
@@ -329,6 +365,10 @@ CMD_ARGS="$CMD_ARGS --action-range-x $ACTION_RANGE_X"
 CMD_ARGS="$CMD_ARGS --action-range-y $ACTION_RANGE_Y"
 CMD_ARGS="$CMD_ARGS --action-range-z $ACTION_RANGE_Z"
 CMD_ARGS="$CMD_ARGS --damping $DAMPING"
+CMD_ARGS="$CMD_ARGS --simulation-dt $SIMULATION_DT"
+CMD_ARGS="$CMD_ARGS --z-action-bias $Z_ACTION_BIAS"
+CMD_ARGS="$CMD_ARGS --quadrotor-attitude-response-time $QUADROTOR_ATTITUDE_RESPONSE_TIME"
+CMD_ARGS="$CMD_ARGS --quadrotor-psi-cmd $QUADROTOR_PSI_CMD"
 CMD_ARGS="$CMD_ARGS --reward-pos-scale $REWARD_POS_SCALE"
 CMD_ARGS="$CMD_ARGS --reward-neg-scale $REWARD_NEG_SCALE"
 
@@ -464,6 +504,10 @@ try:
             'action_range_y',
             'action_range_z',
             'damping',
+            'simulation_dt',
+            'z_action_bias',
+            'quadrotor_attitude_response_time',
+            'quadrotor_psi_cmd',
             'reward_pos_scale',
             'reward_neg_scale',
             'distance_weight',
@@ -496,12 +540,23 @@ try:
             'global_reward_mode',
             'shaping_gamma',
             'terrain_contact_eps',
+            'random_terrain',
+            'terrain_seed',
+            'per_episode_terrain',
+            'per_env_terrain',
+            'semi_random_terrain',
+            'terrain_base_seed',
+            'terrain_complexity_level',
+            'map_size',
+            'mountain_min_distance',
             'use_fixed_positions',
             'positions_file'
         ]
         for param_name in param_names:
             if param_name in args:
                 params[param_name] = args[param_name]
+            elif isinstance(results, dict) and param_name in results:
+                params[param_name] = results[param_name]
         
         # 输出为JSON格式，方便bash解析
         import json
@@ -532,7 +587,16 @@ if [ -n "$TRAINING_PARAMS" ]; then
         TRAINING_ACTION_RANGE_X=$(json_get_from_training_params action_range_x)
         TRAINING_ACTION_RANGE_Y=$(json_get_from_training_params action_range_y)
         TRAINING_ACTION_RANGE_Z=$(json_get_from_training_params action_range_z)
+        TRAINING_GRAVITY=$(json_get_from_training_params gravity)
+        TRAINING_CONTROL_ACCEL_GAIN=$(json_get_from_training_params control_accel_gain)
+        TRAINING_AGENT_MAX_SPEED=$(json_get_from_training_params agent_max_speed)
+        TRAINING_AGENT_ACCEL=$(json_get_from_training_params agent_accel)
         TRAINING_DAMPING=$(json_get_from_training_params damping)
+        TRAINING_SIMULATION_DT=$(json_get_from_training_params simulation_dt)
+        TRAINING_Z_ACTION_BIAS=$(json_get_from_training_params z_action_bias)
+        TRAINING_USE_QUADROTOR_DYNAMICS=$(json_get_from_training_params use_quadrotor_dynamics)
+        TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME=$(json_get_from_training_params quadrotor_attitude_response_time)
+        TRAINING_QUADROTOR_PSI_CMD=$(json_get_from_training_params quadrotor_psi_cmd)
         TRAINING_REWARD_POS_SCALE=$(json_get_from_training_params reward_pos_scale)
         TRAINING_REWARD_NEG_SCALE=$(json_get_from_training_params reward_neg_scale)
         TRAINING_SCENARIO_NAME=$(json_get_from_training_params scenario_name)
@@ -549,6 +613,15 @@ if [ -n "$TRAINING_PARAMS" ]; then
         TRAINING_TERRAIN_CONTACT_EPS=$(json_get_from_training_params terrain_contact_eps)
         TRAINING_USE_FIXED_POSITIONS=$(json_get_from_training_params use_fixed_positions)
         TRAINING_POSITIONS_FILE=$(json_get_from_training_params positions_file)
+        TRAINING_RANDOM_TERRAIN=$(json_get_from_training_params random_terrain)
+        TRAINING_TERRAIN_SEED=$(json_get_from_training_params terrain_seed)
+        TRAINING_PER_EPISODE_TERRAIN=$(json_get_from_training_params per_episode_terrain)
+        TRAINING_PER_ENV_TERRAIN=$(json_get_from_training_params per_env_terrain)
+        TRAINING_SEMI_RANDOM_TERRAIN=$(json_get_from_training_params semi_random_terrain)
+        TRAINING_TERRAIN_BASE_SEED=$(json_get_from_training_params terrain_base_seed)
+        TRAINING_TERRAIN_COMPLEXITY_LEVEL=$(json_get_from_training_params terrain_complexity_level)
+        TRAINING_MAP_SIZE=$(json_get_from_training_params map_size)
+        TRAINING_MOUNTAIN_MIN_DISTANCE=$(json_get_from_training_params mountain_min_distance)
 
         TRAINING_REWARD_PARAM_KEYS=(
             distance_weight exploration_weight stationary_weight direction_weight deviation_weight
@@ -588,6 +661,33 @@ if [ -n "$TRAINING_PARAMS" ]; then
         if [ -n "$TRAINING_ACTION_RANGE_Z" ]; then
             echo "✅ 从训练配置读取ACTION_RANGE_Z: $TRAINING_ACTION_RANGE_Z"
         fi
+        if [ -n "$TRAINING_GRAVITY" ]; then
+            echo "✅ 从训练配置读取GRAVITY: $TRAINING_GRAVITY"
+        fi
+        if [ -n "$TRAINING_CONTROL_ACCEL_GAIN" ]; then
+            echo "✅ 从训练配置读取CONTROL_ACCEL_GAIN: $TRAINING_CONTROL_ACCEL_GAIN"
+        fi
+        if [ -n "$TRAINING_AGENT_MAX_SPEED" ]; then
+            echo "✅ 从训练配置读取AGENT_MAX_SPEED: $TRAINING_AGENT_MAX_SPEED"
+        fi
+        if [ -n "$TRAINING_AGENT_ACCEL" ]; then
+            echo "✅ 从训练配置读取AGENT_ACCEL: $TRAINING_AGENT_ACCEL"
+        fi
+        if [ -n "$TRAINING_SIMULATION_DT" ]; then
+            echo "✅ 从训练配置读取SIMULATION_DT: $TRAINING_SIMULATION_DT"
+        fi
+        if [ -n "$TRAINING_Z_ACTION_BIAS" ]; then
+            echo "✅ 从训练配置读取Z_ACTION_BIAS: $TRAINING_Z_ACTION_BIAS"
+        fi
+        if [ -n "$TRAINING_USE_QUADROTOR_DYNAMICS" ]; then
+            echo "✅ 从训练配置读取USE_QUADROTOR_DYNAMICS: $TRAINING_USE_QUADROTOR_DYNAMICS"
+        fi
+        if [ -n "$TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME" ]; then
+            echo "✅ 从训练配置读取QUADROTOR_ATTITUDE_RESPONSE_TIME: $TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME"
+        fi
+        if [ -n "$TRAINING_QUADROTOR_PSI_CMD" ]; then
+            echo "✅ 从训练配置读取QUADROTOR_PSI_CMD: $TRAINING_QUADROTOR_PSI_CMD"
+        fi
         if [ -n "$TRAINING_SCENARIO_NAME" ]; then
             echo "✅ 从训练配置读取SCENARIO_NAME: $TRAINING_SCENARIO_NAME"
         fi
@@ -612,6 +712,33 @@ if [ -n "$TRAINING_PARAMS" ]; then
         if [ -n "$TRAINING_POSITIONS_FILE" ]; then
             echo "✅ 从训练配置读取POSITIONS_FILE: $TRAINING_POSITIONS_FILE"
         fi
+        if [ -n "$TRAINING_RANDOM_TERRAIN" ]; then
+            echo "✅ 从训练配置读取RANDOM_TERRAIN: $TRAINING_RANDOM_TERRAIN"
+        fi
+        if [ -n "$TRAINING_TERRAIN_SEED" ]; then
+            echo "✅ 从训练配置读取TERRAIN_SEED: $TRAINING_TERRAIN_SEED"
+        fi
+        if [ -n "$TRAINING_PER_EPISODE_TERRAIN" ]; then
+            echo "✅ 从训练配置读取PER_EPISODE_TERRAIN: $TRAINING_PER_EPISODE_TERRAIN"
+        fi
+        if [ -n "$TRAINING_PER_ENV_TERRAIN" ]; then
+            echo "✅ 从训练配置读取PER_ENV_TERRAIN: $TRAINING_PER_ENV_TERRAIN"
+        fi
+        if [ -n "$TRAINING_SEMI_RANDOM_TERRAIN" ]; then
+            echo "✅ 从训练配置读取SEMI_RANDOM_TERRAIN: $TRAINING_SEMI_RANDOM_TERRAIN"
+        fi
+        if [ -n "$TRAINING_TERRAIN_BASE_SEED" ]; then
+            echo "✅ 从训练配置读取TERRAIN_BASE_SEED: $TRAINING_TERRAIN_BASE_SEED"
+        fi
+        if [ -n "$TRAINING_TERRAIN_COMPLEXITY_LEVEL" ]; then
+            echo "✅ 从训练配置读取TERRAIN_COMPLEXITY_LEVEL: $TRAINING_TERRAIN_COMPLEXITY_LEVEL"
+        fi
+        if [ -n "$TRAINING_MAP_SIZE" ]; then
+            echo "✅ 从训练配置读取MAP_SIZE: $TRAINING_MAP_SIZE"
+        fi
+        if [ -n "$TRAINING_MOUNTAIN_MIN_DISTANCE" ]; then
+            echo "✅ 从训练配置读取MOUNTAIN_MIN_DISTANCE: $TRAINING_MOUNTAIN_MIN_DISTANCE"
+        fi
     fi
 fi
 
@@ -630,6 +757,16 @@ apply_training_or_default() {
     export "$target_var"
 }
 
+normalize_bool_env_value() {
+    local raw="${1:-}"
+    raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$raw" in
+        1|true|yes|on) printf '1' ;;
+        0|false|no|off) printf '0' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 # ===== 严格对齐训练关键参数（场景/算法/步长/成功与碰撞阈值）=====
 if [ -n "$TRAINING_SCENARIO_NAME" ]; then
     SCENARIO_NAME="$TRAINING_SCENARIO_NAME"
@@ -639,6 +776,19 @@ if [ -n "$TRAINING_ALGORITHM" ]; then
 fi
 if [ -n "$TRAINING_EPISODE_LENGTH" ]; then
     EPISODE_LENGTH="$TRAINING_EPISODE_LENGTH"
+fi
+if [ -n "$EVAL_EPISODE_LENGTH_MULTIPLIER" ]; then
+    MULTIPLIER_VALID=$(awk -v v="$EVAL_EPISODE_LENGTH_MULTIPLIER" 'BEGIN {print ((v+0)>0) ? 1 : 0}')
+    if [ "$MULTIPLIER_VALID" = "1" ]; then
+        MULTIPLIER_IS_DEFAULT=$(awk -v v="$EVAL_EPISODE_LENGTH_MULTIPLIER" 'BEGIN {print (v >= 0.999999 && v <= 1.000001) ? 1 : 0}')
+        if [ "$MULTIPLIER_IS_DEFAULT" != "1" ]; then
+            BASE_EPISODE_LENGTH="$EPISODE_LENGTH"
+            EPISODE_LENGTH=$(awk -v base="$BASE_EPISODE_LENGTH" -v mult="$EVAL_EPISODE_LENGTH_MULTIPLIER" 'BEGIN {v=int(base*mult + 0.5); if (v < 1) v = 1; print v}')
+            echo "✅ 测试步长倍率生效: ${BASE_EPISODE_LENGTH} x ${EVAL_EPISODE_LENGTH_MULTIPLIER} -> ${EPISODE_LENGTH}"
+        fi
+    else
+        echo "⚠️  无效的 EVAL_EPISODE_LENGTH_MULTIPLIER=$EVAL_EPISODE_LENGTH_MULTIPLIER，忽略步长倍率设置"
+    fi
 fi
 if [ -n "$TRAINING_SUCCESS_DISTANCE_THRESHOLD" ]; then
     export SUCCESS_DISTANCE_THRESHOLD="$TRAINING_SUCCESS_DISTANCE_THRESHOLD"
@@ -658,6 +808,76 @@ if [ -z "$TRAINING_TERRAIN_CONTACT_EPS" ]; then
     export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}
     echo "⚠️  训练配置缺少 terrain_contact_eps，回退使用: $TERRAIN_CONTACT_EPS"
 fi
+
+# ===== 严格对齐训练地形生成参数（随机模式/seed/复杂度/地图尺寸）=====
+if [ -n "$TRAINING_RANDOM_TERRAIN" ]; then
+    export RANDOM_TERRAIN=$(normalize_bool_env_value "$TRAINING_RANDOM_TERRAIN")
+fi
+if [ -n "$TRAINING_PER_EPISODE_TERRAIN" ]; then
+    export PER_EPISODE_TERRAIN=$(normalize_bool_env_value "$TRAINING_PER_EPISODE_TERRAIN")
+fi
+if [ -n "$TRAINING_PER_ENV_TERRAIN" ]; then
+    export PER_ENV_TERRAIN=$(normalize_bool_env_value "$TRAINING_PER_ENV_TERRAIN")
+fi
+if [ -n "$TRAINING_SEMI_RANDOM_TERRAIN" ]; then
+    export SEMI_RANDOM_TERRAIN=$(normalize_bool_env_value "$TRAINING_SEMI_RANDOM_TERRAIN")
+fi
+if [ -n "$TRAINING_TERRAIN_SEED" ]; then
+    export USE_SCENARIO_SEED=1
+    export SCENARIO_SEED="$TRAINING_TERRAIN_SEED"
+fi
+if [ -n "$TRAINING_TERRAIN_BASE_SEED" ]; then
+    export TERRAIN_BASE_SEED="$TRAINING_TERRAIN_BASE_SEED"
+elif [ -n "$TRAINING_TERRAIN_SEED" ]; then
+    export TERRAIN_BASE_SEED="$TRAINING_TERRAIN_SEED"
+fi
+if [ -n "$TRAINING_TERRAIN_COMPLEXITY_LEVEL" ]; then
+    export TERRAIN_COMPLEXITY_LEVEL="$TRAINING_TERRAIN_COMPLEXITY_LEVEL"
+fi
+if [ -n "$TRAINING_MAP_SIZE" ]; then
+    export MAP_SIZE="$TRAINING_MAP_SIZE"
+fi
+if [ -n "$TRAINING_MOUNTAIN_MIN_DISTANCE" ]; then
+    export MOUNTAIN_MIN_DISTANCE="$TRAINING_MOUNTAIN_MIN_DISTANCE"
+fi
+
+CMD_ARGS=$(echo "$CMD_ARGS" | sed -E 's/ --random-terrain//g')
+if [ "${RANDOM_TERRAIN,,}" = "1" ] || [ "${RANDOM_TERRAIN,,}" = "true" ] || [ "${RANDOM_TERRAIN,,}" = "yes" ] || [ "${RANDOM_TERRAIN,,}" = "on" ]; then
+    CMD_ARGS="$CMD_ARGS --random-terrain"
+    echo "🏔️ 使用随机地形模式"
+else
+    echo "🏔️ 使用固定地形模式（与训练环境一致）"
+fi
+if [ -n "$TERRAIN_COMPLEXITY_LEVEL" ]; then
+    echo "🏔️ 地形复杂度等级: $TERRAIN_COMPLEXITY_LEVEL"
+fi
+if [ -n "$SCENARIO_SEED" ]; then
+    echo "🏔️ 地形种子: $SCENARIO_SEED"
+fi
+if [ -n "$MAP_SIZE" ]; then
+    echo "🗺️ 地图尺寸: $MAP_SIZE"
+fi
+if [ -n "$MOUNTAIN_MIN_DISTANCE" ]; then
+    echo "⛰️ 山峰最小间距: $MOUNTAIN_MIN_DISTANCE"
+fi
+
+# 关键物理/控制参数最初在脚本前半段就写进了 CMD_ARGS；
+# 这里在训练配置读取完成后再次统一回写，确保最终命令真正使用训练时的值。
+apply_training_or_default GRAVITY TRAINING_GRAVITY 0.0
+apply_training_or_default CONTROL_ACCEL_GAIN TRAINING_CONTROL_ACCEL_GAIN 1.0
+apply_training_or_default AGENT_MAX_SPEED TRAINING_AGENT_MAX_SPEED 37.5
+apply_training_or_default AGENT_ACCEL TRAINING_AGENT_ACCEL 3.6
+apply_training_or_default ACTION_RANGE_X TRAINING_ACTION_RANGE_X 2.5
+apply_training_or_default ACTION_RANGE_Y TRAINING_ACTION_RANGE_Y 2.5
+apply_training_or_default ACTION_RANGE_Z TRAINING_ACTION_RANGE_Z 2.2
+apply_training_or_default DAMPING TRAINING_DAMPING 0.12
+apply_training_or_default SIMULATION_DT TRAINING_SIMULATION_DT 0.08
+apply_training_or_default Z_ACTION_BIAS TRAINING_Z_ACTION_BIAS 0.0
+apply_training_or_default USE_QUADROTOR_DYNAMICS TRAINING_USE_QUADROTOR_DYNAMICS 0
+apply_training_or_default QUADROTOR_ATTITUDE_RESPONSE_TIME TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME 0.0
+apply_training_or_default QUADROTOR_PSI_CMD TRAINING_QUADROTOR_PSI_CMD 0.0
+apply_training_or_default REWARD_POS_SCALE TRAINING_REWARD_POS_SCALE 1.0
+apply_training_or_default REWARD_NEG_SCALE TRAINING_REWARD_NEG_SCALE 1.0
 
 # 固定位置策略：在严格模式下优先对齐训练时的位置文件
 if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
@@ -688,11 +908,27 @@ fi
 echo "使用评估场景: $SCENARIO_NAME"
 echo "使用算法: $ALGORITHM"
 echo "评估步长(episode_length): $EPISODE_LENGTH"
+echo "评估步长倍率: $EVAL_EPISODE_LENGTH_MULTIPLIER"
 
 # 更新已构造的基础参数，避免前面默认值遗留到最终命令
 CMD_ARGS=$(echo "$CMD_ARGS" | sed -E "s/--scenario-name [^ ]+/--scenario-name ${SCENARIO_NAME}/")
 CMD_ARGS=$(echo "$CMD_ARGS" | sed -E "s/--episode-length [^ ]+/--episode-length ${EPISODE_LENGTH}/")
 CMD_ARGS=$(echo "$CMD_ARGS" | sed -E "s/--algorithm [^ ]+/--algorithm ${ALGORITHM}/")
+CMD_ARGS="$CMD_ARGS --gravity $GRAVITY"
+CMD_ARGS="$CMD_ARGS --control-accel-gain $CONTROL_ACCEL_GAIN"
+CMD_ARGS="$CMD_ARGS --agent-max-speed $AGENT_MAX_SPEED"
+CMD_ARGS="$CMD_ARGS --agent-accel $AGENT_ACCEL"
+CMD_ARGS="$CMD_ARGS --action-range-x $ACTION_RANGE_X"
+CMD_ARGS="$CMD_ARGS --action-range-y $ACTION_RANGE_Y"
+CMD_ARGS="$CMD_ARGS --action-range-z $ACTION_RANGE_Z"
+CMD_ARGS="$CMD_ARGS --damping $DAMPING"
+CMD_ARGS="$CMD_ARGS --simulation-dt $SIMULATION_DT"
+CMD_ARGS="$CMD_ARGS --z-action-bias $Z_ACTION_BIAS"
+CMD_ARGS="$CMD_ARGS --use-quadrotor-dynamics $USE_QUADROTOR_DYNAMICS"
+CMD_ARGS="$CMD_ARGS --quadrotor-attitude-response-time $QUADROTOR_ATTITUDE_RESPONSE_TIME"
+CMD_ARGS="$CMD_ARGS --quadrotor-psi-cmd $QUADROTOR_PSI_CMD"
+CMD_ARGS="$CMD_ARGS --reward-pos-scale $REWARD_POS_SCALE"
+CMD_ARGS="$CMD_ARGS --reward-neg-scale $REWARD_NEG_SCALE"
 
 # 🔧 关键修复：设置势场参数（优先级：训练配置 > 环境变量 > 默认值）
 # 确保评估时使用的势场参数与训练时完全一致
@@ -919,9 +1155,17 @@ else
     echo ""
 fi
 
-# 默认可视化策略：保留交互式HTML与动作时序图，不生成overlay/GIF
+# 默认可视化策略：只保留最佳奖励/最佳成功回合结果，避免每个episode都生成PNG/HTML拖慢评估
 export SAVE_INTERACTIVE_TRAJ=${SAVE_INTERACTIVE_TRAJ:-1}
-export SAVE_EVAL_ALL_EPISODES=${SAVE_EVAL_ALL_EPISODES:-1}
+export SAVE_EVAL_ALL_EPISODES=${SAVE_EVAL_ALL_EPISODES:-0}
+export SAVE_BEST_TRAJ=${SAVE_BEST_TRAJ:-1}
+export SAVE_TEAM_SUCCESS_HTML=${SAVE_TEAM_SUCCESS_HTML:-1}
+export SAVE_EVAL_TRAJECTORY_JSON=${SAVE_EVAL_TRAJECTORY_JSON:-0}
+export SAVE_EVAL_TRAJECTORY_PNG=${SAVE_EVAL_TRAJECTORY_PNG:-0}
+export SAVE_EVAL_ACTOR_SEQUENCE=${SAVE_EVAL_ACTOR_SEQUENCE:-1}
+export SAVE_EVAL_CONTROL_DIAGNOSTICS=${SAVE_EVAL_CONTROL_DIAGNOSTICS:-0}
+export QUIET_OUTPUT=${QUIET_OUTPUT:-1}
+export TQDM_DISABLE=${TQDM_DISABLE:-1}
 export ENABLE_OVERLAY=${ENABLE_OVERLAY:-0}
 export DISABLE_GIF=${DISABLE_GIF:-1}
 

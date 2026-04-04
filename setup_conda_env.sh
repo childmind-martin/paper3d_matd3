@@ -36,17 +36,28 @@ pip install -U pip
 pip install tensorflow==2.12.0 tensorboard==2.12.0 gym==0.26.2
 pip install numpy==1.23.5 scipy==1.15.2 pandas==2.3.0
 pip install matplotlib==3.10.1 plotly==5.22.0 tqdm==4.67.1
+echo "安装当前代码实际使用的运行依赖 (opencv, pygame, imageio, psutil, OpenGL/pyglet)..."
+pip install imageio imageio-ffmpeg opencv-python pygame psutil PyOpenGL pyglet
 
 echo "安装项目 multiagent 包 (可编辑)..."
 pip install -e "$SCRIPT_DIR/src/multiagent"
 
+if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "检测到 NVIDIA GPU，安装 TensorFlow 2.12 对应的 CUDA 11.8 / cuDNN 8.x 运行库..."
+    conda install -y -n "$ENV_NAME" --override-channels -c conda-forge -c nvidia \
+        cudatoolkit=11.8 "cudnn>=8.6,<9"
+    if [ -n "${CONDA_PREFIX:-}" ] && [ -d "${CONDA_PREFIX}/lib" ]; then
+        export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+    if [ -f "$SCRIPT_DIR/tools/setup_conda_ld_path.sh" ]; then
+        bash "$SCRIPT_DIR/tools/setup_conda_ld_path.sh"
+    fi
+else
+    echo "未检测到 NVIDIA GPU，跳过 CUDA/cuDNN 运行库安装。"
+fi
+
 echo "验证 TensorFlow 与 GPU..."
-python -c "
-import tensorflow as tf
-print('TensorFlow', tf.__version__)
-gpus = tf.config.list_physical_devices('GPU')
-print('GPU devices:', gpus)
-"
+python "$SCRIPT_DIR/tools/check_tf_env.py" --label "TensorFlow Environment Check"
 
 echo ""
 echo "环境已就绪。运行训练:"

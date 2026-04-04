@@ -8,7 +8,7 @@ MADDPG算法优化版训练脚本
 import os
 import sys
 # 🔧 关键修复：在导入 TensorFlow 之前清除 XLA_FLAGS（TensorFlow 2.x 不再支持某些flag）
-# 🚨 修复：移除不支持的 --xla_gpu_enable_triton_gemm flag（当前TF版本不识别）
+# 🚨 修复：移除不支持的历史 XLA GPU flags（当前TF版本不识别）
 # TensorFlow 2.x 只读取 TF_XLA_FLAGS，不再读取 XLA_FLAGS
 # 因此清除 XLA_FLAGS，避免触发 "Unknown flags in XLA_FLAGS" 错误
 if 'XLA_FLAGS' in os.environ:
@@ -18,6 +18,12 @@ if 'XLA_FLAGS' in os.environ:
     flags_to_remove = [
         '--xla_gpu_enable_triton_gemm=false',
         '--xla_gpu_enable_triton_gemm=true',
+        '--xla_gpu_deterministic_ops=true',
+        '--xla_gpu_deterministic_ops=false',
+        '--xla_gpu_autotune_level=1',
+        '--xla_gpu_autotune_level=2',
+        '--xla_gpu_autotune_level=3',
+        '--xla_gpu_autotune_level=4',
         '--xla_gpu_force_compilation_parallelism=1',  # 移除串行编译参数（如果存在）
         '--xla_gpu_force_compilation_parallelism=0',
     ]
@@ -66,6 +72,24 @@ def _make_json_safe(value):
     if isinstance(value, (list, tuple, set)):
         return [_make_json_safe(v) for v in value]
     return str(value)
+
+
+def _apply_runtime_env_overrides_from_args(args):
+    """将隐藏的运行时参数显式回写到环境变量，确保训练执行与结果记录一致。"""
+    runtime_pairs = (
+        ("simulation_dt", "SIMULATION_DT"),
+        ("z_action_bias", "Z_ACTION_BIAS"),
+        ("quadrotor_attitude_response_time", "QUADROTOR_ATTITUDE_RESPONSE_TIME"),
+        ("quadrotor_psi_cmd", "QUADROTOR_PSI_CMD"),
+    )
+    for attr_name, env_name in runtime_pairs:
+        try:
+            value = getattr(args, attr_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        os.environ[env_name] = str(value)
 
 
 def _broadcast_force_ratio(force_ratio, batch_size):
@@ -3540,6 +3564,29 @@ def _clear_gpu_cache():
     except Exception:
         pass
 
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, '1' if default else '0')
+    return str(raw).lower() in ('1', 'true', 'yes', 'on')
+
+
+def _build_safe_gradient_pairs(grads, variables, global_clip_norm, per_tensor_clip=None):
+    safe_grads = []
+    safe_vars = []
+    for grad, var in zip(grads, variables):
+        if grad is None:
+            continue
+        clean_grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+        if per_tensor_clip is not None:
+            clean_grad = tf.clip_by_norm(clean_grad, tf.cast(per_tensor_clip, clean_grad.dtype))
+        safe_grads.append(clean_grad)
+        safe_vars.append(var)
+    if not safe_grads:
+        return [], tf.constant(0.0, dtype=tf.float32)
+    safe_grads, global_norm = tf.clip_by_global_norm(safe_grads, tf.cast(global_clip_norm, tf.float32))
+    safe_grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) for g in safe_grads]
+    return [(g, v) for g, v in zip(safe_grads, safe_vars)], global_norm
+
 def _get_mem_available_mb() -> float:
     """读取/proc/meminfo中的MemAvailable（MB）。失败返回-1。"""
     try:
@@ -4886,7 +4933,8 @@ class OptimizedMADDPG:
         # 负向Z轴专用正则系数（可选），用于抑制Actor长期输出负向Z加速度
         self.neg_z_reg_coef_cached = float(getattr(self.args, 'neg_z_reg_coef', 0.0))
         self.jit_compile_cached = bool(getattr(self.args, 'jit_compile', False))
-        if self.jit_compile_cached:
+        self.force_outer_jit_compile_cached = _env_flag_enabled('FORCE_OUTER_JIT_COMPILE', default=False)
+        if self.jit_compile_cached and not self.force_outer_jit_compile_cached:
             # MADDPG 7D + PF 热路径和 MATD3 主线一样，更适合只保留 PF_JIT 小核。
             # 外层再把 batch_select_actions/train_step 整体 jit_compile，会把较大的控制流、
             # 优化器更新与 raw/corrected 动作拼接一起送入 XLA，编译期开销显著上升。
@@ -4897,6 +4945,9 @@ class OptimizedMADDPG:
                 pass
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
                 print("[MADDPG] JIT_COMPILE 已自动关闭；保留 PF_JIT。")
+        elif self.jit_compile_cached and self.force_outer_jit_compile_cached:
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+                print("[MADDPG] FORCE_OUTER_JIT_COMPILE=1，保留 outer JIT。若单卡多进程不稳，可关闭该开关。")
         self.debug_pf_forces_cached = bool(getattr(self.args, 'debug_pf_forces', False))
         # 势场参数缓存
         self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 1.0))
@@ -6040,10 +6091,12 @@ class OptimizedMADDPG:
         
         # 1. 存储动作：混合随机原始动作和网络原始动作（都加了噪声，但都没修正）
         raw_actions_with_noise = noisy_network_actions  # 网络动作+噪声，无修正
-        actions_for_storage = tf.where(mask3, rand_actions_raw, raw_actions_with_noise)
+        rand_actions_for_storage = tf.cast(rand_actions_raw, raw_actions_with_noise.dtype)
+        actions_for_storage = tf.where(mask3, rand_actions_for_storage, raw_actions_with_noise)
         
         # 2. 执行动作：混合随机原始动作和网络修正动作（网络的有修正，随机的没有）
-        actions_for_execution = tf.where(mask3, rand_actions_raw, final_network_actions)
+        rand_actions_for_execution = tf.cast(rand_actions_raw, final_network_actions.dtype)
+        actions_for_execution = tf.where(mask3, rand_actions_for_execution, final_network_actions)
         
         # 3. 势场力：随机动作的势场力为0（因为没做修正）
         pf_forces_final = tf.where(
@@ -7923,19 +7976,16 @@ class OptimizedMADDPG:
         # 🔧 关键修复：移除逐层裁剪，只保留全局裁剪，避免梯度被过度裁剪
         # 原因：双重裁剪（先clip到1.0，再clip到10.0）会导致梯度不稳定，Loss波动大
         # 修复：只使用全局裁剪，保持各层梯度相对比例，提高训练稳定性
-        critic_grads, global_norm = tf.clip_by_global_norm(critic_grads, self.c_grad_clip_norm)
-        
-        # 🔧 梯度健康性检查：清理NaN/Inf梯度后更新（而不是跳过更新）
-        # 🚨 关键修复：如果梯度包含NaN/Inf，清理后继续更新，而不是跳过更新
-        # 原因：跳过更新会导致网络无法学习，清理NaN/Inf后更新可以保持学习连续性
-        grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in critic_grads if g is not None]
-        if not (grads_finite and tf.reduce_all(tf.stack(grads_finite))):
-            # 🔧 修复：清理NaN/Inf梯度，而不是跳过更新
-            critic_grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) if g is not None else g for g in critic_grads]
-            if not self.jit_compile_cached:  # 🔧 XLA修复：使用缓存的常量
-                self._grad_debug_counter.assign_add(1)
-        # 无论梯度是否包含NaN/Inf，都进行更新（已清理）
-        agent['critic_optimizer'].apply_gradients(zip(critic_grads, agent['critic'].trainable_variables))
+        critic_pairs, global_norm = _build_safe_gradient_pairs(
+            critic_grads,
+            agent['critic'].trainable_variables,
+            self.c_grad_clip_norm,
+            per_tensor_clip=None,
+        )
+        if len(critic_pairs) != len(agent['critic'].trainable_variables) and not self.jit_compile_cached:
+            self._grad_debug_counter.assign_add(1)
+        if critic_pairs:
+            agent['critic_optimizer'].apply_gradients(critic_pairs)
 
         # 训练Actor（MADDPG标准实现：当前智能体生成新动作，其他智能体使用回放动作）
         # 🔧 关键修复：Actor训练时也应用势场修正，与执行路径保持一致
@@ -8329,13 +8379,14 @@ class OptimizedMADDPG:
             
             actor_grads_pairs = [(g, v) for g, v in zip(actor_grads, agent['actor'].trainable_variables) if g is not None]
             if actor_grads_pairs:
-                grads_only = [g for g, v in actor_grads_pairs]
-                vars_only = [v for g, v in actor_grads_pairs]
-                grads_only = [tf.clip_by_norm(g, 1.0) for g in grads_only]
-                grads_only, _ = tf.clip_by_global_norm(grads_only, tf.cast(self.c_grad_clip_norm, tf.float32))
-                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in grads_only]
-                if tf.reduce_all(tf.stack(grads_finite)):
-                    agent['actor_optimizer'].apply_gradients(zip(grads_only, vars_only))
+                safe_pairs, _ = _build_safe_gradient_pairs(
+                    [g for g, _ in actor_grads_pairs],
+                    [v for _, v in actor_grads_pairs],
+                    self.c_grad_clip_norm,
+                    per_tensor_clip=1.0,
+                )
+                if safe_pairs:
+                    agent['actor_optimizer'].apply_gradients(safe_pairs)
         else:
             # 🚨 关键修复：非更新步时，返回与if分支相同数量的占位符，确保TensorFlow条件分支结构一致
             # 非更新步：占位范数（保持返回结构，数量必须与if分支相同）
@@ -9359,7 +9410,8 @@ class OptimizedMATD3:
         # 🔧 放宽前三维正则化：降低默认正则化系数，允许更大的动作范围
         self.action_reg_coef_cached = float(getattr(self.args, 'action_reg_coef', 2e-2))  # 从5e-2降低到2e-2
         self.jit_compile_cached = bool(getattr(self.args, 'jit_compile', False))
-        if self.jit_compile_cached and self.use_dual_q and self.use_separated_gradient:
+        self.force_outer_jit_compile_cached = _env_flag_enabled('FORCE_OUTER_JIT_COMPILE', default=False)
+        if self.jit_compile_cached and self.use_dual_q and self.use_separated_gradient and not self.force_outer_jit_compile_cached:
             # 当前 separated-gradient 热路径仍不适合外层 JIT，保留 PF_JIT 即可。
             self.jit_compile_cached = False
             try:
@@ -9368,6 +9420,9 @@ class OptimizedMATD3:
                 pass
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
                 print("[MATD3] JIT_COMPILE 已在 separated-gradient 热路径上自动关闭；保留 PF_JIT。")
+        elif self.jit_compile_cached and self.force_outer_jit_compile_cached and self.use_dual_q and self.use_separated_gradient:
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+                print("[MATD3] FORCE_OUTER_JIT_COMPILE=1，保留 separated-gradient 热路径的 outer JIT。若不稳可回退。")
         self.debug_pf_forces_cached = bool(getattr(self.args, 'debug_pf_forces', False))
         # 势场参数缓存
         self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 1.0))
@@ -10192,7 +10247,6 @@ class OptimizedMATD3:
             pf_forces_computed,  # ✅ 基于base PF参数计算的PF力
             pf_forces_zero
         )
-        
         # 计算网络动作（对所有智能体都计算，即使会被随机动作覆盖）
         fr_feature_batch = None
         if self.use_fr_feature_flag:
@@ -10290,10 +10344,12 @@ class OptimizedMATD3:
         
         # 3. 处理随机动作（随机动作不做势场修正，也没有噪声）
         # 存储动作：混合随机原始动作和网络原始动作（都加了噪声，但都没修正）
-        actions_for_storage = tf.where(mask3, rand_actions_raw, raw_actions_with_noise)
+        rand_actions_for_storage = tf.cast(rand_actions_raw, raw_actions_with_noise.dtype)
+        actions_for_storage = tf.where(mask3, rand_actions_for_storage, raw_actions_with_noise)
         
         # 执行动作：混合随机原始动作和网络修正动作（网络的有修正，随机的没有）
-        actions_for_execution = tf.where(mask3, rand_actions_raw, network_actions_corrected)
+        rand_actions_for_execution = tf.cast(rand_actions_raw, network_actions_corrected.dtype)
+        actions_for_execution = tf.where(mask3, rand_actions_for_execution, network_actions_corrected)
         
         # 势场力：随机动作的势场力为0（因为没做修正）
         pf_forces_final = tf.where(
@@ -10502,7 +10558,6 @@ class OptimizedMATD3:
         # 🔧 关键修复：支持PF特征作为独立输入
         # 注意：这个循环是必要的，因为每个智能体的target_actor网络是独立的
         # 性能优化：确保所有tensor转换在循环外完成，减少重复转换
-        target_next_actions = []
         fr_next = fr_batch_column
         next_act_corrected_valid = bool(
             next_act_corrected_batch is not None and getattr(replay_buffer, 'stores_next_act_corrected', False)
@@ -10523,6 +10578,8 @@ class OptimizedMATD3:
                 or (use_tf_potential_field and fr_positive and (not next_act_corrected_valid) and shared_next_correction_supported)
             )
         )
+        if detail_enabled:
+            _t_target_sub = _upd_perf_counter()
         if need_shared_next_context:
             try:
                 correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else tf.shape(all_next_obs[0])[1]
@@ -10536,10 +10593,13 @@ class OptimizedMATD3:
                     next_obs_pf_context[4],
                     next_obs_pf_context[5],
                     next_obs_pf_context[6],
-                )
+                    )
             except Exception:
                 next_obs_valid_inputs = None
                 next_obs_geometry_context = None
+        if detail_enabled:
+            update_timing['upd_target_ctx'] = update_timing.get('upd_target_ctx', 0.0) + (_upd_perf_counter() - _t_target_sub)
+            _t_target_sub = _upd_perf_counter()
 
         if self.use_pf_feature_flag:
             current_pf_features_tensor = tf.convert_to_tensor(current_pf_features_np, dtype=tf.float32)
@@ -10569,26 +10629,28 @@ class OptimizedMATD3:
                 self.n_agents,
                 pf_feat_dim,
             )
+        if detail_enabled:
+            update_timing['upd_target_pf'] = update_timing.get('upd_target_pf', 0.0) + (_upd_perf_counter() - _t_target_sub)
+            _t_target_sub = _upd_perf_counter()
 
-        for i in range(self.n_agents):
-            # 🔧 使用缓存的标志，确保与Actor网络构建时的配置一致
-            target_actor_inputs = [all_next_obs[i]]
-            if self.use_fr_feature_flag:  # 🔧 编译时常量，XLA友好
-                target_actor_inputs.append(fr_next)
-            if self.use_pf_feature_flag:  # 🔧 编译时常量，XLA友好
-                target_actor_inputs.append(next_pf_features_tensor[:, i, :pf_feat_dim])
-            
-            if len(target_actor_inputs) == 1:
-                target_action = self.agents[i]['target_actor'](target_actor_inputs[0], training=False)
-            else:
-                target_action = self.agents[i]['target_actor'](target_actor_inputs, training=False)
-            target_next_actions.append(target_action)
+        target_pf_features_for_actor = next_pf_features_tensor
+        if target_pf_features_for_actor is None:
+            target_pf_features_for_actor = tf.zeros(
+                [batch_size_dyn, self.n_agents, max(int(pf_feat_dim), 1)],
+                dtype=next_obs_n_tensor.dtype,
+            )
+        target_actions_tensor = self._forward_target_actors_batch(
+            next_obs_n_tensor,
+            fr_next,
+            target_pf_features_for_actor,
+            int(pf_feat_dim),
+        )
+        if detail_enabled:
+            update_timing['upd_target_actor'] = update_timing.get('upd_target_actor', 0.0) + (_upd_perf_counter() - _t_target_sub)
+            _t_target_sub = _upd_perf_counter()
         
         # 目标动作统一采用“先平滑、后 PF 修正”的顺序。
         current_force_ratio = fr_batch_column
-        
-        # 预构建：将 list of tensors 转换为 tensor for batch processing
-        target_actions_tensor = tf.concat(target_next_actions, axis=1)  # 保存原始target动作
 
         dtype = target_actions_tensor.dtype
         noise = tf.random.normal(tf.shape(target_actions_tensor), stddev=self.policy_noise, dtype=dtype)
@@ -10709,7 +10771,9 @@ class OptimizedMATD3:
                 global_a_next_corr = tf.ensure_shape(global_a_next_corr, [None, self.total_action_dim])
             except Exception:
                 pass
-        
+        if detail_enabled:
+            update_timing['upd_target_corr'] = update_timing.get('upd_target_corr', 0.0) + (_upd_perf_counter() - _t_target_sub)
+
         # 🔧 关键修复：Critic使用修正后动作进行学习，确保训练-执行一致性
         # 原因：环境实际执行的是修正后的动作 [修正前3维, 原始后4维]
         # 因此Critic必须评估修正后的动作，才能正确学习Q值
@@ -11105,11 +11169,14 @@ class OptimizedMATD3:
             critic1_grads = agent['critic1_optimizer'].get_unscaled_gradients(scaled_grads1)
         else:
             critic1_grads = tape.gradient(critic_loss1, agent['critic1'].trainable_variables)
-        # 🔧 修复梯度过度裁剪：移除逐层裁剪，只使用全局裁剪
-        critic1_grads, _ = tf.clip_by_global_norm(critic1_grads, self.c_grad_clip_norm)
-        _gf1 = [tf.reduce_all(tf.math.is_finite(g)) for g in critic1_grads if g is not None]
-        if _gf1 and tf.reduce_all(tf.stack(_gf1)):
-            agent['critic1_optimizer'].apply_gradients(zip(critic1_grads, agent['critic1'].trainable_variables))
+        critic1_pairs, _ = _build_safe_gradient_pairs(
+            critic1_grads,
+            agent['critic1'].trainable_variables,
+            self.c_grad_clip_norm,
+            per_tensor_clip=None,
+        )
+        if critic1_pairs:
+            agent['critic1_optimizer'].apply_gradients(critic1_pairs)
         
         # 更新Critic2
         if hasattr(agent['critic2_optimizer'], 'get_scaled_loss'):
@@ -11118,14 +11185,14 @@ class OptimizedMATD3:
             critic2_grads = agent['critic2_optimizer'].get_unscaled_gradients(scaled_grads2)
         else:
             critic2_grads = tape.gradient(critic_loss2, agent['critic2'].trainable_variables)
-        critic2_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in critic2_grads]
-        critic2_grads, _ = tf.clip_by_global_norm(critic2_grads, self.c_grad_clip_norm)
-        _gf2 = [tf.reduce_all(tf.math.is_finite(g)) for g in critic2_grads if g is not None]
-        if _gf2 and tf.reduce_all(tf.stack(_gf2)):
-            agent['critic2_optimizer'].apply_gradients(zip(critic2_grads, agent['critic2'].trainable_variables))
-        else:
-            if not bool(getattr(self.args, 'jit_compile', False)):
-                self._grad_debug_counter.assign_add(1)
+        critic2_pairs, _ = _build_safe_gradient_pairs(
+            critic2_grads,
+            agent['critic2'].trainable_variables,
+            self.c_grad_clip_norm,
+            per_tensor_clip=1.0,
+        )
+        if critic2_pairs:
+            agent['critic2_optimizer'].apply_gradients(critic2_pairs)
         
         # 延迟更新Actor（MATD3的核心特性）
         # 未更新时记为NaN，便于后续nanmean统计时自动忽略
@@ -11212,14 +11279,15 @@ class OptimizedMATD3:
                 actor_grads = agent['actor_optimizer'].get_unscaled_gradients(scaled_grads)
             else:
                 actor_grads = tape.gradient(actor_loss, agent['actor'].trainable_variables)
-            
-            # 🚨 修复Actor梯度不稳定：使用单一全局梯度裁剪，避免双重裁剪导致梯度不稳定
-            # 🔧 关键修复：移除逐层裁剪，只保留全局裁剪，避免梯度被过度裁剪
-            actor_grads, _ = tf.clip_by_global_norm(actor_grads, self.c_grad_clip_norm)
-            
-            grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in actor_grads if g is not None]
-            if grads_finite and tf.reduce_all(tf.stack(grads_finite)):
-                agent['actor_optimizer'].apply_gradients(zip(actor_grads, agent['actor'].trainable_variables))
+
+            actor_pairs, _ = _build_safe_gradient_pairs(
+                actor_grads,
+                agent['actor'].trainable_variables,
+                self.c_grad_clip_norm,
+                per_tensor_clip=None,
+            )
+            if actor_pairs:
+                agent['actor_optimizer'].apply_gradients(actor_pairs)
         
         # 🚨 修正MATD3：返回两个Critic网络的总损失
         # 🔧 关键修复：在调用.numpy()之前，使用tf.identity确保tensor已经被计算完成
@@ -11729,12 +11797,14 @@ class OptimizedMATD3:
             critic1_grads = agent['critic1_optimizer'].get_unscaled_gradients(scaled_grads1)
         else:
             critic1_grads = tape.gradient(critic1_loss, agent['critic1'].trainable_variables)
-        
-        critic1_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in critic1_grads]
-        critic1_grads, _ = tf.clip_by_global_norm(critic1_grads, self.c_grad_clip_norm)
-        _gf1 = [tf.reduce_all(tf.math.is_finite(g)) for g in critic1_grads if g is not None]
-        if _gf1 and tf.reduce_all(tf.stack(_gf1)):
-            agent['critic1_optimizer'].apply_gradients(zip(critic1_grads, agent['critic1'].trainable_variables))
+        critic1_pairs, _ = _build_safe_gradient_pairs(
+            critic1_grads,
+            agent['critic1'].trainable_variables,
+            self.c_grad_clip_norm,
+            per_tensor_clip=1.0,
+        )
+        if critic1_pairs:
+            agent['critic1_optimizer'].apply_gradients(critic1_pairs)
         
         # 更新Critic2
         if hasattr(agent['critic2_optimizer'], 'get_scaled_loss'):
@@ -11743,15 +11813,14 @@ class OptimizedMATD3:
             critic2_grads = agent['critic2_optimizer'].get_unscaled_gradients(scaled_grads2)
         else:
             critic2_grads = tape.gradient(critic2_loss, agent['critic2'].trainable_variables)
-        
-        critic2_grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in critic2_grads]
-        critic2_grads, _ = tf.clip_by_global_norm(critic2_grads, self.c_grad_clip_norm)
-        _gf2 = [tf.reduce_all(tf.math.is_finite(g)) for g in critic2_grads if g is not None]
-        if _gf2 and tf.reduce_all(tf.stack(_gf2)):
-            agent['critic2_optimizer'].apply_gradients(zip(critic2_grads, agent['critic2'].trainable_variables))
-        else:
-            if not bool(getattr(self.args, 'jit_compile', False)):
-                self._grad_debug_counter.assign_add(1)
+        critic2_pairs, _ = _build_safe_gradient_pairs(
+            critic2_grads,
+            agent['critic2'].trainable_variables,
+            self.c_grad_clip_norm,
+            per_tensor_clip=1.0,
+        )
+        if critic2_pairs:
+            agent['critic2_optimizer'].apply_gradients(critic2_pairs)
         
         # 延迟更新Actor（MATD3的核心特性）
         # 未更新时记为NaN，便于后续nanmean统计时自动忽略
@@ -11911,13 +11980,14 @@ class OptimizedMATD3:
             
             actor_grads_pairs = [(g, v) for g, v in zip(actor_grads, agent['actor'].trainable_variables) if g is not None]
             if actor_grads_pairs:
-                grads_only = [g for g, v in actor_grads_pairs]
-                vars_only = [v for g, v in actor_grads_pairs]
-                grads_only = [tf.clip_by_norm(g, 1.0) for g in grads_only]
-                grads_only, _ = tf.clip_by_global_norm(grads_only, tf.cast(self.c_grad_clip_norm, tf.float32))
-                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in grads_only]
-                if tf.reduce_all(tf.stack(grads_finite)):
-                    agent['actor_optimizer'].apply_gradients(zip(grads_only, vars_only))
+                safe_pairs, _ = _build_safe_gradient_pairs(
+                    [g for g, _ in actor_grads_pairs],
+                    [v for _, v in actor_grads_pairs],
+                    self.c_grad_clip_norm,
+                    per_tensor_clip=1.0,
+                )
+                if safe_pairs:
+                    agent['actor_optimizer'].apply_gradients(safe_pairs)
         
         # 若本步未更新Actor，则将actor_loss标记为NaN，便于上层使用nanmean聚合
         actor_loss_out = tf.where(should_update_actor,
@@ -11946,6 +12016,24 @@ class OptimizedMATD3:
         q1_a, q1_b = tf.split(q1_all, 2, axis=0)
         q2_a, q2_b = tf.split(q2_all, 2, axis=0)
         return q1_a, q2_a, q1_b, q2_b
+
+    @tf.function(reduce_retracing=True)
+    def _forward_target_actors_batch(self, next_obs_n_tensor, fr_next, next_pf_features_tensor, pf_feat_dim):
+        """将逐 agent target actor 前向收进单个图，减少 update() 外层 eager 调度开销。"""
+        target_next_actions = []
+        for i in range(self.n_agents):
+            target_actor_inputs = [next_obs_n_tensor[:, i, :self.obs_shapes[i]]]
+            if self.use_fr_feature_flag:
+                target_actor_inputs.append(fr_next)
+            if self.use_pf_feature_flag:
+                target_actor_inputs.append(next_pf_features_tensor[:, i, :pf_feat_dim])
+
+            if len(target_actor_inputs) == 1:
+                target_action = self.agents[i]['target_actor'](target_actor_inputs[0], training=False)
+            else:
+                target_action = self.agents[i]['target_actor'](target_actor_inputs, training=False)
+            target_next_actions.append(target_action)
+        return tf.concat(target_next_actions, axis=1)
 
     def _merge_action_head_tail_static(self, head, tail, action_dim):
         """使用静态 padding 合并 head/tail，减少梯度图中的动态 concat。"""
@@ -12102,15 +12190,9 @@ class OptimizedMATD3:
             gamma = self.c_gamma
             huber_delta = self.c_huber_delta
             q_clip = self.c_q_clip
-            # 🔧 优化：计算有效裁剪范围，确保Bellman更新后不超出原始q_clip
-            # 使用 q_clip * (1 - gamma * 0.1) 作为更合理的估计，保留更多学习空间
-            # 例如：gamma=0.95时，q_clip_effective = 5000 * 0.905 = 4525，比原来的2564大得多
-            # 这样既保证了Bellman更新后不会超出范围，又不会过度限制学习能力
-            # 🔧 XLA修复：使用tf.constant确保类型一致性，避免XLA编译问题
             factor = tf.constant(0.1, dtype=tf.float32)
             q_clip_effective = q_clip * (tf.constant(1.0, dtype=tf.float32) - gamma * factor)
             sw = tf.cast(sample_weights, tf.float32) if sample_weights is not None else None
-            # PER复用：累计每样本TD误差（跨智能体求均值）
             td_err_sum = tf.zeros([batch_size], dtype=tf.float32)
             td_err_cnt = tf.zeros([batch_size], dtype=tf.float32)
             for i in range(self.n_agents):
@@ -12118,7 +12200,7 @@ class OptimizedMATD3:
                 rewards = tf.cast(rew_n[:, i], tf.float32)
                 dones = tf.cast(done_n[:, i], tf.float32)
                 agent = self.agents[i]
-                
+
                 critic1_reg_add = tf.cast(0.0, tf.float32)
                 critic2_reg_add = tf.cast(0.0, tf.float32)
                 if dual_q_mode:
@@ -12241,85 +12323,62 @@ class OptimizedMATD3:
                 mask_c1 = tf.math.is_finite(current_qtot_1)
                 mask_c2 = tf.math.is_finite(current_qtot_2)
                 _mask_all = tf.squeeze(tf.logical_and(tf.logical_and(mask_t, mask_c1), mask_c2), axis=1)
-                
-                # ✅ 正确做法：只计算一个TD误差（对total Q）
-                # 不再对单个head使用统一的target（错误），而是对总Q使用统一的target（正确）
-                td1_full = tf.squeeze(y_tot - current_qtot_1, axis=1)  # Critic1的TD误差
-                td2_full = tf.squeeze(y_tot - current_qtot_2, axis=1)  # Critic2的TD误差
-                
-                # PER复用：累计每样本TD误差（仅统计有效样本）
+
+                td1_full = tf.squeeze(y_tot - current_qtot_1, axis=1)
+                td2_full = tf.squeeze(y_tot - current_qtot_2, axis=1)
+
                 td_abs = 0.5 * (tf.abs(td1_full) + tf.abs(td2_full))
                 td_abs = tf.where(_mask_all, td_abs, tf.zeros_like(td_abs))
                 td_err_sum += td_abs
                 td_err_cnt += tf.cast(_mask_all, tf.float32)
-                
-                # 🚨 标准MATD3：分别计算两个Critic网络的Huber损失
-                # Critic1的损失：Huber(y_tot - current_qtot_1)
+
                 td1 = tf.where(_mask_all, td1_full, tf.zeros_like(td1_full))
                 abs_td1 = tf.abs(td1)
                 squared_loss1 = 0.5 * tf.square(td1)
                 linear_loss1 = huber_delta * (abs_td1 - 0.5 * huber_delta)
                 transition1 = tf.nn.sigmoid((huber_delta - abs_td1) * 100.0)
                 per_loss1_vec = transition1 * squared_loss1 + (1.0 - transition1) * linear_loss1
-                
-                # Critic2的损失：Huber(y_tot - current_qtot_2)
+
                 td2 = tf.where(_mask_all, td2_full, tf.zeros_like(td2_full))
                 abs_td2 = tf.abs(td2)
                 squared_loss2 = 0.5 * tf.square(td2)
                 linear_loss2 = huber_delta * (abs_td2 - 0.5 * huber_delta)
                 transition2 = tf.nn.sigmoid((huber_delta - abs_td2) * 100.0)
                 per_loss2_vec = transition2 * squared_loss2 + (1.0 - transition2) * linear_loss2
-                
+
                 if sw is not None:
-                    sw_safe = tf.clip_by_value(sw, 0.01, 100.0)  # [B]
+                    sw_safe = tf.clip_by_value(sw, 0.01, 100.0)
                     sw_safe = tf.reshape(sw_safe, [-1])
                     sw_safe = tf.clip_by_value(sw_safe, 0.1, 10.0)
                     per_loss1_vec = per_loss1_vec * sw_safe
                     per_loss2_vec = per_loss2_vec * sw_safe
-                
-                # 逐样本掩码（避免 boolean_mask 与 tf.cond 触发 Variant/Optional）
+
                 _valid = tf.logical_and(tf.math.is_finite(per_loss1_vec), tf.math.is_finite(per_loss2_vec))
                 valid_f = tf.cast(_valid, tf.float32)
-                # 按掩码做加权均值
                 num1 = tf.reduce_sum(per_loss1_vec * valid_f)
                 num2 = tf.reduce_sum(per_loss2_vec * valid_f)
-                cnt = tf.reduce_sum(valid_f)
-                cnt = tf.maximum(cnt, tf.cast(1.0, tf.float32))
-                # 🔧 修复NaN传播：在除法前确保 num1 和 num2 是有限值
+                cnt = tf.maximum(tf.reduce_sum(valid_f), tf.cast(1.0, tf.float32))
                 num1 = tf.where(tf.math.is_finite(num1), num1, tf.cast(0.0, num1.dtype))
                 num2 = tf.where(tf.math.is_finite(num2), num2, tf.cast(0.0, num2.dtype))
-                # Critic1的损失：Huber(y_tot - current_qtot_1)
                 critic1_loss = num1 / cnt
-                # Critic2的损失：Huber(y_tot - current_qtot_2)
                 critic2_loss = num2 / cnt
-                # 🔧 修复NaN传播：确保最终损失是有限值
                 critic1_loss = tf.clip_by_value(critic1_loss, -1e4, 1e4)
                 critic2_loss = tf.clip_by_value(critic2_loss, -1e4, 1e4)
                 critic1_loss = tf.where(tf.math.is_finite(critic1_loss), critic1_loss, tf.cast(0.0, critic1_loss.dtype))
                 critic2_loss = tf.where(tf.math.is_finite(critic2_loss), critic2_loss, tf.cast(0.0, critic2_loss.dtype))
-                
-                # 统计本agent有效样本数
+
                 valid_count = tf.reduce_sum(tf.cast(_mask_all, tf.int32))
                 valid_counts.append(valid_count)
-                
+
                 critic1_loss += critic1_reg_add
                 critic2_loss += critic2_reg_add
-
-                # 训练公平权重：低成功率agent放大loss，提升其训练梯度
                 critic1_loss = critic1_loss * agent_fairness_weight
                 critic2_loss = critic2_loss * agent_fairness_weight
-                
-                # 🚨 标准MATD3：分别累积两个Critic网络的损失
-                critic_losses.append(critic1_loss + critic2_loss)  # 总损失用于统计
+
+                critic_losses.append(critic1_loss + critic2_loss)
                 total_critic1_loss += tf.cast(critic1_loss, tf.float32)
                 total_critic2_loss += tf.cast(critic2_loss, tf.float32)
-        # 🔧 修复：检查有效样本数量异常，仅在异常时输出日志
-        # 在 Python 层面检查（在 tf.function 外部）
-        # 注意：valid_counts 是 Tensor 列表，需要在函数返回后转换为 numpy 检查
-        # 统计有效样本计数（不打印）
-        # valid_counts已收集，可用于后续分析
         # 🚨 标准MATD3：分别计算和应用两个Critic网络的梯度
-        # Critic1的梯度
         all_critic1_vars = []
         per_agent_critic1_slices = []
         start1 = 0
@@ -12328,8 +12387,7 @@ class OptimizedMATD3:
             all_critic1_vars.extend(vars_i)
             per_agent_critic1_slices.append((start1, start1 + len(vars_i)))
             start1 += len(vars_i)
-        
-        # Critic2的梯度
+
         all_critic2_vars = []
         per_agent_critic2_slices = []
         start2 = 0
@@ -12338,51 +12396,37 @@ class OptimizedMATD3:
             all_critic2_vars.extend(vars_i)
             per_agent_critic2_slices.append((start2, start2 + len(vars_i)))
             start2 += len(vars_i)
-        
-        # 🚨 标准MATD3：分别计算两个Critic网络的梯度
+
         critic1_grads = tape_c.gradient(total_critic1_loss, all_critic1_vars)
         critic2_grads = tape_c.gradient(total_critic2_loss, all_critic2_vars)
-        
-        # 分片并逐 agent 应用Critic1的梯度
+
         for i in range(self.n_agents):
             s, e = per_agent_critic1_slices[i]
             agent_vars = self.agents[i]['critic1'].trainable_variables
             agent_grads = [g for g in critic1_grads[s:e] if g is not None]
-            # 确保梯度数量与变量数量匹配（过滤掉None梯度）
             if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
-                # 🚨 修复Critic发散：增强梯度裁剪（两级裁剪策略）
-                # 级别1：逐层梯度裁剪（per-layer clipping）
-                grads_i = [tf.clip_by_norm(g, 1.0) for g in agent_grads]
-                # 级别2：全局梯度裁剪（global norm clipping）
-                gi, _ = tf.clip_by_global_norm(grads_i, tf.cast(self.c_grad_clip_norm, tf.float32))
-                # 检查梯度有限性
-                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in gi]
-                if tf.reduce_all(tf.stack(grads_finite)):
-                    # 🔧 XLA修复：使用pairs列表形式，与预热优化器保持一致
-                    # 在XLA模式下，优化器无法识别从zip得到的变量对象，需要使用pairs列表
-                    pairs = [(g, v) for g, v in zip(gi, agent_vars) if g is not None]
-                    if pairs:
-                        self.agents[i]['critic1_optimizer'].apply_gradients(pairs)
-        
-        # 分片并逐 agent 应用Critic2的梯度
+                pairs, _ = _build_safe_gradient_pairs(
+                    agent_grads,
+                    agent_vars,
+                    self.c_grad_clip_norm,
+                    per_tensor_clip=1.0,
+                )
+                if pairs:
+                    self.agents[i]['critic1_optimizer'].apply_gradients(pairs)
+
         for i in range(self.n_agents):
             s, e = per_agent_critic2_slices[i]
             agent_vars = self.agents[i]['critic2'].trainable_variables
             agent_grads = [g for g in critic2_grads[s:e] if g is not None]
-            # 确保梯度数量与变量数量匹配（过滤掉None梯度）
             if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
-                # 🚨 修复Critic发散：增强梯度裁剪（两级裁剪策略）
-                # 级别1：逐层梯度裁剪（per-layer clipping）
-                grads_i = [tf.clip_by_norm(g, 1.0) for g in agent_grads]
-                # 级别2：全局梯度裁剪（global norm clipping）
-                gi, _ = tf.clip_by_global_norm(grads_i, tf.cast(self.c_grad_clip_norm, tf.float32))
-                # 检查梯度有限性
-                grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in gi]
-                if tf.reduce_all(tf.stack(grads_finite)):
-                    # 🔧 XLA修复：使用pairs列表形式，与预热优化器保持一致
-                    pairs = [(g, v) for g, v in zip(gi, agent_vars) if g is not None]
-                    if pairs:
-                        self.agents[i]['critic2_optimizer'].apply_gradients(pairs)
+                pairs, _ = _build_safe_gradient_pairs(
+                    agent_grads,
+                    agent_vars,
+                    self.c_grad_clip_norm,
+                    per_tensor_clip=1.0,
+                )
+                if pairs:
+                    self.agents[i]['critic2_optimizer'].apply_gradients(pairs)
         del tape_c
 
         # === 统一训练所有 Actor（仅在延迟更新步进入）===
@@ -12391,6 +12435,29 @@ class OptimizedMATD3:
         # 正确修复是：在 Python 侧使用 should_update_actor_bool，让 tf.function 只保留两张稳定图
         # （更新 Actor / 不更新 Actor），从而彻底跳过非延迟步的 Actor 分支，而不重新引入图内条件控制流。
         if should_update_actor:
+            actor_has_shared_pf_context = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
+            actor_uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1 and self.action_dims[0] >= 3
+            actor_pf_context_by_agent = None
+            actor_pf_context_flat = ()
+            actor_pf_geometry_context_flat = ()
+            if actor_has_shared_pf_context:
+                correct_obs_dim_actor = self.obs_shapes[0]
+                actor_obs_agent_major = tf.transpose(
+                    obs_n[:, :, :correct_obs_dim_actor],
+                    perm=[1, 0, 2],
+                )
+                flat_actor_obs = tf.ensure_shape(
+                    tf.reshape(actor_obs_agent_major, [-1, correct_obs_dim_actor]),
+                    [None, correct_obs_dim_actor],
+                )
+                actor_pf_context_flat = self._extract_pf_obs_context_compiled_tf(flat_actor_obs)
+                actor_pf_geometry_context_flat = self._extract_pf_geometry_context_compiled_tf(
+                    actor_pf_context_flat[1],
+                    actor_pf_context_flat[2],
+                    actor_pf_context_flat[4],
+                    actor_pf_context_flat[5],
+                    actor_pf_context_flat[6],
+                )
             with tf.GradientTape(persistent=True) as tape_a:
                 total_actor_loss = tf.constant(0.0, dtype=tf.float32)
                 actor_losses = []
@@ -12398,29 +12465,6 @@ class OptimizedMATD3:
                 actor_use_pf = self.use_tf_potential_field_cached and tf.reduce_any(
                     tf.greater(current_force_ratio_actor, 0.0)
                 )
-                actor_has_shared_pf_context = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
-                actor_uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1 and self.action_dims[0] >= 3
-                actor_pf_context_by_agent = None
-                actor_pf_context_flat = ()
-                actor_pf_geometry_context_flat = ()
-                if actor_has_shared_pf_context:
-                    correct_obs_dim_actor = self.obs_shapes[0]
-                    actor_obs_agent_major = tf.transpose(
-                        obs_n[:, :, :correct_obs_dim_actor],
-                        perm=[1, 0, 2],
-                    )
-                    flat_actor_obs = tf.ensure_shape(
-                        tf.reshape(actor_obs_agent_major, [-1, correct_obs_dim_actor]),
-                        [None, correct_obs_dim_actor],
-                    )
-                    actor_pf_context_flat = self._extract_pf_obs_context_compiled_tf(flat_actor_obs)
-                    actor_pf_geometry_context_flat = self._extract_pf_geometry_context_compiled_tf(
-                        actor_pf_context_flat[1],
-                        actor_pf_context_flat[2],
-                        actor_pf_context_flat[4],
-                        actor_pf_context_flat[5],
-                        actor_pf_context_flat[6],
-                    )
                 actor_agent_fairness_weights = []
                 actor_agents_list = []
                 actor_action_dims = []
@@ -12738,13 +12782,14 @@ class OptimizedMATD3:
                 agent_vars = self.agents[i]['actor'].trainable_variables
                 agent_grads = [g for g in actor_grads[s:e] if g is not None]
                 if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
-                    grads_i = [tf.clip_by_norm(g, 1.0) for g in agent_grads]
-                    gi, _ = tf.clip_by_global_norm(grads_i, tf.cast(self.c_grad_clip_norm, tf.float32))
-                    grads_finite = [tf.reduce_all(tf.math.is_finite(g)) for g in gi]
-                    if tf.reduce_all(tf.stack(grads_finite)):
-                        pairs = [(g, v) for g, v in zip(gi, agent_vars) if g is not None]
-                        if pairs:
-                            self.agents[i]['actor_optimizer'].apply_gradients(pairs)
+                    pairs, _ = _build_safe_gradient_pairs(
+                        agent_grads,
+                        agent_vars,
+                        self.c_grad_clip_norm,
+                        per_tensor_clip=1.0,
+                    )
+                    if pairs:
+                        self.agents[i]['actor_optimizer'].apply_gradients(pairs)
             del tape_a
             actor_losses_vec = tf.stack(actor_losses) if len(actor_losses) > 0 else tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
         else:
@@ -14216,6 +14261,8 @@ def train(args):
             args.seed = int(_seed)
     except Exception:
         pass
+    # 将隐藏运行时参数显式同步回环境变量，确保世界构造与结果记录使用同一口径。
+    _apply_runtime_env_overrides_from_args(args)
     # 读取安静输出开关（默认安静），供后续统一使用
     try:
         _qo_env = os.getenv('QUIET_OUTPUT', '')
@@ -14567,40 +14614,24 @@ def train(args):
     try:
         xla_global = bool(getattr(args, 'xla_global', False))
         if xla_global:
-            # 🔧 关键修复：在启用XLA前设置稳定的XLA配置，避免CUDA_ERROR_INVALID_PC和CUDA_ERROR_MISALIGNED_ADDRESS
-            # 禁用Triton autotuner，使用稳定的cuBLAS实现
-            # 降低autotune级别，减少kernel搜索空间
-            # 🔧 关键修复：清理环境变量中可能存在的冲突配置
-            existing_xla_flags = os.environ.get('XLA_FLAGS', '')
-            # 移除所有可能导致问题的flag
-            flags_to_remove = [
-                '--xla_gpu_enable_triton_gemm=false',
-                '--xla_gpu_enable_triton_gemm=true',
-                '--xla_gpu_force_compilation_parallelism=1',
-                '--xla_gpu_force_compilation_parallelism=0',
-            ]
-            cleaned_flags = existing_xla_flags
-            for flag in flags_to_remove:
-                cleaned_flags = cleaned_flags.replace(flag, '')
-            cleaned_flags = ' '.join(cleaned_flags.split())  # 清理多余空格
-            
-            # 设置稳定的XLA配置
-            stable_xla_flags = [
-                '--xla_gpu_autotune_level=1',  # 降低autotune级别，减少kernel搜索空间
-                '--xla_gpu_deterministic_ops=true',  # 强制确定性操作
-            ]
-            
-            # 合并配置
-            if cleaned_flags:
-                stable_xla_flags_str = cleaned_flags + ' ' + ' '.join(stable_xla_flags)
-            else:
-                stable_xla_flags_str = ' '.join(stable_xla_flags)
-            os.environ['XLA_FLAGS'] = stable_xla_flags_str
-            
+            compile_parallelism_raw = os.getenv('XLA_COMPILE_PARALLELISM', '').strip()
+            compile_parallelism = None
+            if compile_parallelism_raw:
+                try:
+                    compile_parallelism = max(1, int(compile_parallelism_raw))
+                except Exception:
+                    compile_parallelism = None
+            # RTX 50 系 + TF 2.12 兼容模式：不再向 XLA_FLAGS 注入旧 GPU 私有 flag。
+            # 这些 flag 在当前 TF 构建上会直接触发 parse_flags_from_env 崩溃。
+            os.environ.pop('XLA_FLAGS', None)
+            os.environ.setdefault('TF_XLA_FLAGS', '--tf_xla_auto_jit=0')
+
             tf.config.optimizer.set_jit(True)
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
                 print('已启用 XLA 全局 JIT')
-                print(f'  XLA配置: {stable_xla_flags_str}')
+                print('  XLA配置: compatibility mode (XLA_FLAGS cleared, TF_XLA_FLAGS=--tf_xla_auto_jit=0)')
+                if compile_parallelism is not None:
+                    print(f'  注意: XLA_COMPILE_PARALLELISM={compile_parallelism} 已忽略，以避免旧版 XLA flag 兼容性问题')
     except Exception as _e:
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
             print(f'启用 XLA 失败: {_e}')
@@ -15446,6 +15477,12 @@ def train(args):
                 'upd_per',
                 'upd_post',
             )
+            _detail_target_keys = (
+                'upd_target_ctx',
+                'upd_target_pf',
+                'upd_target_actor',
+                'upd_target_corr',
+            )
             _detail_labels = {
                 'env_set': 'set',
                 'env_world': 'world',
@@ -15474,8 +15511,12 @@ def train(args):
                 'upd_train': 'train',
                 'upd_per': 'per',
                 'upd_post': 'post',
+                'upd_target_ctx': 'ctx',
+                'upd_target_pf': 'pf',
+                'upd_target_actor': 'actor',
+                'upd_target_corr': 'corr',
             }
-            _detail_all_keys = _detail_env_keys + _detail_rew_keys + _detail_upd_keys
+            _detail_all_keys = _detail_env_keys + _detail_rew_keys + _detail_upd_keys + _detail_target_keys
             def _new_timing_detail_bucket():
                 bucket = {}
                 for key in _detail_all_keys:
@@ -15541,6 +15582,9 @@ def train(args):
                 upd_part = _fmt_detail_group("upd", float(timing.get('update', 0.0)), detail, _detail_upd_keys, steps)
                 if upd_part is not None:
                     parts.append(upd_part)
+                target_part = _fmt_detail_group("target", float(detail.get('upd_target', 0.0)), detail, _detail_target_keys, steps)
+                if target_part is not None:
+                    parts.append(target_part)
                 if not parts:
                     return
                 line = f"[TIMING2] {label} | " + " | ".join(parts) + " ms/step"
@@ -16078,14 +16122,15 @@ def train(args):
                 size3 = num_envs_sync * n_agents_sync * 3
                 size4 = num_envs_sync * n_agents_sync * 3
                 size5 = num_envs_sync * n_agents_sync * raw_action_dim_sync
+                sync_dtype = tf.float32
                 concat_parts = [
-                    tf.reshape(actions_for_storage_tensor, [-1]),
-                    tf.reshape(actions_for_execution_tensor, [-1]),
-                    tf.reshape(pf_forces_tensor, [-1]),
-                    tf.reshape(current_pf_features_tensor, [-1]),
+                    tf.cast(tf.reshape(actions_for_storage_tensor, [-1]), sync_dtype),
+                    tf.cast(tf.reshape(actions_for_execution_tensor, [-1]), sync_dtype),
+                    tf.cast(tf.reshape(pf_forces_tensor, [-1]), sync_dtype),
+                    tf.cast(tf.reshape(current_pf_features_tensor, [-1]), sync_dtype),
                 ]
                 if collect_actor_outputs_this_step:
-                    concat_parts.append(tf.reshape(raw_actor_outputs_tensor, [-1]))
+                    concat_parts.append(tf.cast(tf.reshape(raw_actor_outputs_tensor, [-1]), sync_dtype))
                 try:
                     combined_tf = tf.concat(concat_parts, axis=0)
                     flat = np.ascontiguousarray(_safe_tensor_to_numpy(combined_tf), dtype=np.float32)
@@ -19563,6 +19608,14 @@ def parse_args():
     parser.add_argument("--gravity", type=float, default=9.81, help="环境重力加速度（作用于 -Z 方向），0 关闭")
     parser.add_argument("--control-accel-gain", type=float, default=12.0, help="动作到物理加速度的控制增益")
     parser.add_argument("--damping", type=float, default=0.25, help="速度阻尼系数，减少物理振荡")
+    parser.add_argument("--simulation-dt", type=float, default=float(os.getenv('SIMULATION_DT', '0.08')),
+                       help="仿真步长dt（秒），默认从SIMULATION_DT读取")
+    parser.add_argument("--z-action-bias", type=float, default=float(os.getenv('Z_ACTION_BIAS', '0.0')),
+                       help="Z轴动作偏置，默认从Z_ACTION_BIAS读取")
+    parser.add_argument("--quadrotor-attitude-response-time", type=float, default=float(os.getenv('QUADROTOR_ATTITUDE_RESPONSE_TIME', '0.0')),
+                       help="四旋翼姿态响应时间，默认从QUADROTOR_ATTITUDE_RESPONSE_TIME读取")
+    parser.add_argument("--quadrotor-psi-cmd", type=float, default=float(os.getenv('QUADROTOR_PSI_CMD', '0.0')),
+                       help="四旋翼偏航指令，默认从QUADROTOR_PSI_CMD读取")
     parser.add_argument("--action-range-x", type=float, default=2.0, help="动作X轴映射范围系数（将网络输出乘以该系数）")
     parser.add_argument("--action-range-y", type=float, default=2.0, help="动作Y轴映射范围系数（将网络输出乘以该系数）")
     parser.add_argument("--action-range-z", type=float, default=1.0, help="动作Z轴映射范围系数（将网络输出乘以该系数）")
@@ -19782,6 +19835,25 @@ if __name__ == "__main__":
         # 保存训练结果
         best_ep_idx = rewards.index(max(rewards))
         last_ep_idx = len(rewards) - 1  # 最后回合的索引
+        results_args = dict(vars(args))
+        runtime_fallbacks = (
+            ("simulation_dt", "SIMULATION_DT", float),
+            ("z_action_bias", "Z_ACTION_BIAS", float),
+            ("quadrotor_attitude_response_time", "QUADROTOR_ATTITUDE_RESPONSE_TIME", float),
+            ("quadrotor_psi_cmd", "QUADROTOR_PSI_CMD", float),
+        )
+        for arg_name, env_name, caster in runtime_fallbacks:
+            if results_args.get(arg_name) is not None:
+                continue
+            env_value = os.getenv(env_name, "").strip()
+            if not env_value:
+                continue
+            try:
+                results_args[arg_name] = caster(env_value)
+            except Exception:
+                results_args[arg_name] = env_value
+        results_args["use_quadrotor_dynamics"] = os.getenv('USE_QUADROTOR_DYNAMICS', '0').lower() in ('1', 'true', 'yes', 'on')
+
         results = {
             'episodes': len(rewards),
             'rewards': rewards,
@@ -19794,7 +19866,7 @@ if __name__ == "__main__":
             'best_team_sr_episode': int(getattr(maddpg, '_best_team_sr_episode', -1)),
             'best_team_sr_force_ratio': float(getattr(maddpg, '_best_team_sr_force_ratio', 0.0)),
             'best_team_sr_reward': getattr(maddpg, '_best_team_sr_reward', None),
-            'args': vars(args)
+            'args': results_args
         }
         
         with open(os.path.join(run_dir, "results.json"), 'w') as f:

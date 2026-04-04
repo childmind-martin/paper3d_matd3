@@ -1,4 +1,5 @@
 import os
+import sys
 import warnings
 
 try:
@@ -40,4 +41,21 @@ warnings.warn("This code base is no longer maintained, and is not expected to be
               "to results run on this version of the environments. \n")
 
 if os.getenv('SUPPRESS_MA_PROMPT') != '1':
-    input("Please read the raised warning, then press Enter to continue... (to suppress this prompt, please set the environment variable `SUPPRESS_MA_PROMPT=1`)\n")
+    prompt = (
+        "Please read the raised warning, then press Enter to continue... "
+        "(to suppress this prompt, please set the environment variable "
+        "`SUPPRESS_MA_PROMPT=1`)\n"
+    )
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            input(prompt)
+        else:
+            warnings.warn(
+                "SUPPRESS_MA_PROMPT is not set, but stdin is non-interactive; "
+                "skipping multiagent confirmation prompt."
+            )
+    except EOFError:
+        warnings.warn(
+            "Encountered EOF while waiting for multiagent confirmation prompt; "
+            "continuing in non-interactive mode."
+        )

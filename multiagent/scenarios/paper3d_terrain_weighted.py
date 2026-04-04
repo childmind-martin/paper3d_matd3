@@ -662,7 +662,7 @@ class Scenario(BaseTerrainScenario):
             world._team_sync_bottleneck_dist = float(bottleneck_dist)
             world._team_sync_bottleneck_delta = float(bottleneck_delta)
             world._team_sync_waiting_ratio = float(waiting_ratio)
-            world._team_sync_occupancy_basis = 'reach' if use_reach_progress else 'succ'
+            world._team_sync_occupancy_basis = 'succ'
             return float(reward_scalar)
         except Exception:
             return 0.0

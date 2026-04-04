@@ -27,9 +27,12 @@ from ablation_action_pf_comparison import load_metrics
 from ablation_dual_q_separated_gradient import (
     DEFAULT_POST_EVAL_EPISODES,
     EXPERIMENT_CONFIGS,
+    _aggregate_multi_seed_runs,
+    _audit_multi_seed_children,
     _build_post_eval_spec,
     _collect_post_eval_series,
     _evaluate_claims,
+    _evaluate_multi_seed_claims,
     _load_manifest,
     _post_eval_enabled,
     _resolve_post_eval_seed,
@@ -38,7 +41,11 @@ from ablation_dual_q_separated_gradient import (
     _save_json,
     _sort_experiment_configs,
     _validate_loaded_result,
+    _write_experiment_result_artifact,
+    _write_multi_seed_audit_report,
+    _write_multi_seed_outputs,
     _write_post_eval_summary_text,
+    _write_single_seed_outputs,
     _plot_post_eval_arrival_path_comparison,
     _plot_post_eval_summary_dashboard,
     plot_comparison_rewards_dualq,
@@ -108,6 +115,30 @@ def parse_args() -> argparse.Namespace:
         help="后评估使用的模型检查点变体；默认优先读取 batch config",
     )
     parser.add_argument(
+        "--post-eval-peak-jitter-range",
+        type=float,
+        default=None,
+        help="heldout_shared 下相似地形的山峰局部扰动范围（米）",
+    )
+    parser.add_argument(
+        "--post-eval-start-center-jitter",
+        type=float,
+        default=None,
+        help="heldout_shared 下起点簇中心相对训练区域的随机扰动半径（米）",
+    )
+    parser.add_argument(
+        "--post-eval-agent-local-jitter",
+        type=float,
+        default=None,
+        help="heldout_shared 下每个智能体相对参考队形的局部扰动幅度（米）",
+    )
+    parser.add_argument(
+        "--post-eval-goal-region-radius",
+        type=float,
+        default=None,
+        help="heldout_shared 下目标相对训练目标区域的随机半径（米）",
+    )
+    parser.add_argument(
         "--smooth-window",
         type=int,
         default=5,
@@ -134,6 +165,21 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="仅解析 batch、manifest 和日志目录，不实际执行评估",
+    )
+    parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="忽略已有 evaluation_results.json，强制重跑 post-eval 并重写图像",
+    )
+    parser.add_argument(
+        "--regenerate-testset",
+        action="store_true",
+        help="强制重生成 heldout_shared 的 episode_positions 测试集",
+    )
+    parser.add_argument(
+        "--save-all-episode-visualizations",
+        action="store_true",
+        help="为每个评估回合保存 PNG/HTML，可用于逐回合检查测试集是否合理",
     )
     return parser.parse_args()
 
@@ -224,11 +270,358 @@ def _build_runtime_args(batch_config: Dict[str, Any]) -> SimpleNamespace:
     )
     args.post_eval_seed = batch_config.get("post_eval_seed")
     args.post_eval_mode = str(batch_config.get("post_eval_mode", "heldout_shared"))
-    args.post_eval_model_variant = str(batch_config.get("post_eval_model_variant", "final"))
+    args.post_eval_model_variant = str(batch_config.get("post_eval_model_variant", "best_by_team_sr"))
+    args.post_eval_terrain_base_seed = batch_config.get("post_eval_terrain_base_seed")
+    args.post_eval_peak_jitter_range = batch_config.get("post_eval_peak_jitter_range")
+    args.post_eval_start_center_jitter = batch_config.get("post_eval_start_center_jitter")
+    args.post_eval_agent_local_jitter = batch_config.get("post_eval_agent_local_jitter")
+    args.post_eval_goal_region_radius = batch_config.get("post_eval_goal_region_radius")
     args.smooth_window = 5
     args.fit_method = "moving_average"
     args.resolved_post_eval_seed = _resolve_post_eval_seed(args)
+    args.skip_local_plots = False
+    args.generate_interactive = False
+    args.disable_strict_validity = False
+    args.force_post_eval_rerun = False
+    args.force_post_eval_testset_regen = False
+    args.post_eval_save_all_episodes = False
+    args.post_eval_save_interactive_html = True
+    args.post_eval_save_best_reward_html = True
+    args.post_eval_save_team_success_html = True
+    args.post_eval_save_trajectory_json = False
+    args.max_parallel = int(batch_config.get("max_parallel", 0) or 0)
+    args.experiment_group = str(batch_config.get("experiment_group", "A"))
+    args.episodes = int(batch_config.get("episodes", 0) or 0)
     return args
+
+
+def _apply_cli_overrides(runtime_args: SimpleNamespace, cli_args: argparse.Namespace) -> None:
+    runtime_args.skip_plots = bool(cli_args.skip_plots)
+    runtime_args.skip_local_plots = bool(cli_args.skip_plots)
+    runtime_args.smooth_window = int(cli_args.smooth_window)
+    runtime_args.fit_method = str(cli_args.fit_method)
+    runtime_args.force_post_eval_rerun = bool(cli_args.force_rerun)
+    runtime_args.force_post_eval_testset_regen = bool(cli_args.regenerate_testset)
+    runtime_args.post_eval_save_all_episodes = bool(cli_args.save_all_episode_visualizations)
+    runtime_args.post_eval_save_interactive_html = True
+    runtime_args.post_eval_save_best_reward_html = True
+    runtime_args.post_eval_save_team_success_html = True
+    runtime_args.post_eval_save_trajectory_json = False
+
+    if cli_args.post_eval_episodes is not None:
+        runtime_args.post_eval_episodes = int(cli_args.post_eval_episodes)
+    if cli_args.post_eval_seed is not None:
+        runtime_args.post_eval_seed = int(cli_args.post_eval_seed)
+    if cli_args.post_eval_mode is not None:
+        runtime_args.post_eval_mode = str(cli_args.post_eval_mode)
+    if cli_args.post_eval_model_variant is not None:
+        runtime_args.post_eval_model_variant = str(cli_args.post_eval_model_variant)
+    if cli_args.post_eval_peak_jitter_range is not None:
+        runtime_args.post_eval_peak_jitter_range = float(cli_args.post_eval_peak_jitter_range)
+    if cli_args.post_eval_start_center_jitter is not None:
+        runtime_args.post_eval_start_center_jitter = float(cli_args.post_eval_start_center_jitter)
+    if cli_args.post_eval_agent_local_jitter is not None:
+        runtime_args.post_eval_agent_local_jitter = float(cli_args.post_eval_agent_local_jitter)
+    if cli_args.post_eval_goal_region_radius is not None:
+        runtime_args.post_eval_goal_region_radius = float(cli_args.post_eval_goal_region_radius)
+    runtime_args.resolved_post_eval_seed = _resolve_post_eval_seed(runtime_args)
+
+
+def _resolve_group_desc(batch_config: Dict[str, Any], experiment_group: str) -> str:
+    return str(
+        batch_config.get(
+            "experiment_group_desc",
+            "Fixed Map" if experiment_group == "A" else "Random Obstacles",
+        )
+    )
+
+
+def _resolve_seed_batch_dirs(parent_batch_dir: Path) -> List[Path]:
+    seed_root = parent_batch_dir / "seed_batches"
+    if not seed_root.exists():
+        return []
+
+    rows = []
+    for child_dir in seed_root.iterdir():
+        if not child_dir.is_dir():
+            continue
+        if child_dir.name == "latest":
+            continue
+        config_path = child_dir / "config.json"
+        if not config_path.exists():
+            continue
+        try:
+            child_config = _load_json(config_path)
+            if str(child_config.get("batch_mode", "")).strip().lower() != "seed_worker":
+                continue
+            seed = int(child_config.get("seed"))
+        except Exception:
+            seed = None
+        rows.append((seed is None, seed if seed is not None else child_dir.name, child_dir))
+    rows.sort(key=lambda item: item[:2])
+    return [child_dir for _, _, child_dir in rows]
+
+
+def _selected_labels_from_config(batch_config: Dict[str, Any], cli_args: argparse.Namespace) -> List[str]:
+    if cli_args.experiments:
+        return list(cli_args.experiments)
+    selected = list(batch_config.get("experiments", []))
+    if not selected:
+        raise RuntimeError("batch config 中没有 experiments，且命令行也未指定 --experiments")
+    return selected
+
+
+def _run_single_seed_backfill(
+    batch_dir: Path,
+    batch_config: Dict[str, Any],
+    cli_args: argparse.Namespace,
+    logs_root: Path,
+) -> Dict[str, Any]:
+    runtime_args = _build_runtime_args(batch_config)
+    _apply_cli_overrides(runtime_args, cli_args)
+
+    selected_labels = _selected_labels_from_config(batch_config, cli_args)
+    configs_to_run = _resolve_experiment_configs(selected_labels)
+
+    positions_file = _resolve_repo_path(str(batch_config.get("positions_file", "")))
+    if not positions_file.exists():
+        raise FileNotFoundError(f"positions_file 不存在: {positions_file}")
+
+    batch_seed = int(batch_config.get("seed"))
+    scenario_seed = int(batch_config.get("scenario_seed", 88))
+    experiment_group = str(batch_config.get("experiment_group", "A"))
+    runtime_args.experiment_group = experiment_group
+    runtime_args.episodes = int(batch_config.get("episodes", 0) or 0)
+    group_desc = _resolve_group_desc(batch_config, experiment_group)
+
+    post_eval_spec = _build_post_eval_spec(runtime_args, batch_dir, positions_file)
+    if post_eval_spec is None:
+        raise RuntimeError("post-eval 当前被禁用，无法执行补测")
+
+    manifest_dir = batch_dir / "manifests"
+    if not manifest_dir.exists():
+        raise FileNotFoundError(f"缺少 manifests 目录: {manifest_dir}")
+
+    print(f"{'=' * 70}")
+    print(f"Post-eval backfill - seed batch: {batch_dir}")
+    print(f"Experiments: {[cfg['label'] for cfg in configs_to_run]}")
+    print(
+        f"Post-eval: mode={post_eval_spec['mode']}, episodes={post_eval_spec['episodes']}, "
+        f"seed={post_eval_spec['seed']}, model_variant={post_eval_spec['model_variant']}"
+    )
+    print(
+        f"Terrain family: {post_eval_spec.get('terrain_family', 'unknown')}, "
+        f"base_seed={post_eval_spec.get('terrain_base_seed')}, "
+        f"peak_jitter={post_eval_spec.get('peak_jitter_range')}"
+    )
+    print(
+        f"Position family: {post_eval_spec.get('position_family', 'unknown')}, "
+        f"start_jitter={post_eval_spec.get('start_center_jitter')}, "
+        f"agent_jitter={post_eval_spec.get('agent_local_jitter')}, "
+        f"goal_radius={post_eval_spec.get('goal_region_radius')}"
+    )
+    if post_eval_spec.get("episode_positions_dir"):
+        print(f"Heldout testset dir: {post_eval_spec['episode_positions_dir']}")
+    print(f"{'=' * 70}")
+
+    series: List[Dict[str, Any]] = []
+    for cfg in configs_to_run:
+        label = cfg["label"]
+        manifest_path = manifest_dir / f"{label}_resolved_manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"缺少 resolved manifest: {manifest_path}")
+
+        log_dir = _resolve_log_dir_from_manifest_strict(
+            manifest_path=manifest_path,
+            logs_root=logs_root,
+            allow_fallback_latest=bool(cli_args.allow_fallback_latest),
+        )
+        metrics = load_metrics(log_dir)
+        validation_errors = _validate_loaded_result(
+            cfg=cfg,
+            log_dir=log_dir,
+            metrics=metrics,
+            expected_episodes=int(batch_config.get("episodes")),
+            positions_file=positions_file,
+            expected_terrain_seed=scenario_seed,
+            batch_seed=batch_seed,
+        )
+        if validation_errors:
+            raise RuntimeError(
+                f"[{label}] 训练结果有效性校验失败: {' | '.join(validation_errors)}"
+            )
+
+        result = {
+            "label": label,
+            "name": cfg.get("name", label),
+            "name_en": cfg.get("name_en", cfg.get("name", label)),
+            "description": cfg.get("description", ""),
+            "log_dir": log_dir,
+            "manifest_path": str(manifest_path),
+            "metrics": metrics,
+            "success": True,
+        }
+
+        print(f"[{label}] log_dir = {log_dir}")
+        if cli_args.dry_run:
+            series.append(result)
+            continue
+
+        result = _run_post_training_evaluation(
+            result=result,
+            cfg=cfg,
+            positions_file=positions_file,
+            args=runtime_args,
+            batch_dir=batch_dir,
+            post_eval_spec=post_eval_spec,
+        )
+        _write_experiment_result_artifact(
+            result=result,
+            args=runtime_args,
+            batch_dir=batch_dir,
+            positions_file=positions_file,
+            batch_seed=batch_seed,
+            experiment_group=experiment_group,
+            group_desc=group_desc,
+        )
+        series.append(result)
+
+    if cli_args.dry_run:
+        return {
+            "summary_mode": "dry_run",
+            "seed": batch_seed,
+            "batch_dir": str(batch_dir),
+            "experiments": [cfg["label"] for cfg in configs_to_run],
+        }
+
+    claims_report = _evaluate_claims(series, {cfg["label"] for cfg in configs_to_run})
+    summary = _write_single_seed_outputs(
+        series=series,
+        args=runtime_args,
+        batch_dir=batch_dir,
+        output_dir=batch_dir / "plots",
+        positions_file=positions_file,
+        batch_seed=batch_seed,
+        experiment_group=experiment_group,
+        group_desc=group_desc,
+        strict_validity_enabled=not bool(runtime_args.disable_strict_validity),
+        claims_report=claims_report,
+    )
+    summary["summary_path"] = str(batch_dir / "plots" / "latest_summary.json")
+    return summary
+
+
+def _run_multi_seed_parent_backfill(
+    batch_dir: Path,
+    batch_config: Dict[str, Any],
+    cli_args: argparse.Namespace,
+    logs_root: Path,
+) -> Dict[str, Any]:
+    child_batch_dirs = _resolve_seed_batch_dirs(batch_dir)
+    if not child_batch_dirs:
+        raise RuntimeError(f"未找到 seed_batches 子目录: {batch_dir}")
+
+    parent_runtime_args = _build_runtime_args(batch_config)
+    _apply_cli_overrides(parent_runtime_args, cli_args)
+    experiment_group = str(batch_config.get("experiment_group", "A"))
+    parent_runtime_args.experiment_group = experiment_group
+    group_desc = _resolve_group_desc(batch_config, experiment_group)
+
+    positions_file = _resolve_repo_path(str(batch_config.get("positions_file", "")))
+    if not positions_file.exists():
+        raise FileNotFoundError(f"positions_file 不存在: {positions_file}")
+
+    expected_labels = _selected_labels_from_config(batch_config, cli_args)
+    expected_seeds: List[int] = []
+    child_summaries: List[Dict[str, Any]] = []
+    child_runs: List[Dict[str, Any]] = []
+
+    for child_batch_dir in child_batch_dirs:
+        child_config = _load_json(child_batch_dir / "config.json")
+        try:
+            seed = int(child_config.get("seed"))
+            expected_seeds.append(seed)
+        except Exception:
+            seed = None
+
+        try:
+            summary = _run_single_seed_backfill(
+                batch_dir=child_batch_dir,
+                batch_config=child_config,
+                cli_args=cli_args,
+                logs_root=logs_root,
+            )
+            if cli_args.dry_run:
+                status = "dry_run"
+            else:
+                status = "completed"
+            child_runs.append(
+                {
+                    "seed": seed,
+                    "status": status,
+                    "batch_dir": str(child_batch_dir),
+                    "summary_path": str(child_batch_dir / "plots" / "latest_summary.json"),
+                }
+            )
+            if not cli_args.dry_run:
+                summary["summary_path"] = str(child_batch_dir / "plots" / "latest_summary.json")
+                child_summaries.append(summary)
+        except Exception as exc:
+            child_runs.append(
+                {
+                    "seed": seed,
+                    "status": "failed",
+                    "batch_dir": str(child_batch_dir),
+                    "summary_path": "",
+                    "error": str(exc),
+                }
+            )
+            raise
+
+    if cli_args.dry_run:
+        return {
+            "summary_mode": "dry_run_multi_seed",
+            "batch_dir": str(batch_dir),
+            "child_runs": child_runs,
+        }
+
+    expected_post_eval = None
+    if _post_eval_enabled(parent_runtime_args):
+        expected_post_eval = {
+            "enabled": True,
+            "mode": getattr(parent_runtime_args, "post_eval_mode", "heldout_shared"),
+            "episodes": int(getattr(parent_runtime_args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
+            "seed": int(getattr(parent_runtime_args, "resolved_post_eval_seed", _resolve_post_eval_seed(parent_runtime_args))),
+            "model_variant": getattr(parent_runtime_args, "post_eval_model_variant", "best_by_team_sr"),
+        }
+
+    audit_report = _audit_multi_seed_children(
+        child_summaries=child_summaries,
+        expected_labels=expected_labels,
+        expected_seeds=expected_seeds,
+        expected_positions_file=positions_file,
+        expected_post_eval=expected_post_eval,
+    )
+    audit_report_path = _write_multi_seed_audit_report(batch_dir, audit_report)
+    if not audit_report.get("passed", False):
+        raise RuntimeError(f"多seed补测审计失败，详情见: {audit_report_path}")
+
+    aggregates = _aggregate_multi_seed_runs(child_summaries)
+    claims_report_multi_seed = _evaluate_multi_seed_claims(aggregates, set(expected_labels))
+    summary = _write_multi_seed_outputs(
+        batch_dir=batch_dir,
+        args=parent_runtime_args,
+        positions_file=positions_file,
+        seeds=expected_seeds,
+        child_runs=child_runs,
+        aggregates=aggregates,
+        claims_report_multi_seed=claims_report_multi_seed,
+        group_desc=group_desc,
+        audit_report=audit_report,
+        audit_report_path=audit_report_path,
+    )
+    summary["summary_path"] = str(batch_dir / "plots" / "latest_summary.json")
+    return summary
 
 
 def _build_post_eval_only_summary(
@@ -397,132 +790,32 @@ def main() -> int:
         raise FileNotFoundError(f"缺少 batch config: {config_path}")
 
     batch_config = _load_json(config_path)
-    runtime_args = _build_runtime_args(batch_config)
-    runtime_args.skip_plots = bool(args.skip_plots)
-    runtime_args.smooth_window = int(args.smooth_window)
-    runtime_args.fit_method = str(args.fit_method)
-
-    if args.post_eval_episodes is not None:
-        runtime_args.post_eval_episodes = int(args.post_eval_episodes)
-    if args.post_eval_seed is not None:
-        runtime_args.post_eval_seed = int(args.post_eval_seed)
-    if args.post_eval_mode is not None:
-        runtime_args.post_eval_mode = str(args.post_eval_mode)
-    if args.post_eval_model_variant is not None:
-        runtime_args.post_eval_model_variant = str(args.post_eval_model_variant)
-    runtime_args.resolved_post_eval_seed = _resolve_post_eval_seed(runtime_args)
-
-    selected_labels = (
-        list(args.experiments)
-        if args.experiments
-        else list(batch_config.get("experiments", []))
-    )
-    if not selected_labels:
-        raise RuntimeError("batch config 中没有 experiments，且命令行也未指定 --experiments")
-    configs_to_run = _resolve_experiment_configs(selected_labels)
-
-    positions_file = _resolve_repo_path(str(batch_config.get("positions_file", "")))
-    if not positions_file.exists():
-        raise FileNotFoundError(f"positions_file 不存在: {positions_file}")
-
-    batch_seed = int(batch_config.get("seed"))
-    scenario_seed = int(batch_config.get("scenario_seed", 88))
-    experiment_group = str(batch_config.get("experiment_group", "A"))
-    group_desc = str(
-        batch_config.get(
-            "experiment_group_desc",
-            "Fixed Map" if experiment_group == "A" else "Random Obstacles",
-        )
-    )
-
-    post_eval_spec = _build_post_eval_spec(runtime_args, batch_dir, positions_file)
-    if post_eval_spec is None:
-        raise RuntimeError("post-eval 当前被禁用，无法执行补测")
-
-    manifest_dir = batch_dir / "manifests"
-    if not manifest_dir.exists():
-        raise FileNotFoundError(f"缺少 manifests 目录: {manifest_dir}")
-
-    print(f"{'=' * 70}")
-    print("Post-eval backfill")
+    batch_mode = str(batch_config.get("batch_mode", "")).strip().lower()
     print(f"Batch: {batch_dir}")
     print(f"Logs root: {logs_root}")
-    print(f"Experiments: {[cfg['label'] for cfg in configs_to_run]}")
     print(
-        f"Post-eval: mode={post_eval_spec['mode']}, episodes={post_eval_spec['episodes']}, "
-        f"seed={post_eval_spec['seed']}, model_variant={post_eval_spec['model_variant']}"
+        f"Overrides: force_rerun={bool(args.force_rerun)}, "
+        f"regenerate_testset={bool(args.regenerate_testset)}, "
+        f"save_all_episode_visualizations={bool(args.save_all_episode_visualizations)}"
     )
-    if post_eval_spec.get("episode_positions_dir"):
-        print(f"Heldout testset dir: {post_eval_spec['episode_positions_dir']}")
-    print(f"{'=' * 70}")
 
-    series: List[Dict[str, Any]] = []
-    for cfg in configs_to_run:
-        label = cfg["label"]
-        manifest_path = manifest_dir / f"{label}_resolved_manifest.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"缺少 resolved manifest: {manifest_path}")
-
-        log_dir = _resolve_log_dir_from_manifest_strict(
-            manifest_path=manifest_path,
-            logs_root=logs_root,
-            allow_fallback_latest=bool(args.allow_fallback_latest),
-        )
-        metrics = load_metrics(log_dir)
-        validation_errors = _validate_loaded_result(
-            cfg=cfg,
-            log_dir=log_dir,
-            metrics=metrics,
-            expected_episodes=int(batch_config.get("episodes")),
-            positions_file=positions_file,
-            expected_terrain_seed=scenario_seed,
-            batch_seed=batch_seed,
-        )
-        if validation_errors:
-            raise RuntimeError(
-                f"[{label}] 训练结果有效性校验失败: {' | '.join(validation_errors)}"
-            )
-
-        result = {
-            "label": label,
-            "name": cfg.get("name", label),
-            "name_en": cfg.get("name_en", cfg.get("name", label)),
-            "description": cfg.get("description", ""),
-            "log_dir": log_dir,
-            "manifest_path": str(manifest_path),
-            "metrics": metrics,
-            "success": True,
-        }
-
-        print(f"[{label}] log_dir = {log_dir}")
-        if args.dry_run:
-            series.append(result)
-            continue
-
-        result = _run_post_training_evaluation(
-            result=result,
-            cfg=cfg,
-            positions_file=positions_file,
-            args=runtime_args,
+    if batch_mode == "multi_seed_parent":
+        _run_multi_seed_parent_backfill(
             batch_dir=batch_dir,
-            post_eval_spec=post_eval_spec,
+            batch_config=batch_config,
+            cli_args=args,
+            logs_root=logs_root,
         )
-        series.append(result)
+    else:
+        _run_single_seed_backfill(
+            batch_dir=batch_dir,
+            batch_config=batch_config,
+            cli_args=args,
+            logs_root=logs_root,
+        )
 
     if args.dry_run:
         print("\nDry-run complete: manifest、log_dir 和 post-eval 配置解析成功，未执行评估。")
-        return 0
-
-    _write_post_eval_only_outputs(
-        series=series,
-        args=runtime_args,
-        batch_dir=batch_dir,
-        positions_file=positions_file,
-        batch_seed=batch_seed,
-        experiment_group=experiment_group,
-        group_desc=group_desc,
-        post_eval_spec=post_eval_spec,
-    )
     return 0
 
 

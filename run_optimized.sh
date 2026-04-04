@@ -31,6 +31,7 @@ unset XLA_FLAGS 2>/dev/null || true
 # 🚨 修复：移除不支持的 --xla_gpu_enable_triton_gemm flag（当前TF版本不识别）
 # 注意：Triton GEMM 可能默认禁用，或者需要通过其他方式控制
 export TF_XLA_FLAGS="--tf_xla_auto_jit=0"
+export SUPPRESS_MA_PROMPT=${SUPPRESS_MA_PROMPT:-1}
 
 # 检测GPU是否可用（存在 nvidia-smi 且可列出设备，且未显式屏蔽 CUDA_VISIBLE_DEVICES）
 HAS_GPU=0
@@ -53,7 +54,7 @@ echo "MADDPG 优化版训练启动器 (已修复)"
 echo "======================================"
 
 # 设置默认参数
-EPISODES=${1:-300}    
+EPISODES=${1:-800}    
 BATCH_SIZE=${2:-1024}  # 🔧 好效果复现：与 result.json 一致（1024）
 EXP_NAME=${3:-"变FR到0.1、公平权重补偿、静态障碍物、课程学习、随机角色、高球形障碍apf、复杂4_exp"}
 USE_WEIGHTED_REWARD=${4:-1}  # 新增：是否使用分项加权求和奖励机制（1=启用，0=禁用）
@@ -149,8 +150,9 @@ export MAX_WEIGHT_THRESHOLD=${MAX_WEIGHT_THRESHOLD:-0.999}   # 从0.15放宽到0
 export WEIGHT_SCALING_FACTOR=${WEIGHT_SCALING_FACTOR:-0.999}  # 从0.6提高到0.9，更温和的缩放
 
 # === 🚀 加速配置（默认：仅保留 PF_JIT，禁用通用 JIT_COMPILE）===
-export AMP_MODE=off
+export AMP_MODE=${AMP_MODE:-off}
 export JIT_COMPILE=${JIT_COMPILE:-1}            # 当前 MATD3 separated-gradient 热路径下不稳定，默认关闭
+export FORCE_OUTER_JIT_COMPILE=${FORCE_OUTER_JIT_COMPILE:-1}  # 默认启用 outer JIT；若不稳可手动设为0
 export PF_JIT=${PF_JIT:-1}                      # 势场热内核 JIT，当前已验证有效
 
 # === 🔧 XLA Global 配置（默认启用，异步执行模式）===
@@ -297,7 +299,7 @@ export DYNAMIC_FIRST_TIME=${DYNAMIC_FIRST_TIME:-1}    # 🔧 启用动态首次�
 export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3} # 地形复杂度等级 (1-4) - 默认等级2
 export MOUNTAIN_MIN_DISTANCE=${MOUNTAIN_MIN_DISTANCE:-55}      # 山峰之间的最小距离（单位：地图单位，建议范围20-80）
 export MAP_SIZE=${MAP_SIZE:-200}
-export USE_DYNAMIC_OBSTACLES=${USE_DYNAMIC_OBSTACLES:-1}  # 🔧 障碍物生成模式（1=动态，每次reset重新生成；0=固定，只在首次生成）
+export USE_DYNAMIC_OBSTACLES=${USE_DYNAMIC_OBSTACLES:-0}  # 🔧 障碍物生成模式（1=动态，每次reset重新生成；0=固定，只在首次生成）
                                                            # 1: 每次reset时重新生成障碍物位置（课程学习解锁后启用，增加训练多样性）
                                                            # 0: 障碍物位置固定，只在首次生成时创建，后续不再变化（课程学习初始状态）
                                                            # 🚀 课程学习：初始为0（固定障碍物），满足条件后自动解锁为1（随机障碍物）

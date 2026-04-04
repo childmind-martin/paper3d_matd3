@@ -1,4 +1,5 @@
 # 创建multiagent/scenarios/paper3d_terrain.py文件
+import json
 import numpy as np
 import random
 from multiagent.core import World, Agent, Landmark
@@ -297,6 +298,90 @@ class Scenario(BaseScenario):
             print(f"[复杂度设置] 噪声强度: {self.noise_amplitude}")
             print(f"[复杂度设置] 峡谷: {'是' if self.add_canyon else '否'}")
 
+    def _load_heldout_reference_layout(self):
+        position_mode = os.getenv('HELDOUT_POSITION_MODE', '').strip().lower()
+        if position_mode != 'same_region':
+            return None
+
+        reference_path = os.getenv('HELDOUT_REFERENCE_POSITIONS_FILE', '').strip()
+        if not reference_path or not os.path.exists(reference_path):
+            return None
+
+        try:
+            with open(reference_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            agents = np.asarray(data.get('agents', []), dtype=np.float32)
+            goal = np.asarray(data.get('goal', []), dtype=np.float32)
+            if agents.ndim != 2 or agents.shape[0] == 0 or agents.shape[1] < 2:
+                return None
+            if goal.ndim != 1 or goal.size < 2:
+                return None
+            start_center_xy = np.mean(agents[:, :2], axis=0)
+            goal_xy = goal[:2].astype(np.float32)
+            route_xy = goal_xy - start_center_xy
+            route_distance = float(np.linalg.norm(route_xy))
+            route_unit = None
+            if route_distance > 1e-6:
+                route_unit = (route_xy / route_distance).astype(np.float32)
+            return {
+                'path': reference_path,
+                'agents': agents,
+                'goal': goal,
+                'start_center_xy': start_center_xy.astype(np.float32),
+                'goal_xy': goal_xy,
+                'route_xy': route_xy.astype(np.float32),
+                'route_distance': route_distance,
+                'route_unit': route_unit,
+            }
+        except Exception:
+            return None
+
+    def _load_heldout_reference_start_center(self):
+        reference_layout = self._load_heldout_reference_layout()
+        if reference_layout is None:
+            return None
+        return reference_layout.get('start_center_xy')
+
+    def _resolve_start_area_bounds(self, map_size):
+        start_area_size = int(map_size * 0.15)
+        start_area_margin = int(map_size * 0.05)
+
+        reference_center = self._load_heldout_reference_start_center()
+        if reference_center is not None:
+            half_size = max(1.0, start_area_size / 2.0)
+            max_origin = max(start_area_margin, map_size - start_area_margin - start_area_size)
+            origin_x = int(np.clip(np.floor(float(reference_center[0]) - half_size), start_area_margin, max_origin))
+            origin_y = int(np.clip(np.floor(float(reference_center[1]) - half_size), start_area_margin, max_origin))
+            start_area_x = (origin_x, origin_x + start_area_size)
+            start_area_y = (origin_y, origin_y + start_area_size)
+            return start_area_x, start_area_y, {
+                'size': start_area_size,
+                'source': 'heldout_reference_same_region',
+            }
+
+        corner_choice = self.rng.randint(0, 4)  # 0=SW, 1=SE, 2=NW, 3=NE
+        if corner_choice == 0:  # 西南角 (左下)
+            start_area_x = (start_area_margin, start_area_margin + start_area_size)
+            start_area_y = (start_area_margin, start_area_margin + start_area_size)
+            source = 'random_corner_sw'
+        elif corner_choice == 1:  # 东南角 (右下)
+            start_area_x = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
+            start_area_y = (start_area_margin, start_area_margin + start_area_size)
+            source = 'random_corner_se'
+        elif corner_choice == 2:  # 西北角 (左上)
+            start_area_x = (start_area_margin, start_area_margin + start_area_size)
+            start_area_y = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
+            source = 'random_corner_nw'
+        else:  # 东北角 (右上)
+            start_area_x = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
+            start_area_y = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
+            source = 'random_corner_ne'
+
+        return start_area_x, start_area_y, {
+            'size': start_area_size,
+            'source': source,
+        }
+
     def _generate_visualizer_style_terrain(self):
         """
         使用与 visualize_terrain_map.py 相同的逻辑生成地形
@@ -310,35 +395,26 @@ class Scenario(BaseScenario):
         # 初始化高度图，完全复刻 visualize_terrain_map.py 的实现
         height_map = np.zeros((map_size, map_size), dtype=np.float32)
 
-        # 🔧 确定起点区域（通常在地图角落，比如左下角SW象限）
-        # 起点区域大小约为地图的15-20%，确保有足够空间
-        start_area_size = int(map_size * 0.15)  # 起点区域大小
-        start_area_margin = int(map_size * 0.05)  # 起点区域距离边缘的距离
-        
-        # 随机选择一个角落作为起点区域（保持一定的随机性，但确保是角落）
-        corner_choice = self.rng.randint(0, 4)  # 0=SW, 1=SE, 2=NW, 3=NE
-        if corner_choice == 0:  # 西南角 (左下)
-            start_area_x = (start_area_margin, start_area_margin + start_area_size)
-            start_area_y = (start_area_margin, start_area_margin + start_area_size)
-        elif corner_choice == 1:  # 东南角 (右下)
-            start_area_x = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
-            start_area_y = (start_area_margin, start_area_margin + start_area_size)
-        elif corner_choice == 2:  # 西北角 (左上)
-            start_area_x = (start_area_margin, start_area_margin + start_area_size)
-            start_area_y = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
-        else:  # 东北角 (右上)
-            start_area_x = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
-            start_area_y = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
-        
+        # 🔧 确定起点区域：
+        # - 常规训练沿用随机角落平坦区
+        # - heldout same_region 测试时，直接绑定到参考起点区域，避免“同区域位置”却落在另一块随机角落平坦区上
+        start_area_x, start_area_y, start_area_meta = self._resolve_start_area_bounds(map_size)
+        start_area_size = int(start_area_meta['size'])
+
         # 保存起点区域信息，供后续使用
         self.start_area = {
             'x_range': start_area_x,
             'y_range': start_area_y,
-            'size': start_area_size
+            'size': start_area_size,
+            'source': start_area_meta.get('source', 'random_corner')
         }
         
         if not quiet:
-            print(f"[地形生成] 起点区域: x=[{start_area_x[0]}, {start_area_x[1]}], y=[{start_area_y[0]}, {start_area_y[1]}]")
+            print(
+                f"[地形生成] 起点区域: x=[{start_area_x[0]}, {start_area_x[1]}], "
+                f"y=[{start_area_y[0]}, {start_area_y[1]}], "
+                f"source={start_area_meta.get('source', 'random_corner')}"
+            )
 
         # 与可视化脚本相同的参数
         num_peaks = int(getattr(self, 'num_mountains', 6))
@@ -360,85 +436,168 @@ class Scenario(BaseScenario):
             os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')))
         peak_jitter_range = float(getattr(self, 'peak_jitter_range',
             os.getenv('PEAK_JITTER_RANGE', '15.0')))  # 山峰位置波动范围（米）
+
+        heldout_reference_layout = self._load_heldout_reference_layout()
+        reserved_peak_regions = [
+            {
+                'center': np.asarray([start_area_center_x, start_area_center_y], dtype=np.float32),
+                'radius': float(min_distance_from_start),
+                'label': 'start_area',
+            }
+        ]
+        if heldout_reference_layout is not None and heldout_reference_layout.get('goal_xy') is not None:
+            goal_safe_radius = float(np.clip(
+                max(
+                    18.0,
+                    start_area_size * 0.7,
+                    min_distance * 0.45,
+                    peak_jitter_range + 10.0,
+                ),
+                18.0,
+                map_size * 0.18,
+            ))
+            reserved_peak_regions.append(
+                {
+                    'center': np.asarray(heldout_reference_layout['goal_xy'][:2], dtype=np.float32),
+                    'radius': goal_safe_radius,
+                    'label': 'heldout_goal_region',
+                }
+            )
+
+        def _peak_region_clearance(cx, cy):
+            if not reserved_peak_regions:
+                return float('inf')
+            best = float('inf')
+            for region in reserved_peak_regions:
+                center = np.asarray(region['center'], dtype=np.float32)
+                clearance = float(np.hypot(float(cx) - float(center[0]), float(cy) - float(center[1]))) - float(region['radius'])
+                best = min(best, clearance)
+            return best
+
+        peak_spacing_floor = max(18.0, float(min_distance) * 0.82)
         
+        base_seed = None
         if use_semi_random:
             # 使用固定种子生成基准山峰位置（确保每次训练的基准位置相同）
             base_seed = int(getattr(self, 'terrain_base_seed', os.getenv('TERRAIN_BASE_SEED', '67')))
             base_rng = np.random.RandomState(base_seed)
             
-            # 生成基准山峰位置（固定不变）
-            base_peak_positions = []
+            # 生成基准山峰参数（固定不变）
+            # 对 similar_unseen 而言，保持峰高/峰宽/噪声基底稳定，仅允许位置局部漂移。
+            base_peak_specs = []
             for _ in range(num_peaks):
                 attempts = 0
                 while attempts < 200:
                     x = base_rng.randint(margin, max(margin + 1, map_size - margin))
                     y = base_rng.randint(margin, max(margin + 1, map_size - margin))
                     
-                    # 检查是否距离起点区域太近
-                    dist_from_start = np.sqrt((x - start_area_center_x)**2 + (y - start_area_center_y)**2)
-                    if dist_from_start < min_distance_from_start:
+                    if _peak_region_clearance(x, y) < 0.0:
                         attempts += 1
                         continue
                     
                     too_close = False
-                    for px, py in base_peak_positions:
+                    for px, py, _, _ in base_peak_specs:
                         if np.sqrt((x - px)**2 + (y - py)**2) < min_distance:
                             too_close = True
                             break
                     
                     if not too_close:
-                        base_peak_positions.append((x, y))
+                        base_peak_specs.append(
+                            (
+                                x,
+                                y,
+                                float(base_rng.uniform(*height_range)),
+                                float(base_rng.uniform(*width_range)),
+                            )
+                        )
                         break
                     attempts += 1
             
             # 在基准位置周围生成实际山峰位置（波动）
-            peak_positions = []
-            for base_x, base_y in base_peak_positions:
-                # 在基准位置周围±jitter_range范围内随机偏移
-                jitter_x = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
-                jitter_y = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
-                
-                # 实际山峰位置 = 基准位置 + 随机偏移
-                actual_x = int(np.clip(base_x + jitter_x, margin, map_size - margin - 1))
-                actual_y = int(np.clip(base_y + jitter_y, margin, map_size - margin - 1))
-                
-                peak_positions.append((actual_x, actual_y))
+            peak_specs = []
+            for base_x, base_y, base_height, base_width in base_peak_specs:
+                best_candidate = None
+                best_cost = None
+                for attempt in range(48):
+                    if attempt == 0:
+                        jitter_x = 0.0
+                        jitter_y = 0.0
+                    else:
+                        jitter_x = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
+                        jitter_y = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
+
+                    actual_x = int(np.clip(base_x + jitter_x, margin, map_size - margin - 1))
+                    actual_y = int(np.clip(base_y + jitter_y, margin, map_size - margin - 1))
+
+                    candidate_cost = 0.0
+                    region_clearance = _peak_region_clearance(actual_x, actual_y)
+                    if region_clearance < 0.0:
+                        candidate_cost += 1e6 + abs(region_clearance) * 5000.0
+                    for px, py, _, _ in peak_specs:
+                        sep = float(np.hypot(actual_x - px, actual_y - py))
+                        if sep < peak_spacing_floor:
+                            candidate_cost += 1e6 + (peak_spacing_floor - sep) * 5000.0
+                    candidate_cost += float(np.hypot(actual_x - base_x, actual_y - base_y)) * 0.1
+
+                    if best_cost is None or candidate_cost < best_cost:
+                        best_cost = candidate_cost
+                        best_candidate = (actual_x, actual_y)
+                    if candidate_cost < 1e-6:
+                        break
+
+                if best_candidate is None:
+                    best_candidate = (
+                        int(np.clip(base_x, margin, map_size - margin - 1)),
+                        int(np.clip(base_y, margin, map_size - margin - 1)),
+                    )
+
+                peak_specs.append((best_candidate[0], best_candidate[1], base_height, base_width))
             
             if not quiet:
-                avg_jitter = np.mean([np.sqrt((p[0] - bp[0])**2 + (p[1] - bp[1])**2) 
-                                      for p, bp in zip(peak_positions, base_peak_positions)])
+                avg_jitter = np.mean([
+                    np.sqrt((p[0] - bp[0])**2 + (p[1] - bp[1])**2)
+                    for p, bp in zip(peak_specs, base_peak_specs)
+                ])
                 print(f"[半随机地形] 基准种子: {base_seed}, 山峰数量: {num_peaks}")
                 print(f"[半随机地形] 波动范围: ±{peak_jitter_range}m, 平均偏移: {avg_jitter:.2f}m")
+                if len(reserved_peak_regions) > 1:
+                    protected = reserved_peak_regions[1]
+                    print(
+                        f"[半随机地形] 保护目标区域: center=({protected['center'][0]:.1f}, {protected['center'][1]:.1f}), "
+                        f"radius={protected['radius']:.1f}m"
+                    )
         else:
             # 原始的完全随机生成方式
-            peak_positions = []
+            peak_specs = []
             for _ in range(num_peaks):
                 attempts = 0
                 while attempts < 200:
                     x = self.rng.randint(margin, max(margin + 1, map_size - margin))
                     y = self.rng.randint(margin, max(margin + 1, map_size - margin))
 
-                    # 🔧 检查是否距离起点区域太近
-                    dist_from_start = np.sqrt((x - start_area_center_x)**2 + (y - start_area_center_y)**2)
-                    if dist_from_start < min_distance_from_start:
+                    if _peak_region_clearance(x, y) < 0.0:
                         attempts += 1
                         continue
 
                     too_close = False
-                    for px, py in peak_positions:
+                    for px, py, _, _ in peak_specs:
                         if np.sqrt((x - px)**2 + (y - py)**2) < min_distance:
                             too_close = True
                             break
 
                     if not too_close:
-                        peak_positions.append((x, y))
+                        peak_specs.append((x, y, None, None))
                         break
                     attempts += 1
 
         # 純粹依照 visualize_terrain_map.py 的双层循环实现高斯山峰
-        for px, py in peak_positions:
-            height = self.rng.uniform(*height_range)
-            width = self.rng.uniform(*width_range)
+        for px, py, base_height, base_width in peak_specs:
+            if use_semi_random and base_height is not None and base_width is not None:
+                height = float(base_height)
+                width = float(base_width)
+            else:
+                height = self.rng.uniform(*height_range)
+                width = self.rng.uniform(*width_range)
 
             for i in range(map_size):
                 for j in range(map_size):
@@ -446,13 +605,21 @@ class Scenario(BaseScenario):
                     contribution = height * np.exp(-(dist**2) / (2 * width**2))
                     height_map[i, j] += contribution
 
-        noise = self.rng.randn(map_size, map_size) * noise_scale
+        if use_semi_random and base_seed is not None:
+            noise_rng = np.random.RandomState(base_seed + 104729)
+            noise = noise_rng.randn(map_size, map_size) * noise_scale
+        else:
+            noise = self.rng.randn(map_size, map_size) * noise_scale
         height_map += noise.astype(np.float32)
         height_map = np.maximum(height_map, 0.0).astype(np.float32)
         
         # 🔧 对起点区域进行平坦化处理，确保无人机可以正常起飞
         # 将起点区域的高度设为低值（0-5米），并使用平滑过渡
-        start_flat_height = self.rng.uniform(0.0, 5.0)  # 起点区域的目标高度（0-5米）
+        if use_semi_random and base_seed is not None:
+            start_height_rng = np.random.RandomState(base_seed + 2047)
+            start_flat_height = start_height_rng.uniform(0.0, 5.0)
+        else:
+            start_flat_height = self.rng.uniform(0.0, 5.0)  # 起点区域的目标高度（0-5米）
         start_x0, start_x1 = int(start_area_x[0]), int(start_area_x[1])
         start_y0, start_y1 = int(start_area_y[0]), int(start_area_y[1])
         
@@ -511,7 +678,7 @@ class Scenario(BaseScenario):
         self.terrain_sample_rate = sample_rate  # 保存降采样率，用于get_terrain_height插值
         
         # 保存山峰中心坐标（保持原始坐标，不缩放）
-        self.mountain_centers = [(px, py, float(self.get_terrain_height(px, py))) for px, py in peak_positions]
+        self.mountain_centers = [(px, py, float(self.get_terrain_height(px, py))) for px, py, _, _ in peak_specs]
         self.grid_points = np.meshgrid(
             np.arange(map_size, dtype=np.float32),
             np.arange(map_size, dtype=np.float32),
@@ -520,7 +687,7 @@ class Scenario(BaseScenario):
         self.terrain_params = {
             'method': 'visualizer_gaussian',
             'terrain_complexity_level': self.terrain_complexity_level,
-            'num_peaks': len(peak_positions),
+            'num_peaks': len(peak_specs),
             'height_range': tuple(self.mountain_height_range),
             'width_range': tuple(self.mountain_width_range),
             'noise_scale': noise_scale,
@@ -530,7 +697,7 @@ class Scenario(BaseScenario):
 
         if not quiet:
             print(f"[地形生成] ✅ 使用visualizer风格生成完成")
-            print(f"[地形生成] 地图尺寸: {map_size}×{map_size}, 山峰数量: {len(peak_positions)}, 噪声: {noise_scale}")
+            print(f"[地形生成] 地图尺寸: {map_size}×{map_size}, 山峰数量: {len(peak_specs)}, 噪声: {noise_scale}")
 
         return True
 
