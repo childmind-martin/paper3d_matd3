@@ -12,6 +12,36 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+_truthy() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 记录外部是否显式传入关键变量。
+# 半随机地形默认调参只在“用户未手动覆盖”时生效，避免掩盖实验者的显式设置。
+BUFFER_SIZE_WAS_SET=0
+[ -n "${BUFFER_SIZE+x}" ] && BUFFER_SIZE_WAS_SET=1
+ACTION_FORCE_RATIO_SCHEDULE_PCT_WAS_SET=0
+[ -n "${ACTION_FORCE_RATIO_SCHEDULE_PCT+x}" ] && ACTION_FORCE_RATIO_SCHEDULE_PCT_WAS_SET=1
+LATERAL_WEIGHT_WAS_SET=0
+[ -n "${LATERAL_WEIGHT+x}" ] && LATERAL_WEIGHT_WAS_SET=1
+CLEARANCE_WEIGHT_WAS_SET=0
+[ -n "${CLEARANCE_WEIGHT+x}" ] && CLEARANCE_WEIGHT_WAS_SET=1
+CLEARANCE_WEIGHT_FAR_WAS_SET=0
+[ -n "${CLEARANCE_WEIGHT_FAR+x}" ] && CLEARANCE_WEIGHT_FAR_WAS_SET=1
+CLEARANCE_WEIGHT_NEAR_WAS_SET=0
+[ -n "${CLEARANCE_WEIGHT_NEAR+x}" ] && CLEARANCE_WEIGHT_NEAR_WAS_SET=1
+GLOBAL_WEIGHT_WAS_SET=0
+[ -n "${GLOBAL_WEIGHT+x}" ] && GLOBAL_WEIGHT_WAS_SET=1
+SUCCESS_WEIGHT_WAS_SET=0
+[ -n "${SUCCESS_WEIGHT+x}" ] && SUCCESS_WEIGHT_WAS_SET=1
+SUCCESS_REWARD_VALUE_WAS_SET=0
+[ -n "${SUCCESS_REWARD_VALUE+x}" ] && SUCCESS_REWARD_VALUE_WAS_SET=1
+TEAM_SUCCESS_BONUS_WAS_SET=0
+[ -n "${TEAM_SUCCESS_BONUS+x}" ] && TEAM_SUCCESS_BONUS_WAS_SET=1
+
 # MADDPG优化版本快速启动脚本
 
 # 🔧 关键修复：清理可能干扰训练的环境变量残留（避免之前运行的shell变量影响）
@@ -329,6 +359,18 @@ export PEAK_JITTER_RANGE=${PEAK_JITTER_RANGE:-15.0}           # 🔧 山峰位�
                                                                # 作用：每次重置时，山峰在基准位置周围±15m范围内随机偏移
                                                                # 效果：地形布局稳定，但山峰位置有小幅变化，增强泛化能力
                                                                # 建议范围：10.0-25.0米（太小无泛化，太大难度波动大）
+export PEAK_CENTER_JITTER_RANGE=${PEAK_CENTER_JITTER_RANGE:-3.0}  # 峰中心局部扰动范围（同源变体）
+                                                                     # 作用：固定训练基准峰位，只允许小范围微调，避免山峰整体漂移
+export PEAK_HEIGHT_JITTER_RATIO_MIN=${PEAK_HEIGHT_JITTER_RATIO_MIN:-0.20}  # 峰高最小扰动比例（相对配置峰高范围）
+                                                                              # 例：0.20 表示每个山峰高度至少按峰高范围的20%做上下浮动
+export PEAK_HEIGHT_JITTER_RATIO_MAX=${PEAK_HEIGHT_JITTER_RATIO_MAX:-0.40}  # 峰高最大扰动比例（相对配置峰高范围）
+                                                                              # 建议与最小值配合使用，形成20%-40%的有限振幅
+export PEAK_HEIGHT_MAX_SCALE=${PEAK_HEIGHT_MAX_SCALE:-1.30}                 # 峰高上限倍率（相对训练基准地形中最高峰）
+                                                                              # 作用：避免 heldout 山峰过高导致测试难度脱离训练分布
+export TERRAIN_VARIANT_NOISE_RATIO=${TERRAIN_VARIANT_NOISE_RATIO:-0.15}     # 同源变体附加噪声比例
+                                                                              # 作用：保持训练地形风格，同时加入轻微纹理级未见扰动
+export DETERMINISTIC_TRAIN_ENV_SEQUENCE=${DETERMINISTIC_TRAIN_ENV_SEQUENCE:-0}  # 训练时按 episode_idx 确定环境实例序列
+export TRAIN_ENV_SEQUENCE_SEED=${TRAIN_ENV_SEQUENCE_SEED:-${SCENARIO_SEED:-67}} # 与训练SEED解耦的训练环境公共序列种子
 export MIN_START_GOAL_DIST=${MIN_START_GOAL_DIST:-75.0}        # 起点与目标的最小水平距离
 export MAX_START_GOAL_DIST=${MAX_START_GOAL_DIST:-120.0}       # 起点与目标的最大水平距离（控制随机幅度）
 export START_POS_MARGIN=${START_POS_MARGIN:-5.0}               # 起点生成的地图边缘安全距离
@@ -809,6 +851,44 @@ if [ "${ACTION_FORCE_RATIO_SCHEDULE_PCT:-}" = "DISABLED" ]; then
     export ACTION_FORCE_RATIO_SCHEDULE_PCT=""
 # else: 变量已设置且不为空且不是"DISABLED"，使用已有值（不做修改，允许schedule生效）
 fi
+
+# === 半随机地形默认调参（仅限未显式覆盖的默认值）===
+# 目标：
+# 1. 放缓 FR 衰减，避免后期过早撤掉 PF 兜底；
+# 2. 缩短 replay 覆盖历史，降低多 terrain variant 混合带来的 critic 平均化；
+# 3. 降低“安全但不完成”相关 dense shaping 的相对吸引力，把奖励重心拉回团队到达。
+if _truthy "${SEMI_RANDOM_TERRAIN:-0}"; then
+    if [ "$BUFFER_SIZE_WAS_SET" -eq 0 ]; then
+        export BUFFER_SIZE=250000
+    fi
+    if [ "$ACTION_FORCE_RATIO_SCHEDULE_PCT_WAS_SET" -eq 0 ]; then
+        export ACTION_FORCE_RATIO_SCHEDULE_PCT="0%:0.50,25%:0.50,50%:0.48,70%:0.45,85%:0.42,100%:0.40"
+    fi
+    if [ "$LATERAL_WEIGHT_WAS_SET" -eq 0 ]; then
+        export LATERAL_WEIGHT=0.60
+    fi
+    if [ "$CLEARANCE_WEIGHT_WAS_SET" -eq 0 ]; then
+        export CLEARANCE_WEIGHT=1.60
+    fi
+    if [ "$CLEARANCE_WEIGHT_FAR_WAS_SET" -eq 0 ]; then
+        export CLEARANCE_WEIGHT_FAR=0.10
+    fi
+    if [ "$CLEARANCE_WEIGHT_NEAR_WAS_SET" -eq 0 ]; then
+        export CLEARANCE_WEIGHT_NEAR=3.20
+    fi
+    if [ "$GLOBAL_WEIGHT_WAS_SET" -eq 0 ]; then
+        export GLOBAL_WEIGHT=1.20
+    fi
+    if [ "$SUCCESS_WEIGHT_WAS_SET" -eq 0 ]; then
+        export SUCCESS_WEIGHT=3.00
+    fi
+    if [ "$SUCCESS_REWARD_VALUE_WAS_SET" -eq 0 ]; then
+        export SUCCESS_REWARD_VALUE=2600.0
+    fi
+    if [ "$TEAM_SUCCESS_BONUS_WAS_SET" -eq 0 ]; then
+        export TEAM_SUCCESS_BONUS=4500.0
+    fi
+fi
 export MAX_FORCE_MAGNITUDE=${MAX_FORCE_MAGNITUDE:-80.0}               # 🚨 关键修复：大幅提高（28.5→80），避免强斥力被过早裁剪（k_rep*factor可达3000+）
 # 动作-势场混合模式已固定为 pre_tanh（未饱和空间叠加），不再通过环境变量配置
 export SUCCESS_COUNT_MODE=${SUCCESS_COUNT_MODE:-all}                  # 并行环境成功计数聚合：any|all|majority（默认any）
@@ -1015,6 +1095,9 @@ echo "  - GPU: ${GPU_ID}"
 echo "  - 批次大小: ${BATCH_SIZE}"
 echo "  - 训练回合: ${EPISODES}"
 echo "  - 缓冲区: ${BUFFER_SIZE}"
+if _truthy "${SEMI_RANDOM_TERRAIN:-0}"; then
+    echo "  - 半随机调参: FR日程=${ACTION_FORCE_RATIO_SCHEDULE_PCT:-disabled} | hold=${SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES:-?}-${SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES:-?} | reward(lateral/clear/global/success_w)=${LATERAL_WEIGHT}/${CLEARANCE_WEIGHT}/${GLOBAL_WEIGHT}/${SUCCESS_WEIGHT}"
+fi
 echo "  - CPU线程: ${CPU_THREADS}"
 echo "  - 并行环境: ${NUM_ENVS}"
 

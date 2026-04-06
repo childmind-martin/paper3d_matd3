@@ -285,7 +285,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="动作与势场修正消融对比实验、地形复杂度3、无随机动作判断穿透原因是否是随机动作导致的")
     parser.add_argument("--script", type=str, default="./run_optimized.sh",
                         help="训练启动脚本路径 (默认 ./run_optimized.sh)")
-    parser.add_argument("--episodes", type=int, default=450,
+    parser.add_argument("--episodes", type=int, default=800,
                         help="每个实验的训练回合数（默认5）")
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="训练批次大小")
@@ -730,6 +730,31 @@ def _build_standardized_eval_env(
         for key, value in runtime_env_overrides.items():
             if value not in (None, ""):
                 env[str(key)] = str(value)
+
+    eval_python_bin = (
+        str(env.get("EVAL_PYTHON_BIN", "")).strip()
+        or str(env.get("TRAIN_PYTHON_BIN", "")).strip()
+        or sys.executable
+    )
+    inferred_prefix = None
+    try:
+        py_path = Path(str(eval_python_bin)).resolve()
+        if py_path.name in ("python", "python3") and py_path.parent.name == "bin":
+            inferred_prefix = str(py_path.parent.parent)
+    except Exception:
+        inferred_prefix = None
+    if inferred_prefix and not str(env.get("CONDA_PREFIX", "")).strip():
+        env["CONDA_PREFIX"] = inferred_prefix
+    conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
+    if conda_prefix:
+        conda_bin = str(Path(conda_prefix) / "bin")
+        current_path = str(env.get("PATH", "")).strip()
+        if conda_bin and conda_bin not in current_path.split(":"):
+            env["PATH"] = f"{conda_bin}:{current_path}" if current_path else conda_bin
+        conda_lib = str(Path(conda_prefix) / "lib")
+        current_ld = str(env.get("LD_LIBRARY_PATH", "")).strip()
+        if conda_lib and conda_lib not in current_ld.split(":"):
+            env["LD_LIBRARY_PATH"] = f"{conda_lib}:{current_ld}" if current_ld else conda_lib
 
     cpu_threads = max(1, int(_safe_int(getattr(args, "eval_cpu_threads", 4)) or 4))
     env["MODEL_VARIANT"] = "best_by_team_sr"

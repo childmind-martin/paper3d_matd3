@@ -37,7 +37,8 @@ from paper3d_train_optimized import (
     try_apply_scenario_params, 
     build_continuous_action_network, 
     build_continuous_critic_network,
-    build_continuous_critic_network_matd3
+    build_continuous_critic_network_matd3,
+    _save_vis_context_snapshot_artifacts,
 )
 from visualization.trajectory_visualizer import TrajectoryVisualizer
 from utils.observation_processor import ObservationProcessor
@@ -99,6 +100,17 @@ def _env_float(name, default):
         return float(os.getenv(name, str(default)))
     except Exception:
         return float(default)
+
+
+def _episode_positions_filename(episode_idx, terrain_seed=None, terrain_variant_seed=None):
+    episode_idx = int(episode_idx)
+    terrain_seed = None if terrain_seed is None else int(terrain_seed)
+    terrain_variant_seed = None if terrain_variant_seed is None else int(terrain_variant_seed)
+    if terrain_variant_seed is not None:
+        return f"episode_{episode_idx:03d}_seed_{terrain_seed}_variant_{terrain_variant_seed}.json"
+    if terrain_seed is not None:
+        return f"episode_{episode_idx:03d}_seed_{terrain_seed}.json"
+    return f"episode_{episode_idx:03d}.json"
 
 
 def _coerce_optional_bool(value):
@@ -199,11 +211,18 @@ def _load_training_alignment_snapshot(model_path):
             'scenario_name': scenario_name,
             'algorithm': algorithm,
             'random_terrain': _coerce_optional_bool(training_args.get('random_terrain', results.get('random_terrain'))),
+            'use_dynamic_obstacles': _coerce_optional_bool(training_args.get('use_dynamic_obstacles', results.get('use_dynamic_obstacles'))),
             'terrain_seed': _coerce_optional_int(terrain_seed),
             'per_episode_terrain': _coerce_optional_bool(training_args.get('per_episode_terrain', results.get('per_episode_terrain'))),
             'per_env_terrain': _coerce_optional_bool(training_args.get('per_env_terrain', results.get('per_env_terrain'))),
             'semi_random_terrain': _coerce_optional_bool(training_args.get('semi_random_terrain', results.get('semi_random_terrain'))),
             'terrain_base_seed': _coerce_optional_int(training_args.get('terrain_base_seed', results.get('terrain_base_seed'))),
+            'peak_jitter_range': _coerce_optional_float(training_args.get('peak_jitter_range', results.get('peak_jitter_range'))),
+            'peak_center_jitter_range': _coerce_optional_float(training_args.get('peak_center_jitter_range', results.get('peak_center_jitter_range'))),
+            'peak_height_jitter_ratio_min': _coerce_optional_float(training_args.get('peak_height_jitter_ratio_min', results.get('peak_height_jitter_ratio_min'))),
+            'peak_height_jitter_ratio_max': _coerce_optional_float(training_args.get('peak_height_jitter_ratio_max', results.get('peak_height_jitter_ratio_max'))),
+            'peak_height_max_scale': _coerce_optional_float(training_args.get('peak_height_max_scale', results.get('peak_height_max_scale'))),
+            'terrain_variant_noise_ratio': _coerce_optional_float(training_args.get('terrain_variant_noise_ratio', results.get('terrain_variant_noise_ratio'))),
             'terrain_complexity_level': _coerce_optional_int(training_args.get('terrain_complexity_level', results.get('terrain_complexity_level'))),
             'map_size': _coerce_optional_float(training_args.get('map_size', results.get('map_size'))),
             'mountain_min_distance': _coerce_optional_float(training_args.get('mountain_min_distance', results.get('mountain_min_distance'))),
@@ -229,11 +248,18 @@ def _apply_training_alignment_to_args(args, snapshot, quiet=False):
     _apply('scenario_name', snapshot.get('scenario_name'))
     _apply('algorithm', snapshot.get('algorithm'))
     _apply('random_terrain', snapshot.get('random_terrain'))
+    _apply('use_dynamic_obstacles', snapshot.get('use_dynamic_obstacles'))
     _apply('terrain_seed', snapshot.get('terrain_seed'))
     _apply('per_episode_terrain', snapshot.get('per_episode_terrain'))
     _apply('per_env_terrain', snapshot.get('per_env_terrain'))
     _apply('semi_random_terrain', snapshot.get('semi_random_terrain'))
     _apply('terrain_base_seed', snapshot.get('terrain_base_seed'))
+    _apply('peak_jitter_range', snapshot.get('peak_jitter_range'))
+    _apply('peak_center_jitter_range', snapshot.get('peak_center_jitter_range'))
+    _apply('peak_height_jitter_ratio_min', snapshot.get('peak_height_jitter_ratio_min'))
+    _apply('peak_height_jitter_ratio_max', snapshot.get('peak_height_jitter_ratio_max'))
+    _apply('peak_height_max_scale', snapshot.get('peak_height_max_scale'))
+    _apply('terrain_variant_noise_ratio', snapshot.get('terrain_variant_noise_ratio'))
     _apply('terrain_complexity_level', snapshot.get('terrain_complexity_level'))
     _apply('map_size', snapshot.get('map_size'))
     _apply('mountain_min_distance', snapshot.get('mountain_min_distance'))
@@ -269,6 +295,7 @@ def _apply_runtime_env_overrides_from_args(args):
         os.environ["USE_QUADROTOR_DYNAMICS"] = "1" if bool(use_quadrotor_dynamics) else "0"
 
     terrain_bool_pairs = (
+        ("use_dynamic_obstacles", "USE_DYNAMIC_OBSTACLES"),
         ("random_terrain", "RANDOM_TERRAIN"),
         ("per_episode_terrain", "PER_EPISODE_TERRAIN"),
         ("per_env_terrain", "PER_ENV_TERRAIN"),
@@ -299,6 +326,26 @@ def _apply_runtime_env_overrides_from_args(args):
     if terrain_base_seed is not None:
         os.environ["TERRAIN_BASE_SEED"] = str(int(terrain_base_seed))
 
+    terrain_numeric_env_pairs = (
+        ("peak_jitter_range", "PEAK_JITTER_RANGE"),
+        ("peak_center_jitter_range", "PEAK_CENTER_JITTER_RANGE"),
+        ("peak_height_jitter_ratio_min", "PEAK_HEIGHT_JITTER_RATIO_MIN"),
+        ("peak_height_jitter_ratio_max", "PEAK_HEIGHT_JITTER_RATIO_MAX"),
+        ("peak_height_max_scale", "PEAK_HEIGHT_MAX_SCALE"),
+        ("terrain_variant_noise_ratio", "TERRAIN_VARIANT_NOISE_RATIO"),
+    )
+    for attr_name, env_name in terrain_numeric_env_pairs:
+        try:
+            value = getattr(args, attr_name, None)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        try:
+            os.environ[env_name] = str(float(value))
+        except Exception:
+            continue
+
     numeric_env_pairs = (
         ("terrain_complexity_level", "TERRAIN_COMPLEXITY_LEVEL", int),
         ("map_size", "MAP_SIZE", float),
@@ -323,10 +370,17 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
         return
 
     scalar_mappings = (
+        ('use_dynamic_obstacles', bool, 'use_dynamic_obstacles'),
         ('random_terrain', bool, 'random_terrain'),
         ('per_episode_terrain', bool, 'per_episode_terrain'),
         ('per_env_terrain', bool, 'per_env_terrain'),
         ('semi_random_terrain', bool, 'use_semi_random_terrain'),
+        ('peak_jitter_range', float, 'peak_jitter_range'),
+        ('peak_center_jitter_range', float, 'peak_center_jitter_range'),
+        ('peak_height_jitter_ratio_min', float, 'peak_height_jitter_ratio_min'),
+        ('peak_height_jitter_ratio_max', float, 'peak_height_jitter_ratio_max'),
+        ('peak_height_max_scale', float, 'peak_height_max_scale'),
+        ('terrain_variant_noise_ratio', float, 'terrain_variant_noise_ratio'),
         ('terrain_complexity_level', int, 'terrain_complexity_level'),
         ('map_size', float, 'map_size'),
     )
@@ -371,6 +425,17 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
     elif terrain_seed is not None:
         try:
             scenario.terrain_base_seed = int(terrain_seed)
+        except Exception:
+            pass
+
+    try:
+        terrain_variant_seed = getattr(args, 'terrain_variant_seed', None)
+    except Exception:
+        terrain_variant_seed = None
+    if terrain_variant_seed is not None:
+        try:
+            scenario.terrain_variant_seed = int(terrain_variant_seed)
+            setattr(scenario, 'current_terrain_variant_seed', int(terrain_variant_seed))
         except Exception:
             pass
 
@@ -688,6 +753,7 @@ class ModelEvaluator:
     
     def __init__(self, args):
         self.args = args
+        self._current_episode_terrain_info = {}
         self.training_alignment = _load_training_alignment_snapshot(getattr(args, 'load_model_path', None))
         if self.training_alignment:
             _apply_training_alignment_to_args(self.args, self.training_alignment)
@@ -999,19 +1065,28 @@ class ModelEvaluator:
         except Exception:
             pass
 
-    def _load_episode_positions(self, episode_idx, terrain_seed=None):
+    def _load_episode_positions(self, episode_idx, terrain_seed=None, terrain_variant_seed=None):
         """如果存在按回合保存的位置文件，则为当前episode加载。"""
         episode_positions_dir = os.getenv('EPISODE_POSITIONS_DIR', None)
         if not episode_positions_dir:
             return
+        require_episode_positions = os.getenv('EVAL_REQUIRE_EPISODE_POSITIONS', '0').lower() in ('1', 'true', 'yes', 'on')
 
         try:
             from pathlib import Path
 
             positions_dir = Path(episode_positions_dir)
             candidates = []
+            if terrain_seed is not None and terrain_variant_seed is not None:
+                candidates.append(
+                    positions_dir / _episode_positions_filename(
+                        episode_idx,
+                        terrain_seed=terrain_seed,
+                        terrain_variant_seed=terrain_variant_seed,
+                    )
+                )
             if terrain_seed is not None:
-                candidates.append(positions_dir / f"episode_{episode_idx:03d}_seed_{terrain_seed}.json")
+                candidates.append(positions_dir / _episode_positions_filename(episode_idx, terrain_seed=terrain_seed))
             candidates.append(positions_dir / f"episode_{episode_idx:03d}.json")
 
             positions_file = None
@@ -1021,6 +1096,11 @@ class ModelEvaluator:
                     break
 
             if positions_file is None:
+                if require_episode_positions:
+                    raise FileNotFoundError(
+                        f"Episode {episode_idx + 1} 共享位置文件不存在: "
+                        f"{positions_dir / _episode_positions_filename(episode_idx, terrain_seed=terrain_seed, terrain_variant_seed=terrain_variant_seed) if terrain_seed is not None else positions_dir}"
+                    )
                 self.scenario.fixed_positions = None
                 self.scenario.use_fixed_positions = False
                 self.scenario.positions_initialized = False
@@ -1049,24 +1129,40 @@ class ModelEvaluator:
                 self.scenario.positions_initialized = False
                 print(f"⚠️  Episode {episode_idx + 1}位置文件格式错误，将使用动态生成")
         except Exception as e:
+            if require_episode_positions:
+                raise
             self.scenario.fixed_positions = None
             self.scenario.use_fixed_positions = False
             self.scenario.positions_initialized = False
             print(f"⚠️  加载Episode {episode_idx + 1}位置文件失败: {e}，将使用动态生成")
 
-    def _prepare_episode_terrain(self, episode_idx, terrain_seed_sequence=None):
+    def _prepare_episode_terrain(self, episode_idx, terrain_seed_sequence=None, terrain_variant_seed_sequence=None):
         """为当前评估回合显式准备地形，确保每回合地形可控且不会被reset再次改写。"""
         try:
             quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
         except Exception:
             quiet_output = True
-        use_random_terrain = bool(getattr(self.args, 'random_terrain', False)) or bool(terrain_seed_sequence)
+        use_random_terrain = (
+            bool(getattr(self.args, 'random_terrain', False))
+            or bool(terrain_seed_sequence)
+            or bool(terrain_variant_seed_sequence)
+        )
         if not use_random_terrain:
             try:
                 self.scenario.random_terrain = False
             except Exception:
                 pass
-            return getattr(self.scenario, 'current_terrain_seed', getattr(self.scenario, 'seed', None))
+            terrain_seed = getattr(self.scenario, 'current_terrain_seed', getattr(self.scenario, 'seed', None))
+            terrain_variant_seed = getattr(
+                self.scenario,
+                'current_terrain_variant_seed',
+                getattr(self.scenario, 'terrain_variant_seed', None),
+            )
+            self._current_episode_terrain_info = {
+                'terrain_seed': terrain_seed,
+                'terrain_variant_seed': terrain_variant_seed,
+            }
+            return dict(self._current_episode_terrain_info)
 
         if terrain_seed_sequence and episode_idx < len(terrain_seed_sequence):
             terrain_seed = int(terrain_seed_sequence[episode_idx])
@@ -1077,8 +1173,17 @@ class ModelEvaluator:
             if not quiet_output:
                 print(f"🎲 为回合 {episode_idx + 1} 生成新地形种子: {terrain_seed}")
 
+        terrain_variant_seed = None
+        if terrain_variant_seed_sequence and episode_idx < len(terrain_variant_seed_sequence):
+            terrain_variant_seed = int(terrain_variant_seed_sequence[episode_idx])
+            if not quiet_output:
+                print(f"🔧 使用同源扰动种子: {terrain_variant_seed} (回合 {episode_idx + 1})")
+
         if hasattr(self.scenario, 'regenerate_terrain'):
-            self.scenario.regenerate_terrain(new_seed=terrain_seed)
+            if terrain_variant_seed is not None:
+                self.scenario.regenerate_terrain(new_seed=terrain_seed, variant_seed=terrain_variant_seed)
+            else:
+                self.scenario.regenerate_terrain(new_seed=terrain_seed)
         else:
             try:
                 self.scenario.seed = terrain_seed
@@ -1088,7 +1193,7 @@ class ModelEvaluator:
                 pass
 
         self._rebuild_environment()
-        self._load_episode_positions(episode_idx, terrain_seed)
+        self._load_episode_positions(episode_idx, terrain_seed, terrain_variant_seed)
 
         # 当前回合的地图已经显式准备完毕，禁用reset时的再次随机改图。
         try:
@@ -1098,7 +1203,81 @@ class ModelEvaluator:
         except Exception:
             pass
 
-        return terrain_seed
+        self._current_episode_terrain_info = {
+            'terrain_seed': getattr(self.scenario, 'current_terrain_seed', terrain_seed),
+            'terrain_variant_seed': getattr(
+                self.scenario,
+                'current_terrain_variant_seed',
+                terrain_variant_seed,
+            ),
+        }
+        return dict(self._current_episode_terrain_info)
+
+    def _capture_episode_vis_context(self, episode_idx):
+        """捕获当前评估回合的冻结可视化上下文，避免后续 live env/scenario 污染。"""
+        ctx = {
+            'terrain': None,
+            'map_size': None,
+            'goal_pos': None,
+            'agent_goals': [],
+            'obstacles': [],
+            'terrain_source': 'episode_snapshot',
+            'scenario_seed': None,
+            'world_seed': None,
+            'terrain_seed': None,
+            'terrain_variant_seed': None,
+            'terrain_params': {},
+            'base_mountain_centers': [],
+            'actual_mountain_centers': [],
+            'episode': int(episode_idx) + 1,
+        }
+        try:
+            if hasattr(self.scenario, 'build_terrain_snapshot'):
+                snapshot = self.scenario.build_terrain_snapshot()
+            else:
+                snapshot = None
+            if isinstance(snapshot, dict):
+                terrain = snapshot.get('terrain')
+                ctx['terrain'] = np.asarray(terrain, dtype=np.float32).copy() if terrain is not None else None
+                ctx['map_size'] = snapshot.get('map_size', ctx['map_size'])
+                ctx['goal_pos'] = snapshot.get('goal_pos', ctx['goal_pos'])
+                ctx['agent_goals'] = snapshot.get('agent_goals', ctx['agent_goals']) or []
+                ctx['obstacles'] = snapshot.get('obstacles', ctx['obstacles']) or []
+                ctx['terrain_source'] = snapshot.get('terrain_source', ctx['terrain_source'])
+                ctx['terrain_seed'] = snapshot.get('terrain_seed', ctx['terrain_seed'])
+                ctx['terrain_variant_seed'] = snapshot.get('terrain_variant_seed', ctx['terrain_variant_seed'])
+                ctx['terrain_params'] = snapshot.get('terrain_params', ctx['terrain_params']) or {}
+                ctx['base_mountain_centers'] = snapshot.get('base_mountain_centers', ctx['base_mountain_centers']) or []
+                ctx['actual_mountain_centers'] = snapshot.get('actual_mountain_centers', ctx['actual_mountain_centers']) or []
+        except Exception:
+            pass
+
+        try:
+            ctx['scenario_seed'] = getattr(self.scenario, 'seed', ctx['terrain_seed'])
+            ctx['world_seed'] = getattr(self.world, 'terrain_seed', ctx['terrain_seed'])
+        except Exception:
+            pass
+
+        if ctx.get('goal_pos') is None:
+            try:
+                if hasattr(self.scenario, 'goal_pos') and self.scenario.goal_pos is not None:
+                    ctx['goal_pos'] = np.asarray(self.scenario.goal_pos, dtype=np.float32).copy()
+            except Exception:
+                pass
+
+        if not ctx.get('agent_goals'):
+            try:
+                ctx['agent_goals'] = _extract_agent_goal_positions(self.world, self.scenario)
+            except Exception:
+                ctx['agent_goals'] = []
+
+        if not ctx.get('obstacles'):
+            try:
+                ctx['obstacles'] = list(getattr(self.scenario, 'obstacles', []) or [])
+            except Exception:
+                ctx['obstacles'] = []
+
+        return ctx
     
     def select_actions_eval(self, processed_obs, use_fr=False, use_pf=False):
         """
@@ -2848,6 +3027,8 @@ class ModelEvaluator:
                 print(f"   - 穿透统计: 次数={penetration_stat['count']}, 最大深度={penetration_stat['max_depth']:.2f}, 平均深度={penetration_stat['mean_depth']:.2f}")
             if step_count < episode_length:
                 print(f"   ⚠️  注意: 回合提前结束（可能由于done=True或提前终止）")
+
+        vis_context = self._capture_episode_vis_context(episode_idx)
         
         return {
             'episode': episode_idx,
@@ -2883,7 +3064,8 @@ class ModelEvaluator:
             'path_efficiency': path_efficiency,
             'agent_path_efficiencies': agent_path_efficiencies,
             # 🔧 新增：穿透深度统计
-            'penetration_stat': penetration_stat
+            'penetration_stat': penetration_stat,
+            'vis_context': vis_context,
         }
         
     def generate_visualization(self, episode_data, is_best=False):
@@ -2911,6 +3093,27 @@ class ModelEvaluator:
         
         generated_files = {}
         try:
+            vis_context = episode_data.get('vis_context')
+            scenario_for_viz = self.scenario
+            goal_positions_snapshot = None
+            if isinstance(vis_context, dict):
+                scenario_for_viz = argparse.Namespace(**vis_context)
+                goal_positions_snapshot = {
+                    'goal_pos': vis_context.get('goal_pos'),
+                    'agent_goals': vis_context.get('agent_goals', []) or [],
+                }
+                snapshot_prefix = f"episode_{int(episode_data.get('episode', 0)) + 1:03d}"
+                snapshot_artifacts = _save_vis_context_snapshot_artifacts(
+                    self.args.save_viz_path,
+                    snapshot_prefix,
+                    vis_context,
+                )
+                if snapshot_artifacts:
+                    generated_files.update({
+                        'terrain_snapshot_json_path': snapshot_artifacts.get('terrain_snapshot_json_path'),
+                        'terrain_npy_path': snapshot_artifacts.get('terrain_npy_path'),
+                    })
+
             def _extract_action_head_norms(history):
                 if not history:
                     return []
@@ -3122,7 +3325,10 @@ class ModelEvaluator:
             )
             goal_positions_img = None
             try:
-                goal_positions_img = self._get_goal_positions_from_scenario()
+                if goal_positions_snapshot is not None:
+                    goal_positions_img = goal_positions_snapshot
+                else:
+                    goal_positions_img = self._get_goal_positions_from_scenario()
             except Exception:
                 goal_positions_img = None
             
@@ -3162,7 +3368,10 @@ class ModelEvaluator:
             # 🚨 关键修复：确保goal_positions不为None，如果获取失败则使用场景中的目标位置
             if goal_positions_img is None:
                 try:
-                    goal_positions_img = self._get_goal_positions_from_scenario()
+                    if goal_positions_snapshot is not None:
+                        goal_positions_img = goal_positions_snapshot
+                    else:
+                        goal_positions_img = self._get_goal_positions_from_scenario()
                     if goal_positions_img and goal_positions_img.get('goal_pos') is None:
                         # 如果仍然没有目标位置，尝试从world.landmarks获取
                         if hasattr(self.world, 'landmarks') and len(self.world.landmarks) > 0:
@@ -3181,13 +3390,13 @@ class ModelEvaluator:
                 generated_files['image_path'] = image_path
                 self.visualizer.generate_trajectory_image(
                         trajectories=episode_data['trajectory'],
-                        scenario=self.scenario,
+                        scenario=scenario_for_viz,
                         save_path=image_path,
                         episode_num=episode_data['episode'],
                         reward=episode_data['reward'],
                         episode_type='evaluation',
                         goal_positions=goal_positions_img,
-                        env_instance=self.env,  # 🔧 关键修复：传递环境实例，用于获取地形和目标数据
+                        env_instance=None if goal_positions_snapshot is not None else self.env,
                         actor_outputs_history=actor_outputs_history,  # 🔧 传入动作历史（如果存在）
                         title_step_note=f"Total Steps: {int(episode_data.get('steps', len(episode_data.get('trajectory', []))))}"
                 )
@@ -3270,8 +3479,8 @@ class ModelEvaluator:
                     save_path=html_path,
                     title=f"Evaluation Episode {episode_num} (reward={episode_data['reward']:.1f})",
                     goal_positions=goal_positions_html,
-                    scenario=self.scenario,
-                    env_instance=self.env  # 🔧 关键修复：传递环境实例，确保能获取目标位置
+                    scenario=scenario_for_viz,
+                    env_instance=None if goal_positions_snapshot is not None else self.env
                 )
 
             # GIF仍只在显式允许时生成，默认由shell脚本禁用
@@ -3283,7 +3492,7 @@ class ModelEvaluator:
                 generated_files['gif_path'] = gif_path
                 self.visualizer.generate_trajectory_gif(
                     trajectories=episode_data['trajectory'],
-                    scenario=self.scenario,
+                    scenario=scenario_for_viz,
                     save_path=gif_path,
                     episode_num=episode_data['episode'],
                     reward=episode_data['reward'],
@@ -3391,15 +3600,49 @@ class ModelEvaluator:
             except Exception as e:
                 print(f"⚠️  解析地形种子序列失败: {e}，将使用随机地形")
                 terrain_seed_sequence = None
+        terrain_variant_seed_sequence = None
+        terrain_variant_seed_str = os.getenv('TERRAIN_VARIANT_SEED_SEQUENCE', '')
+        if terrain_variant_seed_str:
+            try:
+                terrain_variant_seed_sequence = [int(s.strip()) for s in terrain_variant_seed_str.split(',') if s.strip()]
+                if not quiet_output:
+                    print(
+                        f"🔧 使用预定义同源扰动种子序列（共{len(terrain_variant_seed_sequence)}个）: "
+                        f"{terrain_variant_seed_sequence[:5]}... (前5个)"
+                    )
+            except Exception as e:
+                print(f"⚠️  解析同源扰动种子序列失败: {e}，将忽略 variant 序列")
+                terrain_variant_seed_sequence = None
 
+        terrain_family_override = os.getenv('POST_EVAL_TERRAIN_FAMILY', '').strip()
+        position_family_override = os.getenv('POST_EVAL_POSITION_FAMILY', '').strip()
+        runtime_random_terrain = (
+            _env_flag('RANDOM_TERRAIN', bool(getattr(self.args, 'random_terrain', False)))
+            or bool(terrain_seed_sequence)
+            or bool(terrain_variant_seed_sequence)
+        )
+        setup_semi_random_terrain = _env_flag('SEMI_RANDOM_TERRAIN', False)
         evaluation_setup = {
-            'terrain_family': 'similar_unseen' if _env_flag('SEMI_RANDOM_TERRAIN', False) else (
-                'train_match' if not terrain_seed_sequence and not bool(getattr(self.args, 'random_terrain', False)) else 'random_unseen'
+            'terrain_family': terrain_family_override or (
+                'similar_unseen' if setup_semi_random_terrain else (
+                    'train_match'
+                    if not runtime_random_terrain
+                    else 'random_unseen'
+                )
             ),
-            'semi_random_terrain': _env_flag('SEMI_RANDOM_TERRAIN', False),
+            'semi_random_terrain': setup_semi_random_terrain,
+            'terrain_seed': _env_int(
+                'TERRAIN_BASE_SEED' if setup_semi_random_terrain else 'SCENARIO_SEED',
+                getattr(self.args, 'terrain_seed', 67) if getattr(self.args, 'terrain_seed', None) is not None else 67,
+            ),
             'terrain_base_seed': _env_int('TERRAIN_BASE_SEED', getattr(self.args, 'terrain_seed', 67) if getattr(self.args, 'terrain_seed', None) is not None else 67),
             'peak_jitter_range': _env_float('PEAK_JITTER_RANGE', 15.0),
-            'position_family': os.getenv('HELDOUT_POSITION_MODE', 'train_match'),
+            'peak_center_jitter_range': _env_float('PEAK_CENTER_JITTER_RANGE', min(_env_float('PEAK_JITTER_RANGE', 15.0), 3.0)),
+            'peak_height_jitter_ratio_min': _env_float('PEAK_HEIGHT_JITTER_RATIO_MIN', 0.20),
+            'peak_height_jitter_ratio_max': _env_float('PEAK_HEIGHT_JITTER_RATIO_MAX', 0.40),
+            'peak_height_max_scale': _env_float('PEAK_HEIGHT_MAX_SCALE', 1.30),
+            'terrain_variant_noise_ratio': _env_float('TERRAIN_VARIANT_NOISE_RATIO', 0.15),
+            'position_family': position_family_override or os.getenv('HELDOUT_POSITION_MODE', 'train_match'),
             'reference_positions_file': os.getenv('HELDOUT_REFERENCE_POSITIONS_FILE', ''),
             'start_center_jitter': _env_float('HELDOUT_START_CENTER_JITTER', 12.0),
             'agent_local_jitter': _env_float('HELDOUT_AGENT_LOCAL_JITTER', 3.0),
@@ -3407,7 +3650,7 @@ class ModelEvaluator:
             'terrain_complexity': int(getattr(self.args, 'terrain_complexity_level', 0) or 0),
             'map_size': _env_int('MAP_SIZE', 200),
             'mountain_min_distance': _env_int('MOUNTAIN_MIN_DISTANCE', 55),
-            'random_terrain': bool(getattr(self.args, 'random_terrain', False)) or bool(terrain_seed_sequence),
+            'random_terrain': bool(runtime_random_terrain),
             'use_dynamic_obstacles': _env_flag('USE_DYNAMIC_OBSTACLES', True),
             'use_quadrotor_dynamics': _env_flag('USE_QUADROTOR_DYNAMICS', False),
             'gravity': _finite_float_or_none(getattr(self.args, 'gravity', None)),
@@ -3450,10 +3693,18 @@ class ModelEvaluator:
                     print(f"🏔️ 使用指定地形复杂度等级: {terrain_level}")
             self.scenario.terrain_complexity_level = terrain_level
 
-            terrain_seed = self._prepare_episode_terrain(episode, terrain_seed_sequence)
+            terrain_info = self._prepare_episode_terrain(
+                episode,
+                terrain_seed_sequence,
+                terrain_variant_seed_sequence,
+            )
+            terrain_seed = terrain_info.get('terrain_seed') if isinstance(terrain_info, dict) else terrain_info
+            terrain_variant_seed = (
+                terrain_info.get('terrain_variant_seed') if isinstance(terrain_info, dict) else None
+            )
             if terrain_seed is not None:
                 if not quiet_output:
-                    print(f"🗺️ 当前回合地形种子: {terrain_seed}")
+                    print(f"🗺️ 当前回合地形种子: base={terrain_seed}, variant={terrain_variant_seed}")
             
             # 🔧 关键修复：添加异常处理，确保单个回合失败不会导致整个评估失败
             try:
@@ -3470,6 +3721,7 @@ class ModelEvaluator:
                 
                 episode_data['terrain_complexity_level'] = terrain_level
                 episode_data['terrain_seed'] = terrain_seed
+                episode_data['terrain_variant_seed'] = terrain_variant_seed
                 all_rewards.append(episode_data['reward'])
                 
                 # 🔧 修改：跟踪最佳回合（与训练脚本逻辑一致）
@@ -3499,6 +3751,7 @@ class ModelEvaluator:
                     stored_episode_data['executed_actions_history'] = []
                     stored_episode_data['velocity_history'] = []
                     stored_episode_data['goal_distance_history'] = []
+                stored_episode_data['vis_context'] = None
                 all_episodes_data.append(stored_episode_data)
                 
                 if save_all_episode_visualizations and not self.args.disable_visualization:
@@ -3558,6 +3811,7 @@ class ModelEvaluator:
                 'episode_details': [],
                 'visualization_artifacts': {},
                 'terrain_seed_sequence': terrain_seed_sequence or [],
+                'terrain_variant_seed_sequence': terrain_variant_seed_sequence or [],
                 'evaluation_time': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'error': 'No episodes completed successfully'
             }
@@ -3719,6 +3973,7 @@ class ModelEvaluator:
             'evaluation_setup': evaluation_setup,
             'visualization_artifacts': visualization_artifacts,
             'terrain_seed_sequence': terrain_seed_sequence or [],
+            'terrain_variant_seed_sequence': terrain_variant_seed_sequence or [],
             'episode_details': [
                 {
                     'episode': ep['episode'],
@@ -3726,6 +3981,7 @@ class ModelEvaluator:
                     'steps': ep['steps'],
                     'terrain_complexity_level': ep.get('terrain_complexity_level', 'unknown'),
                     'terrain_seed': ep.get('terrain_seed', None),
+                    'terrain_variant_seed': ep.get('terrain_variant_seed', None),
                     'duration': ep['duration'],
                     'trajectory': ep.get('trajectory', []) if persist_episode_trajectories else [],
                     # 🔧 新增：保存碰撞和成功指标（与训练脚本一致）

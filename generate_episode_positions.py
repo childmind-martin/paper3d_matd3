@@ -35,6 +35,50 @@ def _env_float(env_vars, key, default):
         return float(default)
 
 
+def _env_flag(env_vars, key, default=False):
+    try:
+        raw = env_vars.get(key, default)
+    except Exception:
+        raw = default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extract_terrain_setup(env_vars):
+    try:
+        terrain_base_seed = int(float(env_vars.get("TERRAIN_BASE_SEED", env_vars.get("SCENARIO_SEED", 67))))
+    except Exception:
+        terrain_base_seed = 67
+    try:
+        terrain_variant_seed = int(float(env_vars.get("TERRAIN_VARIANT_SEED", terrain_base_seed)))
+    except Exception:
+        terrain_variant_seed = terrain_base_seed
+    peak_jitter_range = float(_env_float(env_vars, "PEAK_JITTER_RANGE", 15.0))
+    return {
+        "semi_random_terrain": bool(_env_flag(env_vars, "SEMI_RANDOM_TERRAIN", False)),
+        "terrain_base_seed": int(terrain_base_seed),
+        "terrain_variant_seed": int(terrain_variant_seed),
+        "peak_jitter_range": float(peak_jitter_range),
+        "peak_center_jitter_range": float(_env_float(env_vars, "PEAK_CENTER_JITTER_RANGE", min(peak_jitter_range, 3.0))),
+        "peak_height_jitter_ratio_min": float(_env_float(env_vars, "PEAK_HEIGHT_JITTER_RATIO_MIN", 0.20)),
+        "peak_height_jitter_ratio_max": float(_env_float(env_vars, "PEAK_HEIGHT_JITTER_RATIO_MAX", 0.40)),
+        "peak_height_max_scale": float(_env_float(env_vars, "PEAK_HEIGHT_MAX_SCALE", 1.30)),
+        "terrain_variant_noise_ratio": float(_env_float(env_vars, "TERRAIN_VARIANT_NOISE_RATIO", 0.15)),
+    }
+
+
+def _episode_positions_filename(episode_idx, terrain_seed=None, terrain_variant_seed=None):
+    episode_idx = int(episode_idx)
+    terrain_seed = None if terrain_seed is None else int(terrain_seed)
+    terrain_variant_seed = None if terrain_variant_seed is None else int(terrain_variant_seed)
+    if terrain_variant_seed is not None:
+        return f"episode_{episode_idx:03d}_seed_{terrain_seed}_variant_{terrain_variant_seed}.json"
+    if terrain_seed is not None:
+        return f"episode_{episode_idx:03d}_seed_{terrain_seed}.json"
+    return f"episode_{episode_idx:03d}.json"
+
+
 def _sample_disc_offset(rng, radius):
     radius = max(0.0, float(radius))
     if radius <= 1e-9:
@@ -72,6 +116,24 @@ def _load_reference_positions(reference_path):
         "agents": agents_arr,
         "goal": goal_arr,
     }
+
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def _estimate_local_surface_stats(scenario, xy, radius=4.0, grid_points=5):
@@ -513,7 +575,7 @@ def _select_distinct_flat_candidates_with_spacing(
     return chosen
 
 
-def _apply_same_region_positions(scenario, terrain_seed, positions_data, env_vars):
+def _apply_same_region_positions(scenario, position_seed, positions_data, env_vars):
     reference = _load_reference_positions(env_vars.get("HELDOUT_REFERENCE_POSITIONS_FILE"))
     if reference is None:
         return positions_data, None
@@ -522,7 +584,7 @@ def _apply_same_region_positions(scenario, terrain_seed, positions_data, env_var
     if position_mode != "same_region":
         return positions_data, None
 
-    rng = np.random.RandomState(int(terrain_seed) + 7919)
+    rng = np.random.RandomState(int(position_seed) + 7919)
     map_size = float(env_vars.get("MAP_SIZE", 200))
     start_altitude_offset = _env_float(env_vars, "START_ALTITUDE_OFFSET", 7.0)
     goal_altitude = _env_float(env_vars, "GOAL_ALTITUDE", 12.0)
@@ -794,6 +856,8 @@ def _apply_same_region_positions(scenario, terrain_seed, positions_data, env_var
     metadata = {
         "position_family": "same_region",
         "reference_positions_file": reference["path"],
+        "terrain_seed": int(positions_data.get("terrain_seed", position_seed)),
+        "terrain_variant_seed": int(position_seed),
         "start_center_jitter": float(start_center_jitter),
         "agent_local_jitter": float(agent_local_jitter),
         "goal_region_radius": float(goal_region_radius),
@@ -833,15 +897,22 @@ def _apply_same_region_positions(scenario, terrain_seed, positions_data, env_var
     return positions_data, metadata
 
 
-def generate_episode_positions(terrain_seed, episode_idx, output_dir, base_env_vars=None):
+def generate_episode_positions(
+    terrain_seed,
+    episode_idx,
+    output_dir,
+    base_env_vars=None,
+    terrain_variant_seed=None,
+):
     """
     为单个episode生成固定的位置文件
     
     Args:
-        terrain_seed: 地形种子
+        terrain_seed: 基准地形种子
         episode_idx: episode索引（用于文件名）
         output_dir: 输出目录
         base_env_vars: 基础环境变量字典
+        terrain_variant_seed: 同源扰动种子；None 时回退到 terrain_seed
     
     Returns:
         位置文件路径
@@ -853,6 +924,17 @@ def generate_episode_positions(terrain_seed, episode_idx, output_dir, base_env_v
     env_vars = os.environ.copy()
     env_vars.update(base_env_vars)
     
+    try:
+        terrain_seed = int(terrain_seed)
+    except Exception:
+        terrain_seed = 67
+    if terrain_variant_seed is None:
+        terrain_variant_seed = terrain_seed
+    try:
+        terrain_variant_seed = int(terrain_variant_seed)
+    except Exception:
+        terrain_variant_seed = terrain_seed
+
     # 设置地形种子
     env_vars["SCENARIO_SEED"] = str(terrain_seed)
     env_vars["USE_SCENARIO_SEED"] = "1"
@@ -860,6 +942,7 @@ def generate_episode_positions(terrain_seed, episode_idx, output_dir, base_env_v
     env_vars["PER_EPISODE_TERRAIN"] = "0"
     env_vars["USE_FIXED_POSITIONS"] = "0"  # 禁用固定位置，让系统生成
     env_vars["DYNAMIC_FIRST_TIME"] = "1"  # 启用动态首次，生成位置
+    env_vars["TERRAIN_VARIANT_SEED"] = str(terrain_variant_seed)
     
     # 设置其他必要的环境变量
     env_vars.setdefault("MAP_SIZE", "200")
@@ -932,6 +1015,7 @@ def generate_episode_positions(terrain_seed, episode_idx, output_dir, base_env_v
         # 构建位置数据
         positions_data = {
             "terrain_seed": terrain_seed,
+            "terrain_variant_seed": terrain_variant_seed,
             "episode_idx": episode_idx,
             "agents": agent_positions,
             "goal": goal_pos
@@ -939,21 +1023,30 @@ def generate_episode_positions(terrain_seed, episode_idx, output_dir, base_env_v
 
         positions_data, position_setup = _apply_same_region_positions(
             scenario=scenario,
-            terrain_seed=terrain_seed,
+            position_seed=terrain_variant_seed,
             positions_data=positions_data,
             env_vars=env_vars,
         )
-        
+        terrain_setup = _extract_terrain_setup(env_vars)
+        positions_data["terrain_setup"] = terrain_setup
+        if isinstance(position_setup, dict):
+            position_setup["terrain_setup"] = dict(terrain_setup)
+
         # 保存到文件
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        positions_file = output_dir / f"episode_{episode_idx:03d}_seed_{terrain_seed}.json"
-        
-        with open(positions_file, 'w', encoding='utf-8') as f:
-            json.dump(positions_data, f, indent=2, ensure_ascii=False)
+        positions_file = output_dir / _episode_positions_filename(
+            episode_idx,
+            terrain_seed=terrain_seed,
+            terrain_variant_seed=terrain_variant_seed,
+        )
+        canonical_file = output_dir / f"episode_{episode_idx:03d}.json"
+
+        _atomic_write_json(positions_file, positions_data)
+        _atomic_write_json(canonical_file, positions_data)
         
         print(f"✅ 生成Episode {episode_idx}位置文件: {positions_file}")
-        print(f"   地形种子: {terrain_seed}")
+        print(f"   地形种子: base={terrain_seed}, variant={terrain_variant_seed}")
         print(f"   智能体数量: {len(agent_positions)}")
         print(f"   智能体位置: {[f'({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})' for p in positions_data['agents']]}")
         print(f"   目标位置: ({positions_data['goal'][0]:.1f}, {positions_data['goal'][1]:.1f}, {positions_data['goal'][2]:.1f})")
@@ -981,14 +1074,15 @@ def generate_episode_positions(terrain_seed, episode_idx, output_dir, base_env_v
                 os.environ[key] = value
 
 
-def generate_all_episode_positions(terrain_seeds, output_dir, base_env_vars=None):
+def generate_all_episode_positions(terrain_seeds, output_dir, base_env_vars=None, terrain_variant_seeds=None):
     """
     为所有episode生成固定的位置文件
     
     Args:
-        terrain_seeds: 地形种子列表
+        terrain_seeds: 基准地形种子列表
         output_dir: 输出目录
         base_env_vars: 基础环境变量字典
+        terrain_variant_seeds: 同源扰动种子列表；None 时与 terrain_seeds 相同
     
     Returns:
         位置文件路径列表
@@ -996,6 +1090,11 @@ def generate_all_episode_positions(terrain_seeds, output_dir, base_env_vars=None
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    if terrain_variant_seeds is None:
+        terrain_variant_seeds = list(terrain_seeds)
+    if len(terrain_variant_seeds) != len(terrain_seeds):
+        raise ValueError("terrain_variant_seeds 长度必须与 terrain_seeds 一致")
+
     positions_files = []
     
     print(f"\n{'='*70}")
@@ -1003,9 +1102,13 @@ def generate_all_episode_positions(terrain_seeds, output_dir, base_env_vars=None
     print(f"输出目录: {output_dir}")
     print(f"{'='*70}\n")
     
-    for episode_idx, terrain_seed in enumerate(terrain_seeds):
+    for episode_idx, (terrain_seed, terrain_variant_seed) in enumerate(zip(terrain_seeds, terrain_variant_seeds)):
         positions_file = generate_episode_positions(
-            terrain_seed, episode_idx, output_dir, base_env_vars
+            terrain_seed,
+            episode_idx,
+            output_dir,
+            base_env_vars,
+            terrain_variant_seed=terrain_variant_seed,
         )
         if positions_file:
             positions_files.append(positions_file)

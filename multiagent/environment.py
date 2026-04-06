@@ -784,6 +784,17 @@ class MultiAgentEnv(gym.Env):
         # 设置随机种子（如果提供）
         if seed is not None:
             np.random.seed(seed)
+
+        # 在 reset_callback 之前推进 episode 索引，使场景可在 reset_world 内按 episode_idx 决定地形/障碍实例。
+        try:
+            episode_index = int(getattr(self.world, '_episode_index_counter', 0))
+        except Exception:
+            episode_index = 0
+        try:
+            self.world.episode_index = int(episode_index)
+            self.world._episode_index_counter = int(episode_index) + 1
+        except Exception:
+            pass
             
         # reset world
         if self.reset_callback is not None:

@@ -17,6 +17,7 @@
 - 保持主线 MATD3 separated skeleton + separated actor objective 不动
 - 其他 MATD3 实验共享同一个外层 update skeleton，只关闭少数模块
 - 默认禁用课程学习（UNLOCK_ENV_ON_SUCCESS=0, UNLOCK_ENV_ON_PLATEAU=0）
+- 默认禁用随机地形成功后自动升复杂度，保持训练复杂度固定
 - 默认预生成固定位置文件，不依赖 dynamic_first_time
 - 默认固定地形、固定位置、固定障碍物，确保跨实验环境完全一致
 - 当前脚本支持单 seed 串行运行，也支持多 seed 父进程并发调度并统一汇总
@@ -28,6 +29,7 @@
 """
 
 import argparse
+import contextlib
 import importlib
 import json
 import os
@@ -42,6 +44,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import random
 import numpy as np
 import time
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 from algorithm_ablation_colors import (
     ALGORITHM_ABLATION_COLOR_BY_LABEL,
@@ -103,6 +110,10 @@ STRICT_CORE_EXPERIMENT_LABELS = [
     "matd3_single_q",
 ]
 
+SUPPLEMENTAL_EXPERIMENT_LABELS = [
+    "matd3_separated_hybrid_actor",
+]
+
 OPTIONAL_REFERENCE_EXPERIMENT_LABELS = [
     "maddpg_separated_gradient",
     "maddpg_dual_q",
@@ -112,8 +123,27 @@ OPTIONAL_REFERENCE_EXPERIMENT_LABELS = [
 EXPLORATORY_EXPERIMENT_LABELS = OPTIONAL_REFERENCE_EXPERIMENT_LABELS
 
 EXPERIMENT_DISPLAY_ORDER = (
-    STRICT_CORE_EXPERIMENT_LABELS + OPTIONAL_REFERENCE_EXPERIMENT_LABELS
+    STRICT_CORE_EXPERIMENT_LABELS[:2]
+    + SUPPLEMENTAL_EXPERIMENT_LABELS
+    + STRICT_CORE_EXPERIMENT_LABELS[2:]
+    + OPTIONAL_REFERENCE_EXPERIMENT_LABELS
 )
+
+MATD3_TRIO_EXPERIMENT_LABELS = [
+    "matd3_separated_gradient",
+    "matd3_dual_q",
+    "matd3_separated_hybrid_actor",
+]
+
+AUDIT_REFERENCE_LABEL_BY_EXPERIMENT = {
+    "matd3_separated_gradient": "matd3_separated_gradient",
+    "matd3_dual_q": "matd3_separated_gradient",
+    "matd3_separated_hybrid_actor": "matd3_separated_gradient",
+    "matd3_single_q": "matd3_separated_gradient",
+    "maddpg_separated_gradient": "maddpg_separated_gradient",
+    "maddpg_dual_q": "maddpg_separated_gradient",
+    "maddpg_baseline": "maddpg_separated_gradient",
+}
 
 AUTO_POSITIONS_FILE_SENTINEL = "__AUTO_STRICT_POSITIONS__"
 
@@ -128,6 +158,7 @@ LEGACY_POST_EVAL_BOOL_DEFAULTS = {
 EXPERIMENT_ABBR_BY_LABEL = {
     "matd3_separated_gradient": "M3-Sep",
     "matd3_dual_q": "M3-Uni",
+    "matd3_separated_hybrid_actor": "M3-Hyb",
     "matd3_single_q": "M3-Base",
     "maddpg_separated_gradient": "DPG-Sep",
     "maddpg_dual_q": "DPG-Uni",
@@ -217,6 +248,61 @@ def _build_process_env(env_isolation: str) -> Dict[str, str]:
     env.setdefault("PATH", os.defpath)
     env.setdefault("HOME", str(Path.home()))
     env.setdefault("LANG", "C.UTF-8")
+    for key in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "LIBRARY_PATH"):
+        if key in env:
+            env[key] = str(_normalize_path_like_env_value(env[key]))
+    conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
+    if conda_prefix:
+        conda_bin = str(Path(conda_prefix) / "bin")
+        current_path = str(env.get("PATH", "")).strip()
+        if conda_bin and conda_bin not in current_path.split(":"):
+            env["PATH"] = f"{conda_bin}:{current_path}" if current_path else conda_bin
+        conda_lib = str(Path(conda_prefix) / "lib")
+        current_ld = str(env.get("LD_LIBRARY_PATH", "")).strip()
+        if conda_lib and conda_lib not in current_ld.split(":"):
+            env["LD_LIBRARY_PATH"] = f"{conda_lib}:{current_ld}" if current_ld else conda_lib
+    return env
+
+
+def _infer_conda_prefix_from_python(python_bin: Optional[str]) -> Optional[str]:
+    try:
+        if not python_bin:
+            return None
+        py_path = Path(str(python_bin)).resolve()
+        if py_path.name not in ("python", "python3"):
+            return None
+        if py_path.parent.name != "bin":
+            return None
+        prefix = py_path.parent.parent
+        if prefix.exists():
+            return str(prefix)
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_conda_runtime_env(env: Dict[str, str], python_bin: Optional[str] = None) -> Dict[str, str]:
+    conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
+    if not conda_prefix:
+        inferred = _infer_conda_prefix_from_python(python_bin)
+        if inferred:
+            conda_prefix = inferred
+            env["CONDA_PREFIX"] = inferred
+
+    if conda_prefix:
+        conda_bin = str(Path(conda_prefix) / "bin")
+        current_path = str(env.get("PATH", "")).strip()
+        if conda_bin and conda_bin not in current_path.split(":"):
+            env["PATH"] = f"{conda_bin}:{current_path}" if current_path else conda_bin
+
+        conda_lib = str(Path(conda_prefix) / "lib")
+        current_ld = str(env.get("LD_LIBRARY_PATH", "")).strip()
+        if conda_lib and conda_lib not in current_ld.split(":"):
+            env["LD_LIBRARY_PATH"] = f"{conda_lib}:{current_ld}" if current_ld else conda_lib
+
+    for key in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "LIBRARY_PATH"):
+        if key in env:
+            env[key] = str(_normalize_path_like_env_value(env[key]))
     return env
 
 def _extract_exp_name_with_timestamp(log_path: Path) -> Optional[str]:
@@ -534,19 +620,34 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
         elif current_value is None:
             setattr(args, arg_name, bool(default_value))
 
+    cli_experiments = [str(label) for label in (getattr(args, "experiments", None) or [])]
     saved_experiments = parent_config.get("experiments")
     if not isinstance(saved_experiments, list) or not saved_experiments:
         if isinstance(child_config, dict):
             saved_experiments = child_config.get("experiments")
     if isinstance(saved_experiments, list) and saved_experiments:
-        args.experiments = [str(label) for label in saved_experiments]
-        include_refs = any(label in OPTIONAL_REFERENCE_EXPERIMENT_LABELS for label in args.experiments)
+        merged_experiments: List[str] = []
+        for label in list(saved_experiments) + cli_experiments:
+            normalized = str(label)
+            if normalized not in merged_experiments:
+                merged_experiments.append(normalized)
+        setattr(args, "resume_parent_expected_experiments", list(merged_experiments))
+        if cli_experiments:
+            args.experiments = list(cli_experiments)
+        else:
+            args.experiments = merged_experiments
+        include_refs = any(label in OPTIONAL_REFERENCE_EXPERIMENT_LABELS for label in merged_experiments)
         args.include_reference_experiments = include_refs
         args.include_exploratory_experiments = include_refs
+    else:
+        setattr(args, "resume_parent_expected_experiments", list(cli_experiments))
 
     if isinstance(child_config, dict):
         for arg_name, config_key in (
             ("post_eval_peak_jitter_range", "post_eval_peak_jitter_range"),
+            ("post_eval_peak_height_jitter_ratio_min", "post_eval_peak_height_jitter_ratio_min"),
+            ("post_eval_peak_height_jitter_ratio_max", "post_eval_peak_height_jitter_ratio_max"),
+            ("post_eval_peak_height_max_scale", "post_eval_peak_height_max_scale"),
             ("post_eval_start_center_jitter", "post_eval_start_center_jitter"),
             ("post_eval_agent_local_jitter", "post_eval_agent_local_jitter"),
             ("post_eval_goal_region_radius", "post_eval_goal_region_radius"),
@@ -554,6 +655,43 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
             value = child_config.get(config_key, None)
             if value is not None:
                 setattr(args, arg_name, float(value))
+
+    training_environment = _infer_training_environment_from_existing_batch(
+        batch_dir=batch_dir,
+        parent_config=parent_config,
+        child_config=child_config,
+    )
+    if isinstance(training_environment, dict) and training_environment:
+        args.restored_training_environment = dict(training_environment)
+    if isinstance(training_environment, dict):
+        for arg_name, setup_key in (
+            ("group_b_peak_jitter_range", "peak_jitter_range"),
+            ("group_b_peak_center_jitter_range", "peak_center_jitter_range"),
+            ("group_b_peak_height_jitter_ratio_min", "peak_height_jitter_ratio_min"),
+            ("group_b_peak_height_jitter_ratio_max", "peak_height_jitter_ratio_max"),
+            ("group_b_peak_height_max_scale", "peak_height_max_scale"),
+            ("group_b_terrain_variant_noise_ratio", "terrain_variant_noise_ratio"),
+            ("group_b_semi_random_hold_episodes", "semi_random_hold_episodes"),
+            ("group_b_semi_random_hold_min_episodes", "semi_random_hold_min_episodes"),
+            ("group_b_semi_random_hold_max_episodes", "semi_random_hold_max_episodes"),
+            ("training_env_sequence_seed", "training_env_sequence_seed"),
+        ):
+            current_value = getattr(args, arg_name, None)
+            saved_value = training_environment.get(setup_key, None)
+            if current_value is None and saved_value is not None:
+                if arg_name in (
+                    "training_env_sequence_seed",
+                    "group_b_semi_random_hold_episodes",
+                    "group_b_semi_random_hold_min_episodes",
+                    "group_b_semi_random_hold_max_episodes",
+                ):
+                    setattr(args, arg_name, int(saved_value))
+                else:
+                    setattr(args, arg_name, float(saved_value))
+        if getattr(args, "group_b_semi_random_hold_mode", None) is None:
+            saved_hold_mode = training_environment.get("semi_random_hold_mode", None)
+            if saved_hold_mode is not None:
+                args.group_b_semi_random_hold_mode = str(saved_hold_mode)
 
     runtime_overrides = parent_config.get("runtime_overrides", {}) if isinstance(parent_config.get("runtime_overrides"), dict) else {}
     for arg_name in ("xla_global", "jit_compile", "cuda_launch_blocking", "tf_sync_on_finish", "xla_compile_parallelism"):
@@ -699,6 +837,42 @@ def _save_json(path: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+@contextlib.contextmanager
+def _exclusive_file_lock(lock_path: Path, timeout_sec: float = 900.0):
+    """使用文件锁串行化共享测试集生成，避免多 worker 同时重写同一目录。"""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        yield
+        return
+
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
+    start_time = time.monotonic()
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                os.ftruncate(fd, 0)
+                os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+                break
+            except BlockingIOError:
+                if time.monotonic() - start_time > float(timeout_sec):
+                    raise TimeoutError(f"等待测试集生成锁超时: {lock_path}")
+                time.sleep(0.2)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def _load_manifest(path: Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -731,6 +905,66 @@ def _normalize_cli_args(argv: List[str]) -> Dict[str, List[Any]]:
     return normalized
 
 
+def _set_manifest_cli_flag(argv: List[str], flag: str, value: Any) -> List[str]:
+    updated: List[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == flag:
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                i += 2
+            else:
+                i += 1
+            continue
+        updated.append(token)
+        i += 1
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    updated.extend([str(flag), str(value)])
+    return updated
+
+
+def _remove_manifest_cli_flag(argv: List[str], flag: str) -> List[str]:
+    updated: List[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == flag:
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                i += 2
+            else:
+                i += 1
+            continue
+        updated.append(token)
+        i += 1
+    return updated
+
+
+def _set_manifest_presence_flag(argv: List[str], flag: str, enabled: bool) -> List[str]:
+    updated = _remove_manifest_cli_flag(argv, flag)
+    if enabled:
+        updated.append(str(flag))
+    return updated
+
+
+def _normalize_path_like_env_value(value: Any) -> Any:
+    try:
+        raw = str(value).strip()
+    except Exception:
+        return value
+    if not raw:
+        return ""
+    deduped_parts: List[str] = []
+    seen = set()
+    for token in raw.split(":"):
+        part = token.strip()
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        deduped_parts.append(part)
+    return ":".join(deduped_parts)
+
+
 def _normalize_manifest_for_audit(manifest: Dict[str, Any]) -> Dict[str, Any]:
     argv_norm = _normalize_cli_args(manifest.get("argv", []))
     for key in ALLOWED_MANIFEST_ARG_DIFF_KEYS:
@@ -738,6 +972,9 @@ def _normalize_manifest_for_audit(manifest: Dict[str, Any]) -> Dict[str, Any]:
     env_norm = dict(manifest.get("audit_env", {}) or {})
     for key in ALLOWED_MANIFEST_ENV_DIFF_KEYS:
         env_norm.pop(key, None)
+    for key in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "LIBRARY_PATH"):
+        if key in env_norm:
+            env_norm[key] = _normalize_path_like_env_value(env_norm[key])
     return {
         "python_script": manifest.get("python_script"),
         "cwd": manifest.get("cwd"),
@@ -749,6 +986,8 @@ def _normalize_manifest_for_audit(manifest: Dict[str, Any]) -> Dict[str, Any]:
 def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
     ref_norm = _normalize_manifest_for_audit(reference)
     cur_norm = _normalize_manifest_for_audit(current)
+    ref_label = str(reference.get("meta", {}).get("label", "")).strip()
+    cur_label = str(current.get("meta", {}).get("label", "")).strip()
 
     argv_ref = ref_norm.get("argv", {})
     argv_cur = cur_norm.get("argv", {})
@@ -769,19 +1008,59 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         if env_ref.get(key) != env_cur.get(key)
     )
 
+    allowed_argv_only_in_cur = {
+        "--use-dynamic-obstacles",
+        "--semi-random-terrain",
+        "--deterministic-train-env-sequence",
+        "--terrain-base-seed",
+        "--training-env-sequence-seed",
+    }
+    allowed_env_only_in_cur = {
+        "DETERMINISTIC_TRAIN_ENV_SEQUENCE",
+        "ENABLE_RANDOM_TERRAIN_COMPLEXITY_PROGRESSION",
+        "LD_LIBRARY_PATH",
+        "PEAK_CENTER_JITTER_RANGE",
+        "PEAK_HEIGHT_JITTER_RATIO_MAX",
+        "PEAK_HEIGHT_JITTER_RATIO_MIN",
+        "PEAK_HEIGHT_MAX_SCALE",
+        "TERRAIN_VARIANT_NOISE_RATIO",
+        "TRAIN_ENV_SEQUENCE_SEED",
+    }
+    allowed_env_changed = {
+        "LD_LIBRARY_PATH",
+        "TRAIN_PYTHON_BIN",
+    }
+
+    if cur_label == "matd3_separated_hybrid_actor":
+        allowed_env_only_in_cur.update(
+            {
+                "MATD3_USE_HYBRID_ACTOR_OBJECTIVE",
+                "MATD3_HYBRID_ACTOR_ALPHA",
+            }
+        )
+
+    unexpected_argv_only_in_ref = list(argv_only_in_ref)
+    unexpected_argv_only_in_cur = sorted(key for key in argv_only_in_cur if key not in allowed_argv_only_in_cur)
+    unexpected_argv_changed = list(argv_changed)
+    unexpected_env_only_in_ref = list(env_only_in_ref)
+    unexpected_env_only_in_cur = sorted(key for key in env_only_in_cur if key not in allowed_env_only_in_cur)
+    unexpected_env_changed = sorted(key for key in env_changed if key not in allowed_env_changed)
+
     compatible = (
         ref_norm.get("python_script") == cur_norm.get("python_script")
         and ref_norm.get("cwd") == cur_norm.get("cwd")
-        and not argv_only_in_ref
-        and not argv_only_in_cur
-        and not argv_changed
-        and not env_only_in_ref
-        and not env_only_in_cur
-        and not env_changed
+        and not unexpected_argv_only_in_ref
+        and not unexpected_argv_only_in_cur
+        and not unexpected_argv_changed
+        and not unexpected_env_only_in_ref
+        and not unexpected_env_only_in_cur
+        and not unexpected_env_changed
     )
 
     return {
         "compatible": compatible,
+        "reference_label": ref_label,
+        "current_label": cur_label,
         "python_script_ref": ref_norm.get("python_script"),
         "python_script_cur": cur_norm.get("python_script"),
         "cwd_ref": ref_norm.get("cwd"),
@@ -792,6 +1071,15 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "env_only_in_ref": env_only_in_ref,
         "env_only_in_cur": env_only_in_cur,
         "env_changed": {key: {"ref": env_ref.get(key), "cur": env_cur.get(key)} for key in env_changed},
+        "allowed_argv_only_in_cur": sorted(allowed_argv_only_in_cur),
+        "allowed_env_only_in_cur": sorted(allowed_env_only_in_cur),
+        "allowed_env_changed": sorted(allowed_env_changed),
+        "unexpected_argv_only_in_ref": unexpected_argv_only_in_ref,
+        "unexpected_argv_only_in_cur": unexpected_argv_only_in_cur,
+        "unexpected_argv_changed": unexpected_argv_changed,
+        "unexpected_env_only_in_ref": unexpected_env_only_in_ref,
+        "unexpected_env_only_in_cur": unexpected_env_only_in_cur,
+        "unexpected_env_changed": unexpected_env_changed,
     }
 
 
@@ -868,6 +1156,18 @@ def _load_results_args(log_dir: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _load_results_payload(log_dir: str) -> Optional[Dict[str, Any]]:
+    results_path = Path(log_dir) / "results.json"
+    if not results_path.exists():
+        return None
+    try:
+        with open(results_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _safe_float(value: Any) -> Optional[float]:
     try:
         parsed = float(value)
@@ -885,6 +1185,19 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _post_eval_config_value(post_eval: Dict[str, Any], key: str) -> Any:
+    """从 post_eval 顶层读取配置，缺失时兼容回退到 spec。"""
+    if not isinstance(post_eval, dict):
+        return None
+    value = post_eval.get(key)
+    if value is not None:
+        return value
+    spec = post_eval.get("spec", {})
+    if isinstance(spec, dict):
+        return spec.get(key)
+    return None
+
+
 def _post_eval_summary_value(summary: Dict[str, Any], key: str) -> Optional[float]:
     value = _safe_float(summary.get(key))
     if value is not None:
@@ -897,6 +1210,59 @@ def _post_eval_summary_value(summary: Dict[str, Any], key: str) -> Optional[floa
 
 def _post_eval_enabled(args) -> bool:
     return not bool(getattr(args, "disable_post_eval", False))
+
+
+def _training_team_success_feasibility(result: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
+    team_success_flags = metrics.get("team_success_flags", [])
+    success_count = 0
+    if isinstance(team_success_flags, list):
+        success_count = sum(1 for flag in team_success_flags if _safe_int(flag) and int(flag) > 0)
+        if success_count > 0:
+            return True, {
+                "source": "team_success_flags",
+                "success_count": int(success_count),
+                "team_success_rate": _safe_float(metrics.get("team_success_rate")),
+            }
+
+    metric_team_sr = _safe_float(metrics.get("team_success_rate"))
+    if metric_team_sr is not None and metric_team_sr > 0.0:
+        return True, {
+            "source": "metrics.team_success_rate",
+            "success_count": int(success_count),
+            "team_success_rate": float(metric_team_sr),
+        }
+
+    log_dir = str(result.get("log_dir", "")).strip()
+    results_payload = _load_results_payload(log_dir) if log_dir else None
+    if isinstance(results_payload, dict):
+        best_team_sr = _safe_float(results_payload.get("best_team_success_rate"))
+        final_team_sr = _safe_float(results_payload.get("team_success_rate"))
+        if best_team_sr is not None and best_team_sr > 0.0:
+            return True, {
+                "source": "results.best_team_success_rate",
+                "success_count": int(success_count),
+                "team_success_rate": float(final_team_sr) if final_team_sr is not None else None,
+                "best_team_success_rate": float(best_team_sr),
+            }
+        if final_team_sr is not None and final_team_sr > 0.0:
+            return True, {
+                "source": "results.team_success_rate",
+                "success_count": int(success_count),
+                "team_success_rate": float(final_team_sr),
+                "best_team_success_rate": best_team_sr,
+            }
+
+    detail = {
+        "source": "no_train_team_success",
+        "success_count": int(success_count),
+        "team_success_rate": float(metric_team_sr) if metric_team_sr is not None else None,
+    }
+    if isinstance(results_payload, dict):
+        best_team_sr = _safe_float(results_payload.get("best_team_success_rate"))
+        if best_team_sr is not None:
+            detail["best_team_success_rate"] = float(best_team_sr)
+    return False, detail
 
 
 def _resolve_post_eval_seed(args) -> int:
@@ -916,6 +1282,91 @@ def _resolve_post_eval_peak_jitter_range(args) -> float:
         return float(os.getenv("PEAK_JITTER_RANGE", "15.0"))
     except Exception:
         return 15.0
+
+
+def _resolve_post_eval_peak_height_jitter_ratio_min(args) -> float:
+    value = getattr(args, "post_eval_peak_height_jitter_ratio_min", None)
+    if value is not None:
+        try:
+            return float(value)
+        except Exception:
+            pass
+    try:
+        return float(os.getenv("PEAK_HEIGHT_JITTER_RATIO_MIN", "0.20"))
+    except Exception:
+        return 0.20
+
+
+def _resolve_post_eval_peak_height_jitter_ratio_max(args) -> float:
+    value = getattr(args, "post_eval_peak_height_jitter_ratio_max", None)
+    if value is not None:
+        try:
+            return float(value)
+        except Exception:
+            pass
+    try:
+        return float(os.getenv("PEAK_HEIGHT_JITTER_RATIO_MAX", "0.40"))
+    except Exception:
+        return 0.40
+
+
+def _resolve_post_eval_peak_height_max_scale(args) -> float:
+    value = getattr(args, "post_eval_peak_height_max_scale", None)
+    if value is not None:
+        try:
+            return float(value)
+        except Exception:
+            pass
+    try:
+        return float(os.getenv("PEAK_HEIGHT_MAX_SCALE", "1.30"))
+    except Exception:
+        return 1.30
+
+
+def _resolve_post_eval_peak_center_jitter_range(args) -> float:
+    value = getattr(args, "post_eval_peak_center_jitter_range", None)
+    if value is not None:
+        try:
+            return float(value)
+        except Exception:
+            pass
+    try:
+        peak_jitter = float(_resolve_post_eval_peak_jitter_range(args))
+    except Exception:
+        peak_jitter = 15.0
+    try:
+        return float(os.getenv("PEAK_CENTER_JITTER_RANGE", str(min(peak_jitter, 3.0))))
+    except Exception:
+        return min(peak_jitter, 3.0)
+
+
+def _resolve_post_eval_terrain_variant_noise_ratio(args) -> float:
+    value = getattr(args, "post_eval_terrain_variant_noise_ratio", None)
+    if value is not None:
+        try:
+            return float(value)
+        except Exception:
+            pass
+    try:
+        return float(os.getenv("TERRAIN_VARIANT_NOISE_RATIO", "0.15"))
+    except Exception:
+        return 0.15
+
+
+def _resolve_training_env_sequence_seed(args) -> int:
+    value = getattr(args, "training_env_sequence_seed", None)
+    if value is not None:
+        try:
+            return int(value)
+        except Exception:
+            pass
+    env_value = str(os.getenv("TRAIN_ENV_SEQUENCE_SEED", "")).strip()
+    if env_value:
+        try:
+            return int(env_value)
+        except Exception:
+            pass
+    return int(getattr(args, "resolved_scenario_seed", 88))
 
 
 def _resolve_post_eval_start_center_jitter(args) -> float:
@@ -955,6 +1406,495 @@ def _resolve_post_eval_goal_region_radius(args) -> float:
         return float(os.getenv("HELDOUT_GOAL_REGION_RADIUS", "18.0"))
     except Exception:
         return 18.0
+
+
+def _derive_group_b_training_terrain_profile(args) -> Dict[str, float]:
+    """训练侧 Group B 的默认地形扰动略弱于 heldout 测试。"""
+    test_peak_jitter = max(0.0, float(_resolve_post_eval_peak_jitter_range(args)))
+    test_center_jitter = max(0.0, float(_resolve_post_eval_peak_center_jitter_range(args)))
+    test_height_min = max(0.0, float(_resolve_post_eval_peak_height_jitter_ratio_min(args)))
+    test_height_max = max(test_height_min, float(_resolve_post_eval_peak_height_jitter_ratio_max(args)))
+    test_height_cap = max(1.0, float(_resolve_post_eval_peak_height_max_scale(args)))
+    test_variant_noise = max(0.0, float(_resolve_post_eval_terrain_variant_noise_ratio(args)))
+
+    peak_jitter_range = max(1.5, test_peak_jitter * 0.55)
+    peak_center_jitter_range = min(
+        peak_jitter_range,
+        max(0.35, test_center_jitter * 0.50),
+    )
+    peak_height_jitter_ratio_min = max(0.0, test_height_min * 0.50)
+    peak_height_jitter_ratio_max = max(
+        peak_height_jitter_ratio_min,
+        test_height_max * 0.55,
+    )
+    peak_height_max_scale = max(1.0, 1.0 + (test_height_cap - 1.0) * 0.50)
+    terrain_variant_noise_ratio = max(0.0, test_variant_noise * 0.50)
+
+    return {
+        "peak_jitter_range": float(peak_jitter_range),
+        "peak_center_jitter_range": float(peak_center_jitter_range),
+        "peak_height_jitter_ratio_min": float(peak_height_jitter_ratio_min),
+        "peak_height_jitter_ratio_max": float(peak_height_jitter_ratio_max),
+        "peak_height_max_scale": float(peak_height_max_scale),
+        "terrain_variant_noise_ratio": float(terrain_variant_noise_ratio),
+    }
+
+
+def _resolve_group_b_training_terrain_profile(args) -> Dict[str, Any]:
+    derived = _derive_group_b_training_terrain_profile(args)
+
+    def _float_or_default(attr_name: str, profile_key: str, min_value: Optional[float] = None) -> float:
+        candidate = _safe_float(getattr(args, attr_name, None))
+        value = derived[profile_key] if candidate is None else float(candidate)
+        if min_value is not None:
+            value = max(float(min_value), float(value))
+        return float(value)
+
+    peak_jitter_range = _float_or_default("group_b_peak_jitter_range", "peak_jitter_range", min_value=0.0)
+    peak_center_jitter_range = _float_or_default(
+        "group_b_peak_center_jitter_range",
+        "peak_center_jitter_range",
+        min_value=0.0,
+    )
+    peak_center_jitter_range = min(peak_jitter_range, peak_center_jitter_range)
+    peak_height_jitter_ratio_min = _float_or_default(
+        "group_b_peak_height_jitter_ratio_min",
+        "peak_height_jitter_ratio_min",
+        min_value=0.0,
+    )
+    peak_height_jitter_ratio_max = _float_or_default(
+        "group_b_peak_height_jitter_ratio_max",
+        "peak_height_jitter_ratio_max",
+        min_value=peak_height_jitter_ratio_min,
+    )
+    peak_height_max_scale = _float_or_default(
+        "group_b_peak_height_max_scale",
+        "peak_height_max_scale",
+        min_value=1.0,
+    )
+    terrain_variant_noise_ratio = _float_or_default(
+        "group_b_terrain_variant_noise_ratio",
+        "terrain_variant_noise_ratio",
+        min_value=0.0,
+    )
+    hold_mode = str(getattr(args, "group_b_semi_random_hold_mode", None) or "range").strip().lower()
+    if hold_mode not in ("episode", "fixed", "range"):
+        hold_mode = "range"
+    hold_episodes = _safe_int(getattr(args, "group_b_semi_random_hold_episodes", None))
+    if hold_episodes is None:
+        hold_episodes = 18
+    hold_episodes = max(1, int(hold_episodes))
+    hold_min_episodes = _safe_int(getattr(args, "group_b_semi_random_hold_min_episodes", None))
+    if hold_min_episodes is None:
+        hold_min_episodes = 15
+    hold_min_episodes = max(1, int(hold_min_episodes))
+    hold_max_episodes = _safe_int(getattr(args, "group_b_semi_random_hold_max_episodes", None))
+    if hold_max_episodes is None:
+        hold_max_episodes = 20
+    hold_max_episodes = max(hold_min_episodes, int(hold_max_episodes))
+    return {
+        "peak_jitter_range": float(peak_jitter_range),
+        "peak_center_jitter_range": float(peak_center_jitter_range),
+        "peak_height_jitter_ratio_min": float(peak_height_jitter_ratio_min),
+        "peak_height_jitter_ratio_max": float(peak_height_jitter_ratio_max),
+        "peak_height_max_scale": float(peak_height_max_scale),
+        "terrain_variant_noise_ratio": float(terrain_variant_noise_ratio),
+        "semi_random_hold_mode": str(hold_mode),
+        "semi_random_hold_episodes": int(hold_episodes),
+        "semi_random_hold_min_episodes": int(hold_min_episodes),
+        "semi_random_hold_max_episodes": int(hold_max_episodes),
+    }
+
+
+def _resolve_training_environment_setup(args) -> Dict[str, Any]:
+    terrain_seed = int(getattr(args, "resolved_scenario_seed", 88))
+    training_env_sequence_seed = int(_resolve_training_env_sequence_seed(args))
+    experiment_group = str(getattr(args, "experiment_group", "A")).strip().upper()
+    use_dynamic_obstacles = bool(getattr(args, "use_dynamic_obstacles", False))
+    if experiment_group == "B":
+        use_dynamic_obstacles = True
+    setup: Dict[str, Any] = {
+        "use_fixed_positions": True,
+        "use_dynamic_obstacles": use_dynamic_obstacles,
+        "random_terrain": False,
+        "semi_random_terrain": False,
+        "deterministic_env_sequence": False,
+        "terrain_seed": terrain_seed,
+        "terrain_base_seed": terrain_seed,
+        "training_env_sequence_seed": training_env_sequence_seed,
+    }
+    if experiment_group != "B":
+        return setup
+
+    profile = _resolve_group_b_training_terrain_profile(args)
+    setup.update(
+        {
+            "random_terrain": True,
+            "semi_random_terrain": True,
+            "deterministic_env_sequence": True,
+            "terrain_base_seed": terrain_seed,
+            **profile,
+        }
+    )
+    return setup
+
+
+def _effective_training_environment_setup(args) -> Dict[str, Any]:
+    restored = getattr(args, "restored_training_environment", None)
+    if isinstance(restored, dict) and restored:
+        return dict(restored)
+    return _resolve_training_environment_setup(args)
+
+
+def _infer_training_environment_from_run_args(
+    run_args: Optional[Dict[str, Any]],
+    fallback_use_dynamic_obstacles: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(run_args, dict) or not run_args:
+        return None
+
+    terrain_seed = _safe_int(run_args.get("terrain_seed"))
+    if terrain_seed is None:
+        terrain_seed = _safe_int(run_args.get("scenario_seed"))
+    if terrain_seed is None:
+        return None
+
+    random_terrain = _to_bool(run_args.get("random_terrain", False))
+    peak_param_keys = (
+        "peak_jitter_range",
+        "peak_center_jitter_range",
+        "peak_height_jitter_ratio_min",
+        "peak_height_jitter_ratio_max",
+        "peak_height_max_scale",
+        "terrain_variant_noise_ratio",
+    )
+    peak_params = {
+        key: _safe_float(run_args.get(key))
+        for key in peak_param_keys
+    }
+    hold_mode = str(run_args.get("semi_random_hold_mode", "")).strip().lower() or None
+    if hold_mode not in (None, "episode", "fixed", "range"):
+        hold_mode = None
+    terrain_base_seed = _safe_int(run_args.get("terrain_base_seed"))
+    training_env_sequence_seed = _safe_int(run_args.get("training_env_sequence_seed"))
+    semi_random_signature = (
+        terrain_base_seed is not None
+        or training_env_sequence_seed is not None
+        or any(value is not None for value in peak_params.values())
+    )
+    semi_random_raw = run_args.get("semi_random_terrain", None)
+    if semi_random_raw is None:
+        semi_random_terrain = bool(random_terrain and semi_random_signature)
+    else:
+        semi_random_terrain = _to_bool(semi_random_raw)
+
+    deterministic_raw = run_args.get("deterministic_train_env_sequence", None)
+    if deterministic_raw is None:
+        deterministic_env_sequence = bool(semi_random_terrain and (training_env_sequence_seed is not None or terrain_base_seed is not None))
+    else:
+        deterministic_env_sequence = _to_bool(deterministic_raw)
+
+    dynamic_obstacles_raw = run_args.get("use_dynamic_obstacles", None)
+    if dynamic_obstacles_raw is None:
+        use_dynamic_obstacles = bool(fallback_use_dynamic_obstacles)
+    else:
+        use_dynamic_obstacles = _to_bool(dynamic_obstacles_raw)
+
+    if terrain_base_seed is None:
+        if semi_random_terrain and training_env_sequence_seed is not None:
+            terrain_base_seed = int(training_env_sequence_seed)
+        else:
+            terrain_base_seed = int(terrain_seed)
+
+    if training_env_sequence_seed is None:
+        if deterministic_env_sequence:
+            training_env_sequence_seed = int(terrain_base_seed)
+        else:
+            training_env_sequence_seed = int(terrain_base_seed)
+
+    setup: Dict[str, Any] = {
+        "use_fixed_positions": _to_bool(run_args.get("use_fixed_positions", True)),
+        "use_dynamic_obstacles": bool(use_dynamic_obstacles),
+        "random_terrain": bool(random_terrain),
+        "semi_random_terrain": bool(semi_random_terrain),
+        "deterministic_env_sequence": bool(deterministic_env_sequence),
+        "terrain_seed": int(terrain_seed),
+        "terrain_base_seed": int(terrain_base_seed),
+        "training_env_sequence_seed": int(training_env_sequence_seed),
+        "semi_random_hold_mode": hold_mode,
+        "semi_random_hold_episodes": _safe_int(run_args.get("semi_random_hold_episodes")),
+        "semi_random_hold_min_episodes": _safe_int(run_args.get("semi_random_hold_min_episodes")),
+        "semi_random_hold_max_episodes": _safe_int(run_args.get("semi_random_hold_max_episodes")),
+    }
+
+    for key in peak_param_keys:
+        value = peak_params.get(key)
+        if value is not None:
+            setup[key] = float(value)
+
+    return setup
+
+
+def _infer_training_environment_from_manifest(
+    manifest: Optional[Dict[str, Any]],
+    fallback_use_dynamic_obstacles: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(manifest, dict) or not manifest:
+        return None
+    meta = manifest.get("meta")
+    if isinstance(meta, dict):
+        meta_training_environment = _normalize_training_environment_record(meta.get("training_environment"))
+        if isinstance(meta_training_environment, dict) and meta_training_environment:
+            return meta_training_environment
+    exec_env = manifest.get("exec_env")
+    if not isinstance(exec_env, dict) or not exec_env:
+        return None
+    argv_norm = _normalize_cli_args(manifest.get("argv", [])) if isinstance(manifest.get("argv"), list) else {}
+
+    def _first_cli_value(flag: str) -> Optional[Any]:
+        values = argv_norm.get(flag, [])
+        if not values:
+            return None
+        return values[0]
+
+    def _env_or_cli_int(env_name: str, flag: str) -> Optional[int]:
+        value = _safe_int(exec_env.get(env_name))
+        if value is not None:
+            return value
+        return _safe_int(_first_cli_value(flag))
+
+    def _env_or_cli_float(env_name: str, flag: str) -> Optional[float]:
+        value = _safe_float(exec_env.get(env_name))
+        if value is not None:
+            return value
+        return _safe_float(_first_cli_value(flag))
+
+    terrain_seed = _env_or_cli_int("SCENARIO_SEED", "--terrain-seed")
+    if terrain_seed is None:
+        terrain_seed = _env_or_cli_int("TERRAIN_BASE_SEED", "--terrain-base-seed")
+    if terrain_seed is None:
+        return None
+
+    random_terrain = _to_bool(exec_env.get("RANDOM_TERRAIN", False))
+    if not random_terrain and "--random-terrain" in argv_norm:
+        random_terrain = True
+
+    peak_params = {
+        "peak_jitter_range": _env_or_cli_float("PEAK_JITTER_RANGE", "--peak-jitter-range"),
+        "peak_center_jitter_range": _env_or_cli_float("PEAK_CENTER_JITTER_RANGE", "--peak-center-jitter-range"),
+        "peak_height_jitter_ratio_min": _env_or_cli_float("PEAK_HEIGHT_JITTER_RATIO_MIN", "--peak-height-jitter-ratio-min"),
+        "peak_height_jitter_ratio_max": _env_or_cli_float("PEAK_HEIGHT_JITTER_RATIO_MAX", "--peak-height-jitter-ratio-max"),
+        "peak_height_max_scale": _env_or_cli_float("PEAK_HEIGHT_MAX_SCALE", "--peak-height-max-scale"),
+        "terrain_variant_noise_ratio": _env_or_cli_float("TERRAIN_VARIANT_NOISE_RATIO", "--terrain-variant-noise-ratio"),
+    }
+    hold_mode_raw = exec_env.get("SEMI_RANDOM_TERRAIN_HOLD_MODE", _first_cli_value("--semi-random-hold-mode"))
+    hold_mode = str(hold_mode_raw).strip().lower() if hold_mode_raw is not None else None
+    if hold_mode not in (None, "episode", "fixed", "range"):
+        hold_mode = None
+    terrain_base_seed = _env_or_cli_int("TERRAIN_BASE_SEED", "--terrain-base-seed")
+    training_env_sequence_seed = _env_or_cli_int("TRAIN_ENV_SEQUENCE_SEED", "--training-env-sequence-seed")
+    if training_env_sequence_seed is None:
+        training_env_sequence_seed = _env_or_cli_int("TRAIN_ENV_SEQUENCE_SEED", "--train-env-sequence-seed")
+
+    semi_random_signature = (
+        terrain_base_seed is not None
+        or training_env_sequence_seed is not None
+        or any(value is not None for value in peak_params.values())
+    )
+    semi_random_raw = exec_env.get("SEMI_RANDOM_TERRAIN", None)
+    if semi_random_raw is None:
+        semi_random_terrain = bool(random_terrain and semi_random_signature)
+    else:
+        semi_random_terrain = _to_bool(semi_random_raw)
+
+    deterministic_raw = exec_env.get("DETERMINISTIC_TRAIN_ENV_SEQUENCE", None)
+    if deterministic_raw is None:
+        deterministic_env_sequence = bool(semi_random_terrain and (training_env_sequence_seed is not None or terrain_base_seed is not None))
+    else:
+        deterministic_env_sequence = _to_bool(deterministic_raw)
+
+    dynamic_obstacles_raw = exec_env.get("USE_DYNAMIC_OBSTACLES", None)
+    if dynamic_obstacles_raw is None:
+        use_dynamic_obstacles = bool(fallback_use_dynamic_obstacles)
+    else:
+        use_dynamic_obstacles = _to_bool(dynamic_obstacles_raw)
+
+    if terrain_base_seed is None:
+        terrain_base_seed = int(terrain_seed)
+    if training_env_sequence_seed is None:
+        training_env_sequence_seed = int(terrain_base_seed)
+
+    setup: Dict[str, Any] = {
+        "use_fixed_positions": ("--use-fixed-positions" in argv_norm),
+        "use_dynamic_obstacles": bool(use_dynamic_obstacles),
+        "random_terrain": bool(random_terrain),
+        "semi_random_terrain": bool(semi_random_terrain),
+        "deterministic_env_sequence": bool(deterministic_env_sequence),
+        "terrain_seed": int(terrain_seed),
+        "terrain_base_seed": int(terrain_base_seed),
+        "training_env_sequence_seed": int(training_env_sequence_seed),
+        "semi_random_hold_mode": hold_mode,
+        "semi_random_hold_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_EPISODES", "--semi-random-hold-episodes"),
+        "semi_random_hold_min_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES", "--semi-random-hold-min-episodes"),
+        "semi_random_hold_max_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES", "--semi-random-hold-max-episodes"),
+    }
+    for key, value in peak_params.items():
+        if value is not None:
+            setup[key] = float(value)
+    return setup
+
+
+def _merge_training_environment_setups(*setups: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    merged: Dict[str, Any] = {}
+    saw_any = False
+    for setup in setups:
+        if not isinstance(setup, dict) or not setup:
+            continue
+        saw_any = True
+        for key, value in setup.items():
+            if value is not None:
+                merged[key] = value
+    return merged if saw_any else None
+
+
+def _normalize_training_environment_record(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(record, dict) or not record:
+        return None
+    normalized: Dict[str, Any] = {}
+    bool_keys = (
+        "use_fixed_positions",
+        "use_dynamic_obstacles",
+        "random_terrain",
+        "semi_random_terrain",
+        "deterministic_env_sequence",
+    )
+    int_keys = (
+        "schema_version",
+        "terrain_seed",
+        "terrain_base_seed",
+        "training_env_sequence_seed",
+        "semi_random_hold_episodes",
+        "semi_random_hold_min_episodes",
+        "semi_random_hold_max_episodes",
+    )
+    float_keys = (
+        "peak_jitter_range",
+        "peak_center_jitter_range",
+        "peak_height_jitter_ratio_min",
+        "peak_height_jitter_ratio_max",
+        "peak_height_max_scale",
+        "terrain_variant_noise_ratio",
+    )
+    for key in bool_keys:
+        if key in record and record.get(key) is not None:
+            normalized[key] = _to_bool(record.get(key))
+    for key in int_keys:
+        value = _safe_int(record.get(key))
+        if value is not None:
+            normalized[key] = int(value)
+    for key in float_keys:
+        value = _safe_float(record.get(key))
+        if value is not None:
+            normalized[key] = float(value)
+    if record.get("source") is not None:
+        normalized["source"] = str(record.get("source"))
+    if record.get("semi_random_hold_mode") is not None:
+        hold_mode = str(record.get("semi_random_hold_mode")).strip().lower()
+        if hold_mode in ("episode", "fixed", "range"):
+            normalized["semi_random_hold_mode"] = hold_mode
+    return normalized if normalized else None
+
+
+def _infer_training_environment_from_existing_batch(
+    batch_dir: Path,
+    parent_config: Optional[Dict[str, Any]] = None,
+    child_config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    parent_config = parent_config if isinstance(parent_config, dict) else {}
+    child_config = child_config if isinstance(child_config, dict) else {}
+    fallback_use_dynamic_obstacles = None
+    if child_config.get("use_dynamic_obstacles") is not None:
+        fallback_use_dynamic_obstacles = _to_bool(child_config.get("use_dynamic_obstacles"))
+    elif parent_config.get("use_dynamic_obstacles") is not None:
+        fallback_use_dynamic_obstacles = _to_bool(parent_config.get("use_dynamic_obstacles"))
+
+    seed_batches_root = batch_dir / "seed_batches"
+    summary_candidates = []
+    if seed_batches_root.exists():
+        summary_candidates = sorted(seed_batches_root.glob("*/plots/latest_summary.json"))
+
+    for summary_path in summary_candidates:
+        try:
+            summary_data = _load_json_file(summary_path)
+        except Exception:
+            continue
+        summary_use_dynamic = summary_data.get("use_dynamic_obstacles", fallback_use_dynamic_obstacles)
+        experiments = summary_data.get("experiments", [])
+        if not isinstance(experiments, list):
+            continue
+        for exp in experiments:
+            log_dir = str(exp.get("log_dir", "")).strip()
+            if not log_dir:
+                continue
+            payload = _load_results_payload(log_dir)
+            structured = None
+            if isinstance(payload, dict):
+                structured = _normalize_training_environment_record(payload.get("training_environment"))
+            run_args = _load_results_args(log_dir)
+            inferred = _merge_training_environment_setups(
+                _infer_training_environment_from_run_args(run_args, summary_use_dynamic),
+                structured,
+            )
+            if inferred:
+                return inferred
+
+    saved_training_environment = parent_config.get("training_environment")
+    if isinstance(saved_training_environment, dict) and saved_training_environment:
+        return dict(saved_training_environment)
+    saved_training_environment = child_config.get("training_environment")
+    if isinstance(saved_training_environment, dict) and saved_training_environment:
+        return dict(saved_training_environment)
+    return None
+
+
+def _infer_training_environment_from_child_batch(
+    batch_dir: Path,
+    batch_config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    batch_config = batch_config if isinstance(batch_config, dict) else {}
+    fallback_use_dynamic_obstacles = None
+    if batch_config.get("use_dynamic_obstacles") is not None:
+        fallback_use_dynamic_obstacles = _to_bool(batch_config.get("use_dynamic_obstacles"))
+
+    summary_path = batch_dir / "plots" / "latest_summary.json"
+    if summary_path.exists():
+        try:
+            summary_data = _load_json_file(summary_path)
+        except Exception:
+            summary_data = {}
+        summary_use_dynamic = summary_data.get("use_dynamic_obstacles", fallback_use_dynamic_obstacles)
+        experiments = summary_data.get("experiments", [])
+        if isinstance(experiments, list):
+            for exp in experiments:
+                log_dir = str(exp.get("log_dir", "")).strip()
+                if not log_dir:
+                    continue
+                payload = _load_results_payload(log_dir)
+                structured = None
+                if isinstance(payload, dict):
+                    structured = _normalize_training_environment_record(payload.get("training_environment"))
+                run_args = _load_results_args(log_dir)
+                inferred = _merge_training_environment_setups(
+                    _infer_training_environment_from_run_args(run_args, summary_use_dynamic),
+                    structured,
+                )
+                if inferred:
+                    return inferred
+
+    saved_training_environment = batch_config.get("training_environment")
+    if isinstance(saved_training_environment, dict) and saved_training_environment:
+        return dict(saved_training_environment)
+    return None
 
 
 def _resolve_post_eval_episode_length_multiplier(args) -> float:
@@ -1038,6 +1978,21 @@ def _existing_episode_positions_need_regen(
 
     target_spacing = max(10.0, float(reference_min_spacing) * 0.85)
     compatibility_floor = target_spacing * 0.7
+    expected_terrain_setup = {
+        "semi_random_terrain": bool(spec.get("semi_random_terrain", False)),
+        "terrain_base_seed": _safe_int(spec.get("terrain_base_seed")),
+        "terrain_variant_seed": None,
+        "peak_jitter_range": _safe_float(spec.get("peak_jitter_range")),
+        "peak_center_jitter_range": _safe_float(spec.get("peak_center_jitter_range")),
+        "peak_height_jitter_ratio_min": _safe_float(spec.get("peak_height_jitter_ratio_min")),
+        "peak_height_jitter_ratio_max": _safe_float(spec.get("peak_height_jitter_ratio_max")),
+        "peak_height_max_scale": _safe_float(spec.get("peak_height_max_scale")),
+        "terrain_variant_noise_ratio": _safe_float(spec.get("terrain_variant_noise_ratio")),
+        "semi_random_hold_mode": str(spec.get("semi_random_hold_mode")).strip().lower() if spec.get("semi_random_hold_mode") is not None else None,
+        "semi_random_hold_episodes": _safe_int(spec.get("semi_random_hold_episodes")),
+        "semi_random_hold_min_episodes": _safe_int(spec.get("semi_random_hold_min_episodes")),
+        "semi_random_hold_max_episodes": _safe_int(spec.get("semi_random_hold_max_episodes")),
+    }
 
     for candidate in candidate_files:
         try:
@@ -1057,6 +2012,47 @@ def _existing_episode_positions_need_regen(
             position_setup = data.get("position_setup")
             if not isinstance(position_setup, dict):
                 position_setup = data.get("heldout_metadata")
+            terrain_setup = data.get("terrain_setup")
+            if not isinstance(terrain_setup, dict) and isinstance(position_setup, dict):
+                terrain_setup = position_setup.get("terrain_setup")
+            if bool(spec.get("semi_random_terrain", False)):
+                if not isinstance(terrain_setup, dict):
+                    return True, f"{candidate.name} 缺少 terrain_setup 元数据"
+                if bool(terrain_setup.get("semi_random_terrain", False)) != bool(expected_terrain_setup["semi_random_terrain"]):
+                    return True, f"{candidate.name} semi_random_terrain 不匹配"
+                if _safe_int(terrain_setup.get("terrain_base_seed")) != expected_terrain_setup["terrain_base_seed"]:
+                    return True, f"{candidate.name} terrain_base_seed 不匹配"
+                for field_name in (
+                    "peak_jitter_range",
+                    "peak_center_jitter_range",
+                    "peak_height_jitter_ratio_min",
+                    "peak_height_jitter_ratio_max",
+                    "peak_height_max_scale",
+                    "terrain_variant_noise_ratio",
+                ):
+                    actual_value = _safe_float(terrain_setup.get(field_name))
+                    expected_value = expected_terrain_setup[field_name]
+                    if (
+                        actual_value is None
+                        or expected_value is None
+                        or abs(actual_value - expected_value) > 1e-6
+                    ):
+                        return True, f"{candidate.name} {field_name} 不匹配"
+                for field_name in (
+                    "semi_random_hold_episodes",
+                    "semi_random_hold_min_episodes",
+                    "semi_random_hold_max_episodes",
+                ):
+                    actual_value = _safe_int(terrain_setup.get(field_name))
+                    expected_value = expected_terrain_setup[field_name]
+                    if expected_value is None:
+                        continue
+                    if actual_value is None or int(actual_value) != int(expected_value):
+                        return True, f"{candidate.name} {field_name} 不匹配"
+                expected_hold_mode = expected_terrain_setup.get("semi_random_hold_mode")
+                actual_hold_mode = str(terrain_setup.get("semi_random_hold_mode", "")).strip().lower()
+                if expected_hold_mode and actual_hold_mode != expected_hold_mode:
+                    return True, f"{candidate.name} semi_random_hold_mode 不匹配"
             if isinstance(position_setup, dict):
                 goal_surface_stats = (
                     position_setup.get("goal_surface_stats")
@@ -1087,7 +2083,7 @@ def _existing_episode_positions_need_regen(
     return False, None
 
 
-def _generate_post_eval_terrain_seeds(seed: int, episodes: int) -> List[int]:
+def _generate_post_eval_terrain_variant_seeds(seed: int, episodes: int) -> List[int]:
     rng = random.Random(int(seed))
     return [int(rng.randint(1000, 99999)) for _ in range(int(episodes))]
 
@@ -1099,7 +2095,10 @@ def _validate_loaded_result(
     expected_episodes: int,
     positions_file: Path,
     expected_terrain_seed: Optional[int] = None,
+    expected_training_setup: Optional[Dict[str, Any]] = None,
     batch_seed: int = None,
+    manifest_path: Optional[Path] = None,
+    require_explicit_training_environment: bool = False,
 ) -> List[str]:
     """验证单次实验结果是否完整且与消融配置一致。"""
     errors: List[str] = []
@@ -1116,10 +2115,105 @@ def _validate_loaded_result(
     except Exception:
         errors.append("episode_rewards 不是可解析的数值数组")
 
+    results_payload = _load_results_payload(log_dir)
     run_args = _load_results_args(log_dir)
     if run_args is None:
         errors.append("缺少 results.json 或 args 字段")
         return errors
+    structured_training_setup = None
+    if isinstance(results_payload, dict):
+        structured_training_setup = _normalize_training_environment_record(
+            results_payload.get("training_environment")
+        )
+    if require_explicit_training_environment:
+        if not isinstance(structured_training_setup, dict) or not structured_training_setup:
+            errors.append("results.json 缺少结构化 training_environment")
+        else:
+            required_keys = (
+                "use_fixed_positions",
+                "use_dynamic_obstacles",
+                "random_terrain",
+                "semi_random_terrain",
+                "deterministic_env_sequence",
+                "terrain_seed",
+                "terrain_base_seed",
+                "training_env_sequence_seed",
+            )
+            for key in required_keys:
+                if structured_training_setup.get(key) is None:
+                    errors.append(f"training_environment 缺少有效 {key}")
+            if bool(structured_training_setup.get("semi_random_terrain", False)):
+                for key in (
+                    "peak_jitter_range",
+                    "peak_center_jitter_range",
+                    "peak_height_jitter_ratio_min",
+                    "peak_height_jitter_ratio_max",
+                    "peak_height_max_scale",
+                    "terrain_variant_noise_ratio",
+                    "semi_random_hold_episodes",
+                    "semi_random_hold_min_episodes",
+                    "semi_random_hold_max_episodes",
+                ):
+                    if structured_training_setup.get(key) is None:
+                        errors.append(f"training_environment 缺少有效 {key}")
+                hold_mode = str(structured_training_setup.get("semi_random_hold_mode", "")).strip().lower()
+                if hold_mode not in ("episode", "fixed", "range"):
+                    errors.append("training_environment 缺少有效 semi_random_hold_mode")
+    fallback_dynamic_obstacles = None
+    if isinstance(expected_training_setup, dict):
+        fallback_dynamic_obstacles = expected_training_setup.get("use_dynamic_obstacles", None)
+    results_training_setup = _infer_training_environment_from_run_args(
+        run_args,
+        fallback_use_dynamic_obstacles=fallback_dynamic_obstacles,
+    )
+    manifest_training_setup = None
+    if manifest_path is not None:
+        try:
+            manifest_training_setup = _infer_training_environment_from_manifest(
+                _load_manifest(Path(manifest_path)),
+                fallback_use_dynamic_obstacles=fallback_dynamic_obstacles,
+            )
+        except Exception:
+            manifest_training_setup = None
+    actual_training_setup = _merge_training_environment_setups(
+        results_training_setup,
+        manifest_training_setup,
+        structured_training_setup,
+    )
+    if require_explicit_training_environment and isinstance(structured_training_setup, dict):
+        if not isinstance(manifest_training_setup, dict) or not manifest_training_setup:
+            errors.append("manifest 缺少结构化 training_environment")
+        else:
+            compare_keys = (
+                "use_fixed_positions",
+                "use_dynamic_obstacles",
+                "random_terrain",
+                "semi_random_terrain",
+                "deterministic_env_sequence",
+                "terrain_seed",
+                "terrain_base_seed",
+                "training_env_sequence_seed",
+                "peak_jitter_range",
+                "peak_center_jitter_range",
+                "peak_height_jitter_ratio_min",
+                "peak_height_jitter_ratio_max",
+                "peak_height_max_scale",
+                "terrain_variant_noise_ratio",
+                "semi_random_hold_mode",
+                "semi_random_hold_episodes",
+                "semi_random_hold_min_episodes",
+                "semi_random_hold_max_episodes",
+            )
+            for key in compare_keys:
+                struct_value = structured_training_setup.get(key)
+                manifest_value = manifest_training_setup.get(key)
+                if struct_value is None or manifest_value is None:
+                    continue
+                if isinstance(struct_value, float) or isinstance(manifest_value, float):
+                    if not np.isclose(float(struct_value), float(manifest_value), atol=1e-6, rtol=0.0):
+                        errors.append(f"training_environment 与 manifest 不一致: {key}")
+                elif struct_value != manifest_value:
+                    errors.append(f"training_environment 与 manifest 不一致: {key}")
 
     expected = _expected_algo_flags(cfg, batch_seed=batch_seed)
     algo = str(run_args.get("algo", "")).strip().lower()
@@ -1155,7 +2249,115 @@ def _validate_loaded_result(
 
     if not _to_bool(run_args.get("use_fixed_positions", False)):
         errors.append("use_fixed_positions=False（消融要求固定位置）")
-    if expected_terrain_seed is not None:
+    if isinstance(expected_training_setup, dict):
+        expected_semi_random_terrain = bool(expected_training_setup.get("semi_random_terrain", False))
+        if expected_terrain_seed is not None:
+            if expected_semi_random_terrain:
+                actual_base_seed = None
+                if isinstance(actual_training_setup, dict):
+                    actual_base_seed = _safe_int(actual_training_setup.get("terrain_base_seed"))
+                if actual_base_seed is None:
+                    errors.append("results.json 中缺少有效 terrain_base_seed")
+                elif actual_base_seed != int(expected_terrain_seed):
+                    errors.append(
+                        f"terrain_base_seed 不匹配: got={actual_base_seed}, expected={expected_terrain_seed}"
+                    )
+            else:
+                try:
+                    terrain_seed = int(run_args.get("terrain_seed"))
+                    if terrain_seed != int(expected_terrain_seed):
+                        errors.append(
+                            f"terrain_seed 不匹配: got={terrain_seed}, expected={expected_terrain_seed}"
+                        )
+                except Exception:
+                    errors.append("results.json 中缺少有效 terrain_seed")
+
+        expected_random_terrain = expected_training_setup.get("random_terrain", None)
+        if expected_random_terrain is not None:
+            got_random_terrain = (
+                bool(actual_training_setup.get("random_terrain"))
+                if isinstance(actual_training_setup, dict)
+                else _to_bool(run_args.get("random_terrain", False))
+            )
+            if got_random_terrain != bool(expected_random_terrain):
+                errors.append(
+                    f"random_terrain 不匹配: got={got_random_terrain}, expected={bool(expected_random_terrain)}"
+                )
+
+        expected_deterministic_env = expected_training_setup.get("deterministic_env_sequence", None)
+        if expected_deterministic_env is not None:
+            got_deterministic_env = (
+                bool(actual_training_setup.get("deterministic_env_sequence"))
+                if isinstance(actual_training_setup, dict)
+                else _to_bool(run_args.get("deterministic_train_env_sequence", False))
+            )
+            if got_deterministic_env != bool(expected_deterministic_env):
+                errors.append(
+                    f"deterministic_train_env_sequence 不匹配: got={got_deterministic_env}, expected={bool(expected_deterministic_env)}"
+                )
+
+        expected_sequence_seed = _safe_int(expected_training_setup.get("training_env_sequence_seed"))
+        if expected_sequence_seed is not None and bool(expected_deterministic_env):
+            got_sequence_seed = (
+                _safe_int(actual_training_setup.get("training_env_sequence_seed"))
+                if isinstance(actual_training_setup, dict)
+                else _safe_int(run_args.get("training_env_sequence_seed"))
+            )
+            if got_sequence_seed is None:
+                errors.append("results.json 中缺少有效 training_env_sequence_seed")
+            elif got_sequence_seed != int(expected_sequence_seed):
+                errors.append(
+                    f"training_env_sequence_seed 不匹配: got={got_sequence_seed}, expected={expected_sequence_seed}"
+                )
+
+        if expected_semi_random_terrain:
+            expected_base_seed = _safe_int(expected_training_setup.get("terrain_base_seed"))
+            if expected_base_seed is not None:
+                got_base_seed = (
+                    _safe_int(actual_training_setup.get("terrain_base_seed"))
+                    if isinstance(actual_training_setup, dict)
+                    else _safe_int(run_args.get("terrain_base_seed"))
+                )
+                if got_base_seed is not None and got_base_seed != int(expected_base_seed):
+                    errors.append(
+                        f"terrain_base_seed 不匹配: got={got_base_seed}, expected={expected_base_seed}"
+                    )
+
+            for key in (
+                "peak_jitter_range",
+                "peak_center_jitter_range",
+                "peak_height_jitter_ratio_min",
+                "peak_height_jitter_ratio_max",
+                "peak_height_max_scale",
+                "terrain_variant_noise_ratio",
+                "semi_random_hold_episodes",
+                "semi_random_hold_min_episodes",
+                "semi_random_hold_max_episodes",
+            ):
+                expected_value = _safe_float(expected_training_setup.get(key))
+                if expected_value is None:
+                    continue
+                got_value = (
+                    _safe_float(actual_training_setup.get(key))
+                    if isinstance(actual_training_setup, dict)
+                    else _safe_float(run_args.get(key))
+                )
+                if got_value is None:
+                    errors.append(f"results.json 中缺少有效 {key}")
+                elif abs(float(got_value) - float(expected_value)) > 1e-6:
+                    errors.append(f"{key} 不匹配: got={got_value}, expected={expected_value}")
+            expected_hold_mode = str(expected_training_setup.get("semi_random_hold_mode", "")).strip().lower()
+            if expected_hold_mode:
+                got_hold_mode = ""
+                if isinstance(actual_training_setup, dict):
+                    got_hold_mode = str(actual_training_setup.get("semi_random_hold_mode", "")).strip().lower()
+                if not got_hold_mode:
+                    got_hold_mode = str(run_args.get("semi_random_hold_mode", "")).strip().lower()
+                if got_hold_mode != expected_hold_mode:
+                    errors.append(
+                        f"semi_random_hold_mode 不匹配: got={got_hold_mode or 'missing'}, expected={expected_hold_mode}"
+                    )
+    elif expected_terrain_seed is not None:
         try:
             terrain_seed = int(run_args.get("terrain_seed"))
             if terrain_seed != int(expected_terrain_seed):
@@ -1183,49 +2385,58 @@ def _ensure_post_eval_episode_positions(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     episode_positions_dir = Path(spec["episode_positions_dir"])
     terrain_seed_sequence = [int(seed) for seed in spec.get("terrain_seed_sequence", [])]
+    terrain_variant_seed_sequence = [int(seed) for seed in spec.get("terrain_variant_seed_sequence", [])]
     episode_positions_dir.mkdir(parents=True, exist_ok=True)
 
-    candidate_files = [
-        episode_positions_dir / f"episode_{idx:03d}_seed_{terrain_seed}.json"
-        for idx, terrain_seed in enumerate(terrain_seed_sequence)
-    ]
-    force_regenerate = bool(spec.get("force_regenerate_testset"))
-    needs_generation = force_regenerate or any(not candidate.exists() for candidate in candidate_files)
-    if not needs_generation:
-        compatibility_regen, compatibility_reason = _existing_episode_positions_need_regen(spec, candidate_files)
-        if compatibility_regen:
-            needs_generation = True
-            print(f"[后评估测试集] 现有 episode positions 不兼容，准备重建: {compatibility_reason}")
+    lock_path = episode_positions_dir / ".generation.lock"
+    with _exclusive_file_lock(lock_path):
+        candidate_files = [
+            episode_positions_dir / f"episode_{idx:03d}.json"
+            for idx, _ in enumerate(terrain_seed_sequence)
+        ]
+        force_regenerate = bool(spec.get("force_regenerate_testset"))
+        needs_generation = force_regenerate or any(not candidate.exists() for candidate in candidate_files)
+        if not needs_generation:
+            compatibility_regen, compatibility_reason = _existing_episode_positions_need_regen(spec, candidate_files)
+            if compatibility_regen:
+                needs_generation = True
+                print(f"[后评估测试集] 现有 episode positions 不兼容，准备重建: {compatibility_reason}")
 
-    if needs_generation:
-        os.environ.setdefault("SUPPRESS_MA_PROMPT", "1")
-        from generate_episode_positions import generate_all_episode_positions
+        if needs_generation:
+            os.environ.setdefault("SUPPRESS_MA_PROMPT", "1")
+            from generate_episode_positions import generate_all_episode_positions
 
-        base_env_vars = {
-            "MAP_SIZE": str(spec["map_size"]),
-            "TERRAIN_COMPLEXITY_LEVEL": str(spec["terrain_complexity"]),
-            "MOUNTAIN_MIN_DISTANCE": str(spec["mountain_min_distance"]),
-        }
-        if spec.get("semi_random_terrain"):
-            base_env_vars["SEMI_RANDOM_TERRAIN"] = "1"
-            base_env_vars["TERRAIN_BASE_SEED"] = str(spec["terrain_base_seed"])
-            base_env_vars["PEAK_JITTER_RANGE"] = str(spec["peak_jitter_range"])
-        if spec.get("position_family") == "same_region":
-            base_env_vars["HELDOUT_POSITION_MODE"] = "same_region"
-            base_env_vars["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(spec["reference_positions_file"])
-            base_env_vars["HELDOUT_START_CENTER_JITTER"] = str(spec["start_center_jitter"])
-            base_env_vars["HELDOUT_AGENT_LOCAL_JITTER"] = str(spec["agent_local_jitter"])
-            base_env_vars["HELDOUT_GOAL_REGION_RADIUS"] = str(spec["goal_region_radius"])
-        if force_regenerate:
-            print(f"[后评估测试集] 强制重生成 episode positions: {episode_positions_dir}")
-        generate_all_episode_positions(
-            terrain_seeds=terrain_seed_sequence,
-            output_dir=episode_positions_dir,
-            base_env_vars=base_env_vars,
-        )
+            base_env_vars = {
+                "MAP_SIZE": str(spec["map_size"]),
+                "TERRAIN_COMPLEXITY_LEVEL": str(spec["terrain_complexity"]),
+                "MOUNTAIN_MIN_DISTANCE": str(spec["mountain_min_distance"]),
+            }
+            if spec.get("semi_random_terrain"):
+                base_env_vars["SEMI_RANDOM_TERRAIN"] = "1"
+                base_env_vars["TERRAIN_BASE_SEED"] = str(spec["terrain_base_seed"])
+                base_env_vars["PEAK_JITTER_RANGE"] = str(spec["peak_jitter_range"])
+                base_env_vars["PEAK_CENTER_JITTER_RANGE"] = str(spec["peak_center_jitter_range"])
+                base_env_vars["PEAK_HEIGHT_JITTER_RATIO_MIN"] = str(spec["peak_height_jitter_ratio_min"])
+                base_env_vars["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(spec["peak_height_jitter_ratio_max"])
+                base_env_vars["PEAK_HEIGHT_MAX_SCALE"] = str(spec["peak_height_max_scale"])
+                base_env_vars["TERRAIN_VARIANT_NOISE_RATIO"] = str(spec["terrain_variant_noise_ratio"])
+            if spec.get("position_family") == "same_region":
+                base_env_vars["HELDOUT_POSITION_MODE"] = "same_region"
+                base_env_vars["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(spec["reference_positions_file"])
+                base_env_vars["HELDOUT_START_CENTER_JITTER"] = str(spec["start_center_jitter"])
+                base_env_vars["HELDOUT_AGENT_LOCAL_JITTER"] = str(spec["agent_local_jitter"])
+                base_env_vars["HELDOUT_GOAL_REGION_RADIUS"] = str(spec["goal_region_radius"])
+            if force_regenerate:
+                print(f"[后评估测试集] 强制重生成 episode positions: {episode_positions_dir}")
+            generate_all_episode_positions(
+                terrain_seeds=terrain_seed_sequence,
+                terrain_variant_seeds=terrain_variant_seed_sequence or None,
+                output_dir=episode_positions_dir,
+                base_env_vars=base_env_vars,
+            )
 
-    for idx, terrain_seed in enumerate(terrain_seed_sequence):
-        candidate = episode_positions_dir / f"episode_{idx:03d}_seed_{terrain_seed}.json"
+    for idx, _ in enumerate(terrain_seed_sequence):
+        candidate = episode_positions_dir / f"episode_{idx:03d}.json"
         if candidate.exists():
             spec["default_positions_file"] = str(candidate)
             break
@@ -1238,6 +2449,8 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         return None
 
     artifact_policy = _resolve_post_eval_artifact_policy(args)
+    post_eval_testset_prepared = bool(getattr(args, "post_eval_testset_prepared", False))
+    training_environment = _effective_training_environment_setup(args)
     base_env = setup_base_env_vars(
         positions_file=positions_file,
         env_isolation="strict",
@@ -1255,11 +2468,65 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         terrain_base_seed_value = getattr(args, "resolved_scenario_seed", 88)
     terrain_base_seed = int(terrain_base_seed_value)
     peak_jitter_range = float(_resolve_post_eval_peak_jitter_range(args))
+    peak_height_jitter_ratio_min = max(0.0, float(_resolve_post_eval_peak_height_jitter_ratio_min(args)))
+    peak_height_jitter_ratio_max = max(
+        peak_height_jitter_ratio_min,
+        float(_resolve_post_eval_peak_height_jitter_ratio_max(args)),
+    )
+    peak_height_max_scale = max(1.0, float(_resolve_post_eval_peak_height_max_scale(args)))
+    peak_center_jitter_range = max(0.0, float(_resolve_post_eval_peak_center_jitter_range(args)))
+    terrain_variant_noise_ratio = max(0.0, float(_resolve_post_eval_terrain_variant_noise_ratio(args)))
     start_center_jitter = float(_resolve_post_eval_start_center_jitter(args))
     agent_local_jitter = float(_resolve_post_eval_agent_local_jitter(args))
     goal_region_radius = float(_resolve_post_eval_goal_region_radius(args))
+    match_train_random_terrain = bool(training_environment.get("random_terrain", False))
+    match_train_semi_random = bool(training_environment.get("semi_random_terrain", False))
+    match_train_terrain_seed = int(training_environment.get("terrain_seed", getattr(args, "resolved_scenario_seed", 88)))
+    match_train_terrain_base_seed = int(training_environment.get("terrain_base_seed", match_train_terrain_seed))
+    match_train_use_dynamic_obstacles = bool(
+        training_environment.get("use_dynamic_obstacles", getattr(args, "use_dynamic_obstacles", False))
+    )
+    match_train_peak_jitter_range = float(training_environment.get("peak_jitter_range", 0.0))
+    match_train_peak_center_jitter_range = float(training_environment.get("peak_center_jitter_range", 0.0))
+    match_train_peak_height_jitter_ratio_min = float(training_environment.get("peak_height_jitter_ratio_min", 0.0))
+    match_train_peak_height_jitter_ratio_max = float(
+        training_environment.get("peak_height_jitter_ratio_max", match_train_peak_height_jitter_ratio_min)
+    )
+    match_train_peak_height_max_scale = float(training_environment.get("peak_height_max_scale", 1.0))
+    match_train_variant_noise_ratio = float(training_environment.get("terrain_variant_noise_ratio", 0.0))
+    spec_random_terrain = True if mode == "heldout_shared" else bool(match_train_random_terrain)
+    spec_semi_random_terrain = bool(semi_random_terrain) if mode == "heldout_shared" else bool(match_train_semi_random)
+    spec_terrain_seed = int(terrain_base_seed) if mode == "heldout_shared" else int(match_train_terrain_seed)
+    spec_terrain_base_seed = int(terrain_base_seed) if mode == "heldout_shared" else int(match_train_terrain_base_seed)
+    spec_peak_jitter_range = float(peak_jitter_range) if mode == "heldout_shared" else float(match_train_peak_jitter_range)
+    spec_peak_center_jitter_range = (
+        float(peak_center_jitter_range) if mode == "heldout_shared" else float(match_train_peak_center_jitter_range)
+    )
+    spec_peak_height_jitter_ratio_min = (
+        float(peak_height_jitter_ratio_min)
+        if mode == "heldout_shared"
+        else float(match_train_peak_height_jitter_ratio_min)
+    )
+    spec_peak_height_jitter_ratio_max = (
+        float(peak_height_jitter_ratio_max)
+        if mode == "heldout_shared"
+        else float(match_train_peak_height_jitter_ratio_max)
+    )
+    spec_peak_height_max_scale = (
+        float(peak_height_max_scale) if mode == "heldout_shared" else float(match_train_peak_height_max_scale)
+    )
+    spec_terrain_variant_noise_ratio = (
+        float(terrain_variant_noise_ratio)
+        if mode == "heldout_shared"
+        else float(match_train_variant_noise_ratio)
+    )
+    spec_use_dynamic_obstacles = (
+        bool(getattr(args, "use_dynamic_obstacles", False))
+        if mode == "heldout_shared"
+        else bool(match_train_use_dynamic_obstacles)
+    )
     spec = {
-        "version": 6,
+        "version": 9,
         "enabled": True,
         "mode": mode,
         "episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
@@ -1270,34 +2537,52 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         "terrain_complexity": int(terrain_complexity),
         "map_size": int(map_size),
         "mountain_min_distance": int(mountain_min_distance),
-        "terrain_family": "similar_unseen" if semi_random_terrain else "train_match",
-        "semi_random_terrain": bool(semi_random_terrain),
-        "terrain_base_seed": int(terrain_base_seed),
-        "peak_jitter_range": float(peak_jitter_range),
+        "terrain_family": "similar_unseen" if mode == "heldout_shared" else "train_match",
+        "random_terrain": bool(spec_random_terrain),
+        "semi_random_terrain": bool(spec_semi_random_terrain),
+        "terrain_seed": int(spec_terrain_seed),
+        "terrain_base_seed": int(spec_terrain_base_seed),
+        "peak_jitter_range": float(spec_peak_jitter_range),
+        "peak_center_jitter_range": float(spec_peak_center_jitter_range),
+        "peak_height_jitter_ratio_min": float(spec_peak_height_jitter_ratio_min),
+        "peak_height_jitter_ratio_max": float(spec_peak_height_jitter_ratio_max),
+        "peak_height_max_scale": float(spec_peak_height_max_scale),
+        "terrain_variant_noise_ratio": float(spec_terrain_variant_noise_ratio),
         "position_family": "same_region" if semi_random_terrain else "train_match",
         "reference_positions_file": str(positions_file),
         "start_center_jitter": float(start_center_jitter),
         "agent_local_jitter": float(agent_local_jitter),
         "goal_region_radius": float(goal_region_radius),
-        "force_regenerate_testset": bool(getattr(args, "force_post_eval_testset_regen", False)),
-        "use_dynamic_obstacles": bool(getattr(args, "use_dynamic_obstacles", False)),
+        "force_regenerate_testset": bool(getattr(args, "force_post_eval_testset_regen", False)) and not post_eval_testset_prepared,
+        "use_dynamic_obstacles": bool(spec_use_dynamic_obstacles),
         "use_fixed_positions": True,
         "shared_positions_file": str(positions_file),
         "default_positions_file": str(positions_file),
         "terrain_seed_sequence": [],
+        "terrain_variant_seed_sequence": [],
         "episode_positions_dir": "",
         "artifact_policy": artifact_policy,
+        "testset_prepared": bool(post_eval_testset_prepared),
     }
 
     if spec["mode"] == "heldout_shared":
-        spec["terrain_seed_sequence"] = _generate_post_eval_terrain_seeds(spec["seed"], spec["episodes"])
+        spec["terrain_seed_sequence"] = [int(spec["terrain_base_seed"])] * int(spec["episodes"])
+        spec["terrain_variant_seed_sequence"] = _generate_post_eval_terrain_variant_seeds(spec["seed"], spec["episodes"])
         if spec.get("semi_random_terrain"):
             jitter_tag = str(spec.get("peak_jitter_range", 15.0)).replace(".", "p")
+            center_tag = str(spec.get("peak_center_jitter_range", 3.0)).replace(".", "p")
+            height_min_tag = str(spec.get("peak_height_jitter_ratio_min", 0.20)).replace(".", "p")
+            height_max_tag = str(spec.get("peak_height_jitter_ratio_max", 0.40)).replace(".", "p")
+            height_cap_tag = str(spec.get("peak_height_max_scale", 1.30)).replace(".", "p")
+            variant_noise_tag = str(spec.get("terrain_variant_noise_ratio", 0.15)).replace(".", "p")
             start_tag = str(spec.get("start_center_jitter", 12.0)).replace(".", "p")
             goal_tag = str(spec.get("goal_region_radius", 18.0)).replace(".", "p")
             testset_tag = (
                 f"seed_{spec['seed']}_similar_base_{spec['terrain_base_seed']}_jitter_{jitter_tag}"
-                f"_start_{start_tag}_goal_{goal_tag}_posv3"
+                f"_center_{center_tag}"
+                f"_hjit_{height_min_tag}_{height_max_tag}_hcap_{height_cap_tag}"
+                f"_vnoise_{variant_noise_tag}"
+                f"_start_{start_tag}_goal_{goal_tag}_posv5"
             )
         else:
             testset_tag = f"seed_{spec['seed']}_random"
@@ -1305,7 +2590,7 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         spec["episode_positions_dir"] = str(episode_positions_dir)
         spec = _ensure_post_eval_episode_positions(spec)
     elif spec["mode"] == "match_train_env":
-        pass
+        spec["position_family"] = "train_match"
     else:
         raise ValueError(f"未知 post-eval 模式: {spec['mode']}")
 
@@ -1392,6 +2677,15 @@ POST_EVAL_INHERITED_RUNTIME_ENV_KEYS = (
     "ACTION_RANGE_Z",
 )
 
+POST_EVAL_LAUNCH_ENV_KEYS = (
+    "TRAIN_PYTHON_BIN",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "LD_LIBRARY_PATH",
+    "CUDA_VISIBLE_DEVICES",
+    "GPU_ID",
+)
+
 
 def _load_post_eval_runtime_env(result: Dict[str, Any]) -> Dict[str, str]:
     runtime_env: Dict[str, str] = {}
@@ -1403,7 +2697,7 @@ def _load_post_eval_runtime_env(result: Dict[str, Any]) -> Dict[str, str]:
                 section = manifest.get(section_name)
                 if not isinstance(section, dict) or not section:
                     continue
-                for key in POST_EVAL_INHERITED_RUNTIME_ENV_KEYS:
+                for key in POST_EVAL_INHERITED_RUNTIME_ENV_KEYS + POST_EVAL_LAUNCH_ENV_KEYS:
                     value = section.get(key)
                     if value is None:
                         continue
@@ -1470,6 +2764,11 @@ def _validate_post_eval_results(
         actual_seeds = data.get("terrain_seed_sequence", [])
         if [int(seed) for seed in actual_seeds] != expected_seeds:
             errors.append("terrain_seed_sequence 不匹配")
+    expected_variant_seeds = [int(seed) for seed in spec.get("terrain_variant_seed_sequence", [])]
+    if expected_variant_seeds:
+        actual_variant_seeds = data.get("terrain_variant_seed_sequence", [])
+        if [int(seed) for seed in actual_variant_seeds] != expected_variant_seeds:
+            errors.append("terrain_variant_seed_sequence 不匹配")
 
     artifact_policy = spec.get("artifact_policy", {}) if isinstance(spec.get("artifact_policy"), dict) else {}
     episode_details = data.get("episode_details", []) if isinstance(data.get("episode_details"), list) else []
@@ -1518,6 +2817,18 @@ def _validate_post_eval_results(
         spec_peak_jitter = _safe_float(spec.get("peak_jitter_range"))
         if setup_peak_jitter is None or spec_peak_jitter is None or abs(setup_peak_jitter - spec_peak_jitter) > 1e-6:
             errors.append("peak_jitter_range 不匹配")
+        if bool(spec.get("semi_random_terrain", False)):
+            for field_name in (
+                "peak_center_jitter_range",
+                "peak_height_jitter_ratio_min",
+                "peak_height_jitter_ratio_max",
+                "peak_height_max_scale",
+                "terrain_variant_noise_ratio",
+            ):
+                setup_value = _safe_float(evaluation_setup.get(field_name))
+                spec_value = _safe_float(spec.get(field_name))
+                if setup_value is None or spec_value is None or abs(setup_value - spec_value) > 1e-6:
+                    errors.append(f"{field_name} 不匹配")
         setup_start_jitter = _safe_float(evaluation_setup.get("start_center_jitter"))
         spec_start_jitter = _safe_float(spec.get("start_center_jitter"))
         if setup_start_jitter is None or spec_start_jitter is None or abs(setup_start_jitter - spec_start_jitter) > 1e-6:
@@ -1538,8 +2849,10 @@ def _validate_post_eval_results(
             errors.append("mountain_min_distance 不匹配")
         if bool(evaluation_setup.get("use_dynamic_obstacles", False)) != bool(spec.get("use_dynamic_obstacles", False)):
             errors.append("use_dynamic_obstacles 不匹配")
-        if bool(evaluation_setup.get("random_terrain", False)) != bool(spec.get("mode") == "heldout_shared"):
+        if bool(evaluation_setup.get("random_terrain", False)) != bool(spec.get("random_terrain", False)):
             errors.append("random_terrain 不匹配")
+        if _safe_int(evaluation_setup.get("terrain_seed")) != _safe_int(spec.get("terrain_seed")):
+            errors.append("terrain_seed 不匹配")
         setup_episode_length_multiplier = _safe_float(evaluation_setup.get("requested_episode_length_multiplier"))
         spec_episode_length_multiplier = _safe_float(spec.get("episode_length_multiplier"))
         if (
@@ -1758,6 +3071,27 @@ def _run_post_training_evaluation(
         if isinstance(post_eval_spec.get("artifact_policy"), dict)
         else _resolve_post_eval_artifact_policy(args)
     )
+    training_feasible, feasibility_detail = _training_team_success_feasibility(result)
+    result["post_eval_eligible"] = bool(training_feasible)
+    result["post_eval_eligibility_detail"] = dict(feasibility_detail)
+    if not training_feasible:
+        skip_reason = (
+            "训练阶段未出现团队成功回合，跳过 post-eval"
+            f" | detail={feasibility_detail}"
+        )
+        print(f"[后评估-{label}] 跳过: {skip_reason}")
+        result["post_eval_dir"] = str(eval_dir)
+        result["post_eval_log_path"] = ""
+        result["post_eval_results_path"] = ""
+        result["post_eval_spec_path"] = str(eval_spec_path)
+        result["post_eval_spec"] = dict(post_eval_spec)
+        result["post_eval_metrics"] = None
+        result["post_eval_summary"] = None
+        result["post_eval_episode_count"] = 0
+        result["post_eval_skipped"] = True
+        result["post_eval_skip_reason"] = skip_reason
+        result["post_eval_status"] = "skipped_no_train_success"
+        return result
 
     reuse_existing = False
     existing_payload = None
@@ -1782,10 +3116,18 @@ def _run_post_training_evaluation(
 
         env = _build_process_env(args.env_isolation)
         env.update(inherited_runtime_env)
+        conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
+        if conda_prefix:
+            conda_bin = str(Path(conda_prefix) / "bin")
+            current_path = str(env.get("PATH", "")).strip()
+            if conda_bin and not current_path.startswith(conda_bin):
+                env["PATH"] = f"{conda_bin}:{current_path}" if current_path else conda_bin
+        env.setdefault("TRAIN_PYTHON_BIN", _resolve_post_eval_python(result))
         env["SUPPRESS_MA_PROMPT"] = "1"
         env["STRICT_EVAL_MATCH"] = "1"
         env["EVAL_RESPECT_INPUT_POSITIONS"] = "1"
         env["EVAL_PYTHON_BIN"] = _resolve_post_eval_python(result)
+        _ensure_conda_runtime_env(env, env.get("EVAL_PYTHON_BIN"))
         env["MODEL_VARIANT"] = model_variant
         env["PYTHONUNBUFFERED"] = "1"
         env["QUIET_OUTPUT"] = "1"
@@ -1847,30 +3189,41 @@ def _run_post_training_evaluation(
         env["RANDOM_ACTION_PROB"] = "0.0"
         env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"
         env["USE_SCENARIO_SEED"] = "1"
-        env["SCENARIO_SEED"] = str(post_eval_spec["scenario_seed"])
+        env["SCENARIO_SEED"] = str(post_eval_spec.get("terrain_seed", post_eval_spec["scenario_seed"]))
         env["TERRAIN_COMPLEXITY_LEVEL"] = str(post_eval_spec["terrain_complexity"])
         env["MAP_SIZE"] = str(post_eval_spec["map_size"])
         env["MOUNTAIN_MIN_DISTANCE"] = str(post_eval_spec["mountain_min_distance"])
         env["SEMI_RANDOM_TERRAIN"] = "1" if post_eval_spec.get("semi_random_terrain") else "0"
         env["TERRAIN_BASE_SEED"] = str(post_eval_spec.get("terrain_base_seed", post_eval_spec["scenario_seed"]))
         env["PEAK_JITTER_RANGE"] = str(post_eval_spec.get("peak_jitter_range", 15.0))
+        env["PEAK_CENTER_JITTER_RANGE"] = str(post_eval_spec.get("peak_center_jitter_range", 3.0))
+        env["PEAK_HEIGHT_JITTER_RATIO_MIN"] = str(post_eval_spec.get("peak_height_jitter_ratio_min", 0.20))
+        env["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(post_eval_spec.get("peak_height_jitter_ratio_max", 0.40))
+        env["PEAK_HEIGHT_MAX_SCALE"] = str(post_eval_spec.get("peak_height_max_scale", 1.30))
+        env["TERRAIN_VARIANT_NOISE_RATIO"] = str(post_eval_spec.get("terrain_variant_noise_ratio", 0.15))
         env["HELDOUT_POSITION_MODE"] = str(post_eval_spec.get("position_family", "train_match"))
         env["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(post_eval_spec.get("reference_positions_file", positions_file))
         env["HELDOUT_START_CENTER_JITTER"] = str(post_eval_spec.get("start_center_jitter", 12.0))
         env["HELDOUT_AGENT_LOCAL_JITTER"] = str(post_eval_spec.get("agent_local_jitter", 3.0))
         env["HELDOUT_GOAL_REGION_RADIUS"] = str(post_eval_spec.get("goal_region_radius", 18.0))
         env["USE_DYNAMIC_OBSTACLES"] = "1" if post_eval_spec.get("use_dynamic_obstacles") else "0"
+        env["POST_EVAL_MODE"] = str(post_eval_spec.get("mode", "heldout_shared"))
+        env["POST_EVAL_TERRAIN_FAMILY"] = str(post_eval_spec.get("terrain_family", "train_match"))
+        env["POST_EVAL_POSITION_FAMILY"] = str(post_eval_spec.get("position_family", "train_match"))
         env["USE_FIXED_POSITIONS"] = "1"
         env["POSITIONS_FILE"] = str(post_eval_spec["default_positions_file"])
+        env["RANDOM_TERRAIN"] = "1" if post_eval_spec.get("random_terrain") else "0"
         if post_eval_spec.get("mode") == "heldout_shared":
-            env["RANDOM_TERRAIN"] = "1"
             env["TERRAIN_SEED_SEQUENCE"] = ",".join(map(str, post_eval_spec.get("terrain_seed_sequence", [])))
+            env["TERRAIN_VARIANT_SEED_SEQUENCE"] = ",".join(map(str, post_eval_spec.get("terrain_variant_seed_sequence", [])))
+            env["EVAL_REQUIRE_EPISODE_POSITIONS"] = "1"
             if post_eval_spec.get("episode_positions_dir"):
                 env["EPISODE_POSITIONS_DIR"] = str(post_eval_spec["episode_positions_dir"])
         else:
-            env["RANDOM_TERRAIN"] = "0"
+            env.pop("EVAL_REQUIRE_EPISODE_POSITIONS", None)
             env.pop("EPISODE_POSITIONS_DIR", None)
             env.pop("TERRAIN_SEED_SEQUENCE", None)
+            env.pop("TERRAIN_VARIANT_SEED_SEQUENCE", None)
 
         eval_command = [
             "/bin/bash",
@@ -1893,7 +3246,10 @@ def _run_post_training_evaluation(
         if post_eval_spec.get("semi_random_terrain"):
             print(
                 f"[后评估-{label}] 相似地形heldout: base_seed={post_eval_spec['terrain_base_seed']}, "
-                f"peak_jitter={post_eval_spec['peak_jitter_range']}"
+                f"peak_jitter={post_eval_spec['peak_jitter_range']}, "
+                f"height_jitter=[{post_eval_spec.get('peak_height_jitter_ratio_min', 0.20)}, "
+                f"{post_eval_spec.get('peak_height_jitter_ratio_max', 0.40)}] x range, "
+                f"height_cap={post_eval_spec.get('peak_height_max_scale', 1.30)}x"
             )
             print(
                 f"[后评估-{label}] 同区域位置heldout: ref={Path(post_eval_spec['reference_positions_file']).name}, "
@@ -2509,26 +3865,36 @@ def _write_post_eval_summary_text(series: List[Dict[str, Any]], output_path: Pat
             f.write("\n")
 
 
-def _plot_multi_seed_post_eval_dashboard(aggregates: Dict[str, Dict[str, Any]], output_path: Path) -> None:
+def _plot_multi_seed_post_eval_dashboard(
+    aggregates: Dict[str, Dict[str, Any]],
+    output_path: Path,
+    labels: Optional[Sequence[str]] = None,
+    metric_specs: Optional[Sequence[Tuple[str, str, bool, bool]]] = None,
+    title: str = "Multi-seed Post-training Evaluation Summary",
+) -> None:
     if not HAS_MATPLOTLIB:
         return
 
+    ordered_labels = list(labels) if labels is not None else list(EXPERIMENT_DISPLAY_ORDER)
+    resolved_metric_specs = list(metric_specs) if metric_specs is not None else list(POST_EVAL_SUMMARY_SPECS)
     items = [
         aggregates[label]
-        for label in EXPERIMENT_DISPLAY_ORDER
+        for label in ordered_labels
         if label in aggregates and isinstance(aggregates[label].get("post_eval_metric_stats"), dict)
     ]
-    if not items:
+    if not items or not resolved_metric_specs:
         return
 
     setup_english_fonts()
-    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
-    axes = axes.flatten()
+    n_cols = min(3, max(1, len(resolved_metric_specs)))
+    n_rows = int(np.ceil(len(resolved_metric_specs) / float(n_cols)))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5.5 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
     label_entries = _build_plot_label_entries(items)
     labels = [entry["abbr"] for entry in label_entries]
     colors = [entry["color"] for entry in label_entries]
 
-    for ax, (metric_key, metric_title, is_percent, lower_better) in zip(axes, POST_EVAL_SUMMARY_SPECS):
+    for ax, (metric_key, metric_title, is_percent, lower_better) in zip(axes, resolved_metric_specs):
         metric_rows = [item.get("post_eval_metric_stats", {}).get(metric_key, {}) for item in items]
         values = [_safe_float(row.get("mean")) for row in metric_rows]
         errors = [_safe_float(row.get("std")) or 0.0 for row in metric_rows]
@@ -2562,6 +3928,9 @@ def _plot_multi_seed_post_eval_dashboard(aggregates: Dict[str, Dict[str, Any]], 
                 is_percent=is_percent,
             )
 
+    for ax in axes[len(resolved_metric_specs):]:
+        ax.set_visible(False)
+
     mapping_text = _format_plot_label_mapping(label_entries, entries_per_line=2)
     _add_plot_label_legend(fig, label_entries, loc="upper right", bbox_to_anchor=(0.985, 0.975))
     if mapping_text:
@@ -2576,7 +3945,7 @@ def _plot_multi_seed_post_eval_dashboard(aggregates: Dict[str, Dict[str, Any]], 
             fontfamily="DejaVu Sans",
         )
 
-    fig.suptitle("Multi-seed Post-training Evaluation Summary", fontsize=16, fontweight='bold', y=0.98)
+    fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
     fig.tight_layout(rect=[0.03, 0.10, 0.97, 0.92])
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
@@ -2584,6 +3953,17 @@ def _plot_multi_seed_post_eval_dashboard(aggregates: Dict[str, Dict[str, Any]], 
 
 def _build_experiment_summary_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     post_eval_spec = item.get("post_eval_spec", {}) if isinstance(item.get("post_eval_spec"), dict) else {}
+    post_eval_summary = item.get("post_eval_summary")
+    post_eval_status = str(item.get("post_eval_status", "")).strip()
+    post_eval_skipped = bool(item.get("post_eval_skipped", False))
+    post_eval_eligible = bool(item.get("post_eval_eligible", post_eval_summary is not None))
+    if not post_eval_status:
+        if post_eval_summary is not None:
+            post_eval_status = "completed"
+        elif post_eval_skipped or not post_eval_eligible:
+            post_eval_status = "skipped_no_train_success"
+        else:
+            post_eval_status = "disabled"
     return {
         "label": item["label"],
         "name": item.get("name", item["label"]),
@@ -2597,9 +3977,15 @@ def _build_experiment_summary_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "collision_distance_threshold": item["metrics"].get("collision_distance_threshold"),
         "collision_threshold_source": item["metrics"].get("collision_threshold_source", "unknown"),
         "post_eval": {
-            "enabled": item.get("post_eval_summary") is not None,
+            "enabled": bool(post_eval_summary is not None or post_eval_skipped or not post_eval_eligible),
+            "eligible": post_eval_eligible,
+            "status": post_eval_status,
+            "skipped": post_eval_skipped,
+            "skip_reason": item.get("post_eval_skip_reason", ""),
+            "eligibility_detail": item.get("post_eval_eligibility_detail"),
             "mode": post_eval_spec.get("mode"),
             "episodes": item.get("post_eval_episode_count"),
+            "episode_length_multiplier": post_eval_spec.get("episode_length_multiplier"),
             "seed": post_eval_spec.get("seed"),
             "model_variant": post_eval_spec.get("model_variant"),
             "eval_dir": item.get("post_eval_dir", ""),
@@ -2607,7 +3993,7 @@ def _build_experiment_summary_entry(item: Dict[str, Any]) -> Dict[str, Any]:
             "log_path": item.get("post_eval_log_path", ""),
             "spec_path": item.get("post_eval_spec_path", ""),
             "spec": post_eval_spec,
-            "summary": item.get("post_eval_summary"),
+            "summary": post_eval_summary,
         },
     }
 
@@ -2633,6 +4019,7 @@ def _write_experiment_result_artifact(
         "batch_dir": str(batch_dir),
         "positions_file": str(positions_file),
         "use_dynamic_obstacles": getattr(args, "use_dynamic_obstacles", False),
+        "training_environment": _effective_training_environment_setup(args),
         "post_eval_enabled": _post_eval_enabled(args),
         "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
@@ -2652,6 +4039,7 @@ def _load_experiment_series_from_artifacts(
     positions_file: Path,
     expected_episodes: int,
     expected_terrain_seed: int,
+    expected_training_setup: Optional[Dict[str, Any]],
     batch_seed: int,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     artifact_dir = batch_dir / "results" / "experiment_artifacts"
@@ -2677,7 +4065,9 @@ def _load_experiment_series_from_artifacts(
             expected_episodes=int(expected_episodes),
             positions_file=positions_file,
             expected_terrain_seed=int(expected_terrain_seed),
+            expected_training_setup=expected_training_setup,
             batch_seed=int(batch_seed),
+            manifest_path=Path(exp.get("manifest_path")) if str(exp.get("manifest_path", "")).strip() else None,
         )
         if validation_errors:
             raise RuntimeError(
@@ -2744,6 +4134,7 @@ def _finalize_seed_batch_from_artifacts(
         positions_file=positions_file,
         expected_episodes=int(args.episodes),
         expected_terrain_seed=int(args.resolved_scenario_seed),
+        expected_training_setup=_effective_training_environment_setup(args),
         batch_seed=int(batch_seed),
     )
     if missing_labels:
@@ -2885,6 +4276,7 @@ def _write_single_seed_outputs(
         "batch_dir": str(batch_dir),
         "positions_file": str(positions_file),
         "use_dynamic_obstacles": getattr(args, "use_dynamic_obstacles", False),
+        "training_environment": _effective_training_environment_setup(args),
         "strict_validity_enabled": strict_validity_enabled,
         "skip_local_plots": bool(args.skip_local_plots),
         "post_eval_enabled": _post_eval_enabled(args),
@@ -3123,31 +4515,50 @@ def _audit_multi_seed_children(
                 if not isinstance(post_eval, dict):
                     child_errors.append(f"{label}: 缺少 post_eval 字段")
                     continue
+                post_eval_status = str(post_eval.get("status", "")).strip()
+                post_eval_eligible = post_eval.get("eligible", None)
+                skip_reason = str(post_eval.get("skip_reason", "")).strip()
+                skipped_due_to_feasibility = (
+                    post_eval_status == "skipped_no_train_success"
+                    or bool(post_eval.get("skipped", False))
+                    or (post_eval_status == "disabled" and post_eval_eligible is False)
+                    or ("训练阶段未出现团队成功回合" in skip_reason)
+                )
+                if skipped_due_to_feasibility:
+                    child_warnings.append(
+                        f"{label}: 因训练未出现团队成功而跳过后评估"
+                    )
+                    continue
                 if not post_eval.get("enabled"):
                     child_errors.append(f"{label}: 后评估未完成")
                     continue
 
-                if post_eval.get("mode") != expected_post_eval["mode"]:
+                actual_post_eval_mode = _post_eval_config_value(post_eval, "mode")
+                if actual_post_eval_mode != expected_post_eval["mode"]:
                     child_errors.append(
-                        f"{label}: post_eval.mode 不一致 got={post_eval.get('mode')} expected={expected_post_eval['mode']}"
+                        f"{label}: post_eval.mode 不一致 got={actual_post_eval_mode} expected={expected_post_eval['mode']}"
                     )
-                if _safe_int(post_eval.get("episodes")) != expected_post_eval["episodes"]:
+                actual_post_eval_episodes = _safe_int(_post_eval_config_value(post_eval, "episodes"))
+                if actual_post_eval_episodes != expected_post_eval["episodes"]:
                     child_errors.append(
-                        f"{label}: post_eval.episodes 不一致 got={post_eval.get('episodes')} expected={expected_post_eval['episodes']}"
+                        f"{label}: post_eval.episodes 不一致 got={actual_post_eval_episodes} expected={expected_post_eval['episodes']}"
                     )
-                if _safe_float(post_eval.get("episode_length_multiplier")) != _safe_float(expected_post_eval["episode_length_multiplier"]):
+                actual_post_eval_multiplier = _safe_float(_post_eval_config_value(post_eval, "episode_length_multiplier"))
+                if actual_post_eval_multiplier != _safe_float(expected_post_eval["episode_length_multiplier"]):
                     child_errors.append(
                         f"{label}: post_eval.episode_length_multiplier 不一致 "
-                        f"got={post_eval.get('episode_length_multiplier')} "
+                        f"got={actual_post_eval_multiplier} "
                         f"expected={expected_post_eval['episode_length_multiplier']}"
                     )
-                if _safe_int(post_eval.get("seed")) != expected_post_eval["seed"]:
+                actual_post_eval_seed = _safe_int(_post_eval_config_value(post_eval, "seed"))
+                if actual_post_eval_seed != expected_post_eval["seed"]:
                     child_errors.append(
-                        f"{label}: post_eval.seed 不一致 got={post_eval.get('seed')} expected={expected_post_eval['seed']}"
+                        f"{label}: post_eval.seed 不一致 got={actual_post_eval_seed} expected={expected_post_eval['seed']}"
                     )
-                if post_eval.get("model_variant") != expected_post_eval["model_variant"]:
+                actual_post_eval_model_variant = _post_eval_config_value(post_eval, "model_variant")
+                if actual_post_eval_model_variant != expected_post_eval["model_variant"]:
                     child_errors.append(
-                        f"{label}: post_eval.model_variant 不一致 got={post_eval.get('model_variant')} expected={expected_post_eval['model_variant']}"
+                        f"{label}: post_eval.model_variant 不一致 got={actual_post_eval_model_variant} expected={expected_post_eval['model_variant']}"
                     )
 
                 results_path_raw = str(post_eval.get("results_path", "")).strip()
@@ -3361,6 +4772,60 @@ def plot_multi_seed_mean_ablation_comparison(
     plt.close(fig)
 
 
+def plot_multi_seed_focus_metric_curves(
+    aggregates: Dict[str, Dict[str, Any]],
+    output_path: Path,
+    metric_specs: Sequence[Tuple[str, str, str, bool]],
+    title: str,
+    labels: Optional[Sequence[str]] = None,
+    smooth_window: int = 10,
+    fit_method: str = "moving_average",
+) -> None:
+    if not HAS_MATPLOTLIB:
+        return
+
+    ordered_labels = list(labels) if labels is not None else list(EXPERIMENT_DISPLAY_ORDER)
+    present_labels = [label for label in ordered_labels if label in aggregates]
+    resolved_metric_specs = list(metric_specs)
+    if not present_labels or not resolved_metric_specs:
+        return
+
+    setup_english_fonts()
+    fig, axes = plt.subplots(1, len(resolved_metric_specs), figsize=(8 * len(resolved_metric_specs), 6), squeeze=False)
+    axes = axes.flatten()
+
+    for label in present_labels:
+        item = aggregates[label]
+        color = get_algorithm_ablation_color(label)
+        name_en = item.get("name_en", label)
+        stats = item.get("curve_stats", {})
+        for ax, (metric_name, metric_title, y_label, is_rate) in zip(axes, resolved_metric_specs):
+            mean_curve = np.asarray(stats.get(f"{metric_name}_mean", []), dtype=np.float64)
+            std_curve = np.asarray(stats.get(f"{metric_name}_std", []), dtype=np.float64)
+            if mean_curve.size == 0:
+                continue
+            if metric_name != "success":
+                mean_curve = _smooth_curve(mean_curve, method=fit_method, window=smooth_window)
+                std_curve = _smooth_curve(std_curve, method=fit_method, window=smooth_window)
+            xs = np.arange(1, mean_curve.size + 1)
+            ax.plot(xs, mean_curve, color=color, linewidth=2.5, alpha=0.95, label=name_en)
+            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15)
+            ax.set_title(metric_title, fontsize=13, fontweight="bold")
+            ax.set_xlabel("Episode")
+            ax.set_ylabel(y_label)
+            ax.grid(True, alpha=0.3, linestyle="--")
+            if is_rate:
+                ax.set_ylim([0.0, 1.05])
+
+    for ax in axes:
+        ax.legend(loc="best", fontsize=10)
+
+    fig.suptitle(title, fontsize=16, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=[0.02, 0.04, 0.98, 0.94])
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 
 # ============================================================================
 # 实验配置
@@ -3395,6 +4860,20 @@ EXPERIMENT_CONFIGS = [
             "ALGORITHM": "matd3",
             "MATD3_USE_DUAL_Q": "1",
             "MATD3_USE_SEPARATED_GRADIENT": "0",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "matd3_separated_hybrid_actor",
+        "name": "MATD3 Hybrid - Separated Skeleton + Hybrid Actor Objective",
+        "name_en": "MATD3 Hybrid - Separated Skeleton + Hybrid Actor Objective",
+        "description": "Hybrid variant on the same separated update skeleton: keep the separated actor objective as main signal and blend in a low-weight unified total-Q actor objective",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "1",
+            "MATD3_HYBRID_ACTOR_ALPHA": "0.80",
             "USE_TF_POTENTIAL_FIELD": "1",
         }
     },
@@ -3451,7 +4930,7 @@ EXPERIMENT_CONFIGS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(description="围绕 MATD3 separated-skeleton / actor-objective 主线的模块消融实验")
-    parser.add_argument("--episodes", type=int, default=400, help="训练回合数")
+    parser.add_argument("--episodes", type=int, default=1000, help="训练回合数")
     parser.add_argument("--batch-size", type=int, default=1024, help="训练批次大小")
     parser.add_argument("--multi-seed", action="store_true", help="开启多随机种子模式，由当前脚本并发调度多个单-seed子批次")
     parser.add_argument("--seeds", type=str, default=None, help="多seed列表，逗号分隔，例如 101,202,303")
@@ -3519,6 +4998,7 @@ def parse_args():
     parser.add_argument("--parent-batch-root", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--child-batch-tag", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--positions-prepared", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--post-eval-testset-prepared", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-local-plots", action="store_true", help="跳过单seed子批次本地图表，只保留summary，适合多seed模式提速")
     parser.add_argument("--script", type=str, default="./run_optimized.sh", help="训练脚本路径")
     parser.add_argument("--use-weighted-reward", type=int, default=1, help="是否使用分项加权奖励")
@@ -3588,7 +5068,7 @@ def parse_args():
         type=str,
         default="heldout_shared",
         choices=["heldout_shared", "match_train_env"],
-        help="后评估模式：heldout_shared=共享留出测试集；match_train_env=严格复现训练环境",
+        help="后评估模式：heldout_shared=共享留出测试集；match_train_env=按训练环境分布重建测试环境",
     )
     parser.add_argument(
         "--post-eval-model-variant",
@@ -3602,6 +5082,24 @@ def parse_args():
         type=float,
         default=None,
         help="heldout_shared 下相似地形的山峰局部扰动范围（米）",
+    )
+    parser.add_argument(
+        "--post-eval-peak-height-jitter-ratio-min",
+        type=float,
+        default=None,
+        help="heldout_shared 下山峰高度最小扰动比例（相对峰高范围）",
+    )
+    parser.add_argument(
+        "--post-eval-peak-height-jitter-ratio-max",
+        type=float,
+        default=None,
+        help="heldout_shared 下山峰高度最大扰动比例（相对峰高范围）",
+    )
+    parser.add_argument(
+        "--post-eval-peak-height-max-scale",
+        type=float,
+        default=None,
+        help="heldout_shared 下山峰高度上限（相对训练基准最高峰倍率）",
     )
     parser.add_argument(
         "--post-eval-start-center-jitter",
@@ -3718,7 +5216,68 @@ def parse_args():
         type=str,
         default="A",
         choices=["A", "B"],
-        help="实验组：A=纯固定地图（严格默认）；B=从一开始使用随机障碍物（仍禁用课程学习）",
+        help="实验组：A=纯固定地图（严格默认）；B=从一开始使用随机障碍物 + 同源半随机地形（仍禁用课程学习）",
+    )
+    parser.add_argument(
+        "--group-b-peak-jitter-range",
+        type=float,
+        default=None,
+        help="实验B训练侧半随机地形的外层扰动范围；默认自动取测试幅度的约 0.55 倍",
+    )
+    parser.add_argument(
+        "--group-b-peak-center-jitter-range",
+        type=float,
+        default=None,
+        help="实验B训练侧山峰中心局部扰动范围；默认自动取测试幅度的约 0.5 倍",
+    )
+    parser.add_argument(
+        "--group-b-peak-height-jitter-ratio-min",
+        type=float,
+        default=None,
+        help="实验B训练侧山峰高度最小扰动比例；默认自动取测试幅度的约 0.5 倍",
+    )
+    parser.add_argument(
+        "--group-b-peak-height-jitter-ratio-max",
+        type=float,
+        default=None,
+        help="实验B训练侧山峰高度最大扰动比例；默认自动取测试幅度的约 0.55 倍",
+    )
+    parser.add_argument(
+        "--group-b-peak-height-max-scale",
+        type=float,
+        default=None,
+        help="实验B训练侧山峰高度上限倍率；默认自动取测试上限的约 0.5 增量",
+    )
+    parser.add_argument(
+        "--group-b-terrain-variant-noise-ratio",
+        type=float,
+        default=None,
+        help="实验B训练侧同源变体噪声比例；默认自动取测试幅度的约 0.5 倍",
+    )
+    parser.add_argument(
+        "--group-b-semi-random-hold-mode",
+        type=str,
+        default=None,
+        choices=["episode", "fixed", "range"],
+        help="实验B训练侧半随机地形的持有模式；默认 range",
+    )
+    parser.add_argument(
+        "--group-b-semi-random-hold-episodes",
+        type=int,
+        default=None,
+        help="实验B训练侧固定持有模式下每张半随机地形持续的回合数；默认 8",
+    )
+    parser.add_argument(
+        "--group-b-semi-random-hold-min-episodes",
+        type=int,
+        default=None,
+        help="实验B训练侧范围持有模式下每张半随机地形最短持续回合数；默认 5",
+    )
+    parser.add_argument(
+        "--group-b-semi-random-hold-max-episodes",
+        type=int,
+        default=None,
+        help="实验B训练侧范围持有模式下每张半随机地形最长持续回合数；默认 10",
     )
     args = parser.parse_args()
     # 兼容旧字段名，避免主流程或外部脚本仍访问 include_exploratory_experiments。
@@ -3772,7 +5331,8 @@ def _resolve_positions_file(
 def _apply_experiment_group_overrides(args) -> Tuple[str, str]:
     experiment_group = args.experiment_group
     group_label = f"group{experiment_group}"
-    group_desc = "Fixed Map" if experiment_group == "A" else "Random Obstacles"
+    training_setup = _effective_training_environment_setup(args)
+    group_desc = "Fixed Map" if experiment_group == "A" else "Random Obstacles + Semi-random Terrain"
     if experiment_group == "A":
         args.resolved_unlock_env_on_success = 0
         args.resolved_unlock_env_on_plateau = 0
@@ -3782,8 +5342,40 @@ def _apply_experiment_group_overrides(args) -> Tuple[str, str]:
         args.resolved_unlock_env_on_success = 0
         args.resolved_unlock_env_on_plateau = 0
         args.use_dynamic_obstacles = True
-        print("[Group B] Random-obstacle mode: curriculum disabled, USE_DYNAMIC_OBSTACLES=1")
-        print("[Group B] Note: still cross-algorithm consistent, but not the default pure fixed-environment setup.")
+        if training_setup.get("semi_random_terrain"):
+            args.group_b_peak_jitter_range = float(training_setup.get("peak_jitter_range", 0.0))
+            args.group_b_peak_center_jitter_range = float(training_setup.get("peak_center_jitter_range", 0.0))
+            args.group_b_peak_height_jitter_ratio_min = float(training_setup.get("peak_height_jitter_ratio_min", 0.0))
+            args.group_b_peak_height_jitter_ratio_max = float(training_setup.get("peak_height_jitter_ratio_max", 0.0))
+            args.group_b_peak_height_max_scale = float(training_setup.get("peak_height_max_scale", 1.0))
+            args.group_b_terrain_variant_noise_ratio = float(training_setup.get("terrain_variant_noise_ratio", 0.0))
+            args.group_b_semi_random_hold_mode = str(training_setup.get("semi_random_hold_mode", "range"))
+            args.group_b_semi_random_hold_episodes = int(training_setup.get("semi_random_hold_episodes", 18))
+            args.group_b_semi_random_hold_min_episodes = int(training_setup.get("semi_random_hold_min_episodes", 15))
+            args.group_b_semi_random_hold_max_episodes = int(training_setup.get("semi_random_hold_max_episodes", 20))
+            print("[Group B] Random-obstacle + semi-random-terrain mode: curriculum disabled, USE_DYNAMIC_OBSTACLES=1")
+            print(
+                "[Group B] Training terrain profile: "
+                f"base_seed={training_setup.get('terrain_base_seed')}, "
+                f"env_sequence_seed={training_setup.get('training_env_sequence_seed')}, "
+                f"peak_jitter={training_setup.get('peak_jitter_range'):.2f}, "
+                f"center_jitter={training_setup.get('peak_center_jitter_range'):.2f}, "
+                f"height_jitter=[{training_setup.get('peak_height_jitter_ratio_min'):.2f}, "
+                f"{training_setup.get('peak_height_jitter_ratio_max'):.2f}], "
+                f"height_cap={training_setup.get('peak_height_max_scale'):.2f}, "
+                f"variant_noise={training_setup.get('terrain_variant_noise_ratio'):.3f}, "
+                f"hold={training_setup.get('semi_random_hold_mode', 'range')}:"
+                f"{training_setup.get('semi_random_hold_min_episodes', training_setup.get('semi_random_hold_episodes', 1))}-"
+                f"{training_setup.get('semi_random_hold_max_episodes', training_setup.get('semi_random_hold_episodes', 1))}"
+            )
+            print("[Group B] Note: terrain variants stay tied to the training base seed, use milder perturbations, and hold for 15-20 episodes by default.")
+        else:
+            group_desc = "Random Obstacles"
+            print("[Group B] Random-obstacle + fixed-terrain mode: curriculum disabled, USE_DYNAMIC_OBSTACLES=1")
+            print(
+                "[Group B] Historical training terrain profile: "
+                f"terrain_seed={training_setup.get('terrain_seed')}, fixed_terrain=True"
+            )
     return group_label, group_desc
 
 
@@ -3805,6 +5397,65 @@ def _select_experiment_configs(args) -> List[Dict[str, Any]]:
         default_labels.extend(OPTIONAL_REFERENCE_EXPERIMENT_LABELS)
     configs_to_run = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in default_labels]
     return _sort_experiment_configs(configs_to_run)
+
+
+def _select_experiment_configs_by_labels(labels: Sequence[str]) -> List[Dict[str, Any]]:
+    requested = [str(label) for label in labels if str(label).strip()]
+    configs = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in requested]
+    configs = _sort_experiment_configs(configs)
+    if requested and not configs:
+        raise RuntimeError(f"未找到指定实验: {requested}")
+    missing = sorted(set(requested) - {cfg["label"] for cfg in configs})
+    if missing:
+        raise RuntimeError(f"以下实验标签未注册: {missing}")
+    return configs
+
+
+def _resolve_audit_reference_manifest(
+    current_label: str,
+    current_manifest: Dict[str, Any],
+    current_manifest_path: Path,
+    args,
+    manifest_dir: Path,
+) -> Tuple[Dict[str, Any], str]:
+    desired_label = str(
+        AUDIT_REFERENCE_LABEL_BY_EXPERIMENT.get(current_label, getattr(args, "reference_manifest_label", current_label) or current_label)
+    ).strip()
+    loaded_manifest = getattr(args, "reference_manifest", None)
+    loaded_label = str(getattr(args, "reference_manifest_label", "") or "").strip()
+
+    if desired_label == current_label:
+        args.reference_manifest = current_manifest
+        args.reference_manifest_label = current_label
+        return current_manifest, current_label
+
+    if isinstance(loaded_manifest, dict) and loaded_label == desired_label:
+        return loaded_manifest, loaded_label
+
+    candidate_paths = [
+        manifest_dir / f"{desired_label}_resolved_manifest.json",
+        manifest_dir / "_reference_manifest.json",
+    ]
+    for candidate_path in candidate_paths:
+        try:
+            if not candidate_path.exists():
+                continue
+            candidate_manifest = _load_manifest(candidate_path)
+            candidate_label = str(candidate_manifest.get("meta", {}).get("label", "")).strip()
+            if candidate_label != desired_label:
+                continue
+            args.reference_manifest = candidate_manifest
+            args.reference_manifest_label = candidate_label
+            return candidate_manifest, candidate_label
+        except Exception:
+            continue
+
+    if isinstance(loaded_manifest, dict) and loaded_label:
+        return loaded_manifest, loaded_label
+
+    args.reference_manifest = current_manifest
+    args.reference_manifest_label = current_label
+    return current_manifest, current_label
 
 
 def _prepare_positions_for_batch(args, positions_file: Path) -> None:
@@ -3853,6 +5504,7 @@ def _create_batch_dir(
     else:
         batch_id = f"batch_{group_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     is_resume = (batch_root / batch_id).exists()
+    training_environment = _effective_training_environment_setup(args)
 
     batch_config = {
         "episodes": args.episodes,
@@ -3868,6 +5520,7 @@ def _create_batch_dir(
         "experiment_group": args.experiment_group,
         "experiment_group_desc": group_desc,
         "use_dynamic_obstacles": getattr(args, "use_dynamic_obstacles", False),
+        "training_environment": training_environment,
         "unlock_env_on_success": int(args.resolved_unlock_env_on_success),
         "unlock_env_on_plateau": int(args.resolved_unlock_env_on_plateau),
         "positions_file": str(positions_file),
@@ -3884,6 +5537,11 @@ def _create_batch_dir(
             getattr(args, "post_eval_terrain_base_seed", getattr(args, "resolved_scenario_seed", 88))
         ),
         "post_eval_peak_jitter_range": float(_resolve_post_eval_peak_jitter_range(args)),
+        "post_eval_peak_center_jitter_range": float(_resolve_post_eval_peak_center_jitter_range(args)),
+        "post_eval_peak_height_jitter_ratio_min": float(_resolve_post_eval_peak_height_jitter_ratio_min(args)),
+        "post_eval_peak_height_jitter_ratio_max": float(_resolve_post_eval_peak_height_jitter_ratio_max(args)),
+        "post_eval_peak_height_max_scale": float(_resolve_post_eval_peak_height_max_scale(args)),
+        "post_eval_terrain_variant_noise_ratio": float(_resolve_post_eval_terrain_variant_noise_ratio(args)),
         "post_eval_position_family": (
             "same_region" if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" else "train_match"
         ),
@@ -4123,6 +5781,8 @@ def setup_base_env_vars(
     # 仅保留运行时必要的非训练语义开关
     env.setdefault("SUPPRESS_MA_PROMPT", "1")
     env.setdefault("SUPPRESS_TERRAIN_OUTPUT", "1")
+    # 算法消融必须保持训练环境口径固定；随机地形可以变化，但复杂度不能随成功次数自动提升。
+    env["ENABLE_RANDOM_TERRAIN_COMPLEXITY_PROGRESSION"] = "0"
 
     if config_mode == "legacy_ablation":
         # 历史消融模式：固定地形/位置 + 显式超参数
@@ -4304,6 +5964,43 @@ def _resolve_experiment_manifest(
     env["PER_ENV_TERRAIN"] = "0"
     env["PER_EPISODE_TERRAIN"] = "0"
     env["USE_DYNAMIC_OBSTACLES"] = "1" if getattr(args, "use_dynamic_obstacles", False) else "0"
+    training_environment = _effective_training_environment_setup(args)
+    env["RANDOM_TERRAIN"] = "1" if training_environment.get("random_terrain") else "0"
+    env["SEMI_RANDOM_TERRAIN"] = "1" if training_environment.get("semi_random_terrain") else "0"
+    env["DETERMINISTIC_TRAIN_ENV_SEQUENCE"] = "1" if training_environment.get("deterministic_env_sequence") else "0"
+    env["TRAIN_ENV_SEQUENCE_SEED"] = str(
+        int(training_environment.get("training_env_sequence_seed", args.resolved_scenario_seed))
+    )
+    if training_environment.get("semi_random_terrain"):
+        env["TERRAIN_BASE_SEED"] = str(int(training_environment.get("terrain_base_seed", args.resolved_scenario_seed)))
+        env["PEAK_JITTER_RANGE"] = str(float(training_environment.get("peak_jitter_range", 0.0)))
+        env["PEAK_CENTER_JITTER_RANGE"] = str(float(training_environment.get("peak_center_jitter_range", 0.0)))
+        env["PEAK_HEIGHT_JITTER_RATIO_MIN"] = str(float(training_environment.get("peak_height_jitter_ratio_min", 0.0)))
+        env["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(float(training_environment.get("peak_height_jitter_ratio_max", 0.0)))
+        env["PEAK_HEIGHT_MAX_SCALE"] = str(float(training_environment.get("peak_height_max_scale", 1.0)))
+        env["TERRAIN_VARIANT_NOISE_RATIO"] = str(float(training_environment.get("terrain_variant_noise_ratio", 0.0)))
+        env["SEMI_RANDOM_TERRAIN_HOLD_MODE"] = str(training_environment.get("semi_random_hold_mode", "range"))
+        env["SEMI_RANDOM_TERRAIN_HOLD_EPISODES"] = str(int(training_environment.get("semi_random_hold_episodes", 18)))
+        env["SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES"] = str(int(training_environment.get("semi_random_hold_min_episodes", 15)))
+        env["SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES"] = str(int(training_environment.get("semi_random_hold_max_episodes", 20)))
+    else:
+        for key in (
+            "TERRAIN_BASE_SEED",
+            "PEAK_JITTER_RANGE",
+            "PEAK_CENTER_JITTER_RANGE",
+            "PEAK_HEIGHT_JITTER_RATIO_MIN",
+            "PEAK_HEIGHT_JITTER_RATIO_MAX",
+            "PEAK_HEIGHT_MAX_SCALE",
+            "TERRAIN_VARIANT_NOISE_RATIO",
+            "SEMI_RANDOM_TERRAIN_HOLD_MODE",
+            "SEMI_RANDOM_TERRAIN_HOLD_EPISODES",
+            "SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES",
+            "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES",
+        ):
+            env.pop(key, None)
+    if not training_environment.get("deterministic_env_sequence"):
+        env.pop("DETERMINISTIC_TRAIN_ENV_SEQUENCE", None)
+        env.pop("TRAIN_ENV_SEQUENCE_SEED", None)
     env = _apply_runtime_env_overrides(env, args)
 
     algorithm = env.get("ALGORITHM", "matd3")
@@ -4333,6 +6030,132 @@ def _resolve_experiment_manifest(
 
     subprocess.run(cmd, env=resolve_env, cwd=Path(args.script).resolve().parent, check=True)
     manifest = _load_manifest(manifest_path)
+    manifest_exec_env = manifest.setdefault("exec_env", {})
+    training_env_exec_keys = (
+        "RANDOM_TERRAIN",
+        "SEMI_RANDOM_TERRAIN",
+        "DETERMINISTIC_TRAIN_ENV_SEQUENCE",
+        "TRAIN_ENV_SEQUENCE_SEED",
+        "TERRAIN_BASE_SEED",
+        "PEAK_JITTER_RANGE",
+        "PEAK_CENTER_JITTER_RANGE",
+        "PEAK_HEIGHT_JITTER_RATIO_MIN",
+        "PEAK_HEIGHT_JITTER_RATIO_MAX",
+        "PEAK_HEIGHT_MAX_SCALE",
+        "TERRAIN_VARIANT_NOISE_RATIO",
+        "SEMI_RANDOM_TERRAIN_HOLD_MODE",
+        "SEMI_RANDOM_TERRAIN_HOLD_EPISODES",
+        "SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES",
+        "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES",
+        "USE_DYNAMIC_OBSTACLES",
+        "SCENARIO_SEED",
+        "POSITIONS_FILE",
+        "USE_FIXED_POSITIONS",
+    )
+    for key in training_env_exec_keys:
+        if key in env:
+            manifest_exec_env[key] = env[key]
+        else:
+            manifest_exec_env.pop(key, None)
+    argv = list(manifest.get("argv", []))
+    argv = _set_manifest_presence_flag(
+        argv,
+        "--random-terrain",
+        bool(training_environment.get("random_terrain", False)),
+    )
+    argv = _set_manifest_presence_flag(
+        argv,
+        "--use-fixed-positions",
+        bool(training_environment.get("use_fixed_positions", True)),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--use-dynamic-obstacles",
+        bool(training_environment.get("use_dynamic_obstacles", False)),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--semi-random-terrain",
+        bool(training_environment.get("semi_random_terrain", False)),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--deterministic-train-env-sequence",
+        bool(training_environment.get("deterministic_env_sequence", False)),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--terrain-seed",
+        int(training_environment.get("terrain_seed", args.resolved_scenario_seed)),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--terrain-base-seed",
+        int(training_environment.get("terrain_base_seed", args.resolved_scenario_seed)),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--training-env-sequence-seed",
+        int(training_environment.get("training_env_sequence_seed", args.resolved_scenario_seed)),
+    )
+    for flag, key in (
+        ("--peak-jitter-range", "peak_jitter_range"),
+        ("--peak-center-jitter-range", "peak_center_jitter_range"),
+        ("--peak-height-jitter-ratio-min", "peak_height_jitter_ratio_min"),
+        ("--peak-height-jitter-ratio-max", "peak_height_jitter_ratio_max"),
+        ("--peak-height-max-scale", "peak_height_max_scale"),
+        ("--terrain-variant-noise-ratio", "terrain_variant_noise_ratio"),
+        ("--semi-random-hold-mode", "semi_random_hold_mode"),
+        ("--semi-random-hold-episodes", "semi_random_hold_episodes"),
+        ("--semi-random-hold-min-episodes", "semi_random_hold_min_episodes"),
+        ("--semi-random-hold-max-episodes", "semi_random_hold_max_episodes"),
+    ):
+        if training_environment.get(key) is not None:
+            argv = _set_manifest_cli_flag(argv, flag, training_environment.get(key))
+    manifest["argv"] = argv
+    manifest_training_audit = dict(manifest)
+    manifest_training_audit["meta"] = {}
+    inferred_manifest_training_setup = _infer_training_environment_from_manifest(
+        manifest_training_audit,
+        fallback_use_dynamic_obstacles=training_environment.get("use_dynamic_obstacles"),
+    )
+    if not isinstance(inferred_manifest_training_setup, dict) or not inferred_manifest_training_setup:
+        raise RuntimeError(f"[配置冻结失败-{label}] 无法从 manifest argv/exec_env 还原训练环境")
+    compare_keys = (
+        "use_fixed_positions",
+        "use_dynamic_obstacles",
+        "random_terrain",
+        "semi_random_terrain",
+        "deterministic_env_sequence",
+        "terrain_seed",
+        "terrain_base_seed",
+        "training_env_sequence_seed",
+        "peak_jitter_range",
+        "peak_center_jitter_range",
+        "peak_height_jitter_ratio_min",
+        "peak_height_jitter_ratio_max",
+        "peak_height_max_scale",
+        "terrain_variant_noise_ratio",
+        "semi_random_hold_mode",
+        "semi_random_hold_episodes",
+        "semi_random_hold_min_episodes",
+        "semi_random_hold_max_episodes",
+    )
+    coherence_errors: List[str] = []
+    for key in compare_keys:
+        expected_value = training_environment.get(key)
+        inferred_value = inferred_manifest_training_setup.get(key)
+        if expected_value is None or inferred_value is None:
+            continue
+        if isinstance(expected_value, float) or isinstance(inferred_value, float):
+            if not np.isclose(float(expected_value), float(inferred_value), atol=1e-6, rtol=0.0):
+                coherence_errors.append(f"{key}: got={inferred_value}, expected={expected_value}")
+        elif expected_value != inferred_value:
+            coherence_errors.append(f"{key}: got={inferred_value}, expected={expected_value}")
+    if coherence_errors:
+        raise RuntimeError(
+            f"[配置冻结失败-{label}] manifest argv/exec_env 与训练环境不一致: {' | '.join(coherence_errors)}"
+        )
     manifest.setdefault("meta", {})
     manifest["meta"].update({
         "label": label,
@@ -4341,6 +6164,7 @@ def _resolve_experiment_manifest(
         "experiment_group": args.experiment_group,
         "training_python": training_python,
         "exp_name_base": exp_name_base,
+        "training_environment": _effective_training_environment_setup(args),
     })
     _save_json(manifest_path, manifest)
     return manifest, manifest_path
@@ -4362,6 +6186,23 @@ def run_experiment(
         try:
             reuse_logs_root = project_logs_root if args.logs_root == "logs" else Path(args.logs_root).resolve()
             log_dir = None
+            reuse_manifest_path = None
+            try:
+                candidate_manifest_path = Path(args.manifest_dir) / f"{label}_resolved_manifest.json"
+                if candidate_manifest_path.exists():
+                    reuse_manifest_path = candidate_manifest_path
+            except Exception:
+                reuse_manifest_path = None
+            reuse_require_explicit_training_environment = False
+            if reuse_manifest_path is not None:
+                try:
+                    reuse_manifest = _load_manifest(Path(reuse_manifest_path))
+                    reuse_require_explicit_training_environment = bool(
+                        isinstance(reuse_manifest.get("meta"), dict)
+                        and isinstance(reuse_manifest.get("meta", {}).get("training_environment"), dict)
+                    )
+                except Exception:
+                    reuse_require_explicit_training_environment = False
             seeded_exp_name_base = _build_seeded_exp_name_base(label, args)
             if seeded_exp_name_base and seeded_exp_name_base != label:
                 log_dir = _find_latest_log_dir_by_exp_name_base(reuse_logs_root, seeded_exp_name_base)
@@ -4375,7 +6216,10 @@ def run_experiment(
                 expected_episodes=int(args.episodes),
                 positions_file=Path(positions_file),
                 expected_terrain_seed=int(args.resolved_scenario_seed),
+                expected_training_setup=_effective_training_environment_setup(args),
                 batch_seed=getattr(args, 'batch_seed', None),
+                manifest_path=Path(reuse_manifest_path) if reuse_manifest_path is not None else None,
+                require_explicit_training_environment=reuse_require_explicit_training_environment,
             )
             if validation_errors:
                 raise RuntimeError(
@@ -4410,16 +6254,21 @@ def run_experiment(
     dual_q_flag = exec_env.get("MATD3_USE_DUAL_Q") if algorithm == "matd3" else exec_env.get("MADDPG_USE_DUAL_Q")
     sep_grad_flag = exec_env.get("MATD3_USE_SEPARATED_GRADIENT") if algorithm == "matd3" else exec_env.get("MADDPG_USE_SEPARATED_GRADIENT")
 
-    if getattr(args, "reference_manifest", None) is None:
-        args.reference_manifest = manifest
-        args.reference_manifest_label = label
+    reference_manifest, reference_label = _resolve_audit_reference_manifest(
+        current_label=label,
+        current_manifest=manifest,
+        current_manifest_path=manifest_path,
+        args=args,
+        manifest_dir=manifest_dir,
+    )
+    if reference_label == label:
         reference_path = manifest_dir / "_reference_manifest.json"
-        _save_json(reference_path, manifest)
+        _save_json(reference_path, reference_manifest)
     else:
-        diff = _build_manifest_diff(args.reference_manifest, manifest)
+        diff = _build_manifest_diff(reference_manifest, manifest)
         diff.update(
             {
-                "reference_label": getattr(args, "reference_manifest_label", "reference"),
+                "reference_label": reference_label,
                 "current_label": label,
             }
         )
@@ -4477,7 +6326,10 @@ def run_experiment(
         expected_episodes=int(args.episodes),
         positions_file=Path(positions_file),
         expected_terrain_seed=int(args.resolved_scenario_seed),
+        expected_training_setup=_effective_training_environment_setup(args),
         batch_seed=getattr(args, 'batch_seed', None),
+        manifest_path=Path(manifest_path),
+        require_explicit_training_environment=True,
     )
     if validation_errors:
         raise RuntimeError(
@@ -4720,12 +6572,34 @@ def _build_single_seed_experiment_job(
     ]
     for flag, value in (
         ("--post-eval-peak-jitter-range", getattr(args, "post_eval_peak_jitter_range", None)),
+        ("--post-eval-peak-height-jitter-ratio-min", getattr(args, "post_eval_peak_height_jitter_ratio_min", None)),
+        ("--post-eval-peak-height-jitter-ratio-max", getattr(args, "post_eval_peak_height_jitter_ratio_max", None)),
+        ("--post-eval-peak-height-max-scale", getattr(args, "post_eval_peak_height_max_scale", None)),
         ("--post-eval-start-center-jitter", getattr(args, "post_eval_start_center_jitter", None)),
         ("--post-eval-agent-local-jitter", getattr(args, "post_eval_agent_local_jitter", None)),
         ("--post-eval-goal-region-radius", getattr(args, "post_eval_goal_region_radius", None)),
     ):
         if value is not None:
             command.extend([flag, str(float(value))])
+    for flag, value in (
+        ("--group-b-peak-jitter-range", getattr(args, "group_b_peak_jitter_range", None)),
+        ("--group-b-peak-center-jitter-range", getattr(args, "group_b_peak_center_jitter_range", None)),
+        ("--group-b-peak-height-jitter-ratio-min", getattr(args, "group_b_peak_height_jitter_ratio_min", None)),
+        ("--group-b-peak-height-jitter-ratio-max", getattr(args, "group_b_peak_height_jitter_ratio_max", None)),
+        ("--group-b-peak-height-max-scale", getattr(args, "group_b_peak_height_max_scale", None)),
+        ("--group-b-terrain-variant-noise-ratio", getattr(args, "group_b_terrain_variant_noise_ratio", None)),
+    ):
+        if value is not None:
+            command.extend([flag, str(float(value))])
+    if getattr(args, "group_b_semi_random_hold_mode", None):
+        command.extend(["--group-b-semi-random-hold-mode", str(args.group_b_semi_random_hold_mode)])
+    for flag, value in (
+        ("--group-b-semi-random-hold-episodes", getattr(args, "group_b_semi_random_hold_episodes", None)),
+        ("--group-b-semi-random-hold-min-episodes", getattr(args, "group_b_semi_random_hold_min_episodes", None)),
+        ("--group-b-semi-random-hold-max-episodes", getattr(args, "group_b_semi_random_hold_max_episodes", None)),
+    ):
+        if value is not None:
+            command.extend([flag, str(int(value))])
     if args.reuse:
         command.append("--reuse")
     if args.reuse_only:
@@ -4740,6 +6614,8 @@ def _build_single_seed_experiment_job(
         command.append("--disable-post-eval")
     if args.skip_local_plots:
         command.append("--skip-local-plots")
+    if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" and not args.disable_post_eval:
+        command.append("--post-eval-testset-prepared")
     for flag, value in (
         ("--post-eval-light-mode", getattr(args, "post_eval_light_mode", None)),
         ("--post-eval-save-interactive-html", getattr(args, "post_eval_save_interactive_html", None)),
@@ -4833,6 +6709,7 @@ def _run_parallel_experiments_for_single_seed(
         positions_file=positions_file,
         expected_episodes=int(args.episodes),
         expected_terrain_seed=int(args.resolved_scenario_seed),
+        expected_training_setup=_effective_training_environment_setup(args),
         batch_seed=int(batch_seed),
     )
     failed_jobs = [job for job in completed_jobs if int(job.get("returncode", 1)) != 0]
@@ -4894,6 +6771,37 @@ def _write_multi_seed_outputs(
         _plot_multi_seed_post_eval_dashboard(aggregates, post_eval_png)
         output_files["multi_seed_post_eval_summary"] = post_eval_png.name
 
+    has_matd3_trio = all(label in aggregates for label in MATD3_TRIO_EXPERIMENT_LABELS)
+    if has_matd3_trio:
+        trio_train_png = output_dir / f"matd3_trio_train_reward_success_{timestamp}.png"
+        plot_multi_seed_focus_metric_curves(
+            aggregates,
+            trio_train_png,
+            metric_specs=[
+                ("reward", "Training Reward", "Reward", False),
+                ("success", "Training Team Success Rate", "Success Rate", True),
+            ],
+            title="MATD3 Trio Training Comparison",
+            labels=MATD3_TRIO_EXPERIMENT_LABELS,
+            smooth_window=args.smooth_window,
+            fit_method=args.fit_method,
+        )
+        output_files["matd3_trio_train_reward_success"] = trio_train_png.name
+
+        if has_post_eval:
+            trio_post_eval_png = output_dir / f"matd3_trio_post_eval_reward_success_{timestamp}.png"
+            _plot_multi_seed_post_eval_dashboard(
+                aggregates,
+                trio_post_eval_png,
+                labels=MATD3_TRIO_EXPERIMENT_LABELS,
+                metric_specs=[
+                    ("avg_reward", "Average Reward", False, False),
+                    ("team_success_rate", "Team Success Rate", True, False),
+                ],
+                title="MATD3 Trio Post-training Evaluation",
+            )
+            output_files["matd3_trio_post_eval_reward_success"] = trio_post_eval_png.name
+
     aggregated_rows = []
     for label in EXPERIMENT_DISPLAY_ORDER:
         if label not in aggregates:
@@ -4951,6 +6859,7 @@ def _write_multi_seed_outputs(
         "experiment_group_desc": group_desc,
         "batch_dir": str(batch_dir),
         "positions_file": str(positions_file),
+        "training_environment": _effective_training_environment_setup(args),
         "skip_local_plots_for_children": bool(args.skip_local_plots),
         "post_eval_enabled": _post_eval_enabled(args),
         "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
@@ -4983,6 +6892,16 @@ def _write_multi_seed_outputs(
 
 
 def run_single_seed_batch(args) -> int:
+    if getattr(args, "experiment_worker", False) and getattr(args, "parent_batch_root", None) and getattr(args, "child_batch_tag", None):
+        existing_batch_dir = Path(args.parent_batch_root) / str(args.child_batch_tag)
+        if existing_batch_dir.exists():
+            existing_batch_config = _load_batch_config(existing_batch_dir)
+            inferred_training_environment = _infer_training_environment_from_child_batch(
+                batch_dir=existing_batch_dir,
+                batch_config=existing_batch_config,
+            )
+            if isinstance(inferred_training_environment, dict) and inferred_training_environment:
+                args.restored_training_environment = dict(inferred_training_environment)
     group_label, group_desc = _apply_experiment_group_overrides(args)
     parsed_seeds = getattr(args, "parsed_seeds", [])
     if getattr(args, "batch_seed", None) is not None:
@@ -5023,6 +6942,14 @@ def run_single_seed_batch(args) -> int:
                 batch_mode=batch_mode,
             )
         else:
+            existing_batch_config = _load_batch_config(batch_dir)
+            inferred_training_environment = _infer_training_environment_from_child_batch(
+                batch_dir=batch_dir,
+                batch_config=existing_batch_config,
+            )
+            if isinstance(inferred_training_environment, dict) and inferred_training_environment:
+                args.restored_training_environment = dict(inferred_training_environment)
+                group_label, group_desc = _apply_experiment_group_overrides(args)
             output_dir = batch_dir / "plots"
             output_dir.mkdir(parents=True, exist_ok=True)
     else:
@@ -5082,6 +7009,23 @@ def run_single_seed_batch(args) -> int:
     print(f"配置模式: {args.config_mode}")
     print(f"环境隔离: {args.env_isolation}")
     print(f"动态障碍物: {'启用' if getattr(args, 'use_dynamic_obstacles', False) else '禁用'}")
+    training_environment = _effective_training_environment_setup(args)
+    if training_environment.get("semi_random_terrain"):
+        print(
+            "训练地形: 同源半随机"
+            f" | base_seed={training_environment.get('terrain_base_seed')}"
+            f" | env_sequence_seed={training_environment.get('training_env_sequence_seed')}"
+            f" | peak_jitter={training_environment.get('peak_jitter_range'):.2f}"
+            f" | center_jitter={training_environment.get('peak_center_jitter_range'):.2f}"
+            f" | height_jitter=[{training_environment.get('peak_height_jitter_ratio_min'):.2f}, {training_environment.get('peak_height_jitter_ratio_max'):.2f}]"
+            f" | height_cap={training_environment.get('peak_height_max_scale'):.2f}"
+            f" | variant_noise={training_environment.get('terrain_variant_noise_ratio'):.3f}"
+            f" | hold={training_environment.get('semi_random_hold_mode', 'range')}:"
+            f"{training_environment.get('semi_random_hold_min_episodes', training_environment.get('semi_random_hold_episodes', 1))}-"
+            f"{training_environment.get('semi_random_hold_max_episodes', training_environment.get('semi_random_hold_episodes', 1))}"
+        )
+    else:
+        print("训练地形: 固定")
     print(f"课程学习: 已禁用 (success=0, plateau=0)")
     print(f"固定位置文件: {positions_file}")
     print(f"复用策略: reuse={args.reuse}, reuse_only={args.reuse_only}")
@@ -5196,6 +7140,11 @@ def run_multi_seed_parent(args) -> int:
 
     group_label, group_desc = _apply_experiment_group_overrides(args)
     configs_to_run = _select_experiment_configs(args)
+    expected_config_labels = list(getattr(args, "resume_parent_expected_experiments", []) or [])
+    if resume_batch_dir is not None and expected_config_labels:
+        configs_for_summary = _select_experiment_configs_by_labels(expected_config_labels)
+    else:
+        configs_for_summary = list(configs_to_run)
     if resume_batch_dir is not None:
         run_stamp = _extract_parent_run_stamp(resume_batch_dir, group_label)
         batch_dir = resume_batch_dir
@@ -5216,6 +7165,7 @@ def run_multi_seed_parent(args) -> int:
         "experiment_group": args.experiment_group,
         "experiment_group_desc": group_desc,
         "use_dynamic_obstacles": getattr(args, "use_dynamic_obstacles", False),
+        "training_environment": _effective_training_environment_setup(args),
         "positions_file": str(
             _resolve_positions_file(
                 raw_positions_file=args.positions_file,
@@ -5231,6 +7181,11 @@ def run_multi_seed_parent(args) -> int:
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
         "post_eval_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
         "post_eval_peak_jitter_range": float(_resolve_post_eval_peak_jitter_range(args)),
+        "post_eval_peak_center_jitter_range": float(_resolve_post_eval_peak_center_jitter_range(args)),
+        "post_eval_peak_height_jitter_ratio_min": float(_resolve_post_eval_peak_height_jitter_ratio_min(args)),
+        "post_eval_peak_height_jitter_ratio_max": float(_resolve_post_eval_peak_height_jitter_ratio_max(args)),
+        "post_eval_peak_height_max_scale": float(_resolve_post_eval_peak_height_max_scale(args)),
+        "post_eval_terrain_variant_noise_ratio": float(_resolve_post_eval_terrain_variant_noise_ratio(args)),
         "post_eval_start_center_jitter": float(_resolve_post_eval_start_center_jitter(args)),
         "post_eval_agent_local_jitter": float(_resolve_post_eval_agent_local_jitter(args)),
         "post_eval_goal_region_radius": float(_resolve_post_eval_goal_region_radius(args)),
@@ -5247,7 +7202,7 @@ def run_multi_seed_parent(args) -> int:
         "post_eval_disable_gif": bool(_resolve_post_eval_artifact_policy(args).get("disable_gif", True)),
         "runtime_overrides": _runtime_override_summary(args),
         "batch_mode": "multi_seed_parent",
-        "experiments": [cfg["label"] for cfg in configs_to_run],
+        "experiments": [cfg["label"] for cfg in configs_for_summary],
     }
     if resume_batch_dir is not None:
         batch_dir.mkdir(parents=True, exist_ok=True)
@@ -5295,8 +7250,20 @@ def run_multi_seed_parent(args) -> int:
     print("MATD3 Multi-seed Ablation Parent")
     print(f"Group: {args.experiment_group} ({group_desc})")
     print(f"实验数量: {len(configs_to_run)}")
+    if configs_for_summary != configs_to_run:
+        print(
+            "[多seed] 本次仅调度请求实验: "
+            f"{[cfg['label'] for cfg in configs_to_run]} | "
+            "最终汇总将读取父批次已有 artifact 并合并为: "
+            f"{[cfg['label'] for cfg in configs_for_summary]}"
+        )
     print(f"随机种子列表: {seeds}")
     print(f"最大并发: {args.max_parallel if args.max_parallel > 0 else len(seeds)}")
+    if int(getattr(args, "experiment_max_parallel", 1) or 1) != 1:
+        print(
+            "[多seed] 提示: 当前父批次模式会把 (seed, experiment) 展平成独立 worker；"
+            "实际总并发只受 --max-parallel 控制，--experiment-max-parallel 不会再额外叠加。"
+        )
     print(f"运行时覆盖: {_runtime_override_summary(args)}")
     print(f"父批次目录: {batch_dir}")
     print(f"子批次根目录: {seed_batches_root}")
@@ -5386,12 +7353,34 @@ def run_multi_seed_parent(args) -> int:
         ]
         for flag, value in (
             ("--post-eval-peak-jitter-range", getattr(args, "post_eval_peak_jitter_range", None)),
+            ("--post-eval-peak-height-jitter-ratio-min", getattr(args, "post_eval_peak_height_jitter_ratio_min", None)),
+            ("--post-eval-peak-height-jitter-ratio-max", getattr(args, "post_eval_peak_height_jitter_ratio_max", None)),
+            ("--post-eval-peak-height-max-scale", getattr(args, "post_eval_peak_height_max_scale", None)),
             ("--post-eval-start-center-jitter", getattr(args, "post_eval_start_center_jitter", None)),
             ("--post-eval-agent-local-jitter", getattr(args, "post_eval_agent_local_jitter", None)),
             ("--post-eval-goal-region-radius", getattr(args, "post_eval_goal_region_radius", None)),
         ):
             if value is not None:
                 command.extend([flag, str(float(value))])
+        for flag, value in (
+            ("--group-b-peak-jitter-range", getattr(args, "group_b_peak_jitter_range", None)),
+            ("--group-b-peak-center-jitter-range", getattr(args, "group_b_peak_center_jitter_range", None)),
+            ("--group-b-peak-height-jitter-ratio-min", getattr(args, "group_b_peak_height_jitter_ratio_min", None)),
+            ("--group-b-peak-height-jitter-ratio-max", getattr(args, "group_b_peak_height_jitter_ratio_max", None)),
+            ("--group-b-peak-height-max-scale", getattr(args, "group_b_peak_height_max_scale", None)),
+            ("--group-b-terrain-variant-noise-ratio", getattr(args, "group_b_terrain_variant_noise_ratio", None)),
+        ):
+            if value is not None:
+                command.extend([flag, str(float(value))])
+        if getattr(args, "group_b_semi_random_hold_mode", None):
+            command.extend(["--group-b-semi-random-hold-mode", str(args.group_b_semi_random_hold_mode)])
+        for flag, value in (
+            ("--group-b-semi-random-hold-episodes", getattr(args, "group_b_semi_random_hold_episodes", None)),
+            ("--group-b-semi-random-hold-min-episodes", getattr(args, "group_b_semi_random_hold_min_episodes", None)),
+            ("--group-b-semi-random-hold-max-episodes", getattr(args, "group_b_semi_random_hold_max_episodes", None)),
+        ):
+            if value is not None:
+                command.extend([flag, str(int(value))])
         if args.reuse:
             command.append("--reuse")
         if args.reuse_only:
@@ -5406,6 +7395,8 @@ def run_multi_seed_parent(args) -> int:
             command.append("--disable-post-eval")
         if args.skip_local_plots:
             command.append("--skip-local-plots")
+        if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" and not args.disable_post_eval:
+            command.append("--post-eval-testset-prepared")
         for flag, value in (
             ("--post-eval-light-mode", getattr(args, "post_eval_light_mode", None)),
             ("--post-eval-save-interactive-html", getattr(args, "post_eval_save_interactive_html", None)),
@@ -5508,12 +7499,34 @@ def run_multi_seed_parent(args) -> int:
         ]
         for flag, value in (
             ("--post-eval-peak-jitter-range", getattr(args, "post_eval_peak_jitter_range", None)),
+            ("--post-eval-peak-height-jitter-ratio-min", getattr(args, "post_eval_peak_height_jitter_ratio_min", None)),
+            ("--post-eval-peak-height-jitter-ratio-max", getattr(args, "post_eval_peak_height_jitter_ratio_max", None)),
+            ("--post-eval-peak-height-max-scale", getattr(args, "post_eval_peak_height_max_scale", None)),
             ("--post-eval-start-center-jitter", getattr(args, "post_eval_start_center_jitter", None)),
             ("--post-eval-agent-local-jitter", getattr(args, "post_eval_agent_local_jitter", None)),
             ("--post-eval-goal-region-radius", getattr(args, "post_eval_goal_region_radius", None)),
         ):
             if value is not None:
                 bootstrap_command.extend([flag, str(float(value))])
+        for flag, value in (
+            ("--group-b-peak-jitter-range", getattr(args, "group_b_peak_jitter_range", None)),
+            ("--group-b-peak-center-jitter-range", getattr(args, "group_b_peak_center_jitter_range", None)),
+            ("--group-b-peak-height-jitter-ratio-min", getattr(args, "group_b_peak_height_jitter_ratio_min", None)),
+            ("--group-b-peak-height-jitter-ratio-max", getattr(args, "group_b_peak_height_jitter_ratio_max", None)),
+            ("--group-b-peak-height-max-scale", getattr(args, "group_b_peak_height_max_scale", None)),
+            ("--group-b-terrain-variant-noise-ratio", getattr(args, "group_b_terrain_variant_noise_ratio", None)),
+        ):
+            if value is not None:
+                bootstrap_command.extend([flag, str(float(value))])
+        if getattr(args, "group_b_semi_random_hold_mode", None):
+            bootstrap_command.extend(["--group-b-semi-random-hold-mode", str(args.group_b_semi_random_hold_mode)])
+        for flag, value in (
+            ("--group-b-semi-random-hold-episodes", getattr(args, "group_b_semi_random_hold_episodes", None)),
+            ("--group-b-semi-random-hold-min-episodes", getattr(args, "group_b_semi_random_hold_min_episodes", None)),
+            ("--group-b-semi-random-hold-max-episodes", getattr(args, "group_b_semi_random_hold_max_episodes", None)),
+        ):
+            if value is not None:
+                bootstrap_command.extend([flag, str(int(value))])
         if args.reuse:
             bootstrap_command.append("--reuse")
         if args.reuse_only:
@@ -5528,6 +7541,8 @@ def run_multi_seed_parent(args) -> int:
             bootstrap_command.append("--disable-post-eval")
         if args.skip_local_plots:
             bootstrap_command.append("--skip-local-plots")
+        if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" and not args.disable_post_eval:
+            bootstrap_command.append("--post-eval-testset-prepared")
         for flag, value in (
             ("--post-eval-light-mode", getattr(args, "post_eval_light_mode", None)),
             ("--post-eval-save-interactive-html", getattr(args, "post_eval_save_interactive_html", None)),
@@ -5650,8 +7665,8 @@ def run_multi_seed_parent(args) -> int:
                 batch_seed=int(seed),
                 experiment_group=args.experiment_group,
                 group_desc=group_desc,
-                configs_to_run=configs_to_run,
-            )
+            configs_to_run=configs_for_summary,
+        )
             if seed_ctx["summary_path"].exists():
                 summary_data = _load_json_file(seed_ctx["summary_path"])
                 summary_data["summary_path"] = str(seed_ctx["summary_path"])
@@ -5698,7 +7713,7 @@ def run_multi_seed_parent(args) -> int:
 
     audit_report = _audit_multi_seed_children(
         child_summaries=child_summaries,
-        expected_labels=experiment_labels,
+        expected_labels=[cfg["label"] for cfg in configs_for_summary],
         expected_seeds=seeds,
         expected_positions_file=positions_file,
         expected_post_eval=expected_post_eval,

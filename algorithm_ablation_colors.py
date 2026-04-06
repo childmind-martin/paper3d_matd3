@@ -11,6 +11,7 @@ from typing import Optional
 ALGORITHM_ABLATION_COLOR_BY_LABEL = {
     "matd3_separated_gradient": "#0066CC",  # blue
     "matd3_dual_q": "#CC0000",              # red
+    "matd3_separated_hybrid_actor": "#B8860B",  # dark goldenrod
     "matd3_single_q": "#00AA00",            # green
     "maddpg_separated_gradient": "#9900CC", # purple
     "maddpg_dual_q": "#00CCCC",             # cyan

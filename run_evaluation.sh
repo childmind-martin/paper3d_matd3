@@ -260,6 +260,7 @@ echo "开始模型评估..."
 echo "======================================"
 echo "评估解释器: $EVAL_PYTHON_BIN"
 echo "GPU选择: GPU_ID=${GPU_ID:-<unset>} | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "运行环境: CONDA_PREFIX=${CONDA_PREFIX:-<unset>} | LD_LIBRARY_PATH=$([ -n \"${LD_LIBRARY_PATH:-}\" ] && echo set || echo unset)"
 
 # 构造命令参数（关键参数优先由训练配置驱动，确保严格对齐）
 # 场景/算法先设占位默认值，读取训练配置后再覆盖

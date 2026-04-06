@@ -74,6 +74,41 @@ def _make_json_safe(value):
     return str(value)
 
 
+def _save_vis_context_snapshot_artifacts(output_dir, prefix, vis_context):
+    """将地形快照落盘为 JSON + NPY，便于训练/评估严格审计。"""
+    if not isinstance(vis_context, dict):
+        return {}
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception:
+        return {}
+
+    snapshot = dict(vis_context)
+    terrain = snapshot.pop("terrain", None)
+    terrain_npy_path = None
+    if terrain is not None:
+        try:
+            terrain_arr = np.asarray(terrain, dtype=np.float32)
+            terrain_npy_path = os.path.join(output_dir, f"{prefix}_terrain.npy")
+            np.save(terrain_npy_path, terrain_arr)
+        except Exception:
+            terrain_npy_path = None
+
+    snapshot["terrain_npy_path"] = terrain_npy_path
+    snapshot_json_path = os.path.join(output_dir, f"{prefix}_terrain_snapshot.json")
+    try:
+        with open(snapshot_json_path, "w", encoding="utf-8") as f:
+            json.dump(_make_json_safe(snapshot), f, ensure_ascii=False, indent=2)
+    except Exception:
+        snapshot_json_path = None
+
+    return {
+        "terrain_npy_path": terrain_npy_path,
+        "terrain_snapshot_json_path": snapshot_json_path,
+    }
+
+
 def _apply_runtime_env_overrides_from_args(args):
     """将隐藏的运行时参数显式回写到环境变量，确保训练执行与结果记录一致。"""
     runtime_pairs = (
@@ -552,88 +587,107 @@ def _worker(remote, parent_remote, env_fn):
                             env_id = int(getattr(env.world, 'env_id', 0))
                         except Exception:
                             env_id = 0
-                        # 🚨 关键修复：优先从scenario中读取seed，确保并行环境配置独立
-                        _base = None
                         scenario = getattr(env, 'scenario', None)
-                        if scenario is not None and hasattr(scenario, 'seed') and scenario.seed is not None:
-                            _base = int(scenario.seed)
-                        
-                        # 如果scenario中没有seed，从world中获取
-                        if _base is None:
-                            world = getattr(env, 'world', None)
-                            if world is not None and hasattr(world, 'terrain_seed') and world.terrain_seed is not None:
-                                _base = int(world.terrain_seed)
-                        
-                        # 如果仍然没有seed，从环境变量读取（向后兼容）
-                        if _base is None:
-                            _base_str = _os.getenv('SCENARIO_SEED', None)
-                            if _base_str is not None:
-                                _base = int(_base_str)
-                            else:
-                                # 使用时间戳生成真正的随机种子
-                                import time as _time
-                                _base = (int(_time.time() * 1000000) + _episode_idx * 10007) % 2147483647
-                        _selected_terrain_seed = None
+                        _deterministic_train_env_sequence = False
                         try:
-                            _multi_enabled = bool(getattr(scenario, 'curriculum_multi_terrain_enabled', False))
-                            if not _multi_enabled:
-                                _multi_enabled = _os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1','true','yes','on')
-                            if _multi_enabled:
-                                _seed_list = list(getattr(scenario, 'curriculum_multi_terrain_seeds', []) or [])
-                                if not _seed_list:
-                                    _seed_list_raw = _os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '').strip()
-                                    _seed_list = [int(tok.strip()) for tok in _seed_list_raw.split(',') if tok.strip()]
-                                if _seed_list:
-                                    _selected_terrain_seed = int(_seed_list[(_episode_idx + env_id) % len(_seed_list)])
+                            _deterministic_train_env_sequence = bool(
+                                getattr(scenario, 'deterministic_train_env_sequence', False)
+                            )
                         except Exception:
-                            _selected_terrain_seed = None
-                        if _selected_terrain_seed is not None:
-                            _per_ep_seed = int(_selected_terrain_seed)
+                            _deterministic_train_env_sequence = False
+                        if _deterministic_train_env_sequence:
+                            try:
+                                setattr(env.world, 'terrain_seed', int(getattr(scenario, 'current_terrain_seed', getattr(env.world, 'terrain_seed', 0))))
+                            except Exception:
+                                pass
+                            try:
+                                setattr(scenario, 'current_episode_index', int(_episode_idx))
+                                setattr(scenario, 'current_episode_env_id', int(env_id))
+                            except Exception:
+                                pass
+                            try:
+                                if hasattr(env.world, 'episode_index'):
+                                    env.world.episode_index = int(_episode_idx)
+                            except Exception:
+                                pass
                         else:
-                            _per_ep_seed = _base + env_id * 100003 + (_episode_idx % 1000003)
-                        if scenario is not None:
-                            # 🔧 关键修复：保存原始地形种子，防止被episode seed覆盖
-                            if not hasattr(scenario, '_original_terrain_seed'):
-                                scenario._original_terrain_seed = scenario.seed if hasattr(scenario, 'seed') and scenario.seed is not None else _base
+                            # 🚨 关键修复：优先从scenario中读取seed，确保并行环境配置独立
+                            _base = None
+                            if scenario is not None and hasattr(scenario, 'seed') and scenario.seed is not None:
+                                _base = int(scenario.seed)
+                            
+                            # 如果scenario中没有seed，从world中获取
+                            if _base is None:
+                                world = getattr(env, 'world', None)
+                                if world is not None and hasattr(world, 'terrain_seed') and world.terrain_seed is not None:
+                                    _base = int(world.terrain_seed)
+                            
+                            # 如果仍然没有seed，从环境变量读取（向后兼容）
+                            if _base is None:
+                                _base_str = _os.getenv('SCENARIO_SEED', None)
+                                if _base_str is not None:
+                                    _base = int(_base_str)
+                                else:
+                                    # 使用时间戳生成真正的随机种子
+                                    import time as _time
+                                    _base = (int(_time.time() * 1000000) + _episode_idx * 10007) % 2147483647
+                            _selected_terrain_seed = None
+                            try:
+                                _multi_enabled = bool(getattr(scenario, 'curriculum_multi_terrain_enabled', False))
+                                if not _multi_enabled:
+                                    _multi_enabled = _os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1','true','yes','on')
+                                if _multi_enabled:
+                                    _seed_list = list(getattr(scenario, 'curriculum_multi_terrain_seeds', []) or [])
+                                    if not _seed_list:
+                                        _seed_list_raw = _os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '').strip()
+                                        _seed_list = [int(tok.strip()) for tok in _seed_list_raw.split(',') if tok.strip()]
+                                    if _seed_list:
+                                        _selected_terrain_seed = int(_seed_list[(_episode_idx + env_id) % len(_seed_list)])
+                            except Exception:
+                                _selected_terrain_seed = None
                             if _selected_terrain_seed is not None:
+                                _per_ep_seed = int(_selected_terrain_seed)
+                            else:
+                                _per_ep_seed = _base + env_id * 100003 + (_episode_idx % 1000003)
+                            if scenario is not None:
+                                # 🔧 关键修复：保存原始地形种子，防止被episode seed覆盖
+                                if not hasattr(scenario, '_original_terrain_seed'):
+                                    scenario._original_terrain_seed = scenario.seed if hasattr(scenario, 'seed') and scenario.seed is not None else _base
+                                if _selected_terrain_seed is not None:
+                                    try:
+                                        setattr(scenario, 'terrain_base_seed', int(_selected_terrain_seed))
+                                    except Exception:
+                                        pass
+                                
+                                # 检查是否启用随机地形
+                                _random_terrain = _os.getenv('RANDOM_TERRAIN', '0').lower() in ('1','true','yes','on')
+                                _enable_per_episode_terrain = getattr(scenario, 'per_episode_terrain', None)
+                                if _enable_per_episode_terrain is None:
+                                    _enable_per_episode_terrain = _os.getenv('PER_EPISODE_TERRAIN', '0').lower() in ('1','true','yes','on')
+                                
+                                # 🚨 关键修复：只有在启用随机地形时才修改scenario.seed
+                                # 固定地形模式下保持原始种子不变，确保地形一致性
+                                if _random_terrain or _enable_per_episode_terrain:
+                                    setattr(scenario, 'seed', int(_per_ep_seed))
+                                
                                 try:
-                                    setattr(scenario, 'terrain_base_seed', int(_selected_terrain_seed))
+                                    import numpy as _np
+                                    setattr(scenario, 'rng', _np.random.RandomState(int(_per_ep_seed)))
                                 except Exception:
                                     pass
-                            
-                            # 检查是否启用随机地形
-                            _random_terrain = _os.getenv('RANDOM_TERRAIN', '0').lower() in ('1','true','yes','on')
-                            _enable_per_episode_terrain = getattr(scenario, 'per_episode_terrain', None)
-                            if _enable_per_episode_terrain is None:
-                                _enable_per_episode_terrain = _os.getenv('PER_EPISODE_TERRAIN', '0').lower() in ('1','true','yes','on')
-                            
-                            # 🚨 关键修复：只有在启用随机地形时才修改scenario.seed
-                            # 固定地形模式下保持原始种子不变，确保地形一致性
-                            if _random_terrain or _enable_per_episode_terrain:
-                                setattr(scenario, 'seed', int(_per_ep_seed))
-                            # 否则scenario.seed保持为原始值，不被覆盖
-                            
-                            try:
-                                import numpy as _np
-                                setattr(scenario, 'rng', _np.random.RandomState(int(_per_ep_seed)))
-                            except Exception:
-                                pass
-                            # 首次reset时为每个并行环境强制一次"按env区分的地形再生成"，
-                            # 之后保持该环境地形固定（除非开启完全随机地形）。
-                            try:
-                                # 🚨 关键修复：优先从scenario中读取配置，确保并行环境配置独立
-                                _enable_per_env_terrain = getattr(scenario, 'per_env_terrain', None)
-                                if _enable_per_env_terrain is None:
-                                    _enable_per_env_terrain = _os.getenv('PER_ENV_TERRAIN', '1').lower() in ('1','true','yes','on')
-                                
-                                if _enable_per_env_terrain and (not hasattr(scenario, '_per_env_terrain_initialized') or _enable_per_episode_terrain):
-                                    if hasattr(scenario, 'regenerate_terrain') and callable(scenario.regenerate_terrain):
-                                        scenario.regenerate_terrain(int(_per_ep_seed))
-                                    scenario._per_env_terrain_initialized = True
-                            except Exception:
-                                pass
-                        setattr(env.world, 'terrain_seed', int(_per_ep_seed))
-                        setattr(env.world, 'episode_index', _episode_idx + 1)
+                                try:
+                                    _enable_per_env_terrain = getattr(scenario, 'per_env_terrain', None)
+                                    if _enable_per_env_terrain is None:
+                                        _enable_per_env_terrain = _os.getenv('PER_ENV_TERRAIN', '1').lower() in ('1','true','yes','on')
+                                    
+                                    if _enable_per_env_terrain and (not hasattr(scenario, '_per_env_terrain_initialized') or _enable_per_episode_terrain):
+                                        if hasattr(scenario, 'regenerate_terrain') and callable(scenario.regenerate_terrain):
+                                            scenario.regenerate_terrain(int(_per_ep_seed))
+                                        scenario._per_env_terrain_initialized = True
+                                except Exception:
+                                    pass
+                            setattr(env.world, 'terrain_seed', int(_per_ep_seed))
+                            setattr(env.world, 'episode_index', _episode_idx + 1)
                     # 兼容并行封装的单环境包装器
                     if hasattr(env, 'envs'):
                         for _e in env.envs:
@@ -849,17 +903,44 @@ def _worker(remote, parent_remote, env_fn):
                         'agent_goals': [],
                         'obstacles': [],
                         'seed': None,
+                        'terrain_seed': None,
+                        'terrain_variant_seed': None,
+                        'terrain_params': {},
+                        'base_mountain_centers': [],
+                        'actual_mountain_centers': [],
                         'terrain_source': 'unknown',
                         'scenario_seed': None,
                         'world_seed': None,
                         'episode': 'unknown'
                     }
                     
+                    if hasattr(env, 'scenario') and hasattr(env.scenario, 'build_terrain_snapshot'):
+                        try:
+                            terrain_snapshot = env.scenario.build_terrain_snapshot()
+                        except Exception:
+                            terrain_snapshot = None
+                        if isinstance(terrain_snapshot, dict):
+                            terr = terrain_snapshot.get('terrain')
+                            bundle['terrain'] = terr.copy() if terr is not None else None
+                            bundle['map_size'] = terrain_snapshot.get('map_size', bundle['map_size'])
+                            bundle['goal_pos'] = terrain_snapshot.get('goal_pos', bundle['goal_pos'])
+                            bundle['agent_goals'] = terrain_snapshot.get('agent_goals', bundle['agent_goals']) or []
+                            bundle['obstacles'] = terrain_snapshot.get('obstacles', bundle['obstacles']) or []
+                            bundle['terrain_seed'] = terrain_snapshot.get('terrain_seed')
+                            bundle['terrain_variant_seed'] = terrain_snapshot.get('terrain_variant_seed')
+                            bundle['terrain_params'] = terrain_snapshot.get('terrain_params', {}) or {}
+                            bundle['base_mountain_centers'] = terrain_snapshot.get('base_mountain_centers', []) or []
+                            bundle['actual_mountain_centers'] = terrain_snapshot.get('actual_mountain_centers', []) or []
+                            bundle['terrain_source'] = terrain_snapshot.get('terrain_source', 'scenario_snapshot')
+                            bundle['seed'] = terrain_snapshot.get('terrain_seed')
+
                     # 地形与尺寸 - 优先使用scenario.terrain，回退到world.terrain
                     terrain_source = None
                     try:
                         # 首先尝试从scenario获取地形
-                        if hasattr(env, 'scenario') and hasattr(env.scenario, 'terrain') and env.scenario.terrain is not None:
+                        if bundle['terrain'] is not None:
+                            terrain_source = bundle.get('terrain_source', 'scenario_snapshot')
+                        elif hasattr(env, 'scenario') and hasattr(env.scenario, 'terrain') and env.scenario.terrain is not None:
                             bundle['terrain'] = env.scenario.terrain.copy()
                             if hasattr(env.scenario, 'map_size'):
                                 bundle['map_size'] = int(env.scenario.map_size)
@@ -937,9 +1018,11 @@ def _worker(remote, parent_remote, env_fn):
                     try:
                         if hasattr(env, 'scenario') and hasattr(env.scenario, 'seed'):
                             bundle['seed'] = int(env.scenario.seed)
+                            bundle['terrain_seed'] = bundle.get('terrain_seed', int(env.scenario.seed))
                             # print(f"[DEBUG] get_vis_bundle: 从scenario获取种子: {env.scenario.seed}")
                         elif hasattr(env, 'world') and hasattr(env.world, 'terrain_seed'):
                             bundle['seed'] = int(env.world.terrain_seed)
+                            bundle['terrain_seed'] = bundle.get('terrain_seed', int(env.world.terrain_seed))
                             # print(f"[DEBUG] get_vis_bundle: 从world获取种子: {env.world.terrain_seed}")
                         else:
                             print(f"[WARN] get_vis_bundle: 未找到种子数据 - scenario.seed: {hasattr(env, 'scenario') and hasattr(env.scenario, 'seed')}, world.terrain_seed: {hasattr(env, 'world') and hasattr(env.world, 'terrain_seed')}")
@@ -1245,14 +1328,41 @@ class SingleEnvWrapper:
                 'agent_goals': [],
                 'obstacles': [],
                 'seed': None,
+                'terrain_seed': None,
+                'terrain_variant_seed': None,
+                'terrain_params': {},
+                'base_mountain_centers': [],
+                'actual_mountain_centers': [],
                 'terrain_source': 'unknown',
                 'scenario_seed': None,
                 'world_seed': None
             }
             
+            if hasattr(self.env, 'scenario') and hasattr(self.env.scenario, 'build_terrain_snapshot'):
+                try:
+                    terrain_snapshot = self.env.scenario.build_terrain_snapshot()
+                except Exception:
+                    terrain_snapshot = None
+                if isinstance(terrain_snapshot, dict):
+                    terr = terrain_snapshot.get('terrain')
+                    bundle['terrain'] = terr.copy() if terr is not None else None
+                    bundle['map_size'] = terrain_snapshot.get('map_size', bundle['map_size'])
+                    bundle['goal_pos'] = terrain_snapshot.get('goal_pos', bundle['goal_pos'])
+                    bundle['agent_goals'] = terrain_snapshot.get('agent_goals', bundle['agent_goals']) or []
+                    bundle['obstacles'] = terrain_snapshot.get('obstacles', bundle['obstacles']) or []
+                    bundle['terrain_seed'] = terrain_snapshot.get('terrain_seed')
+                    bundle['terrain_variant_seed'] = terrain_snapshot.get('terrain_variant_seed')
+                    bundle['terrain_params'] = terrain_snapshot.get('terrain_params', {}) or {}
+                    bundle['base_mountain_centers'] = terrain_snapshot.get('base_mountain_centers', []) or []
+                    bundle['actual_mountain_centers'] = terrain_snapshot.get('actual_mountain_centers', []) or []
+                    bundle['terrain_source'] = terrain_snapshot.get('terrain_source', 'scenario_snapshot')
+                    bundle['seed'] = terrain_snapshot.get('terrain_seed')
+
             # 获取地形数据
             try:
-                if hasattr(self.env, 'scenario') and hasattr(self.env.scenario, 'terrain') and self.env.scenario.terrain is not None:
+                if bundle['terrain'] is not None:
+                    pass
+                elif hasattr(self.env, 'scenario') and hasattr(self.env.scenario, 'terrain') and self.env.scenario.terrain is not None:
                     bundle['terrain'] = self.env.scenario.terrain.copy()
                     if hasattr(self.env.scenario, 'map_size'):
                         bundle['map_size'] = int(self.env.scenario.map_size)
@@ -1276,10 +1386,12 @@ class SingleEnvWrapper:
                 if hasattr(self.env, 'scenario') and hasattr(self.env.scenario, 'seed') and self.env.scenario.seed is not None:
                     bundle['seed'] = int(self.env.scenario.seed)
                     bundle['scenario_seed'] = int(self.env.scenario.seed)
+                    bundle['terrain_seed'] = bundle.get('terrain_seed', int(self.env.scenario.seed))
                     # print(f"[DEBUG] SingleEnvWrapper.get_vis_bundle: 从scenario获取种子: {self.env.scenario.seed}")
                 elif hasattr(self.env, 'world') and hasattr(self.env.world, 'terrain_seed') and self.env.world.terrain_seed is not None:
                     bundle['seed'] = int(self.env.world.terrain_seed)
                     bundle['world_seed'] = int(self.env.world.terrain_seed)
+                    bundle['terrain_seed'] = bundle.get('terrain_seed', int(self.env.world.terrain_seed))
                     # print(f"[DEBUG] SingleEnvWrapper.get_vis_bundle: 从world获取种子: {self.env.world.terrain_seed}")
                 else:
                     print(f"[WARN] SingleEnvWrapper.get_vis_bundle: 未找到种子数据 - scenario.seed: {hasattr(self.env, 'scenario') and hasattr(self.env.scenario, 'seed')}, world.terrain_seed: {hasattr(self.env, 'world') and hasattr(self.env.world, 'terrain_seed')}")
@@ -4289,6 +4401,30 @@ def load_scenario_module(scenario_name, args=None):
                 'random_z0_positions': random_z0_positions,
                 'terrain_complexity_level': terrain_complexity_level
             }
+            if args is not None:
+                for key in (
+                    'use_dynamic_obstacles',
+                    'semi_random_terrain',
+                    'terrain_base_seed',
+                    'deterministic_train_env_sequence',
+                    'training_env_sequence_seed',
+                    'peak_jitter_range',
+                    'peak_center_jitter_range',
+                    'peak_height_jitter_ratio_min',
+                    'peak_height_jitter_ratio_max',
+                    'peak_height_max_scale',
+                    'terrain_variant_noise_ratio',
+                    'semi_random_hold_mode',
+                    'semi_random_hold_episodes',
+                    'semi_random_hold_min_episodes',
+                    'semi_random_hold_max_episodes',
+                    'per_env_terrain',
+                    'per_episode_terrain',
+                    'map_size',
+                ):
+                    value = getattr(args, key, None)
+                    if value is not None:
+                        scenario_kwargs[key] = value
             
             # 如果是分项加权求和场景，添加权重参数
             if scenario_name in ['paper3d_terrain_weighted', 'paper3d_terrain_vectorized'] and args:
@@ -4565,15 +4701,146 @@ def make_env_init(rank: int, args_dict: dict):
             if per_episode_terrain is None:
                 per_episode_terrain = os.getenv('PER_EPISODE_TERRAIN', '0').lower() in ('1','true','yes','on')
             scenario.per_episode_terrain = bool(per_episode_terrain)
-            scenario.use_semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1','true','yes','on')
+            semi_random_terrain = getattr(args, 'semi_random_terrain', None)
+            if semi_random_terrain is None:
+                semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1','true','yes','on')
+            scenario.use_semi_random_terrain = bool(semi_random_terrain)
+            setattr(args, 'semi_random_terrain', bool(scenario.use_semi_random_terrain))
+            dynamic_obstacles = getattr(args, 'use_dynamic_obstacles', None)
+            if dynamic_obstacles is None:
+                dynamic_obstacles = os.getenv('USE_DYNAMIC_OBSTACLES', '1').lower() in ('1','true','yes','on')
+            scenario.use_dynamic_obstacles = bool(dynamic_obstacles)
+            setattr(args, 'use_dynamic_obstacles', bool(scenario.use_dynamic_obstacles))
+            hold_mode = str(
+                getattr(args, 'semi_random_hold_mode', None)
+                if getattr(args, 'semi_random_hold_mode', None) is not None
+                else os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', str(getattr(args, 'semi_random_hold_mode', 'episode')))
+            ).strip().lower()
+            if hold_mode not in ('episode', 'fixed', 'range'):
+                hold_mode = 'episode'
+            scenario.semi_random_hold_mode = hold_mode
+            setattr(args, 'semi_random_hold_mode', hold_mode)
             try:
-                scenario.terrain_base_seed = int(os.getenv('TERRAIN_BASE_SEED', str(getattr(args, 'terrain_seed', 67) or 67)))
+                scenario.semi_random_hold_episodes = max(
+                    1,
+                    int(
+                        getattr(args, 'semi_random_hold_episodes', None)
+                        if getattr(args, 'semi_random_hold_episodes', None) is not None
+                        else os.getenv('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', str(getattr(args, 'semi_random_hold_episodes', 1) or 1))
+                    ),
+                )
+            except Exception:
+                scenario.semi_random_hold_episodes = max(1, int(getattr(args, 'semi_random_hold_episodes', 1) or 1))
+            setattr(args, 'semi_random_hold_episodes', int(scenario.semi_random_hold_episodes))
+            try:
+                scenario.semi_random_hold_min_episodes = max(
+                    1,
+                    int(
+                        getattr(args, 'semi_random_hold_min_episodes', None)
+                        if getattr(args, 'semi_random_hold_min_episodes', None) is not None
+                        else os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', str(getattr(args, 'semi_random_hold_min_episodes', scenario.semi_random_hold_episodes) or scenario.semi_random_hold_episodes))
+                    ),
+                )
+            except Exception:
+                scenario.semi_random_hold_min_episodes = max(
+                    1,
+                    int(getattr(args, 'semi_random_hold_min_episodes', scenario.semi_random_hold_episodes) or scenario.semi_random_hold_episodes),
+                )
+            setattr(args, 'semi_random_hold_min_episodes', int(scenario.semi_random_hold_min_episodes))
+            try:
+                scenario.semi_random_hold_max_episodes = max(
+                    int(scenario.semi_random_hold_min_episodes),
+                    int(
+                        getattr(args, 'semi_random_hold_max_episodes', None)
+                        if getattr(args, 'semi_random_hold_max_episodes', None) is not None
+                        else os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', str(getattr(args, 'semi_random_hold_max_episodes', scenario.semi_random_hold_min_episodes) or scenario.semi_random_hold_min_episodes))
+                    ),
+                )
+            except Exception:
+                scenario.semi_random_hold_max_episodes = max(
+                    int(scenario.semi_random_hold_min_episodes),
+                    int(getattr(args, 'semi_random_hold_max_episodes', scenario.semi_random_hold_min_episodes) or scenario.semi_random_hold_min_episodes),
+                )
+            setattr(args, 'semi_random_hold_max_episodes', int(scenario.semi_random_hold_max_episodes))
+            deterministic_train_env_sequence = getattr(args, 'deterministic_train_env_sequence', None)
+            if deterministic_train_env_sequence is None:
+                deterministic_train_env_sequence = os.getenv('DETERMINISTIC_TRAIN_ENV_SEQUENCE', '0').lower() in ('1','true','yes','on')
+            scenario.deterministic_train_env_sequence = bool(deterministic_train_env_sequence)
+            setattr(args, 'deterministic_train_env_sequence', bool(scenario.deterministic_train_env_sequence))
+            try:
+                scenario.training_env_sequence_seed = int(
+                    getattr(
+                        args,
+                        'training_env_sequence_seed',
+                        os.getenv('TRAIN_ENV_SEQUENCE_SEED', str(getattr(args, 'terrain_seed', 67) or 67)),
+                    )
+                )
+            except Exception:
+                scenario.training_env_sequence_seed = int(getattr(args, 'terrain_seed', 67) or 67)
+            setattr(args, 'training_env_sequence_seed', int(scenario.training_env_sequence_seed))
+            try:
+                scenario.terrain_base_seed = int(
+                    getattr(args, 'terrain_base_seed', None)
+                    if getattr(args, 'terrain_base_seed', None) is not None
+                    else os.getenv('TERRAIN_BASE_SEED', str(getattr(args, 'terrain_seed', 67) or 67))
+                )
             except Exception:
                 scenario.terrain_base_seed = int(getattr(args, 'terrain_seed', 67) or 67)
+            setattr(args, 'terrain_base_seed', int(scenario.terrain_base_seed))
             try:
-                scenario.peak_jitter_range = float(os.getenv('PEAK_JITTER_RANGE', '15.0'))
+                scenario.peak_jitter_range = float(
+                    getattr(args, 'peak_jitter_range', None)
+                    if getattr(args, 'peak_jitter_range', None) is not None
+                    else os.getenv('PEAK_JITTER_RANGE', '15.0')
+                )
             except Exception:
                 scenario.peak_jitter_range = 15.0
+            setattr(args, 'peak_jitter_range', float(scenario.peak_jitter_range))
+            try:
+                scenario.peak_center_jitter_range = float(
+                    getattr(args, 'peak_center_jitter_range', None)
+                    if getattr(args, 'peak_center_jitter_range', None) is not None
+                    else os.getenv('PEAK_CENTER_JITTER_RANGE', str(min(float(scenario.peak_jitter_range), 3.0)))
+                )
+            except Exception:
+                scenario.peak_center_jitter_range = min(float(scenario.peak_jitter_range), 3.0)
+            setattr(args, 'peak_center_jitter_range', float(scenario.peak_center_jitter_range))
+            try:
+                scenario.peak_height_jitter_ratio_min = float(
+                    getattr(args, 'peak_height_jitter_ratio_min', None)
+                    if getattr(args, 'peak_height_jitter_ratio_min', None) is not None
+                    else os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', '0.20')
+                )
+            except Exception:
+                scenario.peak_height_jitter_ratio_min = 0.20
+            setattr(args, 'peak_height_jitter_ratio_min', float(scenario.peak_height_jitter_ratio_min))
+            try:
+                scenario.peak_height_jitter_ratio_max = float(
+                    getattr(args, 'peak_height_jitter_ratio_max', None)
+                    if getattr(args, 'peak_height_jitter_ratio_max', None) is not None
+                    else os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', '0.40')
+                )
+            except Exception:
+                scenario.peak_height_jitter_ratio_max = 0.40
+            setattr(args, 'peak_height_jitter_ratio_max', float(scenario.peak_height_jitter_ratio_max))
+            try:
+                scenario.peak_height_max_scale = float(
+                    getattr(args, 'peak_height_max_scale', None)
+                    if getattr(args, 'peak_height_max_scale', None) is not None
+                    else os.getenv('PEAK_HEIGHT_MAX_SCALE', '1.30')
+                )
+            except Exception:
+                scenario.peak_height_max_scale = 1.30
+            setattr(args, 'peak_height_max_scale', float(scenario.peak_height_max_scale))
+            try:
+                scenario.terrain_variant_noise_ratio = float(
+                    getattr(args, 'terrain_variant_noise_ratio', None)
+                    if getattr(args, 'terrain_variant_noise_ratio', None) is not None
+                    else os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15')
+                )
+            except Exception:
+                scenario.terrain_variant_noise_ratio = 0.15
+            setattr(args, 'terrain_variant_noise_ratio', float(scenario.terrain_variant_noise_ratio))
             scenario.curriculum_multi_terrain_enabled = os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1','true','yes','on')
             try:
                 multi_seed_raw = os.getenv('CURRICULUM_MULTI_TERRAIN_SEEDS', '').strip()
@@ -7838,6 +8105,7 @@ class OptimizedMADDPG:
         agent = self.agents[agent_idx]
         dual_q_mode = bool(self.use_dual_q)
         separated_actor_mode = bool(dual_q_mode and self.use_separated_gradient)
+        hybrid_actor_mode = bool(separated_actor_mode and self.use_hybrid_actor_objective)
 
         # 禁用计算层NaN→0保护：保留原始数值以便暴露问题
 
@@ -9217,12 +9485,27 @@ class OptimizedMATD3:
         # 双Q头/分离梯度开关（MATD3）
         self.use_dual_q = bool(getattr(args, 'matd3_use_dual_q', True))
         self.use_separated_gradient = bool(getattr(args, 'matd3_use_separated_gradient', True))
+        self.use_hybrid_actor_objective = bool(getattr(args, 'matd3_use_hybrid_actor_objective', False))
+        self.hybrid_actor_alpha = float(getattr(args, 'matd3_hybrid_actor_alpha', 0.80) or 0.80)
         if not self.use_dual_q and self.use_separated_gradient:
             self.use_separated_gradient = False
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
                 print("[MATD3] 已禁用分离梯度：双Q头关闭时不支持分离梯度")
+        if (not self.use_dual_q or not self.use_separated_gradient) and self.use_hybrid_actor_objective:
+            self.use_hybrid_actor_objective = False
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
+                print("[MATD3] 已禁用 hybrid actor objective：仅 dual-q + separated 模式支持")
+        self.hybrid_actor_alpha = float(np.clip(self.hybrid_actor_alpha, 0.0, 1.0))
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
             print(f"[MATD3] Dual Q: {self.use_dual_q}, Separated Gradient: {self.use_separated_gradient}")
+            if self.use_hybrid_actor_objective:
+                print(f"[MATD3] Actor Objective: hybrid (separated_weight={self.hybrid_actor_alpha:.2f}, unified_weight={1.0 - self.hybrid_actor_alpha:.2f})")
+            elif self.use_dual_q and self.use_separated_gradient:
+                print("[MATD3] Actor Objective: separated")
+            elif self.use_dual_q:
+                print("[MATD3] Actor Objective: unified")
+            else:
+                print("[MATD3] Actor Objective: single_q_joint")
 
         # 调试：是否进行actor-critic计算图与敏感度检查（环境变量开启）
         try:
@@ -12122,6 +12405,7 @@ class OptimizedMATD3:
         fr_batch_safe = _broadcast_force_ratio(fr_batch, batch_size)
         dual_q_mode = bool(self.use_dual_q)
         separated_actor_mode = bool(dual_q_mode and self.use_separated_gradient)
+        hybrid_actor_mode = bool(separated_actor_mode and self.use_hybrid_actor_objective)
         
         pf_forces_recomputed = None
         next_pf_forces_recomputed = None
@@ -12694,8 +12978,25 @@ class OptimizedMATD3:
                             _cnt_q_corrected_tail = tf.cast(tf.size(actor_q_corrected_tail_clipped), tf.float32)
                             loss_tail = -(_sum_q_corrected_tail / tf.maximum(_cnt_q_corrected_tail, 1.0))
 
-                            actor_loss_pg = head_weight * loss_head + tail_weight * loss_tail
-                            q_gradient_strength = tf.abs(loss_head)
+                            separated_loss_pg = head_weight * loss_head + tail_weight * loss_tail
+                            if hybrid_actor_mode:
+                                actor_qtot_1 = actor_q1_raw_1 + actor_q2_corrected_1
+                                actor_qtot_2 = actor_q1_raw_2 + actor_q2_corrected_2
+                                actor_qtot_1 = tf.where(tf.math.is_finite(actor_qtot_1), actor_qtot_1, tf.zeros_like(actor_qtot_1))
+                                actor_qtot_2 = tf.where(tf.math.is_finite(actor_qtot_2), actor_qtot_2, tf.zeros_like(actor_qtot_2))
+                                actor_q_min_hybrid = tf.minimum(actor_qtot_1, actor_qtot_2)
+                                actor_q_min_hybrid = tf.clip_by_value(actor_q_min_hybrid, -q_clip, q_clip)
+                                actor_q_min_hybrid = tf.where(
+                                    tf.math.is_finite(actor_q_min_hybrid),
+                                    actor_q_min_hybrid,
+                                    tf.zeros_like(actor_q_min_hybrid),
+                                )
+                                unified_loss_pg = -tf.reduce_mean(actor_q_min_hybrid)
+                                hybrid_alpha = tf.cast(self.hybrid_actor_alpha, tf.float32)
+                                actor_loss_pg = hybrid_alpha * separated_loss_pg + (tf.cast(1.0, tf.float32) - hybrid_alpha) * unified_loss_pg
+                            else:
+                                actor_loss_pg = separated_loss_pg
+                            q_gradient_strength = tf.abs(actor_loss_pg)
                         else:
                             actor_qtot_1 = actor_q1_raw_1 + actor_q2_corrected_1
                             actor_qtot_2 = actor_q1_raw_2 + actor_q2_corrected_2
@@ -14263,6 +14564,93 @@ def train(args):
         pass
     # 将隐藏运行时参数显式同步回环境变量，确保世界构造与结果记录使用同一口径。
     _apply_runtime_env_overrides_from_args(args)
+    try:
+        if getattr(args, 'deterministic_train_env_sequence', None) is None:
+            args.deterministic_train_env_sequence = os.getenv('DETERMINISTIC_TRAIN_ENV_SEQUENCE', '0').lower() in ('1', 'true', 'yes', 'on')
+        else:
+            args.deterministic_train_env_sequence = bool(args.deterministic_train_env_sequence)
+    except Exception:
+        args.deterministic_train_env_sequence = False
+    try:
+        if getattr(args, 'semi_random_terrain', None) is None:
+            args.semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')
+        else:
+            args.semi_random_terrain = bool(args.semi_random_terrain)
+    except Exception:
+        args.semi_random_terrain = False
+    try:
+        if getattr(args, 'semi_random_hold_mode', None) is None:
+            args.semi_random_hold_mode = str(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', 'episode')).strip().lower()
+        else:
+            args.semi_random_hold_mode = str(args.semi_random_hold_mode).strip().lower()
+    except Exception:
+        args.semi_random_hold_mode = 'episode'
+    if args.semi_random_hold_mode not in ('episode', 'fixed', 'range'):
+        args.semi_random_hold_mode = 'episode'
+    try:
+        if getattr(args, 'semi_random_hold_episodes', None) is None:
+            args.semi_random_hold_episodes = max(1, int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', '1')))
+        else:
+            args.semi_random_hold_episodes = max(1, int(args.semi_random_hold_episodes))
+    except Exception:
+        args.semi_random_hold_episodes = 1
+    try:
+        if getattr(args, 'semi_random_hold_min_episodes', None) is None:
+            args.semi_random_hold_min_episodes = max(
+                1,
+                int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', str(args.semi_random_hold_episodes))),
+            )
+        else:
+            args.semi_random_hold_min_episodes = max(1, int(args.semi_random_hold_min_episodes))
+    except Exception:
+        args.semi_random_hold_min_episodes = max(1, int(getattr(args, 'semi_random_hold_episodes', 1) or 1))
+    try:
+        if getattr(args, 'semi_random_hold_max_episodes', None) is None:
+            args.semi_random_hold_max_episodes = max(
+                int(getattr(args, 'semi_random_hold_min_episodes', 1) or 1),
+                int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', str(args.semi_random_hold_min_episodes))),
+            )
+        else:
+            args.semi_random_hold_max_episodes = max(
+                int(getattr(args, 'semi_random_hold_min_episodes', 1) or 1),
+                int(args.semi_random_hold_max_episodes),
+            )
+    except Exception:
+        args.semi_random_hold_max_episodes = max(
+            int(getattr(args, 'semi_random_hold_min_episodes', 1) or 1),
+            int(getattr(args, 'semi_random_hold_max_episodes', getattr(args, 'semi_random_hold_min_episodes', 1)) or 1),
+        )
+    try:
+        if getattr(args, 'use_dynamic_obstacles', None) is None:
+            args.use_dynamic_obstacles = os.getenv('USE_DYNAMIC_OBSTACLES', '0').lower() in ('1', 'true', 'yes', 'on')
+        else:
+            args.use_dynamic_obstacles = bool(args.use_dynamic_obstacles)
+    except Exception:
+        args.use_dynamic_obstacles = False
+    try:
+        if getattr(args, 'terrain_base_seed', None) is None:
+            args.terrain_base_seed = int(
+                os.getenv(
+                    'TERRAIN_BASE_SEED',
+                    str(getattr(args, 'terrain_seed', 67) or 67),
+                )
+            )
+        else:
+            args.terrain_base_seed = int(args.terrain_base_seed)
+    except Exception:
+        args.terrain_base_seed = int(getattr(args, 'terrain_seed', 67) or 67)
+    try:
+        if getattr(args, 'training_env_sequence_seed', None) is None:
+            args.training_env_sequence_seed = int(
+                os.getenv(
+                    'TRAIN_ENV_SEQUENCE_SEED',
+                    str(getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67)),
+                )
+            )
+        else:
+            args.training_env_sequence_seed = int(args.training_env_sequence_seed)
+    except Exception:
+        args.training_env_sequence_seed = int(getattr(args, 'terrain_seed', 67) or 67)
     # 读取安静输出开关（默认安静），供后续统一使用
     try:
         _qo_env = os.getenv('QUIET_OUTPUT', '')
@@ -14357,12 +14745,31 @@ def train(args):
         return seeds
 
     def _apply_curriculum_stage_env(stage_cfg):
+        setattr(args, 'use_dynamic_obstacles', bool(stage_cfg['use_dynamic_obstacles']))
         setattr(args, 'use_fixed_positions', bool(stage_cfg['use_fixed_positions']))
         setattr(args, 'dynamic_first_time', bool(stage_cfg['dynamic_first_time']))
         setattr(args, 'random_terrain', bool(stage_cfg.get('random_terrain', False)))
+        setattr(args, 'semi_random_terrain', bool(stage_cfg.get('semi_random_terrain', False)))
         setattr(args, 'terrain_seed', int(stage_cfg['terrain_seed']))
+        setattr(args, 'terrain_base_seed', int(stage_cfg.get('terrain_base_seed', stage_cfg['terrain_seed'])))
+        setattr(args, 'peak_jitter_range', float(stage_cfg.get('peak_jitter_range', os.getenv('PEAK_JITTER_RANGE', '15.0'))))
+        setattr(args, 'peak_center_jitter_range', float(stage_cfg.get('peak_center_jitter_range', os.getenv('PEAK_CENTER_JITTER_RANGE', str(min(float(stage_cfg.get('peak_jitter_range', os.getenv('PEAK_JITTER_RANGE', '15.0'))), 3.0))))))
         setattr(args, 'per_episode_terrain', bool(stage_cfg.get('per_episode_terrain', False)))
         setattr(args, 'per_env_terrain', bool(stage_cfg.get('per_env_terrain', True)))
+        setattr(args, 'peak_height_jitter_ratio_min', float(stage_cfg.get('peak_height_jitter_ratio_min', os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', '0.20'))))
+        setattr(args, 'peak_height_jitter_ratio_max', float(stage_cfg.get('peak_height_jitter_ratio_max', os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', '0.40'))))
+        setattr(args, 'peak_height_max_scale', float(stage_cfg.get('peak_height_max_scale', os.getenv('PEAK_HEIGHT_MAX_SCALE', '1.30'))))
+        setattr(args, 'terrain_variant_noise_ratio', float(stage_cfg.get('terrain_variant_noise_ratio', os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15'))))
+        hold_mode = str(stage_cfg.get('semi_random_hold_mode', 'episode')).strip().lower()
+        if hold_mode not in ('episode', 'fixed', 'range'):
+            hold_mode = 'episode'
+        hold_episodes = max(1, int(stage_cfg.get('semi_random_hold_episodes', 1)))
+        hold_min_episodes = max(1, int(stage_cfg.get('semi_random_hold_min_episodes', hold_episodes)))
+        hold_max_episodes = max(hold_min_episodes, int(stage_cfg.get('semi_random_hold_max_episodes', hold_min_episodes)))
+        setattr(args, 'semi_random_hold_mode', hold_mode)
+        setattr(args, 'semi_random_hold_episodes', int(hold_episodes))
+        setattr(args, 'semi_random_hold_min_episodes', int(hold_min_episodes))
+        setattr(args, 'semi_random_hold_max_episodes', int(hold_max_episodes))
 
         _set_bool_env('USE_DYNAMIC_OBSTACLES', stage_cfg['use_dynamic_obstacles'])
         _set_bool_env('USE_FIXED_POSITIONS', stage_cfg['use_fixed_positions'])
@@ -14375,6 +14782,15 @@ def train(args):
         os.environ['SCENARIO_SEED'] = str(int(stage_cfg['terrain_seed']))
         os.environ['TERRAIN_BASE_SEED'] = str(int(stage_cfg.get('terrain_base_seed', stage_cfg['terrain_seed'])))
         os.environ['PEAK_JITTER_RANGE'] = str(float(stage_cfg.get('peak_jitter_range', os.getenv('PEAK_JITTER_RANGE', '15.0'))))
+        os.environ['PEAK_CENTER_JITTER_RANGE'] = str(float(stage_cfg.get('peak_center_jitter_range', os.getenv('PEAK_CENTER_JITTER_RANGE', str(min(float(stage_cfg.get('peak_jitter_range', os.getenv('PEAK_JITTER_RANGE', '15.0'))), 3.0))))))
+        os.environ['PEAK_HEIGHT_JITTER_RATIO_MIN'] = str(float(stage_cfg.get('peak_height_jitter_ratio_min', os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', '0.20'))))
+        os.environ['PEAK_HEIGHT_JITTER_RATIO_MAX'] = str(float(stage_cfg.get('peak_height_jitter_ratio_max', os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', '0.40'))))
+        os.environ['PEAK_HEIGHT_MAX_SCALE'] = str(float(stage_cfg.get('peak_height_max_scale', os.getenv('PEAK_HEIGHT_MAX_SCALE', '1.30'))))
+        os.environ['TERRAIN_VARIANT_NOISE_RATIO'] = str(float(stage_cfg.get('terrain_variant_noise_ratio', os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15'))))
+        os.environ['SEMI_RANDOM_TERRAIN_HOLD_MODE'] = str(hold_mode)
+        os.environ['SEMI_RANDOM_TERRAIN_HOLD_EPISODES'] = str(int(hold_episodes))
+        os.environ['SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES'] = str(int(hold_min_episodes))
+        os.environ['SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES'] = str(int(hold_max_episodes))
         os.environ['CURRICULUM_MULTI_TERRAIN_SEEDS'] = ','.join(str(int(seed)) for seed in stage_cfg.get('multi_terrain_seeds', []))
         os.environ['CURRICULUM_STAGE_ID'] = str(int(stage_cfg.get('stage_id', 0)))
         os.environ['CURRICULUM_REWARD_PROFILE'] = str(stage_cfg.get('reward_profile', 'fixed_route'))
@@ -14408,6 +14824,48 @@ def train(args):
         stage4_peak_jitter = float(os.getenv('PEAK_JITTER_RANGE', '15.0'))
     except Exception:
         stage4_peak_jitter = 15.0
+    try:
+        stage4_peak_center_jitter = float(os.getenv('PEAK_CENTER_JITTER_RANGE', str(min(stage4_peak_jitter, 3.0))))
+    except Exception:
+        stage4_peak_center_jitter = min(stage4_peak_jitter, 3.0)
+    try:
+        stage4_peak_height_jitter_ratio_min = float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', '0.20'))
+    except Exception:
+        stage4_peak_height_jitter_ratio_min = 0.20
+    try:
+        stage4_peak_height_jitter_ratio_max = float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', '0.40'))
+    except Exception:
+        stage4_peak_height_jitter_ratio_max = 0.40
+    stage4_peak_height_jitter_ratio_max = max(
+        stage4_peak_height_jitter_ratio_min,
+        stage4_peak_height_jitter_ratio_max,
+    )
+    try:
+        stage4_peak_height_max_scale = float(os.getenv('PEAK_HEIGHT_MAX_SCALE', '1.30'))
+    except Exception:
+        stage4_peak_height_max_scale = 1.30
+    try:
+        stage4_variant_noise_ratio = float(os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15'))
+    except Exception:
+        stage4_variant_noise_ratio = 0.15
+    stage4_hold_mode = str(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', 'range')).strip().lower()
+    if stage4_hold_mode not in ('episode', 'fixed', 'range'):
+        stage4_hold_mode = 'range'
+    try:
+        stage4_hold_episodes = max(1, int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', '8')))
+    except Exception:
+        stage4_hold_episodes = 8
+    try:
+        stage4_hold_min_episodes = max(1, int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', '5')))
+    except Exception:
+        stage4_hold_min_episodes = 5
+    try:
+        stage4_hold_max_episodes = max(
+            stage4_hold_min_episodes,
+            int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', '10')),
+        )
+    except Exception:
+        stage4_hold_max_episodes = max(stage4_hold_min_episodes, 10)
     multi_terrain_seeds = _parse_multi_seed_list(stage4_base_seed)
     stage_success_targets = _parse_stage_series(
         'CURRICULUM_STAGE_SUCCESS_TARGETS',
@@ -14444,6 +14902,15 @@ def train(args):
             'terrain_seed': base_terrain_seed,
             'terrain_base_seed': stage4_base_seed,
             'peak_jitter_range': stage4_peak_jitter,
+            'peak_center_jitter_range': stage4_peak_center_jitter,
+            'peak_height_jitter_ratio_min': stage4_peak_height_jitter_ratio_min,
+            'peak_height_jitter_ratio_max': stage4_peak_height_jitter_ratio_max,
+            'peak_height_max_scale': stage4_peak_height_max_scale,
+            'terrain_variant_noise_ratio': stage4_variant_noise_ratio,
+            'semi_random_hold_mode': 'episode',
+            'semi_random_hold_episodes': 1,
+            'semi_random_hold_min_episodes': 1,
+            'semi_random_hold_max_episodes': 1,
             'multi_terrain_mode': False,
             'multi_terrain_seeds': [],
         },
@@ -14461,6 +14928,15 @@ def train(args):
             'terrain_seed': base_terrain_seed,
             'terrain_base_seed': stage4_base_seed,
             'peak_jitter_range': stage4_peak_jitter,
+            'peak_center_jitter_range': stage4_peak_center_jitter,
+            'peak_height_jitter_ratio_min': stage4_peak_height_jitter_ratio_min,
+            'peak_height_jitter_ratio_max': stage4_peak_height_jitter_ratio_max,
+            'peak_height_max_scale': stage4_peak_height_max_scale,
+            'terrain_variant_noise_ratio': stage4_variant_noise_ratio,
+            'semi_random_hold_mode': 'episode',
+            'semi_random_hold_episodes': 1,
+            'semi_random_hold_min_episodes': 1,
+            'semi_random_hold_max_episodes': 1,
             'multi_terrain_mode': False,
             'multi_terrain_seeds': [],
         },
@@ -14478,6 +14954,15 @@ def train(args):
             'terrain_seed': base_terrain_seed,
             'terrain_base_seed': stage4_base_seed,
             'peak_jitter_range': stage4_peak_jitter,
+            'peak_center_jitter_range': stage4_peak_center_jitter,
+            'peak_height_jitter_ratio_min': stage4_peak_height_jitter_ratio_min,
+            'peak_height_jitter_ratio_max': stage4_peak_height_jitter_ratio_max,
+            'peak_height_max_scale': stage4_peak_height_max_scale,
+            'terrain_variant_noise_ratio': stage4_variant_noise_ratio,
+            'semi_random_hold_mode': 'episode',
+            'semi_random_hold_episodes': 1,
+            'semi_random_hold_min_episodes': 1,
+            'semi_random_hold_max_episodes': 1,
             'multi_terrain_mode': False,
             'multi_terrain_seeds': [],
         },
@@ -14495,6 +14980,15 @@ def train(args):
             'terrain_seed': stage4_base_seed,
             'terrain_base_seed': stage4_base_seed,
             'peak_jitter_range': stage4_peak_jitter,
+            'peak_center_jitter_range': stage4_peak_center_jitter,
+            'peak_height_jitter_ratio_min': stage4_peak_height_jitter_ratio_min,
+            'peak_height_jitter_ratio_max': stage4_peak_height_jitter_ratio_max,
+            'peak_height_max_scale': stage4_peak_height_max_scale,
+            'terrain_variant_noise_ratio': stage4_variant_noise_ratio,
+            'semi_random_hold_mode': stage4_hold_mode,
+            'semi_random_hold_episodes': stage4_hold_episodes,
+            'semi_random_hold_min_episodes': stage4_hold_min_episodes,
+            'semi_random_hold_max_episodes': stage4_hold_max_episodes,
             'multi_terrain_mode': False,
             'multi_terrain_seeds': [],
         },
@@ -14512,6 +15006,15 @@ def train(args):
             'terrain_seed': int(multi_terrain_seeds[0]),
             'terrain_base_seed': int(multi_terrain_seeds[0]),
             'peak_jitter_range': stage4_peak_jitter,
+            'peak_center_jitter_range': stage4_peak_center_jitter,
+            'peak_height_jitter_ratio_min': stage4_peak_height_jitter_ratio_min,
+            'peak_height_jitter_ratio_max': stage4_peak_height_jitter_ratio_max,
+            'peak_height_max_scale': stage4_peak_height_max_scale,
+            'terrain_variant_noise_ratio': stage4_variant_noise_ratio,
+            'semi_random_hold_mode': 'episode',
+            'semi_random_hold_episodes': 1,
+            'semi_random_hold_min_episodes': 1,
+            'semi_random_hold_max_episodes': 1,
             'multi_terrain_mode': True,
             'multi_terrain_seeds': multi_terrain_seeds,
         },
@@ -14567,6 +15070,107 @@ def train(args):
     if not curriculum_enabled:
         os.environ['CURRICULUM_STAGE_ID'] = '0'
         os.environ['CURRICULUM_REWARD_PROFILE'] = 'fixed_route'
+
+    def _capture_training_environment_config():
+        def _env_bool(name, default=False):
+            try:
+                return os.getenv(name, '1' if default else '0').lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                return bool(default)
+
+        def _env_int(name, fallback):
+            try:
+                raw = os.getenv(name, '')
+                if str(raw).strip():
+                    return int(raw)
+            except Exception:
+                pass
+            return int(fallback)
+
+        def _env_float(name, fallback):
+            try:
+                raw = os.getenv(name, '')
+                if str(raw).strip():
+                    return float(raw)
+            except Exception:
+                pass
+            return float(fallback)
+
+        semi_random_enabled = bool(getattr(args, 'semi_random_terrain', False) or _env_bool('SEMI_RANDOM_TERRAIN', False))
+        configured_terrain_seed = _env_int(
+            'SCENARIO_SEED',
+            getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67),
+        )
+        terrain_base_seed = _env_int(
+            'TERRAIN_BASE_SEED',
+            getattr(args, 'terrain_base_seed', configured_terrain_seed),
+        )
+        training_env_sequence_seed = _env_int(
+            'TRAIN_ENV_SEQUENCE_SEED',
+            getattr(args, 'training_env_sequence_seed', terrain_base_seed),
+        )
+        config = {
+            'schema_version': 1,
+            'source': 'train_bootstrap',
+            'use_fixed_positions': bool(getattr(args, 'use_fixed_positions', False)),
+            'use_dynamic_obstacles': bool(getattr(args, 'use_dynamic_obstacles', False) or _env_bool('USE_DYNAMIC_OBSTACLES', False)),
+            'random_terrain': bool(getattr(args, 'random_terrain', False) or _env_bool('RANDOM_TERRAIN', False)),
+            'semi_random_terrain': bool(semi_random_enabled),
+            'deterministic_env_sequence': bool(getattr(args, 'deterministic_train_env_sequence', False) or _env_bool('DETERMINISTIC_TRAIN_ENV_SEQUENCE', False)),
+            'terrain_seed': int(configured_terrain_seed),
+            'terrain_base_seed': int(terrain_base_seed),
+            'training_env_sequence_seed': int(training_env_sequence_seed),
+            'peak_jitter_range': _env_float('PEAK_JITTER_RANGE', getattr(args, 'peak_jitter_range', 0.0) or 0.0),
+            'peak_center_jitter_range': _env_float('PEAK_CENTER_JITTER_RANGE', getattr(args, 'peak_center_jitter_range', 0.0) or 0.0),
+            'peak_height_jitter_ratio_min': _env_float('PEAK_HEIGHT_JITTER_RATIO_MIN', getattr(args, 'peak_height_jitter_ratio_min', 0.0) or 0.0),
+            'peak_height_jitter_ratio_max': _env_float('PEAK_HEIGHT_JITTER_RATIO_MAX', getattr(args, 'peak_height_jitter_ratio_max', 0.0) or 0.0),
+            'peak_height_max_scale': _env_float('PEAK_HEIGHT_MAX_SCALE', getattr(args, 'peak_height_max_scale', 1.0) or 1.0),
+            'terrain_variant_noise_ratio': _env_float('TERRAIN_VARIANT_NOISE_RATIO', getattr(args, 'terrain_variant_noise_ratio', 0.0) or 0.0),
+            'semi_random_hold_mode': str(getattr(args, 'semi_random_hold_mode', os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', 'episode'))),
+            'semi_random_hold_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', getattr(args, 'semi_random_hold_episodes', 1) or 1),
+            'semi_random_hold_min_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', getattr(args, 'semi_random_hold_min_episodes', 1) or 1),
+            'semi_random_hold_max_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', getattr(args, 'semi_random_hold_max_episodes', 1) or 1),
+        }
+        return config
+
+    def _capture_training_hyperparameters_config():
+        algo_name = str(getattr(args, "algo", "") or "").strip().lower()
+        if algo_name == "matd3":
+            use_dual_q = bool(getattr(args, "matd3_use_dual_q", True))
+            use_separated_gradient = bool(getattr(args, "matd3_use_separated_gradient", True))
+            use_hybrid_actor_objective = bool(getattr(args, "matd3_use_hybrid_actor_objective", False))
+            hybrid_actor_alpha = float(getattr(args, "matd3_hybrid_actor_alpha", 0.80) or 0.80)
+        elif algo_name == "maddpg":
+            use_dual_q = bool(getattr(args, "maddpg_use_dual_q", False))
+            use_separated_gradient = bool(getattr(args, "maddpg_use_separated_gradient", True))
+            use_hybrid_actor_objective = False
+            hybrid_actor_alpha = 0.0
+        else:
+            use_dual_q = False
+            use_separated_gradient = False
+            use_hybrid_actor_objective = False
+            hybrid_actor_alpha = 0.0
+
+        if not use_dual_q:
+            actor_objective_mode = "single_q_joint"
+        elif use_separated_gradient:
+            actor_objective_mode = "hybrid" if use_hybrid_actor_objective else "separated"
+        else:
+            actor_objective_mode = "unified"
+
+        return {
+            "replay_buffer_size": int(getattr(args, "buffer_size", 0) or 0),
+            "action_force_ratio": float(getattr(args, "action_force_ratio", 0.0) or 0.0),
+            "action_force_ratio_schedule_pct": str(getattr(args, "action_force_ratio_schedule_pct", "") or ""),
+            "actor_objective_mode": str(actor_objective_mode),
+            "use_dual_q": bool(use_dual_q),
+            "use_separated_gradient": bool(use_separated_gradient),
+            "use_hybrid_actor_objective": bool(use_hybrid_actor_objective),
+            "hybrid_actor_alpha": float(np.clip(hybrid_actor_alpha, 0.0, 1.0)),
+        }
+
+    args.training_environment_config = _capture_training_environment_config()
+    args.training_hyperparameters_config = _capture_training_hyperparameters_config()
 
     # 运行目录：为每次训练创建独立的时间戳目录，避免与历史运行混淆
     try:
@@ -15079,7 +15683,14 @@ def train(args):
     except Exception:
         enable_prerandom_best = True
     pre_random_best_saved = False
-    # 随机地形阶段课程化：累计成功计数，达到阈值则提升地形复杂度
+    # 显式随机地形下，可选地按成功次数自动提升复杂度。
+    # 该逻辑服务于环境课程/测试，不应默认污染算法消融实验。
+    try:
+        enable_random_terrain_complexity_progression = os.getenv(
+            'ENABLE_RANDOM_TERRAIN_COMPLEXITY_PROGRESSION', '1'
+        ).lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        enable_random_terrain_complexity_progression = True
     try:
         complexity_step_successes = int(os.getenv('COMPLEXITY_STEP_SUCCESSES', '5'))
     except Exception:
@@ -15775,7 +16386,7 @@ def train(args):
         random_mode_active = random_terrain_mode_active
 
         # 在每个回合开始时，如果用户显式启用了随机地形，则设置新的随机种子
-        if random_terrain_mode_active:
+        if random_terrain_mode_active and not bool(getattr(args, 'semi_random_terrain', False)) and not bool(getattr(args, 'deterministic_train_env_sequence', False)):
             args.terrain_seed = np.random.randint(0, 100000)
             if not quiet_output:
                 tqdm.write(f"🗺️ 新随机地形种子: {args.terrain_seed}", file=tqdm_file)
@@ -17783,7 +18394,10 @@ def train(args):
                 else:
                     # 对于ParallelEnv或本地收集失败，使用环境快照获取
                     try:
-                        best_trajectory_time_major = _snapshot_env_trajectory(env, env_idx=0)
+                        best_trajectory_time_major = _snapshot_env_trajectory(
+                            env,
+                            env_idx=best_env_idx_this_ep if 'best_env_idx_this_ep' in locals() else 0,
+                        )
                         if not quiet_output and best_trajectory_time_major:
                             print(f"[DEBUG] 从环境快照获取最佳轨迹，步数: {len(best_trajectory_time_major)}")
                     except Exception as e:
@@ -17798,7 +18412,7 @@ def train(args):
                         print(f"[DEBUG] 保存最佳回合Actor输出历史数据（独立保存），步数: {len(best_actor_outputs_history)}")
             # 快照该回合的可视化上下文（地形/障碍/目标），供最优回合绘图使用
             try:
-                def _snapshot_vis_context(_env):
+                def _snapshot_vis_context(_env, env_idx=0):
                     ctx = {}
                     try:
                         import numpy as _np
@@ -17807,7 +18421,7 @@ def train(args):
                         if hasattr(_env, 'get_vis_bundle'):
                             try:
                                 # print(f"[DEBUG] _snapshot_vis_context: 调用 get_vis_bundle(0)")
-                                _vb = _env.get_vis_bundle(0)
+                                _vb = _env.get_vis_bundle(env_idx)
                                 # print(f"[DEBUG] _snapshot_vis_context: get_vis_bundle 返回类型: {type(_vb)}")
                                 if not isinstance(_vb, dict):
                                     print(f"[WARN] _snapshot_vis_context: get_vis_bundle返回非字典类型: {type(_vb)}")
@@ -17832,12 +18446,16 @@ def train(args):
                             ctx['terrain_source'] = _vb.get('terrain_source', 'unknown')
                             ctx['scenario_seed'] = _vb.get('scenario_seed', None)
                             ctx['world_seed'] = _vb.get('world_seed', None)
+                            ctx['terrain_variant_seed'] = _vb.get('terrain_variant_seed', None)
+                            ctx['terrain_params'] = _vb.get('terrain_params', {}) or {}
+                            ctx['base_mountain_centers'] = _vb.get('base_mountain_centers', []) or []
+                            ctx['actual_mountain_centers'] = _vb.get('actual_mountain_centers', []) or []
                             ctx['episode'] = episode + 1  # 记录回合信息
                         else:
                             # 回退：分别从接口获取（可能存在跨调用状态漂移，仅作为兜底）
                             if hasattr(_env, 'get_terrain_data'):
                                 try:
-                                    _tinfo = _env.get_terrain_data(0)
+                                    _tinfo = _env.get_terrain_data(env_idx)
                                     if isinstance(_tinfo, dict):
                                         if _tinfo.get('terrain') is not None:
                                             ctx['terrain'] = _np.array(_tinfo['terrain'], dtype=_np.float32).copy()
@@ -17847,7 +18465,7 @@ def train(args):
                                     print(f"[WARN] _snapshot_vis_context: get_terrain_data调用异常: {e}")
                             if hasattr(_env, 'get_goal_positions'):
                                 try:
-                                    _gp = _env.get_goal_positions(0)
+                                    _gp = _env.get_goal_positions(env_idx)
                                     if isinstance(_gp, dict):
                                         ctx['goal_pos'] = _gp.get('goal_pos', None)
                                         ctx['agent_goals'] = _gp.get('agent_goals', []) or []
@@ -17885,6 +18503,10 @@ def train(args):
                             ctx.setdefault('scenario_name', getattr(args, 'scenario', None))
                             if 'terrain_seed' not in ctx:
                                 ctx['terrain_seed'] = getattr(args, 'terrain_seed', None)
+                            ctx.setdefault('terrain_variant_seed', getattr(scn, 'terrain_variant_seed', None))
+                            ctx.setdefault('terrain_params', dict(getattr(scn, 'terrain_params', {}) or {}))
+                            ctx.setdefault('base_mountain_centers', list(getattr(scn, 'base_mountain_centers', []) or []))
+                            ctx.setdefault('actual_mountain_centers', list(getattr(scn, 'actual_mountain_centers', []) or []))
                             ctx['random_terrain'] = bool(getattr(args, 'random_terrain', False))
                             ctx['use_fixed_positions'] = bool(getattr(args, 'use_fixed_positions', False))
                             ctx['positions_file'] = getattr(args, 'positions_file', None)
@@ -17913,7 +18535,10 @@ def train(args):
                     except Exception:
                         pass
                     return ctx
-                best_vis_context = _snapshot_vis_context(env)
+                best_vis_context = _snapshot_vis_context(
+                    env,
+                    env_idx=best_env_idx_this_ep if 'best_env_idx_this_ep' in locals() else 0,
+                )
                 # 添加调试信息（始终输出，不受安静模式影响）
                 if isinstance(best_vis_context, dict):
                     terrain_shape = best_vis_context.get('terrain').shape if best_vis_context.get('terrain') is not None else None
@@ -17993,6 +18618,11 @@ def train(args):
                     'terrain_source': _vb.get('terrain_source', 'unknown') if isinstance(_vb, dict) else 'unknown',
                     'scenario_seed': _vb.get('scenario_seed', None) if isinstance(_vb, dict) else None,
                     'world_seed': _vb.get('world_seed', None) if isinstance(_vb, dict) else None,
+                    'terrain_seed': _vb.get('terrain_seed', _vb.get('seed')) if isinstance(_vb, dict) else None,
+                    'terrain_variant_seed': _vb.get('terrain_variant_seed', None) if isinstance(_vb, dict) else None,
+                    'terrain_params': _vb.get('terrain_params', {}) if isinstance(_vb, dict) else {},
+                    'base_mountain_centers': _vb.get('base_mountain_centers', []) if isinstance(_vb, dict) else [],
+                    'actual_mountain_centers': _vb.get('actual_mountain_centers', []) if isinstance(_vb, dict) else [],
                     'episode': episode + 1  # 记录回合信息
                 }
                 # 场景补全（仅在缺失时）
@@ -18019,6 +18649,10 @@ def train(args):
                             else:
                                 ags.append(None)
                         last_vis_context['agent_goals'] = ags
+                    last_vis_context.setdefault('terrain_variant_seed', getattr(scn, 'terrain_variant_seed', None))
+                    last_vis_context.setdefault('terrain_params', dict(getattr(scn, 'terrain_params', {}) or {}))
+                    last_vis_context.setdefault('base_mountain_centers', list(getattr(scn, 'base_mountain_centers', []) or []))
+                    last_vis_context.setdefault('actual_mountain_centers', list(getattr(scn, 'actual_mountain_centers', []) or []))
         except Exception:
             pass
         
@@ -18155,6 +18789,11 @@ def train(args):
                         'terrain_source': vb.get('terrain_source', 'unknown') if isinstance(vb, dict) else 'unknown',
                         'scenario_seed': vb.get('scenario_seed', None) if isinstance(vb, dict) else None,
                         'world_seed': vb.get('world_seed', None) if isinstance(vb, dict) else None,
+                        'terrain_seed': vb.get('terrain_seed', vb.get('seed')) if isinstance(vb, dict) else None,
+                        'terrain_variant_seed': vb.get('terrain_variant_seed', None) if isinstance(vb, dict) else None,
+                        'terrain_params': vb.get('terrain_params', {}) if isinstance(vb, dict) else {},
+                        'base_mountain_centers': vb.get('base_mountain_centers', []) if isinstance(vb, dict) else [],
+                        'actual_mountain_centers': vb.get('actual_mountain_centers', []) if isinstance(vb, dict) else [],
                         'episode': 1
                     }
                     # 场景补全（与 last_* 补全逻辑一致）
@@ -18181,6 +18820,10 @@ def train(args):
                                 else:
                                     ags.append(None)
                             first_vis_context['agent_goals'] = ags
+                        first_vis_context.setdefault('terrain_variant_seed', getattr(scn, 'terrain_variant_seed', None))
+                        first_vis_context.setdefault('terrain_params', dict(getattr(scn, 'terrain_params', {}) or {}))
+                        first_vis_context.setdefault('base_mountain_centers', list(getattr(scn, 'base_mountain_centers', []) or []))
+                        first_vis_context.setdefault('actual_mountain_centers', list(getattr(scn, 'actual_mountain_centers', []) or []))
             except Exception:
                 first_vis_context = None
 
@@ -18235,10 +18878,16 @@ def train(args):
                     file=tqdm_file
                 )
             elif debug_episode_summary:
-                tqdm.write(
-                    f"[随机地图] {_format_unlock_mode_desc()} | 成功计数(非连续)={random_success_counter}/{complexity_step_successes}",
-                    file=tqdm_file
-                )
+                if enable_random_terrain_complexity_progression:
+                    tqdm.write(
+                        f"[随机地图] {_format_unlock_mode_desc()} | 成功计数(非连续)={random_success_counter}/{complexity_step_successes}",
+                        file=tqdm_file
+                    )
+                else:
+                    tqdm.write(
+                        f"[随机地图] {_format_unlock_mode_desc()} | 自动升复杂度=关闭",
+                        file=tqdm_file
+                    )
         except Exception:
             pass
 
@@ -18327,7 +18976,12 @@ def train(args):
                 'terrain': np.array(vb_last['terrain'], dtype=np.float32).copy() if isinstance(vb_last, dict) and vb_last.get('terrain') is not None else None,
                 'obstacles': (vb_last.get('obstacles', []) if isinstance(vb_last, dict) else []) or (list(getattr(scn, 'obstacles', [])) if scn is not None and hasattr(scn, 'obstacles') else []),
                 'agent_goals': vb_last.get('agent_goals', []) if isinstance(vb_last, dict) and vb_last.get('agent_goals') is not None else [],
-                'map_size': int(vb_last.get('map_size')) if isinstance(vb_last, dict) and vb_last.get('map_size') is not None else (int(getattr(scn, 'map_size', 200)) if scn is not None else 200)
+                'map_size': int(vb_last.get('map_size')) if isinstance(vb_last, dict) and vb_last.get('map_size') is not None else (int(getattr(scn, 'map_size', 200)) if scn is not None else 200),
+                'terrain_seed': vb_last.get('terrain_seed', vb_last.get('seed')) if isinstance(vb_last, dict) else None,
+                'terrain_variant_seed': vb_last.get('terrain_variant_seed', None) if isinstance(vb_last, dict) else None,
+                'terrain_params': vb_last.get('terrain_params', {}) if isinstance(vb_last, dict) else {},
+                'base_mountain_centers': vb_last.get('base_mountain_centers', []) if isinstance(vb_last, dict) else [],
+                'actual_mountain_centers': vb_last.get('actual_mountain_centers', []) if isinstance(vb_last, dict) else [],
             }
             # 更新agent_goals
             if scn is not None and hasattr(scn, 'agents'):
@@ -18393,6 +19047,11 @@ def train(args):
                         'terrain_source': current_vis_bundle.get('terrain_source', 'unknown'),
                         'scenario_seed': current_vis_bundle.get('scenario_seed', None),
                         'world_seed': current_vis_bundle.get('world_seed', None),
+                        'terrain_seed': current_vis_bundle.get('terrain_seed', current_vis_bundle.get('seed')),
+                        'terrain_variant_seed': current_vis_bundle.get('terrain_variant_seed', None),
+                        'terrain_params': current_vis_bundle.get('terrain_params', {}) or {},
+                        'base_mountain_centers': current_vis_bundle.get('base_mountain_centers', []) or [],
+                        'actual_mountain_centers': current_vis_bundle.get('actual_mountain_centers', []) or [],
                         'episode': current_vis_bundle.get('episode', 'unknown')
                     }
                     # print(f"[DEBUG] 获取可视化数据: 更新 last_vis_context, terrain_source={current_vis_bundle.get('terrain_source', 'unknown')}")
@@ -18654,41 +19313,42 @@ def train(args):
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
                 print(f"最佳回合轨迹图已保存到: {img_path}")
         elif random_mode_active:
-            # 已在随机地形：统计"非连续成功"(到达且未碰撞) 次数，达阈值则提升复杂度（最高4）
-            try:
-                # 统一复用 [成功记录] 的团队成功标志，避免重复计算导致口径偏差
-                current_ep_success = bool(maddpg._episode_success_flags[-1]) if getattr(maddpg, '_episode_success_flags', None) else False
-                if current_ep_success:
-                    random_success_counter += 1
-                    if (random_success_counter >= complexity_step_successes) and hasattr(args, 'terrain_complexity_level'):
-                        new_level = int(getattr(args, 'terrain_complexity_level', 1)) + 1
-                        if new_level > 4:
-                            new_level = 4
-                        if new_level != getattr(args, 'terrain_complexity_level', 1):
-                            setattr(args, 'terrain_complexity_level', new_level)
-                            random_success_counter = 0
-                            if not quiet_output:
-                                tqdm.write(f"📈 随机地形成绩达标，提升地形复杂度到 {new_level}", file=tqdm_file)
-                            # 重建环境以应用新复杂度
-                            try:
-                                if hasattr(env, 'close'):
-                                    env.close()
-                                if args.num_envs > 1:
-                                    env_fns = [functools.partial(make_env_init, i, vars(args)) for i in range(args.num_envs)]
-                                    env = ParallelEnv(env_fns)
-                                else:
-                                    env = SingleEnvWrapper(make_env_init(0, vars(args)))
-                                obs_n = env.reset()
-                                if hasattr(maddpg.obs_processor, 'batch_process_observations_vectorized'):
-                                    processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
-                                else:
-                                    processed_obs = maddpg.obs_processor.batch_process_observations_parallel(obs_n)
-                                maddpg.reset_hidden_states(batch_size=args.num_envs)
-                            except Exception as e:
-                                tqdm.write(f"[WARN] 提升复杂度后重建环境失败: {e}", file=tqdm_file)
-                # 未超过阈值则不变
-            except Exception:
-                pass
+            # 已在随机地形：可选地统计"非连续成功"(到达且未碰撞) 次数，达阈值则提升复杂度（最高4）
+            if enable_random_terrain_complexity_progression:
+                try:
+                    # 统一复用 [成功记录] 的团队成功标志，避免重复计算导致口径偏差
+                    current_ep_success = bool(maddpg._episode_success_flags[-1]) if getattr(maddpg, '_episode_success_flags', None) else False
+                    if current_ep_success:
+                        random_success_counter += 1
+                        if (random_success_counter >= complexity_step_successes) and hasattr(args, 'terrain_complexity_level'):
+                            new_level = int(getattr(args, 'terrain_complexity_level', 1)) + 1
+                            if new_level > 4:
+                                new_level = 4
+                            if new_level != getattr(args, 'terrain_complexity_level', 1):
+                                setattr(args, 'terrain_complexity_level', new_level)
+                                random_success_counter = 0
+                                if not quiet_output:
+                                    tqdm.write(f"📈 随机地形成绩达标，提升地形复杂度到 {new_level}", file=tqdm_file)
+                                # 重建环境以应用新复杂度
+                                try:
+                                    if hasattr(env, 'close'):
+                                        env.close()
+                                    if args.num_envs > 1:
+                                        env_fns = [functools.partial(make_env_init, i, vars(args)) for i in range(args.num_envs)]
+                                        env = ParallelEnv(env_fns)
+                                    else:
+                                        env = SingleEnvWrapper(make_env_init(0, vars(args)))
+                                    obs_n = env.reset()
+                                    if hasattr(maddpg.obs_processor, 'batch_process_observations_vectorized'):
+                                        processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
+                                    else:
+                                        processed_obs = maddpg.obs_processor.batch_process_observations_parallel(obs_n)
+                                    maddpg.reset_hidden_states(batch_size=args.num_envs)
+                                except Exception as e:
+                                    tqdm.write(f"[WARN] 提升复杂度后重建环境失败: {e}", file=tqdm_file)
+                    # 未超过阈值则不变
+                except Exception:
+                    pass
             # 如果最佳轨迹为空，尝试重新获取
             if enable_best_traj:
                 try:
@@ -18839,6 +19499,24 @@ def train(args):
     except Exception as e:
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
             print(f"最后一回合轨迹图保存失败: {e}")
+
+    terrain_snapshot_artifacts = {}
+    try:
+        snapshot_specs = (
+            ("best_episode", best_vis_context),
+            ("first_episode", first_vis_context),
+            ("last_episode", last_vis_context),
+        )
+        for prefix, vis_ctx in snapshot_specs:
+            if isinstance(vis_ctx, dict) and vis_ctx.get("terrain") is not None:
+                terrain_snapshot_artifacts[prefix] = _save_vis_context_snapshot_artifacts(
+                    run_dir,
+                    prefix,
+                    vis_ctx,
+                )
+    except Exception as e:
+        if not quiet_output:
+            print(f"[WARN] 地形快照保存失败: {e}")
 
     # 绘制奖励曲线图（包含碰撞次数和min_distance_to_obstacle）
     if episode_rewards is not None and len(episode_rewards) > 0:
@@ -19466,6 +20144,7 @@ def train(args):
         maddpg._best_team_sr_reward = (
             float(best_team_sr_reward) if np.isfinite(best_team_sr_reward) else None
         )
+        maddpg._terrain_snapshot_artifacts = terrain_snapshot_artifacts if isinstance(terrain_snapshot_artifacts, dict) else {}
     except Exception:
         pass
 
@@ -19559,6 +20238,18 @@ def parse_args():
         help="MATD3是否使用分离式梯度（默认来自MATD3_USE_SEPARATED_GRADIENT）"
     )
     parser.add_argument(
+        "--matd3-use-hybrid-actor-objective",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('MATD3_USE_HYBRID_ACTOR_OBJECTIVE', '0')).lower() in ('true', '1', 'yes', 'on'),
+        help="MATD3是否在 separated actor objective 上混入 unified actor objective（默认来自MATD3_USE_HYBRID_ACTOR_OBJECTIVE）"
+    )
+    parser.add_argument(
+        "--matd3-hybrid-actor-alpha",
+        type=float,
+        default=float(os.getenv('MATD3_HYBRID_ACTOR_ALPHA', '0.80')),
+        help="Hybrid actor objective 中 separated loss 的权重 alpha（默认来自MATD3_HYBRID_ACTOR_ALPHA）"
+    )
+    parser.add_argument(
         "--maddpg-use-dual-q",
         type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
         default=str(os.getenv('MADDPG_USE_DUAL_Q', '0')).lower() in ('true', '1', 'yes', 'on'),
@@ -19597,6 +20288,24 @@ def parse_args():
     parser.add_argument("--random-z0-positions", action="store_true", help="随机初始化智能体位置并保持在地形上方")
     parser.add_argument("--dynamic-first-time", action="store_true", help="动态首次运行")
     parser.add_argument("--random-terrain", action="store_true", help="使用随机地形")
+    parser.add_argument("--semi-random-terrain", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+                       default=None, help="是否启用同源半随机地形")
+    parser.add_argument("--terrain-base-seed", type=int, default=None, help="半随机地形基准seed")
+    parser.add_argument("--deterministic-train-env-sequence", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+                       default=None, help="训练环境是否按 episode_idx 确定性生成")
+    parser.add_argument("--training-env-sequence-seed", type=int, default=None, help="训练环境公共序列seed")
+    parser.add_argument("--peak-jitter-range", type=float, default=None, help="半随机地形峰位扰动范围")
+    parser.add_argument("--peak-center-jitter-range", type=float, default=None, help="半随机地形峰中心局部扰动范围")
+    parser.add_argument("--peak-height-jitter-ratio-min", type=float, default=None, help="半随机地形峰高扰动最小比例")
+    parser.add_argument("--peak-height-jitter-ratio-max", type=float, default=None, help="半随机地形峰高扰动最大比例")
+    parser.add_argument("--peak-height-max-scale", type=float, default=None, help="半随机地形峰高相对基准最高峰上限倍率")
+    parser.add_argument("--terrain-variant-noise-ratio", type=float, default=None, help="半随机同源变体附加噪声比例")
+    parser.add_argument("--semi-random-hold-mode", type=str, default=None, help="半随机地形保持模式: episode/fixed/range")
+    parser.add_argument("--semi-random-hold-episodes", type=int, default=None, help="半随机固定保持回合数")
+    parser.add_argument("--semi-random-hold-min-episodes", type=int, default=None, help="半随机范围保持最小回合数")
+    parser.add_argument("--semi-random-hold-max-episodes", type=int, default=None, help="半随机范围保持最大回合数")
+    parser.add_argument("--use-dynamic-obstacles", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+                       default=None, help="是否启用动态随机障碍物")
     parser.add_argument("--terrain-complexity-level", type=int, default=3, choices=[1, 2, 3, 4], help="地形复杂度等级 (1-4)")
     parser.add_argument("--map-size", type=float, default=float(os.getenv('MAP_SIZE', '200')), help="地图尺寸（边长），用于观察与势场缩放")
     parser.add_argument("--save-positions", action="store_true", help="是否保存位置到文件")
@@ -19836,11 +20545,49 @@ if __name__ == "__main__":
         best_ep_idx = rewards.index(max(rewards))
         last_ep_idx = len(rewards) - 1  # 最后回合的索引
         results_args = dict(vars(args))
+        training_environment = dict(getattr(args, "training_environment_config", {}) or {})
+        training_hyperparameters = dict(getattr(args, "training_hyperparameters_config", {}) or {})
+        if not training_hyperparameters:
+            training_hyperparameters = _capture_training_hyperparameters_config()
+        if not training_environment:
+            training_environment = {
+                "schema_version": 1,
+                "source": "results_fallback",
+                "use_fixed_positions": bool(getattr(args, "use_fixed_positions", False)),
+                "use_dynamic_obstacles": bool(getattr(args, "use_dynamic_obstacles", False) or os.getenv('USE_DYNAMIC_OBSTACLES', '0').lower() in ('1', 'true', 'yes', 'on')),
+                "random_terrain": bool(getattr(args, "random_terrain", False) or os.getenv('RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')),
+                "semi_random_terrain": bool(getattr(args, "semi_random_terrain", False) or os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')),
+                "deterministic_env_sequence": bool(getattr(args, "deterministic_train_env_sequence", False) or os.getenv('DETERMINISTIC_TRAIN_ENV_SEQUENCE', '0').lower() in ('1', 'true', 'yes', 'on')),
+                "terrain_seed": int(os.getenv('SCENARIO_SEED', str(getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67)))),
+                "terrain_base_seed": int(os.getenv('TERRAIN_BASE_SEED', str(getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67)))),
+                "training_env_sequence_seed": int(os.getenv('TRAIN_ENV_SEQUENCE_SEED', str(getattr(args, 'training_env_sequence_seed', getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67))))),
+                "peak_jitter_range": float(os.getenv('PEAK_JITTER_RANGE', str(getattr(args, 'peak_jitter_range', 0.0) or 0.0))),
+                "peak_center_jitter_range": float(os.getenv('PEAK_CENTER_JITTER_RANGE', str(getattr(args, 'peak_center_jitter_range', 0.0) or 0.0))),
+                "peak_height_jitter_ratio_min": float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', str(getattr(args, 'peak_height_jitter_ratio_min', 0.0) or 0.0))),
+                "peak_height_jitter_ratio_max": float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', str(getattr(args, 'peak_height_jitter_ratio_max', 0.0) or 0.0))),
+                "peak_height_max_scale": float(os.getenv('PEAK_HEIGHT_MAX_SCALE', str(getattr(args, 'peak_height_max_scale', 1.0) or 1.0))),
+                "terrain_variant_noise_ratio": float(os.getenv('TERRAIN_VARIANT_NOISE_RATIO', str(getattr(args, 'terrain_variant_noise_ratio', 0.0) or 0.0))),
+                "semi_random_hold_mode": str(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', str(getattr(args, 'semi_random_hold_mode', 'episode')))),
+                "semi_random_hold_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', str(getattr(args, 'semi_random_hold_episodes', 1) or 1))),
+                "semi_random_hold_min_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', str(getattr(args, 'semi_random_hold_min_episodes', 1) or 1))),
+                "semi_random_hold_max_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', str(getattr(args, 'semi_random_hold_max_episodes', 1) or 1))),
+            }
         runtime_fallbacks = (
             ("simulation_dt", "SIMULATION_DT", float),
             ("z_action_bias", "Z_ACTION_BIAS", float),
             ("quadrotor_attitude_response_time", "QUADROTOR_ATTITUDE_RESPONSE_TIME", float),
             ("quadrotor_psi_cmd", "QUADROTOR_PSI_CMD", float),
+            ("terrain_base_seed", "TERRAIN_BASE_SEED", int),
+            ("peak_jitter_range", "PEAK_JITTER_RANGE", float),
+            ("peak_center_jitter_range", "PEAK_CENTER_JITTER_RANGE", float),
+            ("peak_height_jitter_ratio_min", "PEAK_HEIGHT_JITTER_RATIO_MIN", float),
+            ("peak_height_jitter_ratio_max", "PEAK_HEIGHT_JITTER_RATIO_MAX", float),
+            ("peak_height_max_scale", "PEAK_HEIGHT_MAX_SCALE", float),
+            ("terrain_variant_noise_ratio", "TERRAIN_VARIANT_NOISE_RATIO", float),
+            ("training_env_sequence_seed", "TRAIN_ENV_SEQUENCE_SEED", int),
+            ("semi_random_hold_episodes", "SEMI_RANDOM_TERRAIN_HOLD_EPISODES", int),
+            ("semi_random_hold_min_episodes", "SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES", int),
+            ("semi_random_hold_max_episodes", "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES", int),
         )
         for arg_name, env_name, caster in runtime_fallbacks:
             if results_args.get(arg_name) is not None:
@@ -19852,6 +20599,59 @@ if __name__ == "__main__":
                 results_args[arg_name] = caster(env_value)
             except Exception:
                 results_args[arg_name] = env_value
+        results_args["deterministic_train_env_sequence"] = bool(
+            getattr(args, "deterministic_train_env_sequence", False)
+            or os.getenv('DETERMINISTIC_TRAIN_ENV_SEQUENCE', '0').lower() in ('1', 'true', 'yes', 'on')
+        )
+        results_args["semi_random_terrain"] = bool(
+            getattr(args, "semi_random_terrain", False)
+            or os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')
+        )
+        results_args["use_dynamic_obstacles"] = bool(
+            getattr(args, "use_dynamic_obstacles", False)
+            or os.getenv('USE_DYNAMIC_OBSTACLES', '0').lower() in ('1', 'true', 'yes', 'on')
+        )
+        if results_args.get("terrain_base_seed") is None:
+            try:
+                results_args["terrain_base_seed"] = int(
+                    getattr(args, "terrain_base_seed", None)
+                    or os.getenv('TERRAIN_BASE_SEED', '').strip()
+                    or getattr(args, "terrain_seed", 67)
+                )
+            except Exception:
+                pass
+        if results_args.get("training_env_sequence_seed") is None:
+            try:
+                results_args["training_env_sequence_seed"] = int(
+                    getattr(args, "training_env_sequence_seed", None)
+                    or os.getenv('TRAIN_ENV_SEQUENCE_SEED', '').strip()
+                    or results_args.get("terrain_base_seed")
+                    or getattr(args, "terrain_seed", 67)
+                )
+            except Exception:
+                pass
+        results_args["terrain_seed"] = int(training_environment.get("terrain_seed", results_args.get("terrain_seed", 67) or 67))
+        results_args["terrain_base_seed"] = int(training_environment.get("terrain_base_seed", results_args.get("terrain_base_seed", results_args["terrain_seed"])))
+        results_args["training_env_sequence_seed"] = int(training_environment.get("training_env_sequence_seed", results_args.get("training_env_sequence_seed", results_args["terrain_base_seed"])))
+        results_args["semi_random_terrain"] = bool(training_environment.get("semi_random_terrain", results_args.get("semi_random_terrain", False)))
+        results_args["deterministic_train_env_sequence"] = bool(training_environment.get("deterministic_env_sequence", results_args.get("deterministic_train_env_sequence", False)))
+        results_args["random_terrain"] = bool(training_environment.get("random_terrain", results_args.get("random_terrain", False)))
+        results_args["use_dynamic_obstacles"] = bool(training_environment.get("use_dynamic_obstacles", results_args.get("use_dynamic_obstacles", False)))
+        if training_environment.get("semi_random_hold_mode") is not None:
+            results_args["semi_random_hold_mode"] = str(training_environment.get("semi_random_hold_mode"))
+        for key in (
+            "peak_jitter_range",
+            "peak_center_jitter_range",
+            "peak_height_jitter_ratio_min",
+            "peak_height_jitter_ratio_max",
+            "peak_height_max_scale",
+            "terrain_variant_noise_ratio",
+            "semi_random_hold_episodes",
+            "semi_random_hold_min_episodes",
+            "semi_random_hold_max_episodes",
+        ):
+            if training_environment.get(key) is not None:
+                results_args[key] = training_environment.get(key)
         results_args["use_quadrotor_dynamics"] = os.getenv('USE_QUADROTOR_DYNAMICS', '0').lower() in ('1', 'true', 'yes', 'on')
 
         results = {
@@ -19859,6 +20659,9 @@ if __name__ == "__main__":
             'rewards': rewards,
             'best_reward': max(rewards),
             'best_episode': best_ep_idx,
+            'replay_buffer_size': int(training_hyperparameters.get('replay_buffer_size', getattr(args, 'buffer_size', 0) or 0)),
+            'actor_objective_mode': str(training_hyperparameters.get('actor_objective_mode', '')),
+            'hybrid_actor_alpha': float(training_hyperparameters.get('hybrid_actor_alpha', 0.0) or 0.0),
             'best_episode_force_ratio': episode_force_ratios[best_ep_idx] if best_ep_idx < len(episode_force_ratios) else getattr(args, 'action_force_ratio', 0.0),  # 🔧 新增：记录最佳回合的FR值
             'last_episode_force_ratio': episode_force_ratios[last_ep_idx] if last_ep_idx < len(episode_force_ratios) else getattr(args, 'action_force_ratio', 0.0),  # 🔧 新增：记录最后回合的FR值
             'team_success_rate': float(getattr(maddpg, '_final_team_success_rate', 0.0)),
@@ -19866,6 +20669,10 @@ if __name__ == "__main__":
             'best_team_sr_episode': int(getattr(maddpg, '_best_team_sr_episode', -1)),
             'best_team_sr_force_ratio': float(getattr(maddpg, '_best_team_sr_force_ratio', 0.0)),
             'best_team_sr_reward': getattr(maddpg, '_best_team_sr_reward', None),
+            'terrain_snapshot_artifacts': getattr(maddpg, '_terrain_snapshot_artifacts', {}),
+            'training_environment_schema_version': int(training_environment.get('schema_version', 1)),
+            'training_environment': training_environment,
+            'training_hyperparameters': training_hyperparameters,
             'args': results_args
         }
         

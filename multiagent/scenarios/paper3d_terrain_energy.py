@@ -1,4 +1,5 @@
 # 创建multiagent/scenarios/paper3d_terrain.py文件
+import hashlib
 import json
 import numpy as np
 import random
@@ -119,8 +120,12 @@ class Scenario(BaseScenario):
         self.observation_dim = 81
         
         # 🔧 障碍物生成模式：从环境变量读取
+        use_dynamic_obstacles_kw = kwargs.get('use_dynamic_obstacles', None)
         try:
-            use_dynamic_obstacles = os.getenv('USE_DYNAMIC_OBSTACLES', '1').lower() in ('1', 'true', 'yes', 'on')
+            if use_dynamic_obstacles_kw is None:
+                use_dynamic_obstacles = os.getenv('USE_DYNAMIC_OBSTACLES', '1').lower() in ('1', 'true', 'yes', 'on')
+            else:
+                use_dynamic_obstacles = bool(use_dynamic_obstacles_kw)
         except Exception:
             use_dynamic_obstacles = True  # 默认启用动态障碍物
         self.use_dynamic_obstacles = use_dynamic_obstacles  # 是否每次reset时重新生成障碍物
@@ -132,19 +137,123 @@ class Scenario(BaseScenario):
         self.positions_initialized = False              # 标记是否已经初始化过位置
         self.random_z0_positions = random_z0_positions  # 是否随机化高度位置
         self.random_terrain = random_terrain            # 是否随机生成地形
+        semi_random_kw = kwargs.get('semi_random_terrain', None)
         try:
-            self.use_semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')
+            if semi_random_kw is None:
+                self.use_semi_random_terrain = os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')
+            else:
+                self.use_semi_random_terrain = bool(semi_random_kw)
         except Exception:
             self.use_semi_random_terrain = False
         try:
             default_base_seed = self.seed if self.seed is not None else 67
-            self.terrain_base_seed = int(os.getenv('TERRAIN_BASE_SEED', str(default_base_seed)))
+            terrain_base_seed_kw = kwargs.get('terrain_base_seed', None)
+            if terrain_base_seed_kw is None:
+                self.terrain_base_seed = int(os.getenv('TERRAIN_BASE_SEED', str(default_base_seed)))
+            else:
+                self.terrain_base_seed = int(terrain_base_seed_kw)
         except Exception:
             self.terrain_base_seed = int(self.seed if self.seed is not None else 67)
         try:
-            self.peak_jitter_range = float(os.getenv('PEAK_JITTER_RANGE', '15.0'))
+            peak_jitter_kw = kwargs.get('peak_jitter_range', None)
+            self.peak_jitter_range = float(os.getenv('PEAK_JITTER_RANGE', '15.0') if peak_jitter_kw is None else peak_jitter_kw)
         except Exception:
             self.peak_jitter_range = 15.0
+        try:
+            peak_center_jitter_kw = kwargs.get('peak_center_jitter_range', None)
+            self.peak_center_jitter_range = float(
+                os.getenv('PEAK_CENTER_JITTER_RANGE', str(min(float(self.peak_jitter_range), 3.0)))
+                if peak_center_jitter_kw is None else peak_center_jitter_kw
+            )
+        except Exception:
+            self.peak_center_jitter_range = float(min(float(self.peak_jitter_range), 3.0))
+        try:
+            peak_height_jitter_ratio_min_kw = kwargs.get('peak_height_jitter_ratio_min', None)
+            self.peak_height_jitter_ratio_min = float(
+                os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', '0.20')
+                if peak_height_jitter_ratio_min_kw is None else peak_height_jitter_ratio_min_kw
+            )
+        except Exception:
+            self.peak_height_jitter_ratio_min = 0.20
+        try:
+            peak_height_jitter_ratio_max_kw = kwargs.get('peak_height_jitter_ratio_max', None)
+            self.peak_height_jitter_ratio_max = float(
+                os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', '0.40')
+                if peak_height_jitter_ratio_max_kw is None else peak_height_jitter_ratio_max_kw
+            )
+        except Exception:
+            self.peak_height_jitter_ratio_max = 0.40
+        try:
+            peak_height_max_scale_kw = kwargs.get('peak_height_max_scale', None)
+            self.peak_height_max_scale = float(
+                os.getenv('PEAK_HEIGHT_MAX_SCALE', '1.30')
+                if peak_height_max_scale_kw is None else peak_height_max_scale_kw
+            )
+        except Exception:
+            self.peak_height_max_scale = 1.30
+        self.peak_height_jitter_ratio_min = max(0.0, float(self.peak_height_jitter_ratio_min))
+        self.peak_height_jitter_ratio_max = max(
+            float(self.peak_height_jitter_ratio_min),
+            float(self.peak_height_jitter_ratio_max),
+        )
+        self.peak_height_max_scale = max(1.0, float(self.peak_height_max_scale))
+        try:
+            terrain_variant_noise_ratio_kw = kwargs.get('terrain_variant_noise_ratio', None)
+            self.terrain_variant_noise_ratio = float(
+                os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15')
+                if terrain_variant_noise_ratio_kw is None else terrain_variant_noise_ratio_kw
+            )
+        except Exception:
+            self.terrain_variant_noise_ratio = 0.15
+        self.peak_center_jitter_range = max(0.0, float(self.peak_center_jitter_range))
+        self.terrain_variant_noise_ratio = max(0.0, float(self.terrain_variant_noise_ratio))
+        hold_mode_kw = kwargs.get('semi_random_hold_mode', None)
+        hold_mode_raw = str(
+            os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', 'episode')
+            if hold_mode_kw is None else hold_mode_kw
+        ).strip().lower()
+        if hold_mode_raw not in ('episode', 'fixed', 'range'):
+            hold_mode_raw = 'episode'
+        self.semi_random_hold_mode = hold_mode_raw
+        try:
+            hold_episodes_kw = kwargs.get('semi_random_hold_episodes', None)
+            self.semi_random_hold_episodes = max(
+                1,
+                int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', '1') if hold_episodes_kw is None else hold_episodes_kw),
+            )
+        except Exception:
+            self.semi_random_hold_episodes = 1
+        try:
+            hold_min_episodes_kw = kwargs.get('semi_random_hold_min_episodes', None)
+            self.semi_random_hold_min_episodes = max(
+                1,
+                int(
+                    os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', str(self.semi_random_hold_episodes))
+                    if hold_min_episodes_kw is None else hold_min_episodes_kw
+                ),
+            )
+        except Exception:
+            self.semi_random_hold_min_episodes = max(1, int(self.semi_random_hold_episodes))
+        try:
+            hold_max_episodes_kw = kwargs.get('semi_random_hold_max_episodes', None)
+            self.semi_random_hold_max_episodes = max(
+                self.semi_random_hold_min_episodes,
+                int(
+                    os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', str(self.semi_random_hold_min_episodes))
+                    if hold_max_episodes_kw is None else hold_max_episodes_kw
+                ),
+            )
+        except Exception:
+            self.semi_random_hold_max_episodes = max(1, int(self.semi_random_hold_min_episodes))
+        try:
+            self.terrain_variant_seed = int(
+                os.getenv(
+                    'TERRAIN_VARIANT_SEED',
+                    str(self.seed if self.seed is not None else self.terrain_base_seed),
+                )
+            )
+        except Exception:
+            self.terrain_variant_seed = int(self.seed if self.seed is not None else self.terrain_base_seed)
         try:
             self.curriculum_multi_terrain_enabled = os.getenv('CURRICULUM_MULTI_TERRAIN_MODE', '0').lower() in ('1', 'true', 'yes', 'on')
         except Exception:
@@ -156,10 +265,36 @@ class Scenario(BaseScenario):
             ]
         except Exception:
             self.curriculum_multi_terrain_seeds = []
+        try:
+            deterministic_train_env_sequence_kw = kwargs.get('deterministic_train_env_sequence', None)
+            if deterministic_train_env_sequence_kw is None:
+                self.deterministic_train_env_sequence = os.getenv('DETERMINISTIC_TRAIN_ENV_SEQUENCE', '0').lower() in ('1', 'true', 'yes', 'on')
+            else:
+                self.deterministic_train_env_sequence = bool(deterministic_train_env_sequence_kw)
+        except Exception:
+            self.deterministic_train_env_sequence = False
+        try:
+            training_env_sequence_seed_kw = kwargs.get('training_env_sequence_seed', None)
+            self.training_env_sequence_seed = int(
+                os.getenv(
+                    'TRAIN_ENV_SEQUENCE_SEED',
+                    str(self.terrain_base_seed),
+                ) if training_env_sequence_seed_kw is None else training_env_sequence_seed_kw
+            )
+        except Exception:
+            self.training_env_sequence_seed = int(self.terrain_base_seed)
+        self.current_episode_index = 0
+        self.current_episode_env_id = 0
+        self.current_episode_rng_seed = None
+        self.current_episode_obstacle_seed = None
         
         # 🔧 关键修复：跟踪当前地形种子，用于检测地形变化
         # 当地形种子变化时，重置位置初始化标记，使每个新地图都动态生成位置
         self.current_terrain_seed = self.seed  # 记录当前地形种子
+        self.current_terrain_variant_seed = self.terrain_variant_seed
+        self.current_terrain_hold_block_index = 0
+        self.current_terrain_hold_block_start_episode = 0
+        self.current_terrain_hold_block_length = 1
         
         # 固定位置文件
         self.fixed_positions_file = fixed_positions_file
@@ -298,6 +433,123 @@ class Scenario(BaseScenario):
             print(f"[复杂度设置] 噪声强度: {self.noise_amplitude}")
             print(f"[复杂度设置] 峡谷: {'是' if self.add_canyon else '否'}")
 
+    def _use_deterministic_train_env_sequence(self):
+        return bool(getattr(self, 'deterministic_train_env_sequence', False))
+
+    def _resolve_episode_context(self, world=None):
+        try:
+            episode_idx = int(
+                getattr(
+                    world,
+                    'episode_index',
+                    getattr(self, 'current_episode_index', 0),
+                )
+            )
+        except Exception:
+            episode_idx = int(getattr(self, 'current_episode_index', 0) or 0)
+        try:
+            env_id = int(
+                getattr(
+                    world,
+                    'env_id',
+                    getattr(self, 'current_episode_env_id', 0),
+                )
+            )
+        except Exception:
+            env_id = int(getattr(self, 'current_episode_env_id', 0) or 0)
+        return max(0, int(episode_idx)), max(0, int(env_id))
+
+    def _make_deterministic_episode_seed(self, namespace, episode_idx, env_id=0):
+        base_sequence_seed = int(
+            getattr(
+                self,
+                'training_env_sequence_seed',
+                getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67),
+            )
+        )
+        terrain_base_seed = int(getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67))
+        payload = (
+            f"{namespace}|seq={base_sequence_seed}|terrain={terrain_base_seed}|"
+            f"episode={int(episode_idx)}|env={int(env_id)}|"
+            f"complexity={int(getattr(self, 'terrain_complexity_level', 0))}|"
+            f"map={int(round(float(getattr(self, 'map_size', 0.0))))}"
+        )
+        digest = hashlib.blake2b(payload.encode('utf-8'), digest_size=8).digest()
+        seed = int.from_bytes(digest, 'little') % 2147483647
+        return int(seed if seed > 0 else 1)
+
+    def _make_hold_block_length(self, block_idx, env_id=0):
+        hold_mode = str(getattr(self, 'semi_random_hold_mode', 'episode')).strip().lower()
+        if hold_mode != 'range':
+            return max(1, int(getattr(self, 'semi_random_hold_episodes', 1) or 1))
+        min_len = max(1, int(getattr(self, 'semi_random_hold_min_episodes', 1) or 1))
+        max_len = max(min_len, int(getattr(self, 'semi_random_hold_max_episodes', min_len) or min_len))
+        span = max_len - min_len + 1
+        if span <= 1:
+            return int(min_len)
+        base_sequence_seed = int(
+            getattr(
+                self,
+                'training_env_sequence_seed',
+                getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67),
+            )
+        )
+        terrain_base_seed = int(getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67))
+        payload = (
+            f"semi_random_hold|seq={base_sequence_seed}|terrain={terrain_base_seed}|"
+            f"block={int(block_idx)}|env={int(env_id)}|"
+            f"complexity={int(getattr(self, 'terrain_complexity_level', 0))}|"
+            f"map={int(round(float(getattr(self, 'map_size', 0.0))))}"
+        )
+        digest = hashlib.blake2b(payload.encode('utf-8'), digest_size=8).digest()
+        offset = int.from_bytes(digest, 'little') % span
+        return int(min_len + offset)
+
+    def _resolve_semi_random_hold_context(self, episode_idx, env_id=0):
+        episode_idx = max(0, int(episode_idx))
+        env_id = max(0, int(env_id))
+        hold_mode = str(getattr(self, 'semi_random_hold_mode', 'episode')).strip().lower()
+        if hold_mode == 'fixed':
+            hold_length = max(1, int(getattr(self, 'semi_random_hold_episodes', 1) or 1))
+            block_idx = episode_idx // hold_length
+            block_start = block_idx * hold_length
+            return {
+                'mode': 'fixed',
+                'block_idx': int(block_idx),
+                'block_start_episode': int(block_start),
+                'block_length': int(hold_length),
+            }
+        if hold_mode == 'range':
+            block_idx = 0
+            block_start = 0
+            while True:
+                block_length = self._make_hold_block_length(block_idx, env_id)
+                block_end = block_start + block_length
+                if episode_idx < block_end:
+                    return {
+                        'mode': 'range',
+                        'block_idx': int(block_idx),
+                        'block_start_episode': int(block_start),
+                        'block_length': int(block_length),
+                    }
+                block_idx += 1
+                block_start = block_end
+        return {
+            'mode': 'episode',
+            'block_idx': int(episode_idx),
+            'block_start_episode': int(episode_idx),
+            'block_length': 1,
+        }
+
+    def _make_deterministic_terrain_variant_seed(self, episode_idx, env_id=0):
+        hold_ctx = self._resolve_semi_random_hold_context(episode_idx, env_id)
+        block_idx = int(hold_ctx.get('block_idx', max(0, int(episode_idx))))
+        seed = self._make_deterministic_episode_seed('terrain_variant', block_idx, env_id)
+        self.current_terrain_hold_block_index = block_idx
+        self.current_terrain_hold_block_start_episode = int(hold_ctx.get('block_start_episode', 0))
+        self.current_terrain_hold_block_length = int(hold_ctx.get('block_length', 1))
+        return int(seed)
+
     def _load_heldout_reference_layout(self):
         position_mode = os.getenv('HELDOUT_POSITION_MODE', '').strip().lower()
         if position_mode != 'same_region':
@@ -359,23 +611,41 @@ class Scenario(BaseScenario):
                 'source': 'heldout_reference_same_region',
             }
 
-        corner_choice = self.rng.randint(0, 4)  # 0=SW, 1=SE, 2=NW, 3=NE
+        use_semi_random = bool(
+            getattr(
+                self,
+                'use_semi_random_terrain',
+                os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on'),
+            )
+        )
+        if use_semi_random:
+            try:
+                base_seed = int(getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67))
+            except Exception:
+                base_seed = int(self.seed if self.seed is not None else 67)
+            start_area_rng = np.random.RandomState(base_seed + 911)
+            corner_choice = int(start_area_rng.randint(0, 4))
+            source_prefix = 'semi_random_base_corner'
+        else:
+            corner_choice = int(self.rng.randint(0, 4))  # 0=SW, 1=SE, 2=NW, 3=NE
+            source_prefix = 'random_corner'
+
         if corner_choice == 0:  # 西南角 (左下)
             start_area_x = (start_area_margin, start_area_margin + start_area_size)
             start_area_y = (start_area_margin, start_area_margin + start_area_size)
-            source = 'random_corner_sw'
+            source = f'{source_prefix}_sw'
         elif corner_choice == 1:  # 东南角 (右下)
             start_area_x = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
             start_area_y = (start_area_margin, start_area_margin + start_area_size)
-            source = 'random_corner_se'
+            source = f'{source_prefix}_se'
         elif corner_choice == 2:  # 西北角 (左上)
             start_area_x = (start_area_margin, start_area_margin + start_area_size)
             start_area_y = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
-            source = 'random_corner_nw'
+            source = f'{source_prefix}_nw'
         else:  # 东北角 (右上)
             start_area_x = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
             start_area_y = (map_size - start_area_margin - start_area_size, map_size - start_area_margin)
-            source = 'random_corner_ne'
+            source = f'{source_prefix}_ne'
 
         return start_area_x, start_area_y, {
             'size': start_area_size,
@@ -436,6 +706,40 @@ class Scenario(BaseScenario):
             os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on')))
         peak_jitter_range = float(getattr(self, 'peak_jitter_range',
             os.getenv('PEAK_JITTER_RANGE', '15.0')))  # 山峰位置波动范围（米）
+        peak_center_jitter_range = float(
+            getattr(
+                self,
+                'peak_center_jitter_range',
+                os.getenv('PEAK_CENTER_JITTER_RANGE', str(min(float(peak_jitter_range), 3.0))),
+            )
+        )
+        peak_height_jitter_ratio_min = float(
+            getattr(self, 'peak_height_jitter_ratio_min', os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', '0.20'))
+        )
+        peak_height_jitter_ratio_max = float(
+            getattr(self, 'peak_height_jitter_ratio_max', os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', '0.40'))
+        )
+        peak_height_max_scale = float(
+            getattr(self, 'peak_height_max_scale', os.getenv('PEAK_HEIGHT_MAX_SCALE', '1.30'))
+        )
+        peak_height_jitter_ratio_min = max(0.0, peak_height_jitter_ratio_min)
+        peak_height_jitter_ratio_max = max(peak_height_jitter_ratio_min, peak_height_jitter_ratio_max)
+        peak_height_max_scale = max(1.0, peak_height_max_scale)
+        peak_center_jitter_range = max(0.0, peak_center_jitter_range)
+        variant_noise_ratio = max(
+            0.0,
+            float(
+                getattr(self, 'terrain_variant_noise_ratio', os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15'))
+            ),
+        )
+        variant_seed = int(
+            getattr(
+                self,
+                'terrain_variant_seed',
+                self.seed if self.seed is not None else getattr(self, 'terrain_base_seed', 67),
+            )
+        )
+        variant_rng = np.random.RandomState(variant_seed)
 
         heldout_reference_layout = self._load_heldout_reference_layout()
         reserved_peak_regions = [
@@ -475,6 +779,21 @@ class Scenario(BaseScenario):
             return best
 
         peak_spacing_floor = max(18.0, float(min_distance) * 0.82)
+        configured_height_span = max(0.0, float(height_range[1]) - float(height_range[0]))
+
+        def _sample_local_peak_offset():
+            if peak_center_jitter_range <= 1e-6:
+                return 0.0, 0.0
+            offset_std = max(0.35, peak_center_jitter_range / 2.8)
+            for _ in range(16):
+                offset_x = float(variant_rng.normal(0.0, offset_std))
+                offset_y = float(variant_rng.normal(0.0, offset_std))
+                radius = float(np.hypot(offset_x, offset_y))
+                if radius <= peak_center_jitter_range:
+                    return offset_x, offset_y
+            theta = float(variant_rng.uniform(0.0, 2.0 * np.pi))
+            radius = float(variant_rng.uniform(0.35 * peak_center_jitter_range, peak_center_jitter_range))
+            return np.cos(theta) * radius, np.sin(theta) * radius
         
         base_seed = None
         if use_semi_random:
@@ -512,54 +831,88 @@ class Scenario(BaseScenario):
                         )
                         break
                     attempts += 1
+
+            base_peak_heights = [float(spec[2]) for spec in base_peak_specs]
+            base_peak_height_cap = max(base_peak_heights) * peak_height_max_scale if base_peak_heights else float(height_range[1]) * peak_height_max_scale
+            min_peak_height = max(0.0, float(height_range[0]))
             
-            # 在基准位置周围生成实际山峰位置（波动）
+            # 在基准位置周围生成实际山峰位置（小范围波动），峰高允许有限振幅变化
             peak_specs = []
             for base_x, base_y, base_height, base_width in base_peak_specs:
                 best_candidate = None
                 best_cost = None
-                for attempt in range(48):
-                    if attempt == 0:
-                        jitter_x = 0.0
-                        jitter_y = 0.0
-                    else:
-                        jitter_x = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
-                        jitter_y = self.rng.uniform(-peak_jitter_range, peak_jitter_range)
+                sampled_candidate = None
+                num_attempts = 48 if peak_center_jitter_range > 1e-6 else 1
+                for _ in range(num_attempts):
+                    jitter_x, jitter_y = _sample_local_peak_offset()
 
-                    actual_x = int(np.clip(base_x + jitter_x, margin, map_size - margin - 1))
-                    actual_y = int(np.clip(base_y + jitter_y, margin, map_size - margin - 1))
+                    actual_x = int(np.clip(np.rint(base_x + jitter_x), margin, map_size - margin - 1))
+                    actual_y = int(np.clip(np.rint(base_y + jitter_y), margin, map_size - margin - 1))
 
                     candidate_cost = 0.0
                     region_clearance = _peak_region_clearance(actual_x, actual_y)
                     if region_clearance < 0.0:
                         candidate_cost += 1e6 + abs(region_clearance) * 5000.0
+                    is_valid = region_clearance >= 0.0
                     for px, py, _, _ in peak_specs:
                         sep = float(np.hypot(actual_x - px, actual_y - py))
                         if sep < peak_spacing_floor:
                             candidate_cost += 1e6 + (peak_spacing_floor - sep) * 5000.0
-                    candidate_cost += float(np.hypot(actual_x - base_x, actual_y - base_y)) * 0.1
+                            is_valid = False
+                    candidate_cost += float(np.hypot(actual_x - base_x, actual_y - base_y)) * 2.0
 
                     if best_cost is None or candidate_cost < best_cost:
                         best_cost = candidate_cost
                         best_candidate = (actual_x, actual_y)
-                    if candidate_cost < 1e-6:
+                    if is_valid:
+                        sampled_candidate = (actual_x, actual_y)
                         break
 
-                if best_candidate is None:
-                    best_candidate = (
+                if sampled_candidate is not None:
+                    chosen_x, chosen_y = sampled_candidate
+                elif best_candidate is not None:
+                    chosen_x, chosen_y = best_candidate
+                else:
+                    chosen_x, chosen_y = (
                         int(np.clip(base_x, margin, map_size - margin - 1)),
                         int(np.clip(base_y, margin, map_size - margin - 1)),
                     )
 
-                peak_specs.append((best_candidate[0], best_candidate[1], base_height, base_width))
+                height_delta = 0.0
+                if configured_height_span > 1e-6 and peak_height_jitter_ratio_max > 1e-9:
+                    height_delta_ratio = float(
+                        variant_rng.uniform(peak_height_jitter_ratio_min, peak_height_jitter_ratio_max)
+                    )
+                    height_delta_sign = -1.0 if float(variant_rng.uniform(0.0, 1.0)) < 0.5 else 1.0
+                    height_delta = height_delta_sign * height_delta_ratio * configured_height_span
+
+                actual_height = float(
+                    np.clip(
+                        float(base_height) + height_delta,
+                        min_peak_height,
+                        base_peak_height_cap,
+                    )
+                )
+                peak_specs.append((chosen_x, chosen_y, actual_height, float(base_width)))
             
             if not quiet:
                 avg_jitter = np.mean([
                     np.sqrt((p[0] - bp[0])**2 + (p[1] - bp[1])**2)
                     for p, bp in zip(peak_specs, base_peak_specs)
                 ])
+                avg_height_delta = np.mean([
+                    abs(float(p[2]) - float(bp[2]))
+                    for p, bp in zip(peak_specs, base_peak_specs)
+                ]) if peak_specs else 0.0
                 print(f"[半随机地形] 基准种子: {base_seed}, 山峰数量: {num_peaks}")
-                print(f"[半随机地形] 波动范围: ±{peak_jitter_range}m, 平均偏移: {avg_jitter:.2f}m")
+                print(
+                    f"[半随机地形] 同源扰动: base_seed={base_seed}, variant_seed={variant_seed}, "
+                    f"中心扰动≤±{peak_center_jitter_range:.2f}m, 平均偏移={avg_jitter:.2f}m"
+                )
+                print(
+                    f"[半随机地形] 峰高扰动: {peak_height_jitter_ratio_min:.2f}-{peak_height_jitter_ratio_max:.2f} x range, "
+                    f"cap={peak_height_max_scale:.2f}x base_max, 平均|Δh|={avg_height_delta:.2f}m"
+                )
                 if len(reserved_peak_regions) > 1:
                     protected = reserved_peak_regions[1]
                     print(
@@ -608,6 +961,8 @@ class Scenario(BaseScenario):
         if use_semi_random and base_seed is not None:
             noise_rng = np.random.RandomState(base_seed + 104729)
             noise = noise_rng.randn(map_size, map_size) * noise_scale
+            if variant_noise_ratio > 1e-9:
+                noise += variant_rng.randn(map_size, map_size) * (noise_scale * variant_noise_ratio)
         else:
             noise = self.rng.randn(map_size, map_size) * noise_scale
         height_map += noise.astype(np.float32)
@@ -678,7 +1033,16 @@ class Scenario(BaseScenario):
         self.terrain_sample_rate = sample_rate  # 保存降采样率，用于get_terrain_height插值
         
         # 保存山峰中心坐标（保持原始坐标，不缩放）
-        self.mountain_centers = [(px, py, float(self.get_terrain_height(px, py))) for px, py, _, _ in peak_specs]
+        self.base_mountain_centers = []
+        self.actual_mountain_centers = []
+        if use_semi_random and 'base_peak_specs' in locals():
+            self.base_mountain_centers = [
+                (int(px), int(py), float(self.get_terrain_height(px, py))) for px, py, _, _ in base_peak_specs
+            ]
+        self.actual_mountain_centers = [
+            (int(px), int(py), float(self.get_terrain_height(px, py))) for px, py, _, _ in peak_specs
+        ]
+        self.mountain_centers = list(self.actual_mountain_centers)
         self.grid_points = np.meshgrid(
             np.arange(map_size, dtype=np.float32),
             np.arange(map_size, dtype=np.float32),
@@ -692,7 +1056,30 @@ class Scenario(BaseScenario):
             'width_range': tuple(self.mountain_width_range),
             'noise_scale': noise_scale,
             'min_distance': min_distance,
-            'seed': self.seed
+            'seed': self.seed,
+            'terrain_variant_seed': int(variant_seed) if use_semi_random else None,
+            'semi_random_terrain': bool(use_semi_random),
+            'terrain_base_seed': int(base_seed) if base_seed is not None else None,
+            'peak_jitter_range': float(peak_jitter_range),
+            'peak_center_jitter_range': float(peak_center_jitter_range),
+            'peak_height_jitter_ratio_range': (
+                float(peak_height_jitter_ratio_min),
+                float(peak_height_jitter_ratio_max),
+            ),
+            'peak_height_max_scale': float(peak_height_max_scale),
+            'terrain_variant_noise_ratio': float(variant_noise_ratio),
+            'semi_random_hold_mode': str(getattr(self, 'semi_random_hold_mode', 'episode')),
+            'semi_random_hold_episodes': int(getattr(self, 'semi_random_hold_episodes', 1)),
+            'semi_random_hold_min_episodes': int(getattr(self, 'semi_random_hold_min_episodes', 1)),
+            'semi_random_hold_max_episodes': int(getattr(self, 'semi_random_hold_max_episodes', 1)),
+            'terrain_hold_block_index': int(getattr(self, 'current_terrain_hold_block_index', 0)),
+            'terrain_hold_block_start_episode': int(getattr(self, 'current_terrain_hold_block_start_episode', 0)),
+            'terrain_hold_block_length': int(getattr(self, 'current_terrain_hold_block_length', 1)),
+            'deterministic_train_env_sequence': bool(getattr(self, 'deterministic_train_env_sequence', False)),
+            'training_env_sequence_seed': int(getattr(self, 'training_env_sequence_seed', 0)),
+            'episode_index': int(getattr(self, 'current_episode_index', 0)),
+            'env_id': int(getattr(self, 'current_episode_env_id', 0)),
+            'episode_rng_seed': int(getattr(self, 'current_episode_rng_seed', 0)) if getattr(self, 'current_episode_rng_seed', None) is not None else None,
         }
 
         if not quiet:
@@ -708,25 +1095,66 @@ class Scenario(BaseScenario):
             return self._generate_terrain_legacy()
         return self._generate_visualizer_style_terrain()
         
-    def regenerate_terrain(self, new_seed=None):
+    def regenerate_terrain(self, new_seed=None, variant_seed=None):
         """
         重新生成地形，可选择使用新的随机种子
         在训练/测试过程中可调用以动态改变环境
         """
-        # 保存旧的地形种子，用于检测地形是否变化
-        old_terrain_seed = getattr(self, 'current_terrain_seed', self.seed)
-        
-        if new_seed is not None:
-            self.seed = new_seed
-            self.rng = np.random.RandomState(new_seed)
+        use_semi_random = bool(
+            getattr(
+                self,
+                'use_semi_random_terrain',
+                os.getenv('SEMI_RANDOM_TERRAIN', '0').lower() in ('1', 'true', 'yes', 'on'),
+            )
+        )
+
+        old_signature = (
+            getattr(self, 'current_terrain_seed', self.seed),
+            getattr(self, 'current_terrain_variant_seed', getattr(self, 'terrain_variant_seed', self.seed)),
+        )
+
+        if use_semi_random:
+            try:
+                base_seed = int(getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67))
+            except Exception:
+                base_seed = int(self.seed if self.seed is not None else 67)
+            if variant_seed is None:
+                if new_seed is not None:
+                    variant_seed = int(new_seed)
+                elif self._use_deterministic_train_env_sequence():
+                    episode_idx, env_id = self._resolve_episode_context()
+                    variant_seed = self._make_deterministic_terrain_variant_seed(episode_idx, env_id)
+                else:
+                    variant_seed = int(np.random.randint(0, 100000))
+            self.seed = int(base_seed)
+            self.terrain_seed = int(base_seed)
+            self.terrain_variant_seed = int(variant_seed)
+            self.rng = np.random.RandomState(int(variant_seed))
+            if not self._use_deterministic_train_env_sequence():
+                self.current_terrain_hold_block_index = int(getattr(self, 'current_episode_index', 0))
+                self.current_terrain_hold_block_start_episode = int(getattr(self, 'current_episode_index', 0))
+                self.current_terrain_hold_block_length = 1
         else:
-            # 如果没有提供新种子，使用随机种子
-            self.seed = np.random.randint(0, 100000)
-            self.rng = np.random.RandomState(self.seed)
+            if new_seed is not None:
+                self.seed = int(new_seed)
+                self.rng = np.random.RandomState(int(new_seed))
+            elif self._use_deterministic_train_env_sequence():
+                episode_idx, env_id = self._resolve_episode_context()
+                self.seed = self._make_deterministic_episode_seed('terrain', episode_idx, env_id)
+                self.rng = np.random.RandomState(self.seed)
+            else:
+                self.seed = int(np.random.randint(0, 100000))
+                self.rng = np.random.RandomState(self.seed)
+            self.terrain_seed = self.seed
+            self.terrain_variant_seed = None
             
         # 🔧 关键修复：检测地形种子是否变化
         # 如果地形种子变化了，重置位置初始化标记，使每个新地图都动态生成位置
-        terrain_changed = (old_terrain_seed != self.seed)
+        new_signature = (
+            int(self.seed) if self.seed is not None else None,
+            int(self.terrain_variant_seed) if getattr(self, 'terrain_variant_seed', None) is not None else None,
+        )
+        terrain_changed = (old_signature != new_signature)
         if terrain_changed and hasattr(self, 'dynamic_first_time') and self.dynamic_first_time:
             # 地形变化了，重置位置初始化标记
             self.positions_initialized = False
@@ -738,12 +1166,13 @@ class Scenario(BaseScenario):
                 # 🔧 关键修复：添加 SUPPRESS_TERRAIN_OUTPUT 检查，减少并行环境输出
                 suppress_output = os.getenv('SUPPRESS_TERRAIN_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
                 if not suppress_output:
-                    print(f"[位置重置] 检测到地形变化 (旧种子: {old_terrain_seed}, 新种子: {self.seed})，重置位置初始化标记")
+                    print(f"[位置重置] 检测到地形变化 (旧签名: {old_signature}, 新签名: {new_signature})，重置位置初始化标记")
             except Exception:
                 pass
         
         # 更新当前地形种子
         self.current_terrain_seed = self.seed
+        self.current_terrain_variant_seed = self.terrain_variant_seed
             
         # 清空旧数据
         self.terrain = None
@@ -759,11 +1188,52 @@ class Scenario(BaseScenario):
             print(f"\n************************************************")
             print(f"*                                              *")
             print(f"*        [TERRAIN REGENERATED]                 *")
-            print(f"*        Seed: {self.seed}                     *")
+            if use_semi_random:
+                print(f"*  Base Seed: {self.seed:<8} Variant: {self.terrain_variant_seed:<8} *")
+            else:
+                print(f"*        Seed: {self.seed}                     *")
             print(f"*                                              *")
             print(f"************************************************\n")
         
         return self.terrain
+
+    def build_terrain_snapshot(self):
+        """构建可序列化的地形快照，便于训练/评估严格复现与审计。"""
+        snapshot = {
+            'terrain': np.asarray(self.terrain, dtype=np.float32).copy() if self.terrain is not None else None,
+            'map_size': int(self.map_size) if self.map_size is not None else None,
+            'goal_pos': np.asarray(self.goal_pos, dtype=np.float32).copy() if self.goal_pos is not None else None,
+            'obstacles': list(getattr(self, 'obstacles', []) or []),
+            'terrain_seed': int(getattr(self, 'current_terrain_seed', self.seed)) if getattr(self, 'current_terrain_seed', self.seed) is not None else None,
+            'terrain_variant_seed': int(getattr(self, 'current_terrain_variant_seed', getattr(self, 'terrain_variant_seed', 0))) if getattr(self, 'current_terrain_variant_seed', getattr(self, 'terrain_variant_seed', None)) is not None else None,
+            'terrain_params': dict(getattr(self, 'terrain_params', {}) or {}),
+            'terrain_source': 'scenario_snapshot',
+            'base_mountain_centers': list(getattr(self, 'base_mountain_centers', []) or []),
+            'actual_mountain_centers': list(getattr(self, 'actual_mountain_centers', []) or []),
+            'episode_index': int(getattr(self, 'current_episode_index', 0)),
+            'env_id': int(getattr(self, 'current_episode_env_id', 0)),
+            'episode_rng_seed': int(getattr(self, 'current_episode_rng_seed', 0)) if getattr(self, 'current_episode_rng_seed', None) is not None else None,
+            'obstacle_seed': int(getattr(self, 'current_episode_obstacle_seed', 0)) if getattr(self, 'current_episode_obstacle_seed', None) is not None else None,
+            'training_env_sequence_seed': int(getattr(self, 'training_env_sequence_seed', 0)),
+            'deterministic_train_env_sequence': bool(getattr(self, 'deterministic_train_env_sequence', False)),
+            'semi_random_hold_mode': str(getattr(self, 'semi_random_hold_mode', 'episode')),
+            'semi_random_hold_episodes': int(getattr(self, 'semi_random_hold_episodes', 1)),
+            'semi_random_hold_min_episodes': int(getattr(self, 'semi_random_hold_min_episodes', 1)),
+            'semi_random_hold_max_episodes': int(getattr(self, 'semi_random_hold_max_episodes', 1)),
+            'terrain_hold_block_index': int(getattr(self, 'current_terrain_hold_block_index', 0)),
+            'terrain_hold_block_start_episode': int(getattr(self, 'current_terrain_hold_block_start_episode', 0)),
+            'terrain_hold_block_length': int(getattr(self, 'current_terrain_hold_block_length', 1)),
+        }
+        try:
+            snapshot['agent_goals'] = [
+                np.asarray(getattr(getattr(agent, 'goal_a', None).state, 'p_pos', None), dtype=np.float32).copy()
+                if getattr(agent, 'goal_a', None) is not None and getattr(agent.goal_a, 'state', None) is not None and getattr(agent.goal_a.state, 'p_pos', None) is not None
+                else None
+                for agent in getattr(self, 'agents', []) or []
+            ]
+        except Exception:
+            snapshot['agent_goals'] = []
+        return snapshot
     
     def save_fixed_positions(self, file_path):
         """
@@ -1544,6 +2014,17 @@ class Scenario(BaseScenario):
                 self.on_episode_start()
         except Exception:
             pass
+        self.current_episode_index, self.current_episode_env_id = self._resolve_episode_context(world)
+        self.current_episode_obstacle_seed = None
+        if self._use_deterministic_train_env_sequence():
+            self.current_episode_rng_seed = self._make_deterministic_episode_seed(
+                'episode_rng',
+                self.current_episode_index,
+                self.current_episode_env_id,
+            )
+            self.rng = np.random.RandomState(int(self.current_episode_rng_seed))
+        else:
+            self.current_episode_rng_seed = None
         # print("\n=== 重置世界状态 ===")
         # print(f"use_fixed_positions: {self.use_fixed_positions}")
         # print(f"random_z0_positions: {hasattr(self, 'random_z0_positions') and self.random_z0_positions}")
@@ -1616,7 +2097,24 @@ class Scenario(BaseScenario):
                 pass
             # 🔧 关键修复：regenerate_terrain() 内部已经处理了地形变化时的位置重置
             # 当地形种子变化时，会自动重置 positions_initialized = False
-            self.regenerate_terrain()
+            terrain_seed_override = None
+            terrain_variant_seed_override = None
+            if self._use_deterministic_train_env_sequence():
+                if bool(getattr(self, 'use_semi_random_terrain', False)):
+                    terrain_variant_seed_override = self._make_deterministic_terrain_variant_seed(
+                        self.current_episode_index,
+                        self.current_episode_env_id,
+                    )
+                else:
+                    terrain_seed_override = self._make_deterministic_episode_seed(
+                        'terrain',
+                        self.current_episode_index,
+                        self.current_episode_env_id,
+                    )
+            self.regenerate_terrain(
+                new_seed=terrain_seed_override,
+                variant_seed=terrain_variant_seed_override,
+            )
         
         # 🚨 关键修复：只有在use_fixed_positions=True时才加载固定位置文件
         # 原因：即使USE_FIXED_POSITIONS=0，如果fixed_positions_file存在，代码也会加载固定位置
@@ -2374,12 +2872,17 @@ class Scenario(BaseScenario):
         dynamic_obstacles = bool(getattr(self, 'use_dynamic_obstacles', True))
         base_seed = int(self.seed) if self.seed is not None else 42
         if dynamic_obstacles:
-            if not hasattr(self, '_obstacle_reset_count'):
-                self._obstacle_reset_count = 0
-            self._obstacle_reset_count += 1
-            obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
+            if self._use_deterministic_train_env_sequence():
+                episode_idx, env_id = self._resolve_episode_context(world)
+                obstacle_seed = self._make_deterministic_episode_seed('obstacle', episode_idx, env_id)
+            else:
+                if not hasattr(self, '_obstacle_reset_count'):
+                    self._obstacle_reset_count = 0
+                self._obstacle_reset_count += 1
+                obstacle_seed = base_seed + 10000 + self._obstacle_reset_count * 1000
         else:
             obstacle_seed = base_seed + 10000
+        self.current_episode_obstacle_seed = int(obstacle_seed)
 
         target_signature = self._build_obstacle_layout_signature(
             start_positions=start_positions,
