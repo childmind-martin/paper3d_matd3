@@ -18,15 +18,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import matplotlib.image as mpimg
 import numpy as np
 
 os.environ.setdefault("SUPPRESS_MA_PROMPT", "1")
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matd3_mplconfig")
+
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+from matplotlib.colors import LinearSegmentedColormap
 
 from multiagent.scenarios.paper3d_terrain_energy import Scenario
 
@@ -42,6 +48,18 @@ DEFAULT_HEIGHT_JITTER_MIN = 0.15
 DEFAULT_HEIGHT_JITTER_MAX = 0.30
 DEFAULT_HEIGHT_CAP = 1.20
 DEFAULT_VARIANT_NOISE_RATIO = 0.10
+DEFAULT_PAPER_CASE_LABELS = "base_family_seed_88,semi_random_base_88_variant_101,semi_random_base_88_variant_202"
+DEFAULT_GOAL_POSITION_FILE = (
+    Path(__file__).resolve().parent / "saved_positions" / "strict_ablation_seed88_groupB.json"
+)
+PLOTLY_TERRAIN_COLORSCALE = [
+    (0.00, (220, 220, 180)),
+    (0.30, (180, 200, 120)),
+    (0.50, (120, 160, 100)),
+    (0.70, (100, 120, 80)),
+    (0.85, (139, 137, 137)),
+    (1.00, (255, 255, 255)),
+]
 
 
 @contextmanager
@@ -241,6 +259,449 @@ def _format_stat(value: Optional[float], fmt: str = "{:.2f}") -> str:
     return fmt.format(float(value))
 
 
+def _plotly_colorscale_json() -> List[List[object]]:
+    return [
+        [float(stop), f"rgb({int(rgb[0])},{int(rgb[1])},{int(rgb[2])})"]
+        for stop, rgb in PLOTLY_TERRAIN_COLORSCALE
+    ]
+
+
+def _plotly_terrain_cmap() -> LinearSegmentedColormap:
+    return LinearSegmentedColormap.from_list(
+        "plotly_terrain_surface",
+        [(float(stop), tuple(channel / 255.0 for channel in rgb)) for stop, rgb in PLOTLY_TERRAIN_COLORSCALE],
+    )
+
+
+def _paper_case_title(case: Dict[str, object]) -> str:
+    variant_seed = case.get("variant_seed")
+    base_seed = case.get("base_seed")
+    if variant_seed is None:
+        return f"Raw Seed {base_seed}"
+    if int(variant_seed) == int(base_seed) and str(case.get("label", "")).startswith("base_family"):
+        return "Family Base"
+    return f"Variant {variant_seed}"
+
+
+def _resolve_optional_path(raw_path: Optional[str]) -> Optional[Path]:
+    if raw_path is None:
+        return None
+    raw_str = str(raw_path).strip()
+    if not raw_str:
+        return None
+    path = Path(raw_str).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
+def _load_goal_position(goal_position_file: Optional[str]) -> Optional[np.ndarray]:
+    goal_path = _resolve_optional_path(goal_position_file)
+    if goal_path is None or not goal_path.is_file():
+        return None
+
+    payload = json.loads(goal_path.read_text(encoding="utf-8"))
+    goal = None
+    if isinstance(payload, dict):
+        goal = payload.get("goal")
+    elif isinstance(payload, list) and payload:
+        goal = payload[-1]
+
+    if goal is None:
+        return None
+
+    goal_pos = np.asarray(goal, dtype=np.float32).reshape(-1)
+    if goal_pos.size < 2:
+        return None
+    if goal_pos.size == 2:
+        goal_pos = np.asarray([goal_pos[0], goal_pos[1], 0.0], dtype=np.float32)
+    return goal_pos[:3]
+
+
+def _select_paper_cases(
+    cases: Sequence[Dict[str, object]],
+    requested_labels: Optional[str],
+    max_cases: int = 3,
+) -> List[Dict[str, object]]:
+    requested = [chunk.strip() for chunk in str(requested_labels or "").split(",") if chunk.strip()]
+    if not requested:
+        return list(cases[:max_cases])
+
+    lookup = {str(case["label"]): case for case in cases}
+    selected: List[Dict[str, object]] = []
+    missing: List[str] = []
+    for label in requested:
+        case = lookup.get(label)
+        if case is None:
+            missing.append(label)
+            continue
+        selected.append(case)
+
+    if missing:
+        raise ValueError(f"Unknown paper case label(s): {missing}")
+    if not selected:
+        raise ValueError("No paper cases selected.")
+    return selected[:max_cases]
+
+
+def _sample_case_height(case: Dict[str, object], x_coord: float, y_coord: float) -> float:
+    terrain = np.asarray(case["terrain"], dtype=np.float32)
+    x_samples = np.asarray(case["x_samples"], dtype=np.float32)
+    y_samples = np.asarray(case["y_samples"], dtype=np.float32)
+    x_index = int(np.argmin(np.abs(x_samples - float(x_coord))))
+    y_index = int(np.argmin(np.abs(y_samples - float(y_coord))))
+    return float(terrain[y_index, x_index])
+
+
+def _build_case_plotly_figure(
+    case: Dict[str, object],
+    goal_pos: Optional[np.ndarray] = None,
+    *,
+    title: Optional[str] = None,
+    show_scale: bool = False,
+    show_legend: bool = False,
+    show_peak_markers: bool = True,
+    show_peak_shift: bool = True,
+    show_goal_marker: bool = True,
+    camera_eye: Optional[Dict[str, float]] = None,
+    axis_title_size: int = 12,
+    axis_tick_size: int = 10,
+):
+    import plotly.graph_objects as go
+
+    terrain = np.asarray(case["terrain"], dtype=np.float32)
+    x_samples = list(case["x_samples"])
+    y_samples = list(case["y_samples"])
+    base_centers = list(case.get("base_mountain_centers") or [])
+    actual_centers = list(case.get("actual_mountain_centers") or [])
+    shift_lines = _build_shift_line_segments(base_centers, actual_centers)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Surface(
+            x=x_samples,
+            y=y_samples,
+            z=terrain,
+            colorscale=_plotly_colorscale_json(),
+            name="terrain",
+            showscale=show_scale,
+            opacity=1.0,
+            colorbar=(
+                dict(
+                    title="Height (m)",
+                    len=0.78,
+                    thickness=14,
+                    x=1.02,
+                    xanchor="left",
+                )
+                if show_scale else None
+            ),
+            lighting=dict(
+                ambient=0.62,
+                diffuse=0.82,
+                specular=0.18,
+                roughness=0.55,
+            ),
+            contours=dict(
+                z=dict(
+                    show=True,
+                    usecolormap=True,
+                    highlightcolor="limegreen",
+                    project=dict(z=False),
+                )
+            ),
+        )
+    )
+
+    if show_peak_markers and base_centers:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[row[0] for row in base_centers],
+                y=[row[1] for row in base_centers],
+                z=[row[2] + 1.0 for row in base_centers],
+                mode="markers",
+                name="base peaks",
+                marker=dict(size=4, color="royalblue", symbol="diamond"),
+            )
+        )
+
+    if show_peak_markers and actual_centers:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[row[0] for row in actual_centers],
+                y=[row[1] for row in actual_centers],
+                z=[row[2] + 1.5 for row in actual_centers],
+                mode="markers",
+                name="actual peaks",
+                marker=dict(size=5, color="orangered", symbol="circle"),
+            )
+        )
+
+    if show_peak_shift and shift_lines[0]:
+        fig.add_trace(
+            go.Scatter3d(
+                x=shift_lines[0],
+                y=shift_lines[1],
+                z=shift_lines[2],
+                mode="lines",
+                name="peak shift",
+                line=dict(color="rgba(40, 40, 40, 0.45)", width=4),
+                hoverinfo="skip",
+            )
+        )
+
+    if show_goal_marker and goal_pos is not None and goal_pos.size >= 2:
+        goal_x = float(np.clip(goal_pos[0], 0.0, float(case.get("map_size", 200.0))))
+        goal_y = float(np.clip(goal_pos[1], 0.0, float(case.get("map_size", 200.0))))
+        goal_z = _sample_case_height(case, goal_x, goal_y) + 1.5
+        fig.add_trace(
+            go.Scatter3d(
+                x=[goal_x],
+                y=[goal_y],
+                z=[goal_z],
+                mode="markers",
+                name="goal",
+                marker=dict(size=7, color="crimson", symbol="circle"),
+            )
+        )
+
+    fig.update_layout(
+        title=(dict(text=title, x=0.5, xanchor="center") if title else None),
+        margin=dict(l=0, r=0, t=18 if title else 4, b=0),
+        paper_bgcolor="#ffffff",
+        showlegend=show_legend,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=0.98,
+            xanchor="left",
+            x=0.02,
+        ),
+        scene=dict(
+            aspectmode="data",
+            xaxis=dict(title="X", titlefont=dict(size=axis_title_size), tickfont=dict(size=axis_tick_size)),
+            yaxis=dict(title="Y", titlefont=dict(size=axis_title_size), tickfont=dict(size=axis_tick_size)),
+            zaxis=dict(title="Z", titlefont=dict(size=axis_title_size), tickfont=dict(size=axis_tick_size)),
+            camera=dict(eye=(camera_eye or dict(x=1.55, y=1.55, z=0.9))),
+        ),
+    )
+    return fig
+
+
+def _crop_plotly_export_whitespace(image_path: Path, padding: int = 8) -> Path:
+    from PIL import Image, ImageChops
+
+    image = Image.open(image_path).convert("RGB")
+    background = Image.new("RGB", image.size, (255, 255, 255))
+    diff = ImageChops.difference(image, background)
+    bbox = diff.getbbox()
+    if bbox is None:
+        return image_path
+
+    left = max(0, bbox[0] - padding)
+    top = max(0, bbox[1] - padding)
+    right = min(image.width, bbox[2] + padding)
+    bottom = min(image.height, bbox[3] + padding)
+    image.crop((left, top, right, bottom)).save(image_path)
+    return image_path
+
+
+def _export_plotly_case_image(
+    case: Dict[str, object],
+    output_path: Path,
+    goal_pos: Optional[np.ndarray] = None,
+) -> Path:
+    fig = _build_case_plotly_figure(
+        case,
+        goal_pos=goal_pos,
+        title=None,
+        show_scale=False,
+        show_legend=False,
+        show_peak_markers=False,
+        show_peak_shift=False,
+        show_goal_marker=False,
+        camera_eye=dict(x=1.38, y=1.34, z=0.78),
+        axis_title_size=24,
+        axis_tick_size=18,
+    )
+    # Export the Plotly panel at a much higher native resolution and keep that
+    # resolution intact in the final paper figure. The previous pipeline looked
+    # blurry because Matplotlib resampled the top-row images down to figure-dpi
+    # resolution before embedding them into PDF.
+    fig.write_image(str(output_path), width=1200, height=820, scale=3)
+    return _crop_plotly_export_whitespace(output_path, padding=2)
+
+
+def _write_paper_terrain_figure(
+    cases: Sequence[Dict[str, object]],
+    output_stem: Path,
+    goal_pos: Optional[np.ndarray] = None,
+) -> List[Path]:
+    selected_cases = list(cases[:3])
+    if not selected_cases:
+        raise ValueError("At least one case is required to generate the paper terrain figure.")
+
+    top_row_images: List[Optional[np.ndarray]] = [None for _ in selected_cases]
+    plotly_export_error: Optional[Exception] = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="terrain_paper_plotly_", dir=str(output_stem.parent)) as temp_dir:
+            for index, case in enumerate(selected_cases):
+                plotly_path = Path(temp_dir) / f"plotly_top_{index}.png"
+                _export_plotly_case_image(case, plotly_path, goal_pos=goal_pos)
+                top_row_images[index] = mpimg.imread(str(plotly_path))
+    except Exception as exc:
+        plotly_export_error = exc
+
+    plt.rcParams.update(
+        {
+            "font.size": 12,
+            "axes.titlesize": 13,
+            "axes.labelsize": 15,
+            "xtick.labelsize": 12,
+            "ytick.labelsize": 12,
+        }
+    )
+
+    # A higher figure dpi helps preserve any remaining raster artists when the
+    # combined panel is written to PDF/SVG, while the contour row stays vector.
+    fig = plt.figure(figsize=(14.2, 8.4), facecolor="white", dpi=400)
+    grid = gridspec.GridSpec(
+        2,
+        len(selected_cases),
+        figure=fig,
+        height_ratios=[1.2, 1.04],
+        hspace=0.04,
+        wspace=0.08,
+    )
+    fig.subplots_adjust(left=0.022, right=0.995, top=0.965, bottom=0.045)
+    cmap = _plotly_terrain_cmap()
+
+    for index, case in enumerate(selected_cases):
+        terrain = np.asarray(case["terrain"], dtype=np.float32)
+        x_samples = np.asarray(case["x_samples"], dtype=np.float32)
+        y_samples = np.asarray(case["y_samples"], dtype=np.float32)
+        grid_x, grid_y = np.meshgrid(x_samples, y_samples, indexing="xy")
+        map_limit = float(case.get("map_size", max(np.max(x_samples), np.max(y_samples)) + 1))
+        column_title = _paper_case_title(case)
+        case_vmin = float(np.min(terrain))
+        case_vmax = float(np.max(terrain))
+        case_z_padding = max(8.0, 0.08 * max(case_vmax - case_vmin, 1.0))
+        levels = np.linspace(case_vmin + 0.10 * (case_vmax - case_vmin), case_vmax, 5)
+
+        top_image = top_row_images[index]
+        if top_image is not None:
+            ax_top = fig.add_subplot(grid[0, index])
+            # `interpolation="none"` is the key fix here: on PDF/SVG backends it
+            # passes the native pixel buffer through instead of resampling it to
+            # the canvas dpi, which previously collapsed the Plotly exports to
+            # about 100 ppi inside the final PDF.
+            ax_top.imshow(top_image, interpolation="none", resample=False)
+            ax_top.set_axis_off()
+            ax_top.set_title(column_title, pad=4)
+        else:
+            ax3d = fig.add_subplot(grid[0, index], projection="3d")
+            ax3d.plot_surface(
+                grid_x,
+                grid_y,
+                terrain,
+                cmap=cmap,
+                vmin=case_vmin,
+                vmax=case_vmax,
+                linewidth=0.0,
+                antialiased=False,
+                rstride=1,
+                cstride=1,
+                shade=False,
+            )
+            ax3d.contour(
+                grid_x,
+                grid_y,
+                terrain,
+                levels=levels,
+                colors="#67ff67",
+                linewidths=0.82,
+            )
+            ax3d.contour(
+                grid_x,
+                grid_y,
+                terrain,
+                zdir="x",
+                offset=0.0,
+                levels=levels,
+                colors="#2f2f2f",
+                linewidths=0.42,
+                alpha=0.35,
+            )
+            ax3d.view_init(elev=34, azim=-64)
+            ax3d.set_box_aspect((1.0, 1.0, 0.72))
+            ax3d.set_xlim(0, map_limit)
+            ax3d.set_ylim(0, map_limit)
+            ax3d.set_zlim(case_vmin, case_vmax + case_z_padding)
+            ax3d.xaxis.pane.set_facecolor((0.96, 0.96, 0.96, 0.30))
+            ax3d.yaxis.pane.set_facecolor((0.96, 0.96, 0.96, 0.20))
+            ax3d.zaxis.pane.set_facecolor((1.0, 1.0, 1.0, 0.0))
+            for axis in (ax3d.xaxis, ax3d.yaxis, ax3d.zaxis):
+                axis._axinfo["grid"]["color"] = (0.72, 0.72, 0.72, 0.55)
+                axis._axinfo["grid"]["linewidth"] = 0.5
+            ax3d.set_xlabel("X", fontsize=16, labelpad=-1)
+            ax3d.set_ylabel("Y", fontsize=16, labelpad=-1)
+            ax3d.set_zlabel("Z", fontsize=16, labelpad=0)
+            ax3d.set_xticks(np.linspace(0, map_limit, 5))
+            ax3d.set_yticks(np.linspace(0, map_limit, 5))
+            ax3d.set_title(column_title, pad=2)
+            ax3d.tick_params(axis="both", pad=0, labelsize=11.5)
+
+        ax2d = fig.add_subplot(grid[1, index])
+        mesh = ax2d.pcolormesh(
+            grid_x,
+            grid_y,
+            terrain,
+            cmap=cmap,
+            vmin=case_vmin,
+            vmax=case_vmax,
+            shading="nearest",
+        )
+        ax2d.contour(
+            grid_x,
+            grid_y,
+            terrain,
+            levels=levels,
+            colors="#edf0de",
+            linewidths=0.48,
+            alpha=0.62,
+        )
+        ax2d.set_aspect("equal", adjustable="box")
+        ax2d.set_xlim(0, map_limit)
+        ax2d.set_ylim(0, map_limit)
+        ax2d.set_xlabel("X", fontsize=17, labelpad=4)
+        ax2d.set_ylabel("Y", fontsize=17, labelpad=1)
+        ax2d.set_xticks(np.linspace(0, map_limit, 5))
+        ax2d.set_yticks(np.linspace(0, map_limit, 5))
+        ax2d.tick_params(axis="both", labelsize=13.5)
+
+        colorbar = fig.colorbar(
+            mesh,
+            ax=ax2d,
+            fraction=0.046,
+            pad=0.018,
+            ticks=np.linspace(case_vmin, case_vmax, 5),
+        )
+        colorbar.ax.tick_params(labelsize=11.5, pad=1)
+        colorbar.ax.set_title("Z", fontsize=13, pad=4)
+
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
+    png_path = output_stem.with_suffix(".png")
+    pdf_path = output_stem.with_suffix(".pdf")
+    svg_path = output_stem.with_suffix(".svg")
+    fig.savefig(png_path, dpi=500, bbox_inches="tight", pad_inches=0.005, facecolor="white")
+    fig.savefig(pdf_path, dpi=500, bbox_inches="tight", pad_inches=0.005, facecolor="white")
+    fig.savefig(svg_path, dpi=500, bbox_inches="tight", pad_inches=0.005, facecolor="white")
+    plt.close(fig)
+    if plotly_export_error is not None:
+        print(f"[paper figure] Plotly export unavailable, used fallback top row: {plotly_export_error}")
+    return [png_path, pdf_path, svg_path]
+
+
 def _write_case_html(case: Dict[str, object], output_path: Path) -> None:
     terrain = np.asarray(case["terrain"], dtype=np.float32)
     x_samples = list(case["x_samples"])
@@ -329,14 +790,7 @@ def _write_case_html(case: Dict[str, object], output_path: Path) -> None:
       x: xSamples,
       y: ySamples,
       z: terrainZ,
-      colorscale: [
-        [0.00, 'rgb(220,220,180)'],
-        [0.30, 'rgb(180,200,120)'],
-        [0.50, 'rgb(120,160,100)'],
-        [0.70, 'rgb(100,120,80)'],
-        [0.85, 'rgb(139,137,137)'],
-        [1.00, 'rgb(255,255,255)']
-      ],
+      colorscale: {json.dumps(_plotly_colorscale_json())},
       name: 'terrain',
       showscale: true,
       opacity: 1.0,
@@ -482,6 +936,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peak-height-jitter-ratio-max", type=float, default=DEFAULT_HEIGHT_JITTER_MAX)
     parser.add_argument("--peak-height-max-scale", type=float, default=DEFAULT_HEIGHT_CAP)
     parser.add_argument("--terrain-variant-noise-ratio", type=float, default=DEFAULT_VARIANT_NOISE_RATIO)
+    parser.add_argument(
+        "--paper-figure-stem",
+        type=str,
+        default="terrain_family_paper",
+        help="If non-empty, save a matched static paper figure as both PNG and PDF using this output stem.",
+    )
+    parser.add_argument(
+        "--paper-case-labels",
+        type=str,
+        default=DEFAULT_PAPER_CASE_LABELS,
+        help="Comma-separated case labels used in the paper figure (default: family base + variants 101 and 202).",
+    )
+    parser.add_argument(
+        "--goal-position-file",
+        type=str,
+        default=str(DEFAULT_GOAL_POSITION_FILE),
+        help="Optional JSON file that provides the shared goal position overlay for the paper figure.",
+    )
     return parser
 
 
@@ -593,6 +1065,17 @@ def main() -> int:
     summary_path = output_dir / "terrain_family_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True), encoding="utf-8")
 
+    paper_figure_paths: List[Path] = []
+    paper_figure_stem = _resolve_optional_path(args.paper_figure_stem)
+    if paper_figure_stem is not None:
+        selected_paper_cases = _select_paper_cases(cases, args.paper_case_labels)
+        goal_pos = _load_goal_position(args.goal_position_file)
+        paper_figure_paths = _write_paper_terrain_figure(
+            selected_paper_cases,
+            paper_figure_stem,
+            goal_pos=goal_pos,
+        )
+
     print(f"Saved terrain previews to: {output_dir}")
     for row in summary_rows:
         print(
@@ -601,6 +1084,8 @@ def main() -> int:
             f"mean_peak_shift={row['mean_peak_center_shift'] if row['mean_peak_center_shift'] is not None else 'N/A'}"
         )
     print(f"Summary JSON: {summary_path}")
+    for path in paper_figure_paths:
+        print(f"Paper figure: {path}")
     return 0
 
 

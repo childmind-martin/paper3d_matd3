@@ -1136,7 +1136,13 @@ class ModelEvaluator:
             self.scenario.positions_initialized = False
             print(f"⚠️  加载Episode {episode_idx + 1}位置文件失败: {e}，将使用动态生成")
 
-    def _prepare_episode_terrain(self, episode_idx, terrain_seed_sequence=None, terrain_variant_seed_sequence=None):
+    def _prepare_episode_terrain(
+        self,
+        episode_idx,
+        terrain_seed_sequence=None,
+        terrain_variant_seed_sequence=None,
+        obstacle_seed_sequence=None,
+    ):
         """为当前评估回合显式准备地形，确保每回合地形可控且不会被reset再次改写。"""
         try:
             quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
@@ -1148,6 +1154,26 @@ class ModelEvaluator:
             or bool(terrain_variant_seed_sequence)
         )
         if not use_random_terrain:
+            obstacle_seed = None
+            if obstacle_seed_sequence and episode_idx < len(obstacle_seed_sequence):
+                obstacle_seed = int(obstacle_seed_sequence[episode_idx])
+            try:
+                self.scenario.current_episode_index = int(episode_idx)
+                self.scenario.current_episode_env_id = 0
+                self.scenario.current_episode_obstacle_seed_override = (
+                    int(obstacle_seed) if obstacle_seed is not None else None
+                )
+            except Exception:
+                pass
+            try:
+                if hasattr(self.env, 'scenario'):
+                    self.env.scenario.current_episode_index = int(episode_idx)
+                    self.env.scenario.current_episode_env_id = 0
+                    self.env.scenario.current_episode_obstacle_seed_override = (
+                        int(obstacle_seed) if obstacle_seed is not None else None
+                    )
+            except Exception:
+                pass
             try:
                 self.scenario.random_terrain = False
             except Exception:
@@ -1161,6 +1187,7 @@ class ModelEvaluator:
             self._current_episode_terrain_info = {
                 'terrain_seed': terrain_seed,
                 'terrain_variant_seed': terrain_variant_seed,
+                'obstacle_seed': int(obstacle_seed) if obstacle_seed is not None else None,
             }
             return dict(self._current_episode_terrain_info)
 
@@ -1179,6 +1206,12 @@ class ModelEvaluator:
             if not quiet_output:
                 print(f"🔧 使用同源扰动种子: {terrain_variant_seed} (回合 {episode_idx + 1})")
 
+        obstacle_seed = None
+        if obstacle_seed_sequence and episode_idx < len(obstacle_seed_sequence):
+            obstacle_seed = int(obstacle_seed_sequence[episode_idx])
+            if not quiet_output:
+                print(f"🔧 使用共享障碍种子: {obstacle_seed} (回合 {episode_idx + 1})")
+
         if hasattr(self.scenario, 'regenerate_terrain'):
             if terrain_variant_seed is not None:
                 self.scenario.regenerate_terrain(new_seed=terrain_seed, variant_seed=terrain_variant_seed)
@@ -1195,6 +1228,24 @@ class ModelEvaluator:
         self._rebuild_environment()
         self._load_episode_positions(episode_idx, terrain_seed, terrain_variant_seed)
 
+        try:
+            self.scenario.current_episode_index = int(episode_idx)
+            self.scenario.current_episode_env_id = 0
+            self.scenario.current_episode_obstacle_seed_override = (
+                int(obstacle_seed) if obstacle_seed is not None else None
+            )
+        except Exception:
+            pass
+        try:
+            if hasattr(self.env, 'scenario'):
+                self.env.scenario.current_episode_index = int(episode_idx)
+                self.env.scenario.current_episode_env_id = 0
+                self.env.scenario.current_episode_obstacle_seed_override = (
+                    int(obstacle_seed) if obstacle_seed is not None else None
+                )
+        except Exception:
+            pass
+
         # 当前回合的地图已经显式准备完毕，禁用reset时的再次随机改图。
         try:
             self.scenario.random_terrain = False
@@ -1210,6 +1261,7 @@ class ModelEvaluator:
                 'current_terrain_variant_seed',
                 terrain_variant_seed,
             ),
+            'obstacle_seed': int(obstacle_seed) if obstacle_seed is not None else None,
         }
         return dict(self._current_episode_terrain_info)
 
@@ -1581,6 +1633,22 @@ class ModelEvaluator:
                             selected_force_ratio = float(results['action_force_ratio'])
                         selected_force_ratio_label = '最终回合'
                         print(f"✅ 从训练配置读取最终回合的FR值: {selected_force_ratio}")
+                    elif model_leaf_dir == 'checkpoint':
+                        if 'last_episode_force_ratio' in results:
+                            selected_force_ratio = float(results['last_episode_force_ratio'])
+                        elif episode_force_ratios is not None and len(episode_force_ratios) > 0:
+                            selected_force_ratio = float(episode_force_ratios[-1])
+                            selected_force_ratio_episode = len(episode_force_ratios)
+                        elif 'args' in results and isinstance(results['args'], dict) and 'action_force_ratio' in results['args']:
+                            selected_force_ratio = float(results['args']['action_force_ratio'])
+                        elif 'action_force_ratio' in results:
+                            selected_force_ratio = float(results['action_force_ratio'])
+                        selected_force_ratio_label = '检查点最新回合'
+                        print(
+                            f"✅ 从训练配置读取检查点最新回合的FR值: "
+                            f"{selected_force_ratio}"
+                            f"{f' (回合 {selected_force_ratio_episode})' if selected_force_ratio_episode is not None else ''}"
+                        )
                     elif model_leaf_dir == 'best' and 'best_episode_force_ratio' in results:
                         selected_force_ratio = float(results['best_episode_force_ratio'])
                         if 'best_episode' in results:
@@ -1773,7 +1841,7 @@ class ModelEvaluator:
             error_msg = (
                 "❌ 错误：无法找到与当前模型目录对应的FR值\n"
                 "   测试时必须使用与当前模型变体一致的FR值，而不是使用默认值\n"
-                "   final 应读取 last_episode_force_ratio；best_by_team_sr 应读取 best_team_sr_force_ratio；best 应读取 best_episode_force_ratio\n"
+                "   final/checkpoint 应读取最后回合 FR；best_by_team_sr 应读取 best_team_sr_force_ratio；best 应读取 best_episode_force_ratio\n"
                 "   如果训练配置不完整，评估结果将不准确，因此拒绝继续运行"
             )
             print(error_msg)
@@ -3613,6 +3681,19 @@ class ModelEvaluator:
             except Exception as e:
                 print(f"⚠️  解析同源扰动种子序列失败: {e}，将忽略 variant 序列")
                 terrain_variant_seed_sequence = None
+        obstacle_seed_sequence = None
+        obstacle_seed_str = os.getenv('OBSTACLE_SEED_SEQUENCE', '')
+        if obstacle_seed_str:
+            try:
+                obstacle_seed_sequence = [int(s.strip()) for s in obstacle_seed_str.split(',') if s.strip()]
+                if not quiet_output:
+                    print(
+                        f"🔧 使用共享障碍种子序列（共{len(obstacle_seed_sequence)}个）: "
+                        f"{obstacle_seed_sequence[:5]}... (前5个)"
+                    )
+            except Exception as e:
+                print(f"⚠️  解析共享障碍种子序列失败: {e}，将忽略 obstacle 序列")
+                obstacle_seed_sequence = None
 
         terrain_family_override = os.getenv('POST_EVAL_TERRAIN_FAMILY', '').strip()
         position_family_override = os.getenv('POST_EVAL_POSITION_FAMILY', '').strip()
@@ -3651,6 +3732,7 @@ class ModelEvaluator:
             'map_size': _env_int('MAP_SIZE', 200),
             'mountain_min_distance': _env_int('MOUNTAIN_MIN_DISTANCE', 55),
             'random_terrain': bool(runtime_random_terrain),
+            'shared_obstacle_seed_sequence': bool(obstacle_seed_sequence),
             'use_dynamic_obstacles': _env_flag('USE_DYNAMIC_OBSTACLES', True),
             'use_quadrotor_dynamics': _env_flag('USE_QUADROTOR_DYNAMICS', False),
             'gravity': _finite_float_or_none(getattr(self.args, 'gravity', None)),
@@ -3697,14 +3779,18 @@ class ModelEvaluator:
                 episode,
                 terrain_seed_sequence,
                 terrain_variant_seed_sequence,
+                obstacle_seed_sequence,
             )
             terrain_seed = terrain_info.get('terrain_seed') if isinstance(terrain_info, dict) else terrain_info
             terrain_variant_seed = (
                 terrain_info.get('terrain_variant_seed') if isinstance(terrain_info, dict) else None
             )
+            obstacle_seed = (
+                terrain_info.get('obstacle_seed') if isinstance(terrain_info, dict) else None
+            )
             if terrain_seed is not None:
                 if not quiet_output:
-                    print(f"🗺️ 当前回合地形种子: base={terrain_seed}, variant={terrain_variant_seed}")
+                    print(f"🗺️ 当前回合地形种子: base={terrain_seed}, variant={terrain_variant_seed}, obstacle={obstacle_seed}")
             
             # 🔧 关键修复：添加异常处理，确保单个回合失败不会导致整个评估失败
             try:
@@ -3722,6 +3808,7 @@ class ModelEvaluator:
                 episode_data['terrain_complexity_level'] = terrain_level
                 episode_data['terrain_seed'] = terrain_seed
                 episode_data['terrain_variant_seed'] = terrain_variant_seed
+                episode_data['obstacle_seed'] = obstacle_seed
                 all_rewards.append(episode_data['reward'])
                 
                 # 🔧 修改：跟踪最佳回合（与训练脚本逻辑一致）

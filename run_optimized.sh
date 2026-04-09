@@ -12,6 +12,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Matplotlib 在只读 HOME/容器环境下会退回临时目录，重复创建缓存会拖慢每次启动。
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matd3_mpl_${USER:-user}}"
+mkdir -p "$MPLCONFIGDIR" 2>/dev/null || true
+
 _truthy() {
     case "${1,,}" in
         1|true|yes|on) return 0 ;;
@@ -946,6 +950,17 @@ export SAVE_BEST_TRAJ=${SAVE_BEST_TRAJ:-1}          # 保存最佳回合的轨�
 export SAVE_EPISODE_TRAJ=${SAVE_EPISODE_TRAJ:-0}    # 保存每个完成回合的轨迹图（默认关闭，会产生大量图片）
 export SAVE_INTERACTIVE_TRAJ=${SAVE_INTERACTIVE_TRAJ:-1}    # 是否保存可交互HTML轨迹图（需要plotly）
 export SAVE_INTERACTIVE_TRAJ_INDEPENDENT=${SAVE_INTERACTIVE_TRAJ_INDEPENDENT:-0}  # 默认不独立生成每回合交互图
+
+# 批量消融/纯性能测试模式：保留训练语义，关闭重型训练期产物与心跳日志。
+if _truthy "${FAST_ARTIFACTS:-0}"; then
+    export ENABLE_ACTOR_OUTPUT_COLLECTION=0
+    export SAVE_BEST_TRAJ=0
+    export SAVE_EPISODE_TRAJ=0
+    export SAVE_INTERACTIVE_TRAJ=0
+    export SAVE_INTERACTIVE_TRAJ_INDEPENDENT=0
+    export SAVE_PRERANDOM_BEST=0
+    export HEARTBEAT_ENABLE=0
+fi
 
 # 早停策略（防误判）
 export EARLY_STOP_MODE=${EARLY_STOP_MODE:-never}                # 🔧 any|majority|all|never|disabled（默认never：禁用早停）

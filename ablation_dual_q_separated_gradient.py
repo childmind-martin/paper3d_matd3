@@ -30,6 +30,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import importlib
 import json
 import os
@@ -150,6 +151,23 @@ AUTO_POSITIONS_FILE_SENTINEL = "__AUTO_STRICT_POSITIONS__"
 DEFAULT_POST_EVAL_EPISODES = 20
 DEFAULT_POST_EVAL_MODEL_VARIANT = "best_by_team_sr"
 DEFAULT_POST_EVAL_EPISODE_LENGTH_MULTIPLIER = 1.1
+DEFAULT_POST_EVAL_MODE = "shared_match_train_env"
+DEFAULT_POST_EVAL_SELECTION_PROTOCOL = "matched_validation"
+MATCHED_VALIDATION_POST_EVAL_VARIANT = "matched_validation"
+DEFAULT_POST_EVAL_VALIDATION_EPISODES = 10
+DEFAULT_POST_EVAL_VALIDATION_CANDIDATES = (
+    "best_by_team_sr",
+    "best",
+    "checkpoint",
+    "final",
+    "latest_ep",
+)
+POST_EVAL_SELECTION_PROTOCOL_CHOICES = ("fixed", "matched_validation")
+POST_EVAL_MODE_ALIAS_MAP = {
+    "shared_match_train_env": DEFAULT_POST_EVAL_MODE,
+    "heldout_shared": DEFAULT_POST_EVAL_MODE,
+    "match_train_env": DEFAULT_POST_EVAL_MODE,
+}
 LEGACY_POST_EVAL_EPISODE_LENGTH_MULTIPLIER = 2.0
 LEGACY_POST_EVAL_BOOL_DEFAULTS = {
     "post_eval_save_all_episodes": True,
@@ -215,6 +233,17 @@ ALLOWED_MANIFEST_ENV_DIFF_KEYS = {
     "MATD3_USE_SEPARATED_GRADIENT",
     "MADDPG_USE_DUAL_Q",
     "MADDPG_USE_SEPARATED_GRADIENT",
+    # 这些键只影响训练期产物/日志/运行时缓存位置，不改变算法语义。
+    # 允许它们在不同配置或旧批次重跑时存在差异，避免把性能开关误判为消融配置漂移。
+    "FAST_ARTIFACTS",
+    "HEARTBEAT_ENABLE",
+    "MPLCONFIGDIR",
+    "SAVE_PRERANDOM_BEST",
+    "ENABLE_ACTOR_OUTPUT_COLLECTION",
+    "SAVE_BEST_TRAJ",
+    "SAVE_EPISODE_TRAJ",
+    "SAVE_INTERACTIVE_TRAJ",
+    "SAVE_INTERACTIVE_TRAJ_INDEPENDENT",
 }
 
 ALLOWED_MANIFEST_ARG_DIFF_KEYS = {
@@ -445,6 +474,25 @@ def _parse_seed_list(seed_text: Optional[str]) -> List[int]:
     return seeds
 
 
+def _build_balanced_seed_experiment_pairs(
+    seeds: Sequence[int],
+    experiment_labels: Sequence[str],
+) -> List[Tuple[int, str]]:
+    """以 seed/algorithm 交错顺序展开任务，尽量减少尾段同类任务扎堆。"""
+    ordered_pairs: List[Tuple[int, str]] = []
+    seed_list = [int(seed) for seed in seeds]
+    label_list = [str(label) for label in experiment_labels]
+    if not seed_list or not label_list:
+        return ordered_pairs
+
+    seed_count = len(seed_list)
+    for round_idx in range(seed_count):
+        for label_idx, label in enumerate(label_list):
+            seed_value = seed_list[(label_idx + round_idx) % seed_count]
+            ordered_pairs.append((int(seed_value), str(label)))
+    return ordered_pairs
+
+
 def _load_batch_config(batch_dir: Path) -> Dict[str, Any]:
     config_path = batch_dir / "config.json"
     if not config_path.exists():
@@ -538,9 +586,15 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
         args.parsed_seeds = saved_seeds
         args.seeds = ",".join(str(seed) for seed in saved_seeds)
 
-    if "post_eval_enabled" in parent_config:
+    cli_disable_post_eval_specified = bool(getattr(args, "cli_disable_post_eval_specified", False))
+    if "post_eval_enabled" in parent_config and not cli_disable_post_eval_specified:
         args.disable_post_eval = not bool(parent_config.get("post_eval_enabled"))
-    args.post_eval_mode = str(parent_config.get("post_eval_mode", args.post_eval_mode))
+    cli_post_eval_mode_specified = bool(getattr(args, "cli_post_eval_mode_specified", False))
+    if cli_post_eval_mode_specified:
+        pass
+    else:
+        args.post_eval_mode = str(parent_config.get("post_eval_mode", args.post_eval_mode))
+    args.post_eval_mode = _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE))
     args.post_eval_episodes = int(parent_config.get("post_eval_episodes", args.post_eval_episodes))
     saved_post_eval_episode_length_multiplier = parent_config.get("post_eval_episode_length_multiplier", None)
     cli_post_eval_episode_length_multiplier_specified = bool(
@@ -577,6 +631,41 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
     if saved_post_eval_seed is not None:
         args.post_eval_seed = int(saved_post_eval_seed)
         args.resolved_post_eval_seed = int(saved_post_eval_seed)
+    saved_selection_protocol = parent_config.get("post_eval_selection_protocol", None)
+    cli_selection_protocol_specified = bool(
+        getattr(args, "cli_post_eval_selection_protocol_specified", False)
+    )
+    if cli_selection_protocol_specified:
+        pass
+    elif saved_selection_protocol is not None:
+        args.post_eval_selection_protocol = str(saved_selection_protocol)
+    saved_validation_episodes = parent_config.get("post_eval_validation_episodes", None)
+    cli_validation_episodes_specified = bool(
+        getattr(args, "cli_post_eval_validation_episodes_specified", False)
+    )
+    if cli_validation_episodes_specified:
+        pass
+    elif saved_validation_episodes is not None:
+        args.post_eval_validation_episodes = int(saved_validation_episodes)
+    saved_validation_seed = parent_config.get("post_eval_validation_seed", None)
+    cli_validation_seed_specified = bool(
+        getattr(args, "cli_post_eval_validation_seed_specified", False)
+    )
+    if cli_validation_seed_specified:
+        pass
+    elif saved_validation_seed is not None:
+        args.post_eval_validation_seed = int(saved_validation_seed)
+    saved_validation_candidates = parent_config.get("post_eval_validation_candidates", None)
+    cli_validation_candidates_specified = bool(
+        getattr(args, "cli_post_eval_validation_candidates_specified", False)
+    )
+    if cli_validation_candidates_specified:
+        pass
+    elif saved_validation_candidates:
+        if isinstance(saved_validation_candidates, (list, tuple)):
+            args.post_eval_validation_candidates = ",".join(str(item) for item in saved_validation_candidates)
+        else:
+            args.post_eval_validation_candidates = str(saved_validation_candidates)
     saved_post_eval_variant = parent_config.get("post_eval_model_variant", None)
     cli_variant_specified = bool(getattr(args, "cli_post_eval_model_variant_specified", False))
     if cli_variant_specified:
@@ -705,8 +794,15 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
         saved_stagger = runtime_overrides.get("worker_launch_stagger_seconds", None)
         if saved_stagger is not None:
             args.worker_launch_stagger_seconds = float(saved_stagger)
-    if int(getattr(args, "max_parallel", 2) or 0) == 2 and parent_config.get("max_parallel") is not None:
-        args.max_parallel = int(parent_config.get("max_parallel"))
+    saved_max_parallel = parent_config.get("max_parallel", None)
+    cli_max_parallel_specified = bool(getattr(args, "cli_max_parallel_specified", False))
+    if saved_max_parallel is not None and not cli_max_parallel_specified:
+        current_max_parallel = int(getattr(args, "max_parallel", 2) or 0)
+        saved_max_parallel = int(saved_max_parallel)
+        # 历史批次里常见的 3 并发在单卡/WSL 长跑下稳定性较差。
+        # 如果用户没有显式传 --max-parallel，则优先保留当前更稳的默认值 2。
+        if not (current_max_parallel == 2 and saved_max_parallel > 2):
+            args.max_parallel = saved_max_parallel
 
     (
         args.resolved_unlock_env_on_success,
@@ -782,6 +878,31 @@ def _nanmean_std(series_list: Sequence[Sequence[float]]) -> Tuple[np.ndarray, np
     return np.nanmean(padded, axis=0), np.nanstd(padded, axis=0, ddof=0)
 
 
+def _extract_loss_curve(loss_history: Sequence[Any], loss_key: str) -> Tuple[np.ndarray, np.ndarray]:
+    steps: List[float] = []
+    values: List[float] = []
+
+    for idx, entry in enumerate(loss_history):
+        if not isinstance(entry, dict):
+            continue
+        value = _safe_float(entry.get(loss_key))
+        if value is None:
+            continue
+        if loss_key == "critic_loss":
+            if abs(value) <= 1e-12:
+                continue
+        elif loss_key == "actor_loss":
+            if abs(value) >= 1000.0:
+                continue
+        step = _safe_float(entry.get("step"))
+        if step is None:
+            step = float(idx + 1)
+        steps.append(float(step))
+        values.append(float(value))
+
+    return np.asarray(steps, dtype=np.float64), np.asarray(values, dtype=np.float64)
+
+
 def _tail_array(values: Sequence[float], tail: int = 100) -> np.ndarray:
     if not values:
         return np.asarray([], dtype=np.float64)
@@ -831,10 +952,24 @@ def _to_bool(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, set):
+        return sorted(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
 
 
 @contextlib.contextmanager
@@ -1269,6 +1404,68 @@ def _resolve_post_eval_seed(args) -> int:
     if getattr(args, "post_eval_seed", None) is not None:
         return int(args.post_eval_seed)
     return int(getattr(args, "resolved_scenario_seed", 88)) + 10000
+
+
+def _canonicalize_post_eval_mode(mode: Any) -> str:
+    key = str(mode or "").strip().lower()
+    return POST_EVAL_MODE_ALIAS_MAP.get(key, DEFAULT_POST_EVAL_MODE)
+
+
+def _resolve_post_eval_selection_protocol(args) -> str:
+    value = str(
+        getattr(args, "post_eval_selection_protocol", DEFAULT_POST_EVAL_SELECTION_PROTOCOL)
+        or DEFAULT_POST_EVAL_SELECTION_PROTOCOL
+    ).strip().lower()
+    if value not in POST_EVAL_SELECTION_PROTOCOL_CHOICES:
+        return DEFAULT_POST_EVAL_SELECTION_PROTOCOL
+    return value
+
+
+def _resolve_post_eval_storage_variant(args) -> str:
+    protocol = _resolve_post_eval_selection_protocol(args)
+    if protocol == "matched_validation":
+        return MATCHED_VALIDATION_POST_EVAL_VARIANT
+    return str(getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT))
+
+
+def _resolve_post_eval_validation_seed(args) -> int:
+    value = getattr(args, "post_eval_validation_seed", None)
+    if value is not None:
+        return int(value)
+    base_seed = int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args)))
+    return int((base_seed + 104729) % 2147483647)
+
+
+def _resolve_post_eval_validation_episodes(args) -> int:
+    value = getattr(args, "post_eval_validation_episodes", DEFAULT_POST_EVAL_VALIDATION_EPISODES)
+    try:
+        return max(1, int(value))
+    except Exception:
+        return int(DEFAULT_POST_EVAL_VALIDATION_EPISODES)
+
+
+def _resolve_post_eval_validation_candidates(args) -> List[str]:
+    raw_value = getattr(args, "post_eval_validation_candidates", None)
+    if isinstance(raw_value, (list, tuple)):
+        tokens = [str(item).strip().lower() for item in raw_value]
+    else:
+        raw_text = str(
+            raw_value
+            or ",".join(DEFAULT_POST_EVAL_VALIDATION_CANDIDATES)
+        ).strip()
+        tokens = [
+            token.strip().lower()
+            for token in raw_text.replace(";", ",").split(",")
+        ]
+    allowed = {"auto", "final", "best", "best_by_team_sr", "latest_ep", "checkpoint"}
+    ordered: List[str] = []
+    for token in tokens:
+        if not token or token not in allowed or token in ordered:
+            continue
+        ordered.append(token)
+    if not ordered:
+        ordered = list(DEFAULT_POST_EVAL_VALIDATION_CANDIDATES)
+    return ordered
 
 
 def _resolve_post_eval_peak_jitter_range(args) -> float:
@@ -2054,13 +2251,24 @@ def _existing_episode_positions_need_regen(
                 if expected_hold_mode and actual_hold_mode != expected_hold_mode:
                     return True, f"{candidate.name} semi_random_hold_mode 不匹配"
             if isinstance(position_setup, dict):
+                goal_flatness_profile_version = _safe_int(position_setup.get("goal_flatness_profile_version"))
+                if goal_flatness_profile_version is None or goal_flatness_profile_version < 2:
+                    return True, f"{candidate.name} 缺少新版目标平坦化元数据"
                 goal_surface_stats = (
                     position_setup.get("goal_surface_stats")
                     if isinstance(position_setup.get("goal_surface_stats"), dict)
                     else {}
                 )
+                goal_platform_surface_stats = (
+                    position_setup.get("goal_platform_surface_stats")
+                    if isinstance(position_setup.get("goal_platform_surface_stats"), dict)
+                    else {}
+                )
                 goal_slope = _safe_float(goal_surface_stats.get("slope_mag"))
                 goal_height_span = _safe_float(goal_surface_stats.get("height_span"))
+                goal_platform_slope = _safe_float(goal_platform_surface_stats.get("slope_mag"))
+                goal_platform_height_span = _safe_float(goal_platform_surface_stats.get("height_span"))
+                goal_platform_height_std = _safe_float(goal_platform_surface_stats.get("height_std"))
                 goal_peak_clearance = _safe_float(position_setup.get("goal_peak_clearance"))
                 if goal_slope is not None and goal_slope > 1.8:
                     return (
@@ -2077,15 +2285,150 @@ def _existing_episode_positions_need_regen(
                         True,
                         f"{candidate.name} 目标点离山峰过近: clearance={goal_peak_clearance:.3f}",
                     )
+                if goal_platform_slope is not None and goal_platform_slope > 1.9:
+                    return (
+                        True,
+                        f"{candidate.name} 目标平台坡度过大: slope={goal_platform_slope:.3f}",
+                    )
+                if goal_platform_height_span is not None and goal_platform_height_span > 16.0:
+                    return (
+                        True,
+                        f"{candidate.name} 目标平台起伏过大: span={goal_platform_height_span:.3f}",
+                    )
+                if goal_platform_height_std is not None and goal_platform_height_std > 4.5:
+                    return (
+                        True,
+                        f"{candidate.name} 目标平台波动过大: std={goal_platform_height_std:.3f}",
+                    )
         except Exception as exc:
             return True, f"{candidate.name} 无法校验: {exc}"
 
     return False, None
 
 
-def _generate_post_eval_terrain_variant_seeds(seed: int, episodes: int) -> List[int]:
-    rng = random.Random(int(seed))
+def _generate_post_eval_sequence_seeds(seed: int, episodes: int, namespace: str) -> List[int]:
+    rng = random.Random(f"{int(seed)}::{namespace}")
     return [int(rng.randint(1000, 99999)) for _ in range(int(episodes))]
+
+
+def _make_post_eval_hold_length(seed: int, block_idx: int, min_len: int, max_len: int) -> int:
+    min_len = max(1, int(min_len))
+    max_len = max(min_len, int(max_len))
+    if min_len == max_len:
+        return int(min_len)
+    payload = f"post_eval_hold|seed={int(seed)}|block={int(block_idx)}|min={min_len}|max={max_len}"
+    digest = hashlib.blake2b(payload.encode("utf-8"), digest_size=8).digest()
+    span = max_len - min_len + 1
+    return int(min_len + (int.from_bytes(digest, "little") % span))
+
+
+def _generate_post_eval_terrain_variant_seeds(
+    seed: int,
+    episodes: int,
+    hold_mode: str = "episode",
+    hold_episodes: int = 1,
+    hold_min_episodes: int = 1,
+    hold_max_episodes: int = 1,
+) -> List[int]:
+    episodes = max(0, int(episodes))
+    hold_mode = str(hold_mode or "episode").strip().lower()
+    if episodes <= 0:
+        return []
+    if hold_mode == "episode":
+        return _generate_post_eval_sequence_seeds(seed, episodes, "terrain_variant")
+
+    sequence: List[int] = []
+    block_idx = 0
+    emitted = 0
+    while emitted < episodes:
+        if hold_mode == "fixed":
+            block_length = max(1, int(hold_episodes or 1))
+        else:
+            block_length = _make_post_eval_hold_length(
+                seed=seed,
+                block_idx=block_idx,
+                min_len=max(1, int(hold_min_episodes or 1)),
+                max_len=max(1, int(hold_max_episodes or hold_min_episodes or 1)),
+            )
+        block_seed = _generate_post_eval_sequence_seeds(seed + block_idx, 1, "terrain_variant_block")[0]
+        take = min(block_length, episodes - emitted)
+        sequence.extend([int(block_seed)] * take)
+        emitted += take
+        block_idx += 1
+    return sequence
+
+
+def _generate_post_eval_obstacle_seeds(seed: int, episodes: int) -> List[int]:
+    return _generate_post_eval_sequence_seeds(seed, episodes, "obstacle")
+
+
+def _generate_post_eval_terrain_seeds(seed: int, episodes: int) -> List[int]:
+    return _generate_post_eval_sequence_seeds(seed, episodes, "terrain")
+
+
+def _generate_post_eval_testset_tag(spec: Dict[str, Any]) -> str:
+    terrain_kind = "semi_random" if bool(spec.get("semi_random_terrain", False)) else (
+        "random" if bool(spec.get("random_terrain", False)) else "fixed"
+    )
+    obstacle_kind = "dynobs" if bool(spec.get("use_dynamic_obstacles", False)) else "staticobs"
+    return (
+        f"seed_{int(spec['seed'])}_{DEFAULT_POST_EVAL_MODE}_{terrain_kind}_{obstacle_kind}"
+        f"_base_{int(spec.get('terrain_base_seed', spec.get('terrain_seed', spec.get('scenario_seed', 0))))}"
+        f"_episodes_{int(spec.get('episodes', 0))}_posv6"
+    )
+
+
+def _generate_post_eval_positions_from_reference(spec: Dict[str, Any]) -> Dict[str, Any]:
+    episode_positions_dir = Path(spec["episode_positions_dir"])
+    episode_positions_dir.mkdir(parents=True, exist_ok=True)
+    reference_positions_file = Path(str(spec.get("reference_positions_file", "")).strip())
+    if not reference_positions_file.exists():
+        raise RuntimeError(f"共享测试集参考位置文件不存在: {reference_positions_file}")
+
+    lock_path = episode_positions_dir / ".generation.lock"
+    with _exclusive_file_lock(lock_path):
+        force_regenerate = bool(spec.get("force_regenerate_testset"))
+        candidate_files = [
+            episode_positions_dir / f"episode_{idx:03d}.json"
+            for idx in range(int(spec.get("episodes", 0)))
+        ]
+        needs_generation = force_regenerate or any(not candidate.exists() for candidate in candidate_files)
+        if not needs_generation:
+            compatibility_regen, compatibility_reason = _existing_episode_positions_need_regen(spec, candidate_files)
+            if compatibility_regen:
+                needs_generation = True
+                print(f"[后评估测试集] 共享 train-match episode positions 不兼容，准备重建: {compatibility_reason}")
+
+        if needs_generation:
+            with open(reference_positions_file, "r", encoding="utf-8") as f:
+                reference_payload = json.load(f)
+            if not isinstance(reference_payload, dict):
+                raise RuntimeError(f"共享测试集参考位置文件格式错误: {reference_positions_file}")
+            for idx, candidate in enumerate(candidate_files):
+                payload = dict(reference_payload)
+                payload["episode"] = int(idx)
+                terrain_seed_seq = spec.get("terrain_seed_sequence", [])
+                terrain_variant_seed_seq = spec.get("terrain_variant_seed_sequence", [])
+                obstacle_seed_seq = spec.get("obstacle_seed_sequence", [])
+                payload["terrain_seed"] = (
+                    int(terrain_seed_seq[idx]) if idx < len(terrain_seed_seq) else int(spec.get("terrain_seed", spec.get("scenario_seed", 0)))
+                )
+                payload["terrain_variant_seed"] = (
+                    int(terrain_variant_seed_seq[idx]) if idx < len(terrain_variant_seed_seq) else None
+                )
+                payload["obstacle_seed"] = (
+                    int(obstacle_seed_seq[idx]) if idx < len(obstacle_seed_seq) else None
+                )
+                payload["shared_testset_mode"] = DEFAULT_POST_EVAL_MODE
+                payload["goal_flatness_profile_version"] = payload.get("goal_flatness_profile_version", 2)
+                _save_json(candidate, payload)
+
+    for idx in range(int(spec.get("episodes", 0))):
+        candidate = episode_positions_dir / f"episode_{idx:03d}.json"
+        if candidate.exists():
+            spec["default_positions_file"] = str(candidate)
+            break
+    return spec
 
 
 def _validate_loaded_result(
@@ -2380,68 +2723,13 @@ def _validate_loaded_result(
 
 
 def _ensure_post_eval_episode_positions(spec: Dict[str, Any]) -> Dict[str, Any]:
-    if spec.get("mode") != "heldout_shared":
+    mode = _canonicalize_post_eval_mode(spec.get("mode"))
+    spec["mode"] = mode
+    if mode != DEFAULT_POST_EVAL_MODE:
         return spec
-
-    episode_positions_dir = Path(spec["episode_positions_dir"])
-    terrain_seed_sequence = [int(seed) for seed in spec.get("terrain_seed_sequence", [])]
-    terrain_variant_seed_sequence = [int(seed) for seed in spec.get("terrain_variant_seed_sequence", [])]
-    episode_positions_dir.mkdir(parents=True, exist_ok=True)
-
-    lock_path = episode_positions_dir / ".generation.lock"
-    with _exclusive_file_lock(lock_path):
-        candidate_files = [
-            episode_positions_dir / f"episode_{idx:03d}.json"
-            for idx, _ in enumerate(terrain_seed_sequence)
-        ]
-        force_regenerate = bool(spec.get("force_regenerate_testset"))
-        needs_generation = force_regenerate or any(not candidate.exists() for candidate in candidate_files)
-        if not needs_generation:
-            compatibility_regen, compatibility_reason = _existing_episode_positions_need_regen(spec, candidate_files)
-            if compatibility_regen:
-                needs_generation = True
-                print(f"[后评估测试集] 现有 episode positions 不兼容，准备重建: {compatibility_reason}")
-
-        if needs_generation:
-            os.environ.setdefault("SUPPRESS_MA_PROMPT", "1")
-            from generate_episode_positions import generate_all_episode_positions
-
-            base_env_vars = {
-                "MAP_SIZE": str(spec["map_size"]),
-                "TERRAIN_COMPLEXITY_LEVEL": str(spec["terrain_complexity"]),
-                "MOUNTAIN_MIN_DISTANCE": str(spec["mountain_min_distance"]),
-            }
-            if spec.get("semi_random_terrain"):
-                base_env_vars["SEMI_RANDOM_TERRAIN"] = "1"
-                base_env_vars["TERRAIN_BASE_SEED"] = str(spec["terrain_base_seed"])
-                base_env_vars["PEAK_JITTER_RANGE"] = str(spec["peak_jitter_range"])
-                base_env_vars["PEAK_CENTER_JITTER_RANGE"] = str(spec["peak_center_jitter_range"])
-                base_env_vars["PEAK_HEIGHT_JITTER_RATIO_MIN"] = str(spec["peak_height_jitter_ratio_min"])
-                base_env_vars["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(spec["peak_height_jitter_ratio_max"])
-                base_env_vars["PEAK_HEIGHT_MAX_SCALE"] = str(spec["peak_height_max_scale"])
-                base_env_vars["TERRAIN_VARIANT_NOISE_RATIO"] = str(spec["terrain_variant_noise_ratio"])
-            if spec.get("position_family") == "same_region":
-                base_env_vars["HELDOUT_POSITION_MODE"] = "same_region"
-                base_env_vars["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(spec["reference_positions_file"])
-                base_env_vars["HELDOUT_START_CENTER_JITTER"] = str(spec["start_center_jitter"])
-                base_env_vars["HELDOUT_AGENT_LOCAL_JITTER"] = str(spec["agent_local_jitter"])
-                base_env_vars["HELDOUT_GOAL_REGION_RADIUS"] = str(spec["goal_region_radius"])
-            if force_regenerate:
-                print(f"[后评估测试集] 强制重生成 episode positions: {episode_positions_dir}")
-            generate_all_episode_positions(
-                terrain_seeds=terrain_seed_sequence,
-                terrain_variant_seeds=terrain_variant_seed_sequence or None,
-                output_dir=episode_positions_dir,
-                base_env_vars=base_env_vars,
-            )
-
-    for idx, _ in enumerate(terrain_seed_sequence):
-        candidate = episode_positions_dir / f"episode_{idx:03d}.json"
-        if candidate.exists():
-            spec["default_positions_file"] = str(candidate)
-            break
-
-    return spec
+    if not spec.get("episode_positions_dir"):
+        return spec
+    return _generate_post_eval_positions_from_reference(spec)
 
 
 def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Optional[Dict[str, Any]]:
@@ -2449,6 +2737,7 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         return None
 
     artifact_policy = _resolve_post_eval_artifact_policy(args)
+    selection_protocol = _resolve_post_eval_selection_protocol(args)
     post_eval_testset_prepared = bool(getattr(args, "post_eval_testset_prepared", False))
     training_environment = _effective_training_environment_setup(args)
     base_env = setup_base_env_vars(
@@ -2461,24 +2750,7 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
     map_size = _safe_int(float(base_env.get("MAP_SIZE", 200))) or 200
     mountain_min_distance = _safe_int(float(base_env.get("MOUNTAIN_MIN_DISTANCE", 55))) or 55
     post_eval_seed = _resolve_post_eval_seed(args)
-    mode = str(getattr(args, "post_eval_mode", "heldout_shared"))
-    semi_random_terrain = (mode == "heldout_shared")
-    terrain_base_seed_value = getattr(args, "post_eval_terrain_base_seed", None)
-    if terrain_base_seed_value is None:
-        terrain_base_seed_value = getattr(args, "resolved_scenario_seed", 88)
-    terrain_base_seed = int(terrain_base_seed_value)
-    peak_jitter_range = float(_resolve_post_eval_peak_jitter_range(args))
-    peak_height_jitter_ratio_min = max(0.0, float(_resolve_post_eval_peak_height_jitter_ratio_min(args)))
-    peak_height_jitter_ratio_max = max(
-        peak_height_jitter_ratio_min,
-        float(_resolve_post_eval_peak_height_jitter_ratio_max(args)),
-    )
-    peak_height_max_scale = max(1.0, float(_resolve_post_eval_peak_height_max_scale(args)))
-    peak_center_jitter_range = max(0.0, float(_resolve_post_eval_peak_center_jitter_range(args)))
-    terrain_variant_noise_ratio = max(0.0, float(_resolve_post_eval_terrain_variant_noise_ratio(args)))
-    start_center_jitter = float(_resolve_post_eval_start_center_jitter(args))
-    agent_local_jitter = float(_resolve_post_eval_agent_local_jitter(args))
-    goal_region_radius = float(_resolve_post_eval_goal_region_radius(args))
+    mode = _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE))
     match_train_random_terrain = bool(training_environment.get("random_terrain", False))
     match_train_semi_random = bool(training_environment.get("semi_random_terrain", False))
     match_train_terrain_seed = int(training_environment.get("terrain_seed", getattr(args, "resolved_scenario_seed", 88)))
@@ -2494,50 +2766,63 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
     )
     match_train_peak_height_max_scale = float(training_environment.get("peak_height_max_scale", 1.0))
     match_train_variant_noise_ratio = float(training_environment.get("terrain_variant_noise_ratio", 0.0))
-    spec_random_terrain = True if mode == "heldout_shared" else bool(match_train_random_terrain)
-    spec_semi_random_terrain = bool(semi_random_terrain) if mode == "heldout_shared" else bool(match_train_semi_random)
-    spec_terrain_seed = int(terrain_base_seed) if mode == "heldout_shared" else int(match_train_terrain_seed)
-    spec_terrain_base_seed = int(terrain_base_seed) if mode == "heldout_shared" else int(match_train_terrain_base_seed)
-    spec_peak_jitter_range = float(peak_jitter_range) if mode == "heldout_shared" else float(match_train_peak_jitter_range)
-    spec_peak_center_jitter_range = (
-        float(peak_center_jitter_range) if mode == "heldout_shared" else float(match_train_peak_center_jitter_range)
+    match_train_hold_mode = str(training_environment.get("semi_random_hold_mode", "episode") or "episode").strip().lower()
+    match_train_hold_episodes = int(training_environment.get("semi_random_hold_episodes", 1) or 1)
+    match_train_hold_min_episodes = int(training_environment.get("semi_random_hold_min_episodes", 1) or 1)
+    match_train_hold_max_episodes = int(
+        training_environment.get("semi_random_hold_max_episodes", match_train_hold_min_episodes) or match_train_hold_min_episodes
     )
-    spec_peak_height_jitter_ratio_min = (
-        float(peak_height_jitter_ratio_min)
-        if mode == "heldout_shared"
-        else float(match_train_peak_height_jitter_ratio_min)
-    )
-    spec_peak_height_jitter_ratio_max = (
-        float(peak_height_jitter_ratio_max)
-        if mode == "heldout_shared"
-        else float(match_train_peak_height_jitter_ratio_max)
-    )
-    spec_peak_height_max_scale = (
-        float(peak_height_max_scale) if mode == "heldout_shared" else float(match_train_peak_height_max_scale)
-    )
-    spec_terrain_variant_noise_ratio = (
-        float(terrain_variant_noise_ratio)
-        if mode == "heldout_shared"
-        else float(match_train_variant_noise_ratio)
-    )
-    spec_use_dynamic_obstacles = (
-        bool(getattr(args, "use_dynamic_obstacles", False))
-        if mode == "heldout_shared"
-        else bool(match_train_use_dynamic_obstacles)
+    spec_random_terrain = bool(match_train_random_terrain)
+    spec_semi_random_terrain = bool(match_train_semi_random)
+    spec_terrain_seed = int(match_train_terrain_seed)
+    spec_terrain_base_seed = int(match_train_terrain_base_seed)
+    spec_peak_jitter_range = float(match_train_peak_jitter_range)
+    spec_peak_center_jitter_range = float(match_train_peak_center_jitter_range)
+    spec_peak_height_jitter_ratio_min = float(match_train_peak_height_jitter_ratio_min)
+    spec_peak_height_jitter_ratio_max = float(match_train_peak_height_jitter_ratio_max)
+    spec_peak_height_max_scale = float(match_train_peak_height_max_scale)
+    spec_terrain_variant_noise_ratio = float(match_train_variant_noise_ratio)
+    spec_use_dynamic_obstacles = bool(match_train_use_dynamic_obstacles)
+    episodes = int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES))
+    if spec_semi_random_terrain:
+        terrain_seed_sequence = [int(spec_terrain_base_seed)] * episodes
+        terrain_variant_seed_sequence = _generate_post_eval_terrain_variant_seeds(
+            seed=post_eval_seed,
+            episodes=episodes,
+            hold_mode=match_train_hold_mode,
+            hold_episodes=match_train_hold_episodes,
+            hold_min_episodes=match_train_hold_min_episodes,
+            hold_max_episodes=match_train_hold_max_episodes,
+        )
+    elif spec_random_terrain:
+        terrain_seed_sequence = _generate_post_eval_terrain_seeds(post_eval_seed, episodes)
+        terrain_variant_seed_sequence = []
+    else:
+        terrain_seed_sequence = [int(spec_terrain_seed)] * episodes
+        terrain_variant_seed_sequence = []
+    obstacle_seed_sequence = (
+        _generate_post_eval_obstacle_seeds(post_eval_seed, episodes)
+        if spec_use_dynamic_obstacles
+        else [0] * episodes
     )
     spec = {
-        "version": 9,
+        "version": 10,
         "enabled": True,
         "mode": mode,
-        "episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
+        "episodes": int(episodes),
         "episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
         "seed": int(post_eval_seed),
-        "model_variant": str(getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT)),
+        "model_variant": str(_resolve_post_eval_storage_variant(args)),
+        "selection_protocol": str(selection_protocol),
+        "requested_model_variant": str(getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT)),
+        "validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
+        "validation_seed": int(_resolve_post_eval_validation_seed(args)),
+        "validation_candidates": list(_resolve_post_eval_validation_candidates(args)),
         "scenario_seed": int(args.resolved_scenario_seed),
         "terrain_complexity": int(terrain_complexity),
         "map_size": int(map_size),
         "mountain_min_distance": int(mountain_min_distance),
-        "terrain_family": "similar_unseen" if mode == "heldout_shared" else "train_match",
+        "terrain_family": "train_match_shared",
         "random_terrain": bool(spec_random_terrain),
         "semi_random_terrain": bool(spec_semi_random_terrain),
         "terrain_seed": int(spec_terrain_seed),
@@ -2548,51 +2833,32 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         "peak_height_jitter_ratio_max": float(spec_peak_height_jitter_ratio_max),
         "peak_height_max_scale": float(spec_peak_height_max_scale),
         "terrain_variant_noise_ratio": float(spec_terrain_variant_noise_ratio),
-        "position_family": "same_region" if semi_random_terrain else "train_match",
+        "position_family": "train_match",
         "reference_positions_file": str(positions_file),
-        "start_center_jitter": float(start_center_jitter),
-        "agent_local_jitter": float(agent_local_jitter),
-        "goal_region_radius": float(goal_region_radius),
+        "start_center_jitter": 0.0,
+        "agent_local_jitter": 0.0,
+        "goal_region_radius": 0.0,
         "force_regenerate_testset": bool(getattr(args, "force_post_eval_testset_regen", False)) and not post_eval_testset_prepared,
         "use_dynamic_obstacles": bool(spec_use_dynamic_obstacles),
         "use_fixed_positions": True,
         "shared_positions_file": str(positions_file),
         "default_positions_file": str(positions_file),
-        "terrain_seed_sequence": [],
-        "terrain_variant_seed_sequence": [],
+        "terrain_seed_sequence": [int(seed) for seed in terrain_seed_sequence],
+        "terrain_variant_seed_sequence": [int(seed) for seed in terrain_variant_seed_sequence],
+        "obstacle_seed_sequence": [int(seed) for seed in obstacle_seed_sequence],
+        "semi_random_hold_mode": str(match_train_hold_mode),
+        "semi_random_hold_episodes": int(match_train_hold_episodes),
+        "semi_random_hold_min_episodes": int(match_train_hold_min_episodes),
+        "semi_random_hold_max_episodes": int(match_train_hold_max_episodes),
         "episode_positions_dir": "",
         "artifact_policy": artifact_policy,
         "testset_prepared": bool(post_eval_testset_prepared),
     }
 
-    if spec["mode"] == "heldout_shared":
-        spec["terrain_seed_sequence"] = [int(spec["terrain_base_seed"])] * int(spec["episodes"])
-        spec["terrain_variant_seed_sequence"] = _generate_post_eval_terrain_variant_seeds(spec["seed"], spec["episodes"])
-        if spec.get("semi_random_terrain"):
-            jitter_tag = str(spec.get("peak_jitter_range", 15.0)).replace(".", "p")
-            center_tag = str(spec.get("peak_center_jitter_range", 3.0)).replace(".", "p")
-            height_min_tag = str(spec.get("peak_height_jitter_ratio_min", 0.20)).replace(".", "p")
-            height_max_tag = str(spec.get("peak_height_jitter_ratio_max", 0.40)).replace(".", "p")
-            height_cap_tag = str(spec.get("peak_height_max_scale", 1.30)).replace(".", "p")
-            variant_noise_tag = str(spec.get("terrain_variant_noise_ratio", 0.15)).replace(".", "p")
-            start_tag = str(spec.get("start_center_jitter", 12.0)).replace(".", "p")
-            goal_tag = str(spec.get("goal_region_radius", 18.0)).replace(".", "p")
-            testset_tag = (
-                f"seed_{spec['seed']}_similar_base_{spec['terrain_base_seed']}_jitter_{jitter_tag}"
-                f"_center_{center_tag}"
-                f"_hjit_{height_min_tag}_{height_max_tag}_hcap_{height_cap_tag}"
-                f"_vnoise_{variant_noise_tag}"
-                f"_start_{start_tag}_goal_{goal_tag}_posv5"
-            )
-        else:
-            testset_tag = f"seed_{spec['seed']}_random"
-        episode_positions_dir = batch_dir / "results" / "post_eval_testset" / testset_tag / "episode_positions"
-        spec["episode_positions_dir"] = str(episode_positions_dir)
-        spec = _ensure_post_eval_episode_positions(spec)
-    elif spec["mode"] == "match_train_env":
-        spec["position_family"] = "train_match"
-    else:
-        raise ValueError(f"未知 post-eval 模式: {spec['mode']}")
+    testset_tag = _generate_post_eval_testset_tag(spec)
+    episode_positions_dir = batch_dir / "results" / "post_eval_testset" / testset_tag / "episode_positions"
+    spec["episode_positions_dir"] = str(episode_positions_dir)
+    spec = _ensure_post_eval_episode_positions(spec)
 
     spec_path = batch_dir / "results" / "post_eval_shared_spec.json"
     spec_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2758,6 +3024,20 @@ def _validate_post_eval_results(
         for key in ("team_success_rate", "avg_collision_count", "avg_team_total_path_length"):
             if key not in summary:
                 errors.append(f"summary 缺少关键字段: {key}")
+
+    expected_model_variant = str(
+        spec.get("resolved_model_variant")
+        or spec.get("selected_model_variant")
+        or spec.get("requested_model_variant")
+        or ""
+    ).strip()
+    if expected_model_variant:
+        actual_model_path = str(data.get("model_path", "")).strip()
+        actual_model_leaf = Path(actual_model_path).name if actual_model_path else ""
+        if actual_model_leaf != expected_model_variant:
+            errors.append(
+                f"resolved_model_variant 不匹配: got={actual_model_leaf or '<empty>'}, expected={expected_model_variant}"
+            )
 
     expected_seeds = [int(seed) for seed in spec.get("terrain_seed_sequence", [])]
     if expected_seeds:
@@ -3043,77 +3323,168 @@ def _extract_post_eval_payload(
     }
 
 
-def _run_post_training_evaluation(
-    result: Dict[str, Any],
-    cfg: Dict[str, Any],
-    positions_file: Path,
+def _post_eval_validation_artifact_policy() -> Dict[str, bool]:
+    return {
+        "light_mode": True,
+        "save_interactive_html": False,
+        "save_all_episodes": False,
+        "save_best_reward_html": False,
+        "save_team_success_html": False,
+        "save_trajectory_json": False,
+        "save_trajectory_png": False,
+        "save_actor_sequence": False,
+        "save_control_diagnostics": False,
+        "enable_overlay": False,
+        "disable_gif": True,
+    }
+
+
+def _is_valid_post_eval_model_dir(dir_path: Path) -> bool:
+    try:
+        if not dir_path.exists() or not dir_path.is_dir():
+            return False
+        return any(dir_path.glob("actor_*.weights.h5"))
+    except Exception:
+        return False
+
+
+def _ep_dir_sort_key(path: Path) -> Tuple[int, str]:
+    name = path.name
+    digits = "".join(ch for ch in name if ch.isdigit())
+    try:
+        numeric = int(digits) if digits else -1
+    except Exception:
+        numeric = -1
+    return numeric, name
+
+
+def _resolve_model_variant_dir(model_root: Path, model_variant: str) -> Tuple[Optional[Path], Optional[str]]:
+    variant = str(model_variant or "").strip().lower()
+    if not model_root.exists():
+        return None, None
+
+    def _latest_ep_dir() -> Optional[Path]:
+        ep_dirs = [
+            candidate
+            for candidate in model_root.iterdir()
+            if candidate.is_dir() and candidate.name.startswith("ep") and _is_valid_post_eval_model_dir(candidate)
+        ]
+        if not ep_dirs:
+            return None
+        ep_dirs.sort(key=_ep_dir_sort_key, reverse=True)
+        return ep_dirs[0]
+
+    if variant == "auto":
+        for fallback_variant in ("best_by_team_sr", "final", "best", "latest_ep", "checkpoint"):
+            resolved_dir, resolved_variant = _resolve_model_variant_dir(model_root, fallback_variant)
+            if resolved_dir is not None:
+                return resolved_dir, resolved_variant
+        return None, None
+
+    if variant == "latest_ep":
+        latest_ep = _latest_ep_dir()
+        if latest_ep is not None:
+            return latest_ep, latest_ep.name
+        return None, None
+
+    direct_dir = model_root / variant
+    if _is_valid_post_eval_model_dir(direct_dir):
+        return direct_dir, direct_dir.name
+    return None, None
+
+
+def _build_matched_validation_spec(
+    base_post_eval_spec: Dict[str, Any],
     args,
     batch_dir: Path,
-    post_eval_spec: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    if post_eval_spec is None:
-        return result
+    spec = dict(base_post_eval_spec)
+    spec["episodes"] = int(_resolve_post_eval_validation_episodes(args))
+    spec["seed"] = int(_resolve_post_eval_validation_seed(args))
+    spec["artifact_policy"] = _post_eval_validation_artifact_policy()
+    spec["validation_role"] = "checkpoint_selection"
+    spec["testset_prepared"] = False
+    spec["force_regenerate_testset"] = bool(getattr(args, "force_post_eval_testset_regen", False))
 
-    label = cfg["label"]
-    model_variant = str(post_eval_spec["model_variant"])
-    eval_dir = batch_dir / "results" / "post_eval" / label / model_variant
-    force_rerun = bool(getattr(args, "force_post_eval_rerun", False))
+    testset_tag = _generate_post_eval_testset_tag(spec)
+    episode_positions_dir = (
+        batch_dir
+        / "results"
+        / "post_eval_validation_testset"
+        / testset_tag
+        / "episode_positions"
+    )
+    spec["episode_positions_dir"] = str(episode_positions_dir)
+    spec = _ensure_post_eval_episode_positions(spec)
+    return spec
+
+
+def _score_post_eval_summary(summary: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
+    def _metric(key: str, *, fallback: float, invert: bool = False) -> float:
+        value = _safe_float(summary.get(key))
+        if value is None:
+            return fallback
+        value = float(value)
+        return -value if invert else value
+
+    return (
+        _metric("team_success_rate", fallback=-1.0),
+        _metric("collision_free_rate", fallback=-1.0),
+        _metric("avg_team_final_goal_distance", fallback=-1e12, invert=True),
+        _metric("avg_collision_count", fallback=-1e12, invert=True),
+        _metric("avg_team_total_path_length", fallback=-1e12, invert=True),
+    )
+
+
+def _execute_post_eval_run(
+    *,
+    result: Dict[str, Any],
+    label: str,
+    positions_file: Path,
+    args,
+    eval_dir: Path,
+    eval_spec: Dict[str, Any],
+    model_path: Path,
+    banner_prefix: str,
+    inherited_runtime_env: Dict[str, str],
+    force_rerun: bool,
+) -> Dict[str, Any]:
+    eval_dir = Path(eval_dir)
     if force_rerun and eval_dir.exists():
         shutil.rmtree(eval_dir)
     eval_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_model_variant = model_path.name
+    spec = dict(eval_spec)
+    spec["resolved_model_variant"] = str(resolved_model_variant)
+    spec["selected_model_path"] = str(model_path)
+
     eval_results_json = eval_dir / "evaluation_results.json"
     eval_log_path = eval_dir / "post_eval.log"
     eval_spec_path = eval_dir / "post_eval_spec.json"
-    _save_json(eval_spec_path, post_eval_spec)
-    inherited_runtime_env = _load_post_eval_runtime_env(result)
+    _save_json(eval_spec_path, spec)
+
     artifact_policy = (
-        post_eval_spec.get("artifact_policy", {})
-        if isinstance(post_eval_spec.get("artifact_policy"), dict)
+        spec.get("artifact_policy", {})
+        if isinstance(spec.get("artifact_policy"), dict)
         else _resolve_post_eval_artifact_policy(args)
     )
-    training_feasible, feasibility_detail = _training_team_success_feasibility(result)
-    result["post_eval_eligible"] = bool(training_feasible)
-    result["post_eval_eligibility_detail"] = dict(feasibility_detail)
-    if not training_feasible:
-        skip_reason = (
-            "训练阶段未出现团队成功回合，跳过 post-eval"
-            f" | detail={feasibility_detail}"
-        )
-        print(f"[后评估-{label}] 跳过: {skip_reason}")
-        result["post_eval_dir"] = str(eval_dir)
-        result["post_eval_log_path"] = ""
-        result["post_eval_results_path"] = ""
-        result["post_eval_spec_path"] = str(eval_spec_path)
-        result["post_eval_spec"] = dict(post_eval_spec)
-        result["post_eval_metrics"] = None
-        result["post_eval_summary"] = None
-        result["post_eval_episode_count"] = 0
-        result["post_eval_skipped"] = True
-        result["post_eval_skip_reason"] = skip_reason
-        result["post_eval_status"] = "skipped_no_train_success"
-        return result
 
-    reuse_existing = False
-    existing_payload = None
+    payload = None
     if (not force_rerun) and eval_results_json.exists():
         validation_errors = _validate_post_eval_results(
             eval_results_json,
-            post_eval_spec,
+            spec,
             expected_runtime_env=inherited_runtime_env,
         )
         if not validation_errors:
             eval_data = _load_json_file(eval_results_json)
-            existing_payload = _extract_post_eval_payload(
+            payload = _extract_post_eval_payload(
                 eval_data,
                 fallback_collision_threshold=result.get("metrics", {}).get("collision_distance_threshold"),
             )
-            reuse_existing = True
 
-    if not reuse_existing:
-        model_root = _resolve_post_eval_model_root(result)
-        if model_root is None:
-            raise RuntimeError(f"[后评估-{label}] 无法定位模型目录，log_dir={result.get('log_dir')}")
-
+    if payload is None:
         env = _build_process_env(args.env_isolation)
         env.update(inherited_runtime_env)
         conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
@@ -3128,7 +3499,7 @@ def _run_post_training_evaluation(
         env["EVAL_RESPECT_INPUT_POSITIONS"] = "1"
         env["EVAL_PYTHON_BIN"] = _resolve_post_eval_python(result)
         _ensure_conda_runtime_env(env, env.get("EVAL_PYTHON_BIN"))
-        env["MODEL_VARIANT"] = model_variant
+        env["MODEL_VARIANT"] = "auto"
         env["PYTHONUNBUFFERED"] = "1"
         env["QUIET_OUTPUT"] = "1"
         env["MPLCONFIGDIR"] = str((eval_dir / ".mplconfig").resolve())
@@ -3153,7 +3524,7 @@ def _run_post_training_evaluation(
         env.setdefault("TQDM_MINITERS", "200")
         env.setdefault("PF_JIT", "1")
         env["EVAL_EPISODE_LENGTH_MULTIPLIER"] = str(
-            post_eval_spec.get("episode_length_multiplier", DEFAULT_POST_EVAL_EPISODE_LENGTH_MULTIPLIER)
+            spec.get("episode_length_multiplier", DEFAULT_POST_EVAL_EPISODE_LENGTH_MULTIPLIER)
         )
         env["EVAL_DEBUG_ACTION_STEPS"] = "0"
         env["EVAL_DISABLE_VISUALIZATION"] = "0"
@@ -3173,7 +3544,6 @@ def _run_post_training_evaluation(
             env["NUMEXPR_NUM_THREADS"] = str(cpu_threads)
             env["TF_NUM_INTRAOP_THREADS"] = str(cpu_threads)
             env["TF_NUM_INTEROP_THREADS"] = "1"
-        # 轻量模式才稀疏采样轨迹；完整后评估必须保留全长轨迹，避免 2800 步被压成 ~560 点。
         env.setdefault("EVAL_TRAJECTORY_SAMPLE_INTERVAL", "5" if light_mode_enabled else "1")
         env["DISABLE_GIF"] = "1" if _to_bool(artifact_policy.get("disable_gif", True)) else "0"
         env["SAVE_INTERACTIVE_TRAJ"] = "1" if _to_bool(artifact_policy.get("save_interactive_html", True)) else "0"
@@ -3189,84 +3559,78 @@ def _run_post_training_evaluation(
         env["RANDOM_ACTION_PROB"] = "0.0"
         env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"
         env["USE_SCENARIO_SEED"] = "1"
-        env["SCENARIO_SEED"] = str(post_eval_spec.get("terrain_seed", post_eval_spec["scenario_seed"]))
-        env["TERRAIN_COMPLEXITY_LEVEL"] = str(post_eval_spec["terrain_complexity"])
-        env["MAP_SIZE"] = str(post_eval_spec["map_size"])
-        env["MOUNTAIN_MIN_DISTANCE"] = str(post_eval_spec["mountain_min_distance"])
-        env["SEMI_RANDOM_TERRAIN"] = "1" if post_eval_spec.get("semi_random_terrain") else "0"
-        env["TERRAIN_BASE_SEED"] = str(post_eval_spec.get("terrain_base_seed", post_eval_spec["scenario_seed"]))
-        env["PEAK_JITTER_RANGE"] = str(post_eval_spec.get("peak_jitter_range", 15.0))
-        env["PEAK_CENTER_JITTER_RANGE"] = str(post_eval_spec.get("peak_center_jitter_range", 3.0))
-        env["PEAK_HEIGHT_JITTER_RATIO_MIN"] = str(post_eval_spec.get("peak_height_jitter_ratio_min", 0.20))
-        env["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(post_eval_spec.get("peak_height_jitter_ratio_max", 0.40))
-        env["PEAK_HEIGHT_MAX_SCALE"] = str(post_eval_spec.get("peak_height_max_scale", 1.30))
-        env["TERRAIN_VARIANT_NOISE_RATIO"] = str(post_eval_spec.get("terrain_variant_noise_ratio", 0.15))
-        env["HELDOUT_POSITION_MODE"] = str(post_eval_spec.get("position_family", "train_match"))
-        env["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(post_eval_spec.get("reference_positions_file", positions_file))
-        env["HELDOUT_START_CENTER_JITTER"] = str(post_eval_spec.get("start_center_jitter", 12.0))
-        env["HELDOUT_AGENT_LOCAL_JITTER"] = str(post_eval_spec.get("agent_local_jitter", 3.0))
-        env["HELDOUT_GOAL_REGION_RADIUS"] = str(post_eval_spec.get("goal_region_radius", 18.0))
-        env["USE_DYNAMIC_OBSTACLES"] = "1" if post_eval_spec.get("use_dynamic_obstacles") else "0"
-        env["POST_EVAL_MODE"] = str(post_eval_spec.get("mode", "heldout_shared"))
-        env["POST_EVAL_TERRAIN_FAMILY"] = str(post_eval_spec.get("terrain_family", "train_match"))
-        env["POST_EVAL_POSITION_FAMILY"] = str(post_eval_spec.get("position_family", "train_match"))
+        env["SCENARIO_SEED"] = str(spec.get("terrain_seed", spec["scenario_seed"]))
+        env["TERRAIN_COMPLEXITY_LEVEL"] = str(spec["terrain_complexity"])
+        env["MAP_SIZE"] = str(spec["map_size"])
+        env["MOUNTAIN_MIN_DISTANCE"] = str(spec["mountain_min_distance"])
+        env["SEMI_RANDOM_TERRAIN"] = "1" if spec.get("semi_random_terrain") else "0"
+        env["TERRAIN_BASE_SEED"] = str(spec.get("terrain_base_seed", spec["scenario_seed"]))
+        env["PEAK_JITTER_RANGE"] = str(spec.get("peak_jitter_range", 15.0))
+        env["PEAK_CENTER_JITTER_RANGE"] = str(spec.get("peak_center_jitter_range", 3.0))
+        env["PEAK_HEIGHT_JITTER_RATIO_MIN"] = str(spec.get("peak_height_jitter_ratio_min", 0.20))
+        env["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(spec.get("peak_height_jitter_ratio_max", 0.40))
+        env["PEAK_HEIGHT_MAX_SCALE"] = str(spec.get("peak_height_max_scale", 1.30))
+        env["TERRAIN_VARIANT_NOISE_RATIO"] = str(spec.get("terrain_variant_noise_ratio", 0.15))
+        env["HELDOUT_POSITION_MODE"] = str(spec.get("position_family", "train_match"))
+        env["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(spec.get("reference_positions_file", positions_file))
+        env["HELDOUT_START_CENTER_JITTER"] = str(spec.get("start_center_jitter", 12.0))
+        env["HELDOUT_AGENT_LOCAL_JITTER"] = str(spec.get("agent_local_jitter", 3.0))
+        env["HELDOUT_GOAL_REGION_RADIUS"] = str(spec.get("goal_region_radius", 18.0))
+        env["USE_DYNAMIC_OBSTACLES"] = "1" if spec.get("use_dynamic_obstacles") else "0"
+        env["POST_EVAL_MODE"] = str(spec.get("mode", DEFAULT_POST_EVAL_MODE))
+        env["POST_EVAL_TERRAIN_FAMILY"] = str(spec.get("terrain_family", "train_match"))
+        env["POST_EVAL_POSITION_FAMILY"] = str(spec.get("position_family", "train_match"))
         env["USE_FIXED_POSITIONS"] = "1"
-        env["POSITIONS_FILE"] = str(post_eval_spec["default_positions_file"])
-        env["RANDOM_TERRAIN"] = "1" if post_eval_spec.get("random_terrain") else "0"
-        if post_eval_spec.get("mode") == "heldout_shared":
-            env["TERRAIN_SEED_SEQUENCE"] = ",".join(map(str, post_eval_spec.get("terrain_seed_sequence", [])))
-            env["TERRAIN_VARIANT_SEED_SEQUENCE"] = ",".join(map(str, post_eval_spec.get("terrain_variant_seed_sequence", [])))
+        env["POSITIONS_FILE"] = str(spec["default_positions_file"])
+        env["RANDOM_TERRAIN"] = "1" if spec.get("random_terrain") else "0"
+        if spec.get("terrain_seed_sequence"):
+            env["TERRAIN_SEED_SEQUENCE"] = ",".join(map(str, spec.get("terrain_seed_sequence", [])))
+        else:
+            env.pop("TERRAIN_SEED_SEQUENCE", None)
+        if spec.get("terrain_variant_seed_sequence"):
+            env["TERRAIN_VARIANT_SEED_SEQUENCE"] = ",".join(map(str, spec.get("terrain_variant_seed_sequence", [])))
+        else:
+            env.pop("TERRAIN_VARIANT_SEED_SEQUENCE", None)
+        if spec.get("obstacle_seed_sequence"):
+            env["OBSTACLE_SEED_SEQUENCE"] = ",".join(map(str, spec.get("obstacle_seed_sequence", [])))
+        else:
+            env.pop("OBSTACLE_SEED_SEQUENCE", None)
+        if spec.get("episode_positions_dir"):
             env["EVAL_REQUIRE_EPISODE_POSITIONS"] = "1"
-            if post_eval_spec.get("episode_positions_dir"):
-                env["EPISODE_POSITIONS_DIR"] = str(post_eval_spec["episode_positions_dir"])
+            env["EPISODE_POSITIONS_DIR"] = str(spec["episode_positions_dir"])
         else:
             env.pop("EVAL_REQUIRE_EPISODE_POSITIONS", None)
             env.pop("EPISODE_POSITIONS_DIR", None)
-            env.pop("TERRAIN_SEED_SEQUENCE", None)
-            env.pop("TERRAIN_VARIANT_SEED_SEQUENCE", None)
 
         eval_command = [
             "/bin/bash",
             str((Path(__file__).resolve().parent / "run_evaluation.sh").resolve()),
-            str(model_root),
-            str(post_eval_spec["episodes"]),
+            str(model_path),
+            str(spec["episodes"]),
             str(eval_dir),
-            str(post_eval_spec["default_positions_file"]),
+            str(spec["default_positions_file"]),
             "1",
             "false",
         ]
 
         print(f"\n{'='*70}")
-        print(f"[后评估-{label}] 开始共享测试集评估")
-        print(f"[后评估-{label}] 模型目录: {model_root}")
-        print(f"[后评估-{label}] 测试模式: {post_eval_spec['mode']}")
-        print(f"[后评估-{label}] 地形族: {post_eval_spec.get('terrain_family', 'unknown')}")
-        print(f"[后评估-{label}] 位置族: {post_eval_spec.get('position_family', 'unknown')}")
-        print(f"[后评估-{label}] 测试步长倍率: x{post_eval_spec.get('episode_length_multiplier', 1.0)}")
-        if post_eval_spec.get("semi_random_terrain"):
-            print(
-                f"[后评估-{label}] 相似地形heldout: base_seed={post_eval_spec['terrain_base_seed']}, "
-                f"peak_jitter={post_eval_spec['peak_jitter_range']}, "
-                f"height_jitter=[{post_eval_spec.get('peak_height_jitter_ratio_min', 0.20)}, "
-                f"{post_eval_spec.get('peak_height_jitter_ratio_max', 0.40)}] x range, "
-                f"height_cap={post_eval_spec.get('peak_height_max_scale', 1.30)}x"
-            )
-            print(
-                f"[后评估-{label}] 同区域位置heldout: ref={Path(post_eval_spec['reference_positions_file']).name}, "
-                f"start_jitter={post_eval_spec['start_center_jitter']}, "
-                f"agent_jitter={post_eval_spec['agent_local_jitter']}, "
-                f"goal_radius={post_eval_spec['goal_region_radius']}"
-            )
-        print(f"[后评估-{label}] 测试回合数: {post_eval_spec['episodes']}")
-        print(f"[后评估-{label}] 结果目录: {eval_dir}")
-        print(f"[后评估-{label}] 实时日志: {eval_log_path}")
-        print(f"[后评估-{label}] 可视化保存策略: {artifact_policy}")
+        print(f"[{banner_prefix}-{label}] 开始共享测试集评估")
+        print(f"[{banner_prefix}-{label}] 模型路径: {model_path}")
+        print(f"[{banner_prefix}-{label}] 模型变体: {resolved_model_variant}")
+        print(f"[{banner_prefix}-{label}] 测试模式: {spec['mode']}")
+        print(f"[{banner_prefix}-{label}] 地形族: {spec.get('terrain_family', 'unknown')}")
+        print(f"[{banner_prefix}-{label}] 位置族: {spec.get('position_family', 'unknown')}")
+        print(f"[{banner_prefix}-{label}] 测试步长倍率: x{spec.get('episode_length_multiplier', 1.0)}")
+        print(f"[{banner_prefix}-{label}] 测试回合数: {spec['episodes']}")
+        print(f"[{banner_prefix}-{label}] 结果目录: {eval_dir}")
+        print(f"[{banner_prefix}-{label}] 实时日志: {eval_log_path}")
+        print(f"[{banner_prefix}-{label}] 可视化保存策略: {artifact_policy}")
         if inherited_runtime_env:
             runtime_preview = ", ".join(
                 f"{key}={inherited_runtime_env[key]}"
                 for key in sorted(inherited_runtime_env)
             )
-            print(f"[后评估-{label}] 继承训练运行时环境: {runtime_preview}")
+            print(f"[{banner_prefix}-{label}] 继承训练运行时环境: {runtime_preview}")
         print(f"{'='*70}")
 
         _run_post_eval_command_with_live_output(
@@ -3278,27 +3642,291 @@ def _run_post_training_evaluation(
 
         validation_errors = _validate_post_eval_results(
             eval_results_json,
-            post_eval_spec,
+            spec,
             expected_runtime_env=inherited_runtime_env,
         )
         if validation_errors:
             raise RuntimeError(
-                f"[后评估-{label}] 评估结果校验失败: {' | '.join(validation_errors)} | 日志: {eval_log_path}"
+                f"[{banner_prefix}-{label}] 评估结果校验失败: {' | '.join(validation_errors)} | 日志: {eval_log_path}"
             )
         eval_data = _load_json_file(eval_results_json)
-        existing_payload = _extract_post_eval_payload(
+        payload = _extract_post_eval_payload(
             eval_data,
             fallback_collision_threshold=result.get("metrics", {}).get("collision_distance_threshold"),
         )
 
-    result["post_eval_dir"] = str(eval_dir)
-    result["post_eval_log_path"] = str(eval_log_path)
-    result["post_eval_results_path"] = str(eval_results_json)
-    result["post_eval_spec_path"] = str(eval_spec_path)
-    result["post_eval_spec"] = dict(post_eval_spec)
-    result["post_eval_metrics"] = existing_payload["metrics"]
-    result["post_eval_summary"] = existing_payload["summary"]
-    result["post_eval_episode_count"] = int(post_eval_spec["episodes"])
+    return {
+        "eval_dir": str(eval_dir),
+        "log_path": str(eval_log_path),
+        "results_path": str(eval_results_json),
+        "spec_path": str(eval_spec_path),
+        "spec": spec,
+        "payload": payload,
+    }
+
+
+def _select_post_eval_checkpoint_with_matched_validation(
+    *,
+    result: Dict[str, Any],
+    cfg: Dict[str, Any],
+    positions_file: Path,
+    args,
+    batch_dir: Path,
+    post_eval_spec: Dict[str, Any],
+    inherited_runtime_env: Dict[str, str],
+    force_rerun: bool,
+) -> Dict[str, Any]:
+    label = cfg["label"]
+    model_root = _resolve_post_eval_model_root(result)
+    if model_root is None:
+        raise RuntimeError(f"[验证选模-{label}] 无法定位模型目录，log_dir={result.get('log_dir')}")
+
+    candidate_aliases = _resolve_post_eval_validation_candidates(args)
+    requested_variant = str(post_eval_spec.get("requested_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT))
+    if requested_variant not in candidate_aliases and requested_variant != "auto":
+        candidate_aliases = [requested_variant, *candidate_aliases]
+
+    candidates: List[Dict[str, Any]] = []
+    seen_paths = set()
+    for alias in candidate_aliases:
+        candidate_path, resolved_variant = _resolve_model_variant_dir(model_root, alias)
+        if candidate_path is None or resolved_variant is None:
+            continue
+        path_key = str(candidate_path.resolve())
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        candidates.append(
+            {
+                "candidate_alias": str(alias),
+                "resolved_variant": str(resolved_variant),
+                "model_path": candidate_path,
+            }
+        )
+
+    if not candidates:
+        fallback_path, fallback_variant = _resolve_model_variant_dir(model_root, requested_variant)
+        if fallback_path is None or fallback_variant is None:
+            raise RuntimeError(f"[验证选模-{label}] 未找到任何可用 checkpoint，model_root={model_root}")
+        candidates = [
+            {
+                "candidate_alias": str(requested_variant),
+                "resolved_variant": str(fallback_variant),
+                "model_path": fallback_path,
+            }
+        ]
+
+    validation_base_spec = _build_matched_validation_spec(post_eval_spec, args, batch_dir)
+    validation_root = batch_dir / "results" / "post_eval_validation" / label
+    validation_root.mkdir(parents=True, exist_ok=True)
+
+    scored_candidates: List[Dict[str, Any]] = []
+    failed_candidates: List[Dict[str, Any]] = []
+    for order_idx, candidate in enumerate(candidates):
+        candidate_spec = dict(validation_base_spec)
+        candidate_spec["model_variant"] = str(candidate["candidate_alias"])
+        candidate_spec["candidate_alias"] = str(candidate["candidate_alias"])
+        candidate_spec["selection_protocol"] = "matched_validation_candidate"
+        candidate_spec["requested_model_variant"] = str(candidate["resolved_variant"])
+        candidate_eval_dir = validation_root / str(candidate["candidate_alias"])
+        try:
+            eval_record = _execute_post_eval_run(
+                result=result,
+                label=label,
+                positions_file=positions_file,
+                args=args,
+                eval_dir=candidate_eval_dir,
+                eval_spec=candidate_spec,
+                model_path=Path(candidate["model_path"]),
+                banner_prefix="验证选模",
+                inherited_runtime_env=inherited_runtime_env,
+                force_rerun=force_rerun,
+            )
+        except Exception as exc:
+            failure_reason = str(exc)
+            print(
+                f"[验证选模-{label}] 跳过候选 {candidate['candidate_alias']} "
+                f"(resolved={candidate['resolved_variant']}): {failure_reason}"
+            )
+            failed_candidates.append(
+                {
+                    **candidate,
+                    "order": int(order_idx),
+                    "failure_reason": failure_reason,
+                    "eval_dir": str(candidate_eval_dir),
+                }
+            )
+            continue
+        summary = (
+            eval_record["payload"]["summary"]
+            if isinstance(eval_record.get("payload"), dict)
+            else {}
+        )
+        score = _score_post_eval_summary(summary if isinstance(summary, dict) else {})
+        scored_candidates.append(
+            {
+                **candidate,
+                "order": int(order_idx),
+                "eval_record": eval_record,
+                "summary": summary,
+                "score": list(score),
+            }
+        )
+
+    if not scored_candidates:
+        failure_details = " | ".join(
+            f"{item['candidate_alias']}={item['failure_reason']}"
+            for item in failed_candidates
+        ) or "无候选评估结果"
+        raise RuntimeError(f"[验证选模-{label}] 所有候选 checkpoint 均评估失败: {failure_details}")
+
+    best_candidate = max(
+        scored_candidates,
+        key=lambda item: (
+            tuple(item["score"]),
+            -int(item["order"]),
+        ),
+    )
+
+    selection_summary = {
+        "selection_protocol": "matched_validation",
+        "requested_model_variant": requested_variant,
+        "validation_episodes": int(validation_base_spec["episodes"]),
+        "validation_seed": int(validation_base_spec["seed"]),
+        "candidates": [
+            {
+                "candidate_alias": item["candidate_alias"],
+                "resolved_variant": item["resolved_variant"],
+                "model_path": str(item["model_path"]),
+                "score": item["score"],
+                "summary": item["summary"],
+                "eval_dir": item["eval_record"]["eval_dir"],
+                "results_path": item["eval_record"]["results_path"],
+            }
+            for item in scored_candidates
+        ],
+        "failed_candidates": failed_candidates,
+        "selected": {
+            "candidate_alias": best_candidate["candidate_alias"],
+            "resolved_variant": best_candidate["resolved_variant"],
+            "model_path": str(best_candidate["model_path"]),
+            "score": best_candidate["score"],
+            "summary": best_candidate["summary"],
+            "eval_dir": best_candidate["eval_record"]["eval_dir"],
+            "results_path": best_candidate["eval_record"]["results_path"],
+        },
+    }
+    selection_summary_path = validation_root / "selection_summary.json"
+    _save_json(selection_summary_path, selection_summary)
+    best_candidate["selection_summary_path"] = str(selection_summary_path)
+    return best_candidate
+
+
+def _run_post_training_evaluation(
+    result: Dict[str, Any],
+    cfg: Dict[str, Any],
+    positions_file: Path,
+    args,
+    batch_dir: Path,
+    post_eval_spec: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if post_eval_spec is None:
+        return result
+
+    label = cfg["label"]
+    force_rerun = bool(getattr(args, "force_post_eval_rerun", False))
+    inherited_runtime_env = _load_post_eval_runtime_env(result)
+    training_feasible, feasibility_detail = _training_team_success_feasibility(result)
+    result["post_eval_eligible"] = bool(training_feasible)
+    result["post_eval_eligibility_detail"] = dict(feasibility_detail)
+    if not training_feasible:
+        model_variant = str(post_eval_spec["model_variant"])
+        eval_dir = batch_dir / "results" / "post_eval" / label / model_variant
+        eval_spec_path = eval_dir / "post_eval_spec.json"
+        skip_reason = (
+            "训练阶段未出现团队成功回合，跳过 post-eval"
+            f" | detail={feasibility_detail}"
+        )
+        print(f"[后评估-{label}] 跳过: {skip_reason}")
+        result["post_eval_dir"] = str(eval_dir)
+        result["post_eval_log_path"] = ""
+        result["post_eval_results_path"] = ""
+        result["post_eval_spec_path"] = str(eval_spec_path)
+        result["post_eval_spec"] = dict(post_eval_spec)
+        result["post_eval_metrics"] = None
+        result["post_eval_summary"] = None
+        result["post_eval_episode_count"] = 0
+        result["post_eval_skipped"] = True
+        result["post_eval_skip_reason"] = skip_reason
+        result["post_eval_status"] = "skipped_no_train_success"
+        return result
+
+    selection_protocol = str(post_eval_spec.get("selection_protocol", "fixed"))
+    final_eval_spec = dict(post_eval_spec)
+    selected_model_path: Optional[Path] = None
+
+    if selection_protocol == "matched_validation":
+        selected = _select_post_eval_checkpoint_with_matched_validation(
+            result=result,
+            cfg=cfg,
+            positions_file=positions_file,
+            args=args,
+            batch_dir=batch_dir,
+            post_eval_spec=post_eval_spec,
+            inherited_runtime_env=inherited_runtime_env,
+            force_rerun=force_rerun,
+        )
+        selected_model_path = Path(selected["model_path"])
+        final_eval_spec["selected_model_candidate"] = str(selected["candidate_alias"])
+        final_eval_spec["selected_model_variant"] = str(selected["resolved_variant"])
+        final_eval_spec["selected_model_path"] = str(selected_model_path)
+        final_eval_spec["validation_selection_summary_path"] = str(selected.get("selection_summary_path", ""))
+    else:
+        model_root = _resolve_post_eval_model_root(result)
+        if model_root is None:
+            raise RuntimeError(f"[后评估-{label}] 无法定位模型目录，log_dir={result.get('log_dir')}")
+        selected_model_path, resolved_model_variant = _resolve_model_variant_dir(
+            model_root,
+            str(post_eval_spec.get("requested_model_variant", post_eval_spec.get("model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT))),
+        )
+        if selected_model_path is None or resolved_model_variant is None:
+            raise RuntimeError(
+                f"[后评估-{label}] 未找到请求的 checkpoint 变体: "
+                f"{post_eval_spec.get('requested_model_variant', post_eval_spec.get('model_variant'))}"
+            )
+        final_eval_spec["selected_model_candidate"] = str(post_eval_spec.get("requested_model_variant", resolved_model_variant))
+        final_eval_spec["selected_model_variant"] = str(resolved_model_variant)
+        final_eval_spec["selected_model_path"] = str(selected_model_path)
+
+    final_eval_dir = batch_dir / "results" / "post_eval" / label / str(final_eval_spec["model_variant"])
+    eval_record = _execute_post_eval_run(
+        result=result,
+        label=label,
+        positions_file=positions_file,
+        args=args,
+        eval_dir=final_eval_dir,
+        eval_spec=final_eval_spec,
+        model_path=Path(selected_model_path),
+        banner_prefix="后评估",
+        inherited_runtime_env=inherited_runtime_env,
+        force_rerun=force_rerun,
+    )
+
+    result["post_eval_dir"] = str(eval_record["eval_dir"])
+    result["post_eval_log_path"] = str(eval_record["log_path"])
+    result["post_eval_results_path"] = str(eval_record["results_path"])
+    result["post_eval_spec_path"] = str(eval_record["spec_path"])
+    result["post_eval_spec"] = dict(eval_record["spec"])
+    result["post_eval_metrics"] = eval_record["payload"]["metrics"]
+    result["post_eval_summary"] = eval_record["payload"]["summary"]
+    result["post_eval_episode_count"] = int(eval_record["spec"]["episodes"])
+    result["post_eval_selected_model_variant"] = str(eval_record["spec"].get("selected_model_variant", ""))
+    result["post_eval_selected_model_candidate"] = str(eval_record["spec"].get("selected_model_candidate", ""))
+    result["post_eval_selected_model_path"] = str(eval_record["spec"].get("selected_model_path", ""))
+    result["post_eval_selection_protocol"] = str(eval_record["spec"].get("selection_protocol", "fixed"))
+    result["post_eval_validation_selection_summary_path"] = str(
+        eval_record["spec"].get("validation_selection_summary_path", "")
+    )
     return result
 
 
@@ -3551,29 +4179,21 @@ def plot_comparison_losses_dualq(series, title, output_path):
         history = item["metrics"].get("loss_history", [])
         if not history:
             continue
-        
-        steps = [entry.get("step", i) for i, entry in enumerate(history)]
-        critic = [entry.get("critic_loss", 0) for entry in history]
-        actor = [entry.get("actor_loss", 0) for entry in history]
-        
-        # 过滤None和NaN
-        valid_critic = [(s, c) for s, c in zip(steps, critic) 
-                       if c is not None and not (isinstance(c, float) and np.isnan(c)) and c != 0]
-        valid_actor = [(s, a) for s, a in zip(steps, actor) 
-                      if a is not None and not (isinstance(a, float) and np.isnan(a)) and abs(a) < 1000]
-        
+
+        critic_steps, critic_values = _extract_loss_curve(history, "critic_loss")
+        actor_steps, actor_values = _extract_loss_curve(history, "actor_loss")
+
         color = get_algorithm_ablation_color(item.get("label"), idx=idx)
         name_en = item.get('name_en') or item.get('label', 'Unknown')
-        
-        if valid_critic:
+
+        if critic_values.size:
             has_data = True
-            steps_c, values_c = zip(*valid_critic)
-            axes[0].plot(steps_c, values_c, label=f"{name_en} (Critic)", 
+            axes[0].plot(critic_steps, critic_values, label=f"{name_en} (Critic)",
                         color=color, linewidth=2.5, alpha=0.9)
-        
-        if valid_actor:
-            steps_a, values_a = zip(*valid_actor)
-            axes[1].plot(steps_a, values_a, label=f"{name_en} (Actor)", 
+
+        if actor_values.size:
+            has_data = True
+            axes[1].plot(actor_steps, actor_values, label=f"{name_en} (Actor)",
                         color=color, linewidth=2.5, alpha=0.9)
     
     if has_data:
@@ -3951,19 +4571,30 @@ def _plot_multi_seed_post_eval_dashboard(
     plt.close(fig)
 
 
-def _build_experiment_summary_entry(item: Dict[str, Any]) -> Dict[str, Any]:
+def _build_experiment_summary_entry(item: Dict[str, Any], *, post_eval_enabled: bool) -> Dict[str, Any]:
     post_eval_spec = item.get("post_eval_spec", {}) if isinstance(item.get("post_eval_spec"), dict) else {}
     post_eval_summary = item.get("post_eval_summary")
     post_eval_status = str(item.get("post_eval_status", "")).strip()
     post_eval_skipped = bool(item.get("post_eval_skipped", False))
-    post_eval_eligible = bool(item.get("post_eval_eligible", post_eval_summary is not None))
-    if not post_eval_status:
-        if post_eval_summary is not None:
-            post_eval_status = "completed"
-        elif post_eval_skipped or not post_eval_eligible:
-            post_eval_status = "skipped_no_train_success"
-        else:
-            post_eval_status = "disabled"
+    post_eval_eligible_value = item.get("post_eval_eligible", None)
+
+    if not post_eval_enabled:
+        post_eval_spec = {}
+        post_eval_summary = None
+        post_eval_status = "disabled"
+        post_eval_skipped = False
+        post_eval_eligible = False
+    else:
+        post_eval_eligible = bool(
+            post_eval_summary is not None if post_eval_eligible_value is None else post_eval_eligible_value
+        )
+        if not post_eval_status:
+            if post_eval_summary is not None:
+                post_eval_status = "completed"
+            elif post_eval_skipped or (post_eval_eligible_value is not None and not post_eval_eligible):
+                post_eval_status = "skipped_no_train_success"
+            else:
+                post_eval_status = "pending"
     return {
         "label": item["label"],
         "name": item.get("name", item["label"]),
@@ -3977,7 +4608,7 @@ def _build_experiment_summary_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "collision_distance_threshold": item["metrics"].get("collision_distance_threshold"),
         "collision_threshold_source": item["metrics"].get("collision_threshold_source", "unknown"),
         "post_eval": {
-            "enabled": bool(post_eval_summary is not None or post_eval_skipped or not post_eval_eligible),
+            "enabled": bool(post_eval_enabled),
             "eligible": post_eval_eligible,
             "status": post_eval_status,
             "skipped": post_eval_skipped,
@@ -3988,6 +4619,16 @@ def _build_experiment_summary_entry(item: Dict[str, Any]) -> Dict[str, Any]:
             "episode_length_multiplier": post_eval_spec.get("episode_length_multiplier"),
             "seed": post_eval_spec.get("seed"),
             "model_variant": post_eval_spec.get("model_variant"),
+            "selection_protocol": post_eval_spec.get("selection_protocol"),
+            "validation_episodes": post_eval_spec.get("validation_episodes"),
+            "validation_seed": post_eval_spec.get("validation_seed"),
+            "selected_model_candidate": item.get("post_eval_selected_model_candidate", post_eval_spec.get("selected_model_candidate")),
+            "selected_model_variant": item.get("post_eval_selected_model_variant", post_eval_spec.get("selected_model_variant")),
+            "selected_model_path": item.get("post_eval_selected_model_path", post_eval_spec.get("selected_model_path")),
+            "validation_selection_summary_path": item.get(
+                "post_eval_validation_selection_summary_path",
+                post_eval_spec.get("validation_selection_summary_path"),
+            ),
             "eval_dir": item.get("post_eval_dir", ""),
             "results_path": item.get("post_eval_results_path", ""),
             "log_path": item.get("post_eval_log_path", ""),
@@ -4010,6 +4651,7 @@ def _write_experiment_result_artifact(
     artifact_dir = batch_dir / "results" / "experiment_artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{result['label']}.json"
+    post_eval_enabled = _post_eval_enabled(args)
     payload = {
         "artifact_mode": "single_experiment_worker",
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -4020,14 +4662,19 @@ def _write_experiment_result_artifact(
         "positions_file": str(positions_file),
         "use_dynamic_obstacles": getattr(args, "use_dynamic_obstacles", False),
         "training_environment": _effective_training_environment_setup(args),
-        "post_eval_enabled": _post_eval_enabled(args),
-        "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
+        "post_eval_enabled": post_eval_enabled,
+        "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
-        "post_eval_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
+        "post_eval_selection_protocol": str(_resolve_post_eval_selection_protocol(args)),
+        "post_eval_validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
+        "post_eval_validation_seed": int(_resolve_post_eval_validation_seed(args)),
+        "post_eval_validation_candidates": list(_resolve_post_eval_validation_candidates(args)),
+        "post_eval_model_variant": _resolve_post_eval_storage_variant(args),
+        "post_eval_requested_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
         "runtime_overrides": _runtime_override_summary(args),
-        "experiment": _build_experiment_summary_entry(result),
+        "experiment": _build_experiment_summary_entry(result, post_eval_enabled=post_eval_enabled),
     }
     _save_json(artifact_path, payload)
     return artifact_path
@@ -4077,6 +4724,72 @@ def _load_experiment_series_from_artifacts(
         post_eval = exp.get("post_eval", {}) if isinstance(exp.get("post_eval"), dict) else {}
         post_eval_spec = post_eval.get("spec", {}) if isinstance(post_eval.get("spec"), dict) else {}
         results_path = str(post_eval.get("results_path", "")).strip()
+        needs_post_eval_recovery = (
+            (not results_path)
+            or (not post_eval_spec)
+            or (not isinstance(post_eval.get("summary"), dict))
+        )
+        if needs_post_eval_recovery:
+            batch_dir_raw = str(payload.get("batch_dir", "")).strip()
+            model_variant = (
+                str(payload.get("post_eval_model_variant", "")).strip()
+                or str(post_eval.get("model_variant", "")).strip()
+                or DEFAULT_POST_EVAL_MODEL_VARIANT
+            )
+            if batch_dir_raw:
+                recovered_eval_dir = Path(batch_dir_raw) / "results" / "post_eval" / str(cfg["label"]) / model_variant
+                recovered_results_path = recovered_eval_dir / "evaluation_results.json"
+                recovered_spec_path = recovered_eval_dir / "post_eval_spec.json"
+                if recovered_results_path.exists() and recovered_spec_path.exists():
+                    recovered_spec = _load_json_file(recovered_spec_path)
+                    if isinstance(recovered_spec, dict) and recovered_spec:
+                        validation_errors = _validate_post_eval_results(
+                            recovered_results_path,
+                            recovered_spec,
+                            expected_runtime_env=_load_post_eval_runtime_env(
+                                {
+                                    "log_dir": log_dir,
+                                    "manifest_path": exp.get("manifest_path", ""),
+                                }
+                            ),
+                        )
+                        if not validation_errors:
+                            recovered_eval_data = _load_json_file(recovered_results_path)
+                            recovered_payload = _extract_post_eval_payload(
+                                recovered_eval_data,
+                                fallback_collision_threshold=metrics.get("collision_distance_threshold"),
+                            )
+                            recovered_log_path = recovered_eval_dir / "post_eval.log"
+                            post_eval = {
+                                "enabled": True,
+                                "eligible": True,
+                                "status": "completed",
+                                "skipped": False,
+                                "skip_reason": "",
+                                "eligibility_detail": post_eval.get("eligibility_detail"),
+                                "mode": recovered_spec.get("mode"),
+                                "episodes": recovered_spec.get("episodes"),
+                                "episode_length_multiplier": recovered_spec.get("episode_length_multiplier"),
+                                "seed": recovered_spec.get("seed"),
+                                "model_variant": recovered_spec.get("model_variant"),
+                                "eval_dir": str(recovered_eval_dir),
+                                "results_path": str(recovered_results_path),
+                                "log_path": str(recovered_log_path) if recovered_log_path.exists() else "",
+                                "spec_path": str(recovered_spec_path),
+                                "spec": recovered_spec,
+                                "summary": recovered_payload["summary"],
+                            }
+                            exp["post_eval"] = post_eval
+                            payload["experiment"] = exp
+                            payload["post_eval_enabled"] = True
+                            payload["post_eval_mode"] = recovered_spec.get("mode")
+                            payload["post_eval_episodes"] = recovered_spec.get("episodes")
+                            payload["post_eval_episode_length_multiplier"] = recovered_spec.get("episode_length_multiplier")
+                            payload["post_eval_seed"] = recovered_spec.get("seed")
+                            payload["post_eval_model_variant"] = recovered_spec.get("model_variant")
+                            _save_json(artifact_path, payload)
+                            post_eval_spec = recovered_spec
+                            results_path = str(recovered_results_path)
         if post_eval.get("enabled") and results_path and post_eval_spec:
             validation_errors = _validate_post_eval_results(
                 Path(results_path),
@@ -4280,14 +4993,22 @@ def _write_single_seed_outputs(
         "strict_validity_enabled": strict_validity_enabled,
         "skip_local_plots": bool(args.skip_local_plots),
         "post_eval_enabled": _post_eval_enabled(args),
-        "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
+        "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
-        "post_eval_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
+        "post_eval_selection_protocol": str(_resolve_post_eval_selection_protocol(args)),
+        "post_eval_validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
+        "post_eval_validation_seed": int(_resolve_post_eval_validation_seed(args)),
+        "post_eval_validation_candidates": list(_resolve_post_eval_validation_candidates(args)),
+        "post_eval_model_variant": _resolve_post_eval_storage_variant(args),
+        "post_eval_requested_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
         "runtime_overrides": _runtime_override_summary(args),
         "claims_report": claims_report,
-        "experiments": [_build_experiment_summary_entry(item) for item in series],
+        "experiments": [
+            _build_experiment_summary_entry(item, post_eval_enabled=_post_eval_enabled(args))
+            for item in series
+        ],
         "output_files": output_files,
     }
 
@@ -4334,6 +5055,9 @@ def _aggregate_multi_seed_runs(child_summaries: Sequence[Dict[str, Any]]) -> Dic
             success_curve = _moving_average_binary(metrics.get("team_success_flags", []), window=50)
             collision_curve = np.asarray(metrics.get("collision_counts", []), dtype=np.float64)
             clearance_curve = _extract_clearance_series(metrics.get("min_distances_to_obstacle", []), key="mean")
+            loss_history = metrics.get("loss_history", []) if isinstance(metrics.get("loss_history", []), list) else []
+            critic_step_curve, critic_loss_curve = _extract_loss_curve(loss_history, "critic_loss")
+            actor_step_curve, actor_loss_curve = _extract_loss_curve(loss_history, "actor_loss")
 
             tail_reward = _tail_array(metrics.get("episode_rewards", []), tail=100)
             tail_success = _tail_array(metrics.get("team_success_flags", []), tail=100)
@@ -4352,6 +5076,10 @@ def _aggregate_multi_seed_runs(child_summaries: Sequence[Dict[str, Any]]) -> Dic
                     "success_curve": success_curve,
                     "collision_curve": collision_curve,
                     "clearance_curve": clearance_curve,
+                    "critic_step_curve": critic_step_curve,
+                    "critic_loss_curve": critic_loss_curve,
+                    "actor_step_curve": actor_step_curve,
+                    "actor_loss_curve": actor_loss_curve,
                     "tail100_reward_mean": float(np.nanmean(tail_reward)) if tail_reward.size else None,
                     "tail100_success_mean": float(np.nanmean(tail_success)) if tail_success.size else None,
                     "tail100_collision_mean": float(np.nanmean(tail_collision)) if tail_collision.size else None,
@@ -4369,6 +5097,10 @@ def _aggregate_multi_seed_runs(child_summaries: Sequence[Dict[str, Any]]) -> Dic
         success_mean, success_std = _nanmean_std([run["success_curve"] for run in item["runs"]])
         collision_mean, collision_std = _nanmean_std([run["collision_curve"] for run in item["runs"]])
         clearance_mean, clearance_std = _nanmean_std([run["clearance_curve"] for run in item["runs"]])
+        critic_step_mean, _ = _nanmean_std([run["critic_step_curve"] for run in item["runs"] if run["critic_step_curve"].size])
+        critic_loss_mean, critic_loss_std = _nanmean_std([run["critic_loss_curve"] for run in item["runs"] if run["critic_loss_curve"].size])
+        actor_step_mean, _ = _nanmean_std([run["actor_step_curve"] for run in item["runs"] if run["actor_step_curve"].size])
+        actor_loss_mean, actor_loss_std = _nanmean_std([run["actor_loss_curve"] for run in item["runs"] if run["actor_loss_curve"].size])
         reward_tail_values = [run["tail100_reward_mean"] for run in item["runs"] if run["tail100_reward_mean"] is not None]
         success_tail_values = [run["tail100_success_mean"] for run in item["runs"] if run["tail100_success_mean"] is not None]
         collision_tail_values = [run["tail100_collision_mean"] for run in item["runs"] if run["tail100_collision_mean"] is not None]
@@ -4382,6 +5114,12 @@ def _aggregate_multi_seed_runs(child_summaries: Sequence[Dict[str, Any]]) -> Dic
             "collision_std": collision_std,
             "clearance_mean": clearance_mean,
             "clearance_std": clearance_std,
+            "critic_loss_step_mean": critic_step_mean,
+            "critic_loss_mean": critic_loss_mean,
+            "critic_loss_std": critic_loss_std,
+            "actor_loss_step_mean": actor_step_mean,
+            "actor_loss_mean": actor_loss_mean,
+            "actor_loss_std": actor_loss_std,
         }
         item["seed_count"] = len(item["runs"])
         item["tail100_reward_mean"] = float(np.nanmean(reward_tail_values)) if reward_tail_values else None
@@ -4499,6 +5237,9 @@ def _audit_multi_seed_children(
                 "episodes": _safe_int(child_summary.get("post_eval_episodes")),
                 "episode_length_multiplier": _safe_float(child_summary.get("post_eval_episode_length_multiplier")),
                 "seed": _safe_int(child_summary.get("post_eval_seed")),
+                "selection_protocol": child_summary.get("post_eval_selection_protocol"),
+                "validation_episodes": _safe_int(child_summary.get("post_eval_validation_episodes")),
+                "validation_seed": _safe_int(child_summary.get("post_eval_validation_seed")),
                 "model_variant": child_summary.get("post_eval_model_variant"),
             }
             if summary_post_eval != expected_post_eval:
@@ -4554,6 +5295,24 @@ def _audit_multi_seed_children(
                 if actual_post_eval_seed != expected_post_eval["seed"]:
                     child_errors.append(
                         f"{label}: post_eval.seed 不一致 got={actual_post_eval_seed} expected={expected_post_eval['seed']}"
+                    )
+                actual_selection_protocol = _post_eval_config_value(post_eval, "selection_protocol")
+                if actual_selection_protocol != expected_post_eval["selection_protocol"]:
+                    child_errors.append(
+                        f"{label}: post_eval.selection_protocol 不一致 "
+                        f"got={actual_selection_protocol} expected={expected_post_eval['selection_protocol']}"
+                    )
+                actual_validation_episodes = _safe_int(_post_eval_config_value(post_eval, "validation_episodes"))
+                if actual_validation_episodes != expected_post_eval["validation_episodes"]:
+                    child_errors.append(
+                        f"{label}: post_eval.validation_episodes 不一致 "
+                        f"got={actual_validation_episodes} expected={expected_post_eval['validation_episodes']}"
+                    )
+                actual_validation_seed = _safe_int(_post_eval_config_value(post_eval, "validation_seed"))
+                if actual_validation_seed != expected_post_eval["validation_seed"]:
+                    child_errors.append(
+                        f"{label}: post_eval.validation_seed 不一致 "
+                        f"got={actual_validation_seed} expected={expected_post_eval['validation_seed']}"
                     )
                 actual_post_eval_model_variant = _post_eval_config_value(post_eval, "model_variant")
                 if actual_post_eval_model_variant != expected_post_eval["model_variant"]:
@@ -4772,6 +5531,66 @@ def plot_multi_seed_mean_ablation_comparison(
     plt.close(fig)
 
 
+def plot_multi_seed_loss_comparison(
+    aggregates: Dict[str, Dict[str, Any]],
+    output_path: Path,
+    smooth_window: int = 10,
+    fit_method: str = "moving_average",
+) -> None:
+    if not HAS_MATPLOTLIB:
+        return
+
+    labels = [label for label in EXPERIMENT_DISPLAY_ORDER if label in aggregates]
+    if not labels:
+        return
+
+    has_loss_data = any(
+        np.asarray(aggregates[label].get("curve_stats", {}).get("critic_loss_mean", []), dtype=np.float64).size
+        or np.asarray(aggregates[label].get("curve_stats", {}).get("actor_loss_mean", []), dtype=np.float64).size
+        for label in labels
+    )
+    if not has_loss_data:
+        return
+
+    setup_english_fonts()
+    fig, axes = plt.subplots(2, 1, figsize=(16, 11), sharex=False)
+    specs = [
+        ("critic_loss", "Critic Loss", axes[0]),
+        ("actor_loss", "Actor Loss", axes[1]),
+    ]
+
+    for label in labels:
+        item = aggregates[label]
+        color = get_algorithm_ablation_color(label)
+        name_en = item.get("name_en", label)
+        stats = item.get("curve_stats", {})
+
+        for metric_name, title, ax in specs:
+            step_curve = np.asarray(stats.get(f"{metric_name}_step_mean", []), dtype=np.float64)
+            mean_curve = np.asarray(stats.get(f"{metric_name}_mean", []), dtype=np.float64)
+            std_curve = np.asarray(stats.get(f"{metric_name}_std", []), dtype=np.float64)
+            if mean_curve.size == 0:
+                continue
+            if step_curve.size != mean_curve.size:
+                step_curve = np.arange(1, mean_curve.size + 1, dtype=np.float64)
+            mean_curve = _smooth_curve(mean_curve, method=fit_method, window=smooth_window)
+            std_curve = _smooth_curve(std_curve, method=fit_method, window=smooth_window)
+            ax.plot(step_curve, mean_curve, color=color, linewidth=2.5, alpha=0.95, label=name_en)
+            ax.fill_between(step_curve, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15)
+            ax.set_title(title, fontsize=13, fontweight="bold")
+            ax.set_ylabel("Loss")
+            ax.grid(True, alpha=0.3, linestyle="--")
+
+    axes[0].legend(loc="best", fontsize=9)
+    axes[1].legend(loc="best", fontsize=9)
+    axes[1].set_xlabel("Update Step")
+
+    fig.suptitle("Multi-seed Training Loss Comparison (mean ± std)", fontsize=16, fontweight="bold", y=0.995)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_multi_seed_focus_metric_curves(
     aggregates: Dict[str, Dict[str, Any]],
     output_path: Path,
@@ -4940,7 +5759,7 @@ def parse_args():
         default=None,
         help="继续运行已存在的 multi-seed 父批次目录；会在原时间戳目录内补齐剩余 seed/实验并最终汇总",
     )
-    parser.add_argument("--max-parallel", type=int, default=2, help="多seed模式下最多并发多少个子批次；0表示全部同时启动")
+    parser.add_argument("--max-parallel", type=int, default=3, help="多seed模式下最多并发多少个子批次；0表示全部同时启动")
     parser.add_argument(
         "--experiment-max-parallel",
         type=int,
@@ -5054,7 +5873,7 @@ def parse_args():
     parser.add_argument("--generate-interactive", action="store_true", help="生成交互式轨迹图（需要plotly）")
     parser.add_argument("--disable-post-eval", action="store_true", help="关闭训练完成后的共享测试集评估")
     parser.add_argument("--force-post-eval-rerun", action="store_true", help="仅重跑后评估结果，不复用旧 post-eval 产物")
-    parser.add_argument("--force-post-eval-testset-regen", action="store_true", help="强制重建 heldout_shared 测试集位置文件")
+    parser.add_argument("--force-post-eval-testset-regen", action="store_true", help="强制重建共享 train-match 测试集位置文件")
     parser.add_argument("--post-eval-episodes", type=int, default=DEFAULT_POST_EVAL_EPISODES, help="训练完成后共享测试集评估的回合数")
     parser.add_argument(
         "--post-eval-episode-length-multiplier",
@@ -5066,58 +5885,83 @@ def parse_args():
     parser.add_argument(
         "--post-eval-mode",
         type=str,
-        default="heldout_shared",
-        choices=["heldout_shared", "match_train_env"],
-        help="后评估模式：heldout_shared=共享留出测试集；match_train_env=按训练环境分布重建测试环境",
+        default=DEFAULT_POST_EVAL_MODE,
+        choices=sorted(POST_EVAL_MODE_ALIAS_MAP.keys()),
+        help="后评估统一为共享 train-match 测试集；heldout_shared/match_train_env 仅保留为兼容别名",
     )
     parser.add_argument(
         "--post-eval-model-variant",
         type=str,
         default=DEFAULT_POST_EVAL_MODEL_VARIANT,
-        choices=["auto", "final", "best", "best_by_team_sr", "latest_ep"],
+        choices=["auto", "final", "best", "best_by_team_sr", "latest_ep", "checkpoint"],
         help="后评估使用的模型检查点变体；默认使用 Team SR 最佳模型",
+    )
+    parser.add_argument(
+        "--post-eval-selection-protocol",
+        type=str,
+        default=DEFAULT_POST_EVAL_SELECTION_PROTOCOL,
+        choices=list(POST_EVAL_SELECTION_PROTOCOL_CHOICES),
+        help="后评估选模协议：fixed=直接评估指定 checkpoint；matched_validation=先用 matched validation 选模再做正式测试",
+    )
+    parser.add_argument(
+        "--post-eval-validation-episodes",
+        type=int,
+        default=DEFAULT_POST_EVAL_VALIDATION_EPISODES,
+        help="matched validation 选模阶段使用的回合数",
+    )
+    parser.add_argument(
+        "--post-eval-validation-seed",
+        type=int,
+        default=None,
+        help="matched validation 选模阶段的固定随机种子；默认由 post-eval-seed 派生",
+    )
+    parser.add_argument(
+        "--post-eval-validation-candidates",
+        type=str,
+        default=",".join(DEFAULT_POST_EVAL_VALIDATION_CANDIDATES),
+        help="matched validation 候选 checkpoint 列表，逗号分隔；支持 best_by_team_sr,best,checkpoint,final,latest_ep",
     )
     parser.add_argument(
         "--post-eval-peak-jitter-range",
         type=float,
         default=None,
-        help="heldout_shared 下相似地形的山峰局部扰动范围（米）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-peak-height-jitter-ratio-min",
         type=float,
         default=None,
-        help="heldout_shared 下山峰高度最小扰动比例（相对峰高范围）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-peak-height-jitter-ratio-max",
         type=float,
         default=None,
-        help="heldout_shared 下山峰高度最大扰动比例（相对峰高范围）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-peak-height-max-scale",
         type=float,
         default=None,
-        help="heldout_shared 下山峰高度上限（相对训练基准最高峰倍率）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-start-center-jitter",
         type=float,
         default=None,
-        help="heldout_shared 下起点簇中心相对训练区域的随机扰动半径（米）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-agent-local-jitter",
         type=float,
         default=None,
-        help="heldout_shared 下每个智能体相对参考队形的局部扰动幅度（米）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-goal-region-radius",
         type=float,
         default=None,
-        help="heldout_shared 下目标相对训练目标区域的随机半径（米）",
+        help="旧 heldout 参数兼容保留；统一共享 train-match 测试模式下默认不使用",
     )
     parser.add_argument(
         "--post-eval-light-mode",
@@ -5525,14 +6369,17 @@ def _create_batch_dir(
         "unlock_env_on_plateau": int(args.resolved_unlock_env_on_plateau),
         "positions_file": str(positions_file),
         "post_eval_enabled": _post_eval_enabled(args),
-        "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
+        "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
-        "post_eval_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
-        "post_eval_terrain_family": (
-            "similar_unseen" if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" else "train_match"
-        ),
+        "post_eval_selection_protocol": str(_resolve_post_eval_selection_protocol(args)),
+        "post_eval_validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
+        "post_eval_validation_seed": int(_resolve_post_eval_validation_seed(args)),
+        "post_eval_validation_candidates": list(_resolve_post_eval_validation_candidates(args)),
+        "post_eval_model_variant": _resolve_post_eval_storage_variant(args),
+        "post_eval_requested_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
+        "post_eval_terrain_family": "train_match_shared",
         "post_eval_terrain_base_seed": int(
             getattr(args, "post_eval_terrain_base_seed", getattr(args, "resolved_scenario_seed", 88))
         ),
@@ -5542,9 +6389,7 @@ def _create_batch_dir(
         "post_eval_peak_height_jitter_ratio_max": float(_resolve_post_eval_peak_height_jitter_ratio_max(args)),
         "post_eval_peak_height_max_scale": float(_resolve_post_eval_peak_height_max_scale(args)),
         "post_eval_terrain_variant_noise_ratio": float(_resolve_post_eval_terrain_variant_noise_ratio(args)),
-        "post_eval_position_family": (
-            "same_region" if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" else "train_match"
-        ),
+        "post_eval_position_family": "train_match",
         "post_eval_start_center_jitter": float(_resolve_post_eval_start_center_jitter(args)),
         "post_eval_agent_local_jitter": float(_resolve_post_eval_agent_local_jitter(args)),
         "post_eval_goal_region_radius": float(_resolve_post_eval_goal_region_radius(args)),
@@ -5777,8 +6622,11 @@ def setup_base_env_vars(
     env.pop("XLA_FLAGS", None)
     env["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
     env["AUTO_EVAL"] = "0"
+    env.setdefault("HEARTBEAT_ENABLE", "0")
 
-    # 仅保留运行时必要的非训练语义开关
+    # 仅保留运行时必要的非训练语义开关。
+    # 训练完成后的轨迹图/损失图/HTML 等产物默认沿用 run_optimized.sh 的标准行为；
+    # 不再在批跑入口偷偷启用 FAST_ARTIFACTS 轻量模式，避免正式消融结果缺少收尾可视化。
     env.setdefault("SUPPRESS_MA_PROMPT", "1")
     env.setdefault("SUPPRESS_TERRAIN_OUTPUT", "1")
     # 算法消融必须保持训练环境口径固定；随机地形可以变化，但复杂度不能随成功次数自动提升。
@@ -6560,6 +7408,14 @@ def _build_single_seed_experiment_job(
         str(args.post_eval_mode),
         "--post-eval-model-variant",
         str(args.post_eval_model_variant),
+        "--post-eval-selection-protocol",
+        str(_resolve_post_eval_selection_protocol(args)),
+        "--post-eval-validation-episodes",
+        str(_resolve_post_eval_validation_episodes(args)),
+        "--post-eval-validation-seed",
+        str(_resolve_post_eval_validation_seed(args)),
+        "--post-eval-validation-candidates",
+        ",".join(_resolve_post_eval_validation_candidates(args)),
         "--batch-seed",
         str(int(batch_seed)),
         "--experiment-worker",
@@ -6614,7 +7470,7 @@ def _build_single_seed_experiment_job(
         command.append("--disable-post-eval")
     if args.skip_local_plots:
         command.append("--skip-local-plots")
-    if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" and not args.disable_post_eval:
+    if _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE)) == DEFAULT_POST_EVAL_MODE and not args.disable_post_eval:
         command.append("--post-eval-testset-prepared")
     for flag, value in (
         ("--post-eval-light-mode", getattr(args, "post_eval_light_mode", None)),
@@ -6765,6 +7621,21 @@ def _write_multi_seed_outputs(
     )
     output_files["multi_seed_mean_ablation_comparison"] = mean_png.name
 
+    has_loss = any(
+        np.asarray(item.get("curve_stats", {}).get("critic_loss_mean", []), dtype=np.float64).size
+        or np.asarray(item.get("curve_stats", {}).get("actor_loss_mean", []), dtype=np.float64).size
+        for item in aggregates.values()
+    )
+    if has_loss:
+        loss_png = output_dir / f"multi_seed_loss_comparison_{timestamp}.png"
+        plot_multi_seed_loss_comparison(
+            aggregates,
+            loss_png,
+            smooth_window=args.smooth_window,
+            fit_method=args.fit_method,
+        )
+        output_files["multi_seed_loss_comparison"] = loss_png.name
+
     has_post_eval = any(item.get("post_eval_metric_stats") for item in aggregates.values())
     if has_post_eval:
         post_eval_png = output_dir / f"multi_seed_post_eval_summary_{timestamp}.png"
@@ -6838,6 +7709,12 @@ def _write_multi_seed_outputs(
                 "collision_std_curve": np.asarray(stats.get("collision_std", []), dtype=np.float64).tolist(),
                 "clearance_mean_curve": np.asarray(stats.get("clearance_mean", []), dtype=np.float64).tolist(),
                 "clearance_std_curve": np.asarray(stats.get("clearance_std", []), dtype=np.float64).tolist(),
+                "critic_loss_step_curve": np.asarray(stats.get("critic_loss_step_mean", []), dtype=np.float64).tolist(),
+                "critic_loss_mean_curve": np.asarray(stats.get("critic_loss_mean", []), dtype=np.float64).tolist(),
+                "critic_loss_std_curve": np.asarray(stats.get("critic_loss_std", []), dtype=np.float64).tolist(),
+                "actor_loss_step_curve": np.asarray(stats.get("actor_loss_step_mean", []), dtype=np.float64).tolist(),
+                "actor_loss_mean_curve": np.asarray(stats.get("actor_loss_mean", []), dtype=np.float64).tolist(),
+                "actor_loss_std_curve": np.asarray(stats.get("actor_loss_std", []), dtype=np.float64).tolist(),
                 "tail100_reward_mean": item.get("tail100_reward_mean"),
                 "tail100_reward_std": item.get("tail100_reward_std"),
                 "tail100_success_mean": item.get("tail100_success_mean"),
@@ -6862,10 +7739,11 @@ def _write_multi_seed_outputs(
         "training_environment": _effective_training_environment_setup(args),
         "skip_local_plots_for_children": bool(args.skip_local_plots),
         "post_eval_enabled": _post_eval_enabled(args),
-        "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
+        "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
-        "post_eval_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
+        "post_eval_model_variant": _resolve_post_eval_storage_variant(args),
+        "post_eval_requested_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
         "runtime_overrides": _runtime_override_summary(args),
         "child_runs": child_runs,
         "aggregated_experiments": aggregated_rows,
@@ -7176,10 +8054,15 @@ def run_multi_seed_parent(args) -> int:
         "seeds": seeds,
         "max_parallel": args.max_parallel if args.max_parallel > 0 else len(seeds),
         "post_eval_enabled": _post_eval_enabled(args),
-        "post_eval_mode": getattr(args, "post_eval_mode", "heldout_shared"),
+        "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
-        "post_eval_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
+        "post_eval_selection_protocol": str(_resolve_post_eval_selection_protocol(args)),
+        "post_eval_validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
+        "post_eval_validation_seed": int(_resolve_post_eval_validation_seed(args)),
+        "post_eval_validation_candidates": list(_resolve_post_eval_validation_candidates(args)),
+        "post_eval_model_variant": _resolve_post_eval_storage_variant(args),
+        "post_eval_requested_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
         "post_eval_peak_jitter_range": float(_resolve_post_eval_peak_jitter_range(args)),
         "post_eval_peak_center_jitter_range": float(_resolve_post_eval_peak_center_jitter_range(args)),
         "post_eval_peak_height_jitter_ratio_min": float(_resolve_post_eval_peak_height_jitter_ratio_min(args)),
@@ -7340,6 +8223,14 @@ def run_multi_seed_parent(args) -> int:
             str(args.post_eval_mode),
             "--post-eval-model-variant",
             str(args.post_eval_model_variant),
+            "--post-eval-selection-protocol",
+            str(_resolve_post_eval_selection_protocol(args)),
+            "--post-eval-validation-episodes",
+            str(_resolve_post_eval_validation_episodes(args)),
+            "--post-eval-validation-seed",
+            str(_resolve_post_eval_validation_seed(args)),
+            "--post-eval-validation-candidates",
+            ",".join(_resolve_post_eval_validation_candidates(args)),
             "--batch-seed",
             str(int(seed_value)),
             "--seed-worker",
@@ -7395,7 +8286,7 @@ def run_multi_seed_parent(args) -> int:
             command.append("--disable-post-eval")
         if args.skip_local_plots:
             command.append("--skip-local-plots")
-        if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" and not args.disable_post_eval:
+        if _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE)) == DEFAULT_POST_EVAL_MODE and not args.disable_post_eval:
             command.append("--post-eval-testset-prepared")
         for flag, value in (
             ("--post-eval-light-mode", getattr(args, "post_eval_light_mode", None)),
@@ -7431,10 +8322,14 @@ def run_multi_seed_parent(args) -> int:
         for seed in seeds:
             _prepare_seed_context(int(seed))
 
+    job_pairs = _build_balanced_seed_experiment_pairs(seeds, experiment_labels)
     jobs: List[Dict[str, Any]] = []
-    for label in experiment_labels:
-        for seed in seeds:
-            jobs.append(_build_experiment_job(int(seed), str(label)) if positions_prepared else {"seed": int(seed), "label": str(label)})
+    for seed_value, label in job_pairs:
+        jobs.append(
+            _build_experiment_job(int(seed_value), str(label))
+            if positions_prepared
+            else {"seed": int(seed_value), "label": str(label)}
+        )
 
     pending_jobs = list(jobs)
     active_jobs: List[Dict[str, Any]] = []
@@ -7486,6 +8381,14 @@ def run_multi_seed_parent(args) -> int:
             str(args.post_eval_mode),
             "--post-eval-model-variant",
             str(args.post_eval_model_variant),
+            "--post-eval-selection-protocol",
+            str(_resolve_post_eval_selection_protocol(args)),
+            "--post-eval-validation-episodes",
+            str(_resolve_post_eval_validation_episodes(args)),
+            "--post-eval-validation-seed",
+            str(_resolve_post_eval_validation_seed(args)),
+            "--post-eval-validation-candidates",
+            ",".join(_resolve_post_eval_validation_candidates(args)),
             "--batch-seed",
             str(int(bootstrap_seed)),
             "--seed-worker",
@@ -7541,7 +8444,7 @@ def run_multi_seed_parent(args) -> int:
             bootstrap_command.append("--disable-post-eval")
         if args.skip_local_plots:
             bootstrap_command.append("--skip-local-plots")
-        if getattr(args, "post_eval_mode", "heldout_shared") == "heldout_shared" and not args.disable_post_eval:
+        if _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE)) == DEFAULT_POST_EVAL_MODE and not args.disable_post_eval:
             bootstrap_command.append("--post-eval-testset-prepared")
         for flag, value in (
             ("--post-eval-light-mode", getattr(args, "post_eval_light_mode", None)),
@@ -7574,6 +8477,14 @@ def run_multi_seed_parent(args) -> int:
             job for job in pending_jobs
             if not (job.get("seed") == int(bootstrap_seed) and job.get("label") == first_label)
         ]
+        bootstrap_artifact_path = bootstrap_job.get("artifact_path")
+        if bootstrap_artifact_path:
+            try:
+                Path(bootstrap_artifact_path).unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
         _launch_worker_job(bootstrap_job)
         active_jobs.append(bootstrap_job)
         print(
@@ -7591,11 +8502,14 @@ def run_multi_seed_parent(args) -> int:
                     for seed in seeds:
                         _prepare_seed_context(int(seed))
                     pending_jobs = []
-                    for label in experiment_labels:
-                        for seed in seeds:
-                            if bootstrap_job is not None and int(seed) == bootstrap_job["seed"] and label == bootstrap_job["label"]:
-                                continue
-                            pending_jobs.append(_build_experiment_job(int(seed), str(label)))
+                    for seed_value, label in job_pairs:
+                        if (
+                            bootstrap_job is not None
+                            and int(seed_value) == bootstrap_job["seed"]
+                            and str(label) == bootstrap_job["label"]
+                        ):
+                            continue
+                        pending_jobs.append(_build_experiment_job(int(seed_value), str(label)))
                 elif bootstrap_job.get("process") is not None and bootstrap_job["process"].poll() is not None:
                     if not positions_file.exists():
                         raise RuntimeError(
@@ -7606,14 +8520,25 @@ def run_multi_seed_parent(args) -> int:
                     for seed in seeds:
                         _prepare_seed_context(int(seed))
                     pending_jobs = []
-                    for label in experiment_labels:
-                        for seed in seeds:
-                            if bootstrap_job is not None and int(seed) == bootstrap_job["seed"] and label == bootstrap_job["label"]:
-                                continue
-                            pending_jobs.append(_build_experiment_job(int(seed), str(label)))
+                    for seed_value, label in job_pairs:
+                        if (
+                            bootstrap_job is not None
+                            and int(seed_value) == bootstrap_job["seed"]
+                            and str(label) == bootstrap_job["label"]
+                        ):
+                            continue
+                        pending_jobs.append(_build_experiment_job(int(seed_value), str(label)))
 
             while pending_jobs and len(active_jobs) < max_parallel and bootstrap_released:
                 job = pending_jobs.pop(0)
+                artifact_path = job.get("artifact_path")
+                if artifact_path:
+                    try:
+                        Path(artifact_path).unlink()
+                    except FileNotFoundError:
+                        pass
+                    except Exception:
+                        pass
                 _launch_worker_job(job)
                 active_jobs.append(job)
                 print(f"[多seed] 已启动 seed={job['seed']} | exp={job['label']} -> {job['launcher_log']}")
@@ -7704,11 +8629,14 @@ def run_multi_seed_parent(args) -> int:
     if _post_eval_enabled(args):
         expected_post_eval = {
             "enabled": True,
-            "mode": getattr(args, "post_eval_mode", "heldout_shared"),
+            "mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
             "episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
             "episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
             "seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
-            "model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
+            "selection_protocol": str(_resolve_post_eval_selection_protocol(args)),
+            "validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
+            "validation_seed": int(_resolve_post_eval_validation_seed(args)),
+            "model_variant": _resolve_post_eval_storage_variant(args),
         }
 
     audit_report = _audit_multi_seed_children(
@@ -7746,7 +8674,15 @@ def run_multi_seed_parent(args) -> int:
 
 def main():
     args = parse_args()
+    args.post_eval_mode = _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE))
+    args.cli_max_parallel_specified = ("--max-parallel" in sys.argv)
+    args.cli_disable_post_eval_specified = ("--disable-post-eval" in sys.argv)
+    args.cli_post_eval_mode_specified = ("--post-eval-mode" in sys.argv)
     args.cli_post_eval_model_variant_specified = ("--post-eval-model-variant" in sys.argv)
+    args.cli_post_eval_selection_protocol_specified = ("--post-eval-selection-protocol" in sys.argv)
+    args.cli_post_eval_validation_episodes_specified = ("--post-eval-validation-episodes" in sys.argv)
+    args.cli_post_eval_validation_seed_specified = ("--post-eval-validation-seed" in sys.argv)
+    args.cli_post_eval_validation_candidates_specified = ("--post-eval-validation-candidates" in sys.argv)
     args.cli_post_eval_episode_length_multiplier_specified = (
         "--post-eval-episode-length-multiplier" in sys.argv
     )
@@ -7766,6 +8702,8 @@ def main():
         raise RuntimeError("--post-eval-episodes 必须为正整数")
     if float(_resolve_post_eval_episode_length_multiplier(args)) <= 0.0:
         raise RuntimeError("--post-eval-episode-length-multiplier 必须为正数")
+    if int(_resolve_post_eval_validation_episodes(args)) <= 0:
+        raise RuntimeError("--post-eval-validation-episodes 必须为正整数")
 
     if args.seed_worker and args.batch_seed is None:
         raise RuntimeError("--seed-worker 模式必须显式提供 --batch-seed")

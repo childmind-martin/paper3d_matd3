@@ -141,6 +141,8 @@ def _estimate_local_surface_stats(scenario, xy, radius=4.0, grid_points=5):
     if xy.size < 2:
         return {
             "terrain_height": 0.0,
+            "min_height": 0.0,
+            "max_height": 0.0,
             "height_span": float("inf"),
             "height_std": float("inf"),
             "slope_mag": float("inf"),
@@ -169,10 +171,17 @@ def _estimate_local_surface_stats(scenario, xy, radius=4.0, grid_points=5):
 
     return {
         "terrain_height": center_height,
+        "min_height": float(min(heights)) if heights else center_height,
+        "max_height": float(max(heights)) if heights else center_height,
         "height_span": float(max(heights) - min(heights)) if heights else float("inf"),
         "height_std": float(np.std(heights)) if heights else float("inf"),
         "slope_mag": slope_mag,
     }
+
+
+def _goal_platform_radius(goal_region_radius):
+    goal_region_radius = max(0.0, float(goal_region_radius))
+    return float(np.clip(goal_region_radius * 0.45, 6.0, 10.0))
 
 
 def _collect_flat_area_candidates(scenario):
@@ -391,6 +400,10 @@ def _evaluate_same_region_goal_candidate(
     min_peak_clearance,
     max_surface_span,
     max_slope_mag,
+    platform_radius,
+    max_platform_span,
+    max_platform_slope_mag,
+    max_platform_height_std,
     min_direction_cos,
     base_score=0.0,
 ):
@@ -427,6 +440,19 @@ def _evaluate_same_region_goal_candidate(
     if float(surface_stats["slope_mag"]) > float(max_slope_mag):
         return None
 
+    platform_surface_stats = _estimate_local_surface_stats(
+        scenario,
+        candidate_xy[:2],
+        radius=max(5.0, float(platform_radius)),
+        grid_points=7,
+    )
+    if float(platform_surface_stats["height_span"]) > float(max_platform_span):
+        return None
+    if float(platform_surface_stats["slope_mag"]) > float(max_platform_slope_mag):
+        return None
+    if float(platform_surface_stats["height_std"]) > float(max_platform_height_std):
+        return None
+
     peak_clearance = _nearest_peak_distance(scenario, candidate_xy[:2])
     if peak_clearance < float(min_peak_clearance):
         return None
@@ -443,6 +469,9 @@ def _evaluate_same_region_goal_candidate(
         + float(surface_stats["height_span"]) * 3.0
         + float(surface_stats["height_std"]) * 4.0
         + float(surface_stats["slope_mag"]) * 55.0
+        + float(platform_surface_stats["height_span"]) * 4.5
+        + float(platform_surface_stats["height_std"]) * 5.5
+        + float(platform_surface_stats["slope_mag"]) * 75.0
         + terrain_height * 0.45
         - min(peak_clearance, 80.0) * 0.4
     )
@@ -450,6 +479,13 @@ def _evaluate_same_region_goal_candidate(
         "xy": np.asarray(candidate_xy[:2], dtype=np.float32),
         "score": float(score),
         "surface_stats": surface_stats,
+        "platform_surface_stats": platform_surface_stats,
+        "support_terrain_height": float(
+            max(
+                terrain_height,
+                float(platform_surface_stats.get("max_height", terrain_height)),
+            )
+        ),
         "peak_clearance": float(peak_clearance),
         "route_distance": float(route_distance),
         "direction_cosine": float(direction_cosine),
@@ -759,12 +795,16 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
     goal_candidate_source = "reference_goal"
     chosen_goal_candidate = None
     base_peak_clearance_target = max(22.0, min(34.0, goal_region_radius + 8.0))
+    goal_platform_radius = _goal_platform_radius(goal_region_radius)
     goal_selection_tiers = (
         {
             "name": "strict_route_safe_goal",
             "min_peak_clearance": base_peak_clearance_target,
             "max_surface_span": 10.0,
             "max_slope_mag": 1.25,
+            "max_platform_span": 8.0,
+            "max_platform_slope_mag": 1.00,
+            "max_platform_height_std": 1.9,
             "min_direction_cos": 0.84,
         },
         {
@@ -772,6 +812,9 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
             "min_peak_clearance": max(18.0, base_peak_clearance_target * 0.85),
             "max_surface_span": 13.0,
             "max_slope_mag": 1.65,
+            "max_platform_span": 10.5,
+            "max_platform_slope_mag": 1.25,
+            "max_platform_height_std": 2.6,
             "min_direction_cos": 0.72,
         },
         {
@@ -779,7 +822,20 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
             "min_peak_clearance": 16.0,
             "max_surface_span": 16.0,
             "max_slope_mag": 2.0,
+            "max_platform_span": 13.0,
+            "max_platform_slope_mag": 1.55,
+            "max_platform_height_std": 3.4,
             "min_direction_cos": 0.58,
+        },
+        {
+            "name": "fallback_flat_route_goal",
+            "min_peak_clearance": 14.0,
+            "max_surface_span": 20.0,
+            "max_slope_mag": 2.5,
+            "max_platform_span": 16.0,
+            "max_platform_slope_mag": 1.9,
+            "max_platform_height_std": 4.4,
+            "min_direction_cos": 0.40,
         },
     )
 
@@ -799,6 +855,10 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
                 min_peak_clearance=tier["min_peak_clearance"],
                 max_surface_span=tier["max_surface_span"],
                 max_slope_mag=tier["max_slope_mag"],
+                platform_radius=goal_platform_radius,
+                max_platform_span=tier["max_platform_span"],
+                max_platform_slope_mag=tier["max_platform_slope_mag"],
+                max_platform_height_std=tier["max_platform_height_std"],
                 min_direction_cos=tier["min_direction_cos"],
                 base_score=candidate["base_score"],
             )
@@ -827,10 +887,6 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
         goal_xy = np.clip(desired_goal_xy, 8.0, map_size - 8.0)
 
     goal_terrain_h = float(scenario.get_terrain_height(goal_xy[0], goal_xy[1]))
-    goal_z = goal_terrain_h + goal_altitude
-    if ref_goal_z is not None:
-        goal_z = max(goal_z, ref_goal_z)
-
     start_surface_stats = []
     for pos in agent_positions:
         start_surface_stats.append(
@@ -838,11 +894,24 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
         )
     if chosen_goal_candidate is not None:
         goal_surface_stats = dict(chosen_goal_candidate.get("surface_stats", {}))
+        goal_platform_surface_stats = dict(chosen_goal_candidate.get("platform_surface_stats", {}))
         goal_peak_clearance = float(chosen_goal_candidate.get("peak_clearance", _nearest_peak_distance(scenario, goal_xy)))
         goal_route_distance = float(chosen_goal_candidate.get("route_distance", np.linalg.norm(goal_xy - start_center_now[:2])))
         goal_direction_cosine = float(chosen_goal_candidate.get("direction_cosine", 1.0))
+        goal_support_terrain_h = float(
+            chosen_goal_candidate.get(
+                "support_terrain_height",
+                max(goal_terrain_h, float(goal_platform_surface_stats.get("max_height", goal_terrain_h))),
+            )
+        )
     else:
         goal_surface_stats = _estimate_local_surface_stats(scenario, goal_xy, radius=5.0)
+        goal_platform_surface_stats = _estimate_local_surface_stats(
+            scenario,
+            goal_xy,
+            radius=goal_platform_radius,
+            grid_points=7,
+        )
         goal_peak_clearance = _nearest_peak_distance(scenario, goal_xy)
         goal_route_distance = float(np.linalg.norm(goal_xy[:2] - start_center_now[:2]))
         if ref_route_unit is not None and goal_route_distance > 1e-6:
@@ -851,9 +920,16 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
             )
         else:
             goal_direction_cosine = 1.0
+        goal_support_terrain_h = float(
+            max(goal_terrain_h, float(goal_platform_surface_stats.get("max_height", goal_terrain_h)))
+        )
+    goal_z = goal_support_terrain_h + goal_altitude
+    if ref_goal_z is not None:
+        goal_z = max(goal_z, ref_goal_z)
     assigned_pairwise_stats = _pairwise_xy_stats(np.asarray(agent_positions, dtype=np.float32)[:, :2])
 
     metadata = {
+        "goal_flatness_profile_version": 2,
         "position_family": "same_region",
         "reference_positions_file": reference["path"],
         "terrain_seed": int(positions_data.get("terrain_seed", position_seed)),
@@ -884,6 +960,9 @@ def _apply_same_region_positions(scenario, position_seed, positions_data, env_va
         "min_pairwise_spacing_target": float(min_pairwise_spacing),
         "start_surface_stats": start_surface_stats,
         "goal_surface_stats": goal_surface_stats,
+        "goal_platform_radius": float(goal_platform_radius),
+        "goal_platform_surface_stats": goal_platform_surface_stats,
+        "goal_support_terrain_height": float(goal_support_terrain_h),
         "goal_peak_clearance": float(goal_peak_clearance),
         "goal_route_distance": float(goal_route_distance),
         "goal_direction_cosine": float(goal_direction_cosine),

@@ -287,6 +287,7 @@ class Scenario(BaseScenario):
         self.current_episode_env_id = 0
         self.current_episode_rng_seed = None
         self.current_episode_obstacle_seed = None
+        self.current_episode_obstacle_seed_override = None
         
         # 🔧 关键修复：跟踪当前地形种子，用于检测地形变化
         # 当地形种子变化时，重置位置初始化标记，使每个新地图都动态生成位置
@@ -376,6 +377,90 @@ class Scenario(BaseScenario):
             return float(os.getenv('GOAL_ALTITUDE', '12.0'))
         except Exception:
             return 12.0
+
+    def _get_fixed_goal_metadata(self):
+        """提取固定位置文件中的目标元数据。"""
+        fixed_positions = getattr(self, 'fixed_positions', None)
+        if not isinstance(fixed_positions, dict):
+            return {}
+        position_setup = fixed_positions.get('position_setup')
+        if not isinstance(position_setup, dict):
+            position_setup = fixed_positions.get('heldout_metadata')
+        return position_setup if isinstance(position_setup, dict) else {}
+
+    def _estimate_goal_support_height(self, goal_xy, radius=6.0, grid_points=7):
+        """估计目标点周边平台可支撑的最高地形高度。"""
+        try:
+            goal_xy = np.asarray(goal_xy, dtype=np.float32).reshape(-1)
+        except Exception:
+            return 0.0
+        if goal_xy.size < 2:
+            return 0.0
+
+        x = float(goal_xy[0])
+        y = float(goal_xy[1])
+        radius = max(1.0, float(radius))
+        sample_count = max(3, int(grid_points))
+        offsets = np.linspace(-radius, radius, sample_count)
+        max_height = float(self.get_terrain_height(x, y))
+        for dx in offsets:
+            for dy in offsets:
+                try:
+                    h = float(self.get_terrain_height(x + dx, y + dy))
+                except Exception:
+                    continue
+                if h > max_height:
+                    max_height = h
+        return float(max_height)
+
+    def _adjust_fixed_goal_position_for_current_terrain(self, goal_pos, quiet_output=False):
+        """
+        固定位置模式下保持目标 XY 不变，但确保目标 Z 不低于当前地形/平台。
+
+        旧逻辑完全保留固定位置文件中的绝对 Z，这在固定地形下没有问题；
+        但在随机/半随机地形下，同一 XY 处的局部地形会变化，目标可能落到坡面里。
+        这里采用“只抬不降”的策略：仅当当前地形/平台更高时，把目标抬到
+        support_height + required_clearance。
+        """
+        goal_pos = np.asarray(goal_pos, dtype=float).copy()
+        if goal_pos.size < 3:
+            return goal_pos
+
+        goal_pos[0] = np.clip(goal_pos[0], 2, self.map_size - 3)
+        goal_pos[1] = np.clip(goal_pos[1], 2, self.map_size - 3)
+
+        metadata = self._get_fixed_goal_metadata()
+        try:
+            platform_radius = float(metadata.get('goal_platform_radius', 6.0))
+        except Exception:
+            platform_radius = 6.0
+        platform_radius = float(np.clip(platform_radius, 4.0, 12.0))
+
+        support_height = self._estimate_goal_support_height(
+            goal_pos[:2],
+            radius=platform_radius,
+            grid_points=7,
+        )
+
+        required_clearance = float(self._get_goal_altitude())
+        try:
+            stored_support_height = metadata.get('goal_support_terrain_height')
+            if stored_support_height is not None:
+                stored_support_height = float(stored_support_height)
+                required_clearance = max(required_clearance, float(goal_pos[2]) - stored_support_height)
+        except Exception:
+            pass
+
+        required_goal_height = float(support_height + max(required_clearance, 1.0))
+        if float(goal_pos[2]) < required_goal_height - 1e-6:
+            old_goal_z = float(goal_pos[2])
+            goal_pos[2] = required_goal_height
+            if not quiet_output:
+                print(
+                    f"[目标位置修正] 固定目标Z抬升: {old_goal_z:.2f} -> {goal_pos[2]:.2f} "
+                    f"(support_h={support_height:.2f}, clearance={required_clearance:.2f})"
+                )
+        return goal_pos
         
     def _setup_complexity_parameters(self):
         """根据复杂度等级设置地形参数"""
@@ -732,13 +817,12 @@ class Scenario(BaseScenario):
                 getattr(self, 'terrain_variant_noise_ratio', os.getenv('TERRAIN_VARIANT_NOISE_RATIO', '0.15'))
             ),
         )
-        variant_seed = int(
-            getattr(
-                self,
-                'terrain_variant_seed',
-                self.seed if self.seed is not None else getattr(self, 'terrain_base_seed', 67),
-            )
-        )
+        variant_seed_value = getattr(self, 'terrain_variant_seed', None)
+        if variant_seed_value is None:
+            variant_seed_value = getattr(self, 'current_terrain_variant_seed', None)
+        if variant_seed_value is None:
+            variant_seed_value = self.seed if self.seed is not None else getattr(self, 'terrain_base_seed', 67)
+        variant_seed = int(variant_seed_value)
         variant_rng = np.random.RandomState(variant_seed)
 
         heldout_reference_layout = self._load_heldout_reference_layout()
@@ -1345,20 +1429,10 @@ class Scenario(BaseScenario):
                 if not isinstance(goal_pos, np.ndarray):
                     goal_pos = np.array(goal_pos, dtype=np.float32)
                 
-                # 确保目标位置在地图范围内（只调整X、Y坐标）
-                goal_pos[0] = np.clip(goal_pos[0], 2, self.map_size - 3)
-                goal_pos[1] = np.clip(goal_pos[1], 2, self.map_size - 3)
-                
-                # 🚨 关键修复：完全保留文件中的目标Z坐标，不进行任何调整
-                # 原因：
-                # 1. 不同回合之间，即使使用固定地形，地形高度计算可能因为浮点精度或缓存问题导致不一致，
-                #    如果根据地形高度调整Z坐标，会导致目标位置在不同回合之间不一致
-                # 2. 目标位置的Z坐标在第一次生成时已经正确设置（地形高度 + goal_altitude），
-                #    保存到文件中的Z坐标已经是正确的，后续所有回合都应该使用这个Z坐标
-                # 解决方案：完全保留文件中的目标Z坐标，不进行任何调整
-                # 注意：这要求固定位置文件中的目标Z坐标已经是正确的（在地形上方）
-                # 不再根据地形高度调整Z坐标
-                
+                goal_pos = self._adjust_fixed_goal_position_for_current_terrain(
+                    goal_pos,
+                    quiet_output=True,
+                )
                 self.fixed_positions['goal'] = goal_pos.tolist()
 
             self._fixed_positions_validation_signature = self._build_fixed_positions_validation_signature()
@@ -2533,30 +2607,10 @@ class Scenario(BaseScenario):
                     goal = world.landmarks[0]
                     # 确保目标位置是numpy数组，并复制以避免修改原始数据
                     goal_pos = np.array(self.fixed_positions['goal'], dtype=float).copy()
-                    
-                    # 🔧 修复：确保X、Y坐标不被修改（固定目标必须保持X、Y不变）
-                    # 只根据当前地形的实际高度重新计算Z坐标
-                    goal_terrain_h = self.get_terrain_height(goal_pos[0], goal_pos[1])
-                    
-                    # 🔧 修复：验证地形高度是否有效
-                    if goal_terrain_h == 0.0 and self.terrain is not None:
-                        # 🔧 关键修复：使用get_terrain_height方法，自动处理降采样后的坐标映射
-                        x_int = int(np.clip(goal_pos[0], 0, self.map_size - 1))
-                        y_int = int(np.clip(goal_pos[1], 0, self.map_size - 1))
-                        goal_terrain_h = float(self.get_terrain_height(x_int, y_int))
-                    
-                    # 🚨 关键修复：使用固定位置文件时，必须完全保留文件中的目标Z坐标，不根据地形高度调整
-                    # 原因：
-                    # 1. 不同评估模式（local/oracle）可能使用不同的地形种子，如果根据地形高度调整Z坐标，
-                    #    会导致不同评估模式中目标位置的Z坐标不同，影响APF计算和对比公平性
-                    # 2. 不同回合之间，即使使用固定地形，地形高度计算可能因为浮点精度或缓存问题导致不一致，
-                    #    如果根据地形高度调整Z坐标，会导致目标位置在不同回合之间不一致
-                    # 解决方案：完全保留文件中的目标Z坐标，不进行任何调整
-                    # 注意：这要求固定位置文件中的目标Z坐标已经是正确的（在地形上方）
-                    # 🚨 关键修复：移除所有Z坐标调整逻辑，确保目标位置在所有回合之间完全一致
-                    # original_goal_z = goal_pos[2]  # 保存原始Z坐标（不再需要，因为不再调整）
-                    # 完全保留文件中的目标Z坐标，不进行任何调整
-                    
+                    goal_pos = self._adjust_fixed_goal_position_for_current_terrain(
+                        goal_pos,
+                        quiet_output=quiet_output,
+                    )
                     goal.state.p_pos = goal_pos
                     self.goal_pos = goal_pos
                     # 同步到world，便于并行worker/可视化获取
@@ -2611,18 +2665,10 @@ class Scenario(BaseScenario):
                 goal = world.landmarks[0]
                 # 确保目标位置是numpy数组，并复制以避免修改原始数据
                 goal_pos = np.array(self.fixed_positions[-1], dtype=float).copy()
-                
-                # 🚨 关键修复：使用固定位置文件时，必须完全保留文件中的目标Z坐标，不根据地形高度调整
-                # 原因：
-                # 1. 不同episode之间，即使使用固定地形，地形高度计算可能因为浮点精度或缓存问题导致不一致，
-                #    如果根据地形高度调整Z坐标，会导致目标位置在不同回合之间不一致
-                # 2. 不同评估模式（local/oracle）可能使用不同的地形种子，如果根据地形高度调整Z坐标，
-                #    会导致不同评估模式中目标位置的Z坐标不同，影响APF计算和对比公平性
-                # 解决方案：完全保留文件中的目标Z坐标，不进行任何调整
-                # 注意：这要求固定位置文件中的目标Z坐标已经是正确的（在地形上方）
-                # 🚨 关键修复：移除所有Z坐标调整逻辑，确保目标位置在所有回合之间完全一致
-                # 完全保留文件中的目标Z坐标，不进行任何调整
-                
+                goal_pos = self._adjust_fixed_goal_position_for_current_terrain(
+                    goal_pos,
+                    quiet_output=False,
+                )
                 goal.state.p_pos = goal_pos
                 self.goal_pos = goal_pos.copy()
                 if hasattr(world, 'goal_pos'):
@@ -2871,7 +2917,10 @@ class Scenario(BaseScenario):
 
         dynamic_obstacles = bool(getattr(self, 'use_dynamic_obstacles', True))
         base_seed = int(self.seed) if self.seed is not None else 42
-        if dynamic_obstacles:
+        obstacle_seed_override = getattr(self, 'current_episode_obstacle_seed_override', None)
+        if obstacle_seed_override is not None:
+            obstacle_seed = int(obstacle_seed_override)
+        elif dynamic_obstacles:
             if self._use_deterministic_train_env_sequence():
                 episode_idx, env_id = self._resolve_episode_context(world)
                 obstacle_seed = self._make_deterministic_episode_seed('obstacle', episode_idx, env_id)

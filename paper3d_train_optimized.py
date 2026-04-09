@@ -1811,15 +1811,8 @@ class LiteReplayBuffer:
         # 当前/下一状态的 base PF 特征（与在线 Actor 输入语义一致）
         self.pf_features = np.zeros((self.capacity, self.n_agents, 3), dtype=np.float32)
         self.next_pf_features = np.zeros((self.capacity, self.n_agents, 3), dtype=np.float32)
-        # 下一状态的压缩 PF 几何上下文缓存：
-        # [obs_valid(1), goal_dir(3), goal_dist(1), terrain_normal(3), terrain_inv_r_min(1),
-        #  kappa(1), terrain_penalty_factor(1), terrain_max_repulsion(1), obstacle_has(3),
-        #  obstacle_repulsion_dir(9), obstacle_dist_surface(3), obstacle_max_repulsion(3),
-        #  agent_repulsion_dir(6), agent_rel_dist(2)] = 38
-        self.next_pf_geometry_cache = np.zeros((self.capacity, self.n_agents, 38), dtype=np.float32)
         self.stores_pf_features = False
         self.stores_next_pf_features = False
-        self.stores_next_pf_geometry_cache = False
         
         # 设置PER相关参数
         self.negative_slope = float(negative_slope)
@@ -2209,20 +2202,6 @@ class LiteReplayBuffer:
         else:
             self.next_pf_features[self.position] = np.zeros((self.n_agents, 3), dtype=np.float32)
 
-        if next_pf_geometry_cache is not None:
-            try:
-                next_pf_geom_arr = np.asarray(next_pf_geometry_cache, dtype=np.float32)
-                if next_pf_geom_arr.shape != (self.n_agents, 38):
-                    next_pf_geom_arr = self._fit_mat(next_pf_geometry_cache, self.n_agents, 38).astype(np.float32, copy=False)
-                else:
-                    next_pf_geom_arr = next_pf_geom_arr.astype(np.float32, copy=False)
-                self.next_pf_geometry_cache[self.position] = next_pf_geom_arr
-                self.stores_next_pf_geometry_cache = True
-            except Exception:
-                self.next_pf_geometry_cache[self.position] = np.zeros((self.n_agents, 38), dtype=np.float32)
-        else:
-            self.next_pf_geometry_cache[self.position] = np.zeros((self.n_agents, 38), dtype=np.float32)
-
         # 🔧 新增：存储下一步的修正后动作（next_act_corrected），用于 Target Q 计算
         if next_act_corrected is not None:
             if isinstance(next_act_corrected, np.ndarray) and next_act_corrected.shape == (self.n_agents, self.act_dim):
@@ -2264,7 +2243,6 @@ class LiteReplayBuffer:
             - rew_n / done_n: (n_agents,)
             - pf_forces: (n_agents, 3)
             - pf_features / next_pf_features: (n_agents, 3)
-            - next_pf_geometry_cache: (n_agents, 38)
 
         该路径避免 batch coercion、expand_dims 和 SumTree.update_batch 的额外开销。
         """
@@ -2334,15 +2312,6 @@ class LiteReplayBuffer:
         else:
             next_pf_features_arr = None
 
-        if next_pf_geometry_cache is not None:
-            next_pf_geometry_cache_arr = np.asarray(next_pf_geometry_cache, dtype=np.float32)
-            if next_pf_geometry_cache_arr.shape != (self.n_agents, 38):
-                next_pf_geometry_cache_arr = self._fit_mat(next_pf_geometry_cache, self.n_agents, 38).astype(np.float32, copy=False)
-            else:
-                next_pf_geometry_cache_arr = next_pf_geometry_cache_arr.astype(np.float32, copy=False)
-        else:
-            next_pf_geometry_cache_arr = None
-
         if next_act_corrected is not None:
             next_act_corrected_arr = np.asarray(next_act_corrected, dtype=self.storage_dtype)
             if next_act_corrected_arr.shape != (self.n_agents, self.act_dim):
@@ -2366,7 +2335,6 @@ class LiteReplayBuffer:
             next_act_corrected=next_act_corrected_arr,
             pf_features=pf_features_arr,
             next_pf_features=next_pf_features_arr,
-            next_pf_geometry_cache=next_pf_geometry_cache_arr,
         )
 
     def add_batch(self, obs_batch, next_obs_batch, act_batch, rew_batch, done_batch,
@@ -2389,7 +2357,6 @@ class LiteReplayBuffer:
             next_act_corrected_batch: (batch_size, n_agents, act_dim) 或 list of (n_agents, act_dim)，默认None（延迟计算）
             pf_features_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
             next_pf_features_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
-            next_pf_geometry_cache_batch: (batch_size, n_agents, 38) 或 list of (n_agents, 38)，默认None
         """
         batch_size = len(obs_batch) if isinstance(obs_batch, (list, tuple)) else obs_batch.shape[0]
         if batch_size == 0:
@@ -2408,8 +2375,7 @@ class LiteReplayBuffer:
                 next_act_corrected_i = next_act_corrected_batch[i] if next_act_corrected_batch is not None and i < len(next_act_corrected_batch) else None
                 pf_feat_i = pf_features_batch[i] if pf_features_batch is not None and i < len(pf_features_batch) else None
                 next_pf_feat_i = next_pf_features_batch[i] if next_pf_features_batch is not None and i < len(next_pf_features_batch) else None
-                next_pf_geom_i = next_pf_geometry_cache_batch[i] if next_pf_geometry_cache_batch is not None and i < len(next_pf_geometry_cache_batch) else None
-                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i, next_pf_geom_i)
+                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i)
             return
 
         try:
@@ -2432,16 +2398,13 @@ class LiteReplayBuffer:
                 next_act_corrected_i = next_act_corrected_batch[i] if next_act_corrected_batch is not None and i < len(next_act_corrected_batch) else None
                 pf_feat_i = pf_features_batch[i] if pf_features_batch is not None and i < len(pf_features_batch) else None
                 next_pf_feat_i = next_pf_features_batch[i] if next_pf_features_batch is not None and i < len(next_pf_features_batch) else None
-                next_pf_geom_i = next_pf_geometry_cache_batch[i] if next_pf_geometry_cache_batch is not None and i < len(next_pf_geometry_cache_batch) else None
-                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i, next_pf_geom_i)
+                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i)
             return
 
         fr_arr = self._coerce_batch_scalar(fr_values, batch_size, dtype=np.float32)
         pf_arr = self._coerce_batch_matrix(pf_forces_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
         pf_feat_arr = self._coerce_batch_matrix(pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
         next_pf_feat_arr = self._coerce_batch_matrix(next_pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
-        next_pf_geom_arr = self._coerce_batch_matrix(next_pf_geometry_cache_batch, batch_size, self.n_agents, 38, np.float32, allow_none=True)
-
         if act_corrected_batch is not None:
             act_corr_arr = self._coerce_batch_matrix(act_corrected_batch, batch_size, self.n_agents, self.act_dim, self.storage_dtype, allow_none=True)
             if isinstance(act_corrected_batch, (list, tuple)):
@@ -2479,15 +2442,12 @@ class LiteReplayBuffer:
         self.pf_forces[positions] = pf_arr
         self.pf_features[positions] = pf_feat_arr
         self.next_pf_features[positions] = next_pf_feat_arr
-        self.next_pf_geometry_cache[positions] = next_pf_geom_arr
         self.act_corrected[positions] = act_corr_arr
         self.next_act_corrected[positions] = next_act_corr_arr
         if pf_features_batch is not None:
             self.stores_pf_features = True
         if next_pf_features_batch is not None:
             self.stores_next_pf_features = True
-        if next_pf_geometry_cache_batch is not None:
-            self.stores_next_pf_geometry_cache = True
         if stores_next_act_corrected:
             self.stores_next_act_corrected = True
 
@@ -2761,8 +2721,6 @@ class LiteReplayBuffer:
                     self.pf_features[:keep_recent_n] = self.pf_features[recent_start:recent_start + keep_recent_n]
                 if hasattr(self, 'next_pf_features'):
                     self.next_pf_features[:keep_recent_n] = self.next_pf_features[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'next_pf_geometry_cache'):
-                    self.next_pf_geometry_cache[:keep_recent_n] = self.next_pf_geometry_cache[recent_start:recent_start + keep_recent_n]
                 if hasattr(self, '_insert_step'):
                     self._insert_step[:keep_recent_n] = self._insert_step[recent_start:recent_start + keep_recent_n]
             else:
@@ -2797,9 +2755,6 @@ class LiteReplayBuffer:
                 if hasattr(self, 'next_pf_features'):
                     self.next_pf_features[:part1_len] = self.next_pf_features[recent_start:]
                     self.next_pf_features[part1_len:keep_recent_n] = self.next_pf_features[:part2_len]
-                if hasattr(self, 'next_pf_geometry_cache'):
-                    self.next_pf_geometry_cache[:part1_len] = self.next_pf_geometry_cache[recent_start:]
-                    self.next_pf_geometry_cache[part1_len:keep_recent_n] = self.next_pf_geometry_cache[:part2_len]
                 if hasattr(self, '_insert_step'):
                     self._insert_step[:part1_len] = self._insert_step[recent_start:]
                     self._insert_step[part1_len:keep_recent_n] = self._insert_step[:part2_len]
@@ -2839,8 +2794,6 @@ class LiteReplayBuffer:
                 self.stores_pf_features = False
             if hasattr(self, 'stores_next_pf_features'):
                 self.stores_next_pf_features = False
-            if hasattr(self, 'stores_next_pf_geometry_cache'):
-                self.stores_next_pf_geometry_cache = False
             if hasattr(self, 'stores_next_act_corrected'):
                 self.stores_next_act_corrected = False
         # 注意：不需要重置数组内容（会被新数据覆盖），只重置索引和计数器
@@ -5099,9 +5052,6 @@ class OptimizedMADDPG:
             'min_learning_rate': float(os.getenv('ADAPTIVE_MIN_LR', '2e-5')),  # 🔧 修复：提高最小学习率（1e-5 → 2e-5），保持学习能力
             'noise_boost_factor': 1.2,  # 🔧 修复噪声过大：降低噪声提升因子（1.5→1.2），减缓噪声增长
             'max_noise_scale': 2.0,  # 最大噪声尺度（硬上限，通常由ADAPTIVE_NOISE_MAX限制）
-            'reset_threshold': 15,  # 网络重置阈值
-            'consecutive_adaptations': 0,  # 连续自适应调整次数
-            'network_reset_flag': False,  # 网络重置标志
             'xla_reenable_pending': False,  # 🔧 XLA 延迟重新启用标志
             'xla_suspended': False          # 🔧 自适应阶段挂起XLA开关
         }
@@ -5712,8 +5662,6 @@ class OptimizedMADDPG:
         # 🔧 XLA修复：使用tf.Variable存储和更新参数，避免触发XLA重新编译
         # 保持 XLA Global 状态不变，避免在训练中途切换导致的编译/缓存不一致
         
-        self.adaptive_learning['consecutive_adaptations'] += 1
-        
         # 调整每个智能体的学习率和噪声
         for i, agent in enumerate(self.agents):
             # 🔧 XLA修复：从Variable读取当前学习率
@@ -5857,129 +5805,7 @@ class OptimizedMADDPG:
                 if not quiet_output:
                     print(f"⚠️  更新向量化OU噪声std_dev失败: {e}")
         
-        # 检查是否需要网络重置
-        if self.adaptive_learning['consecutive_adaptations'] >= self.adaptive_learning['reset_threshold']:
-            print(f"连续{self.adaptive_learning['consecutive_adaptations']}次自适应调整，触发网络部分重置...")
-            self._partial_reset_networks()
-            self.adaptive_learning['consecutive_adaptations'] = 0
-            
-            # 🚨 关键修复：网络重置时，也重置噪声和学习率，形成完整的循环
-            # 问题：网络重置后，噪声和学习率还保持在调整后的值，无法形成完整的重置循环
-            # 解决方案：重置噪声和学习率到初始值或合理的中等值
-            print("重置噪声和学习率，形成完整的自适应循环...")
-            for i, agent in enumerate(self.agents):
-                # 重置学习率到初始值（或中等值）
-                initial_actor_lr = float(getattr(self.args, 'actor_lr', 0.00025))
-                initial_critic_lr = float(getattr(self.args, 'critic_lr', 0.0035))
-                # 使用初始值的80%，避免完全重置导致训练不稳定
-                reset_actor_lr = initial_actor_lr * 0.8
-                reset_critic_lr = initial_critic_lr * 0.8
-                
-                agent['actor_lr_var'].assign(tf.cast(reset_actor_lr, tf.float32))
-                agent['critic_lr_var'].assign(tf.cast(reset_critic_lr, tf.float32))
-                agent['actor_lr'] = reset_actor_lr
-                agent['critic_lr'] = reset_critic_lr
-                
-            # 更新优化器学习率（使用局部函数）
-            def _safe_set_lr(opt, lr_var):
-                """使用Variable更新优化器学习率"""
-                base_opt = getattr(opt, 'inner_optimizer', getattr(opt, '_optimizer', opt))
-                try:
-                    lr_attr = getattr(base_opt, 'learning_rate', None)
-                    if hasattr(lr_attr, 'assign'):
-                        lr_attr.assign(lr_var)
-                    else:
-                        try:
-                            setattr(base_opt, 'learning_rate', lr_var)
-                        except Exception:
-                            setattr(base_opt, 'learning_rate', float(lr_var.numpy()))
-                except Exception:
-                    try:
-                        setattr(base_opt, 'lr', lr_var)
-                    except Exception:
-                        try:
-                            setattr(base_opt, 'lr', float(lr_var.numpy()))
-                        except Exception:
-                            pass
-            
-            _safe_set_lr(agent['actor_optimizer'], agent['actor_lr_var'])
-            _safe_set_lr(agent['critic_optimizer'], agent['critic_lr_var'])
-            
-            # 重置噪声到初始值（或中等值）
-            initial_noise_scale = max(float(getattr(self.args, 'noise_scale', 0.3)), float(getattr(self.args, 'noise_min', 0.0)))
-            # 使用初始值的80%，避免完全重置导致训练不稳定
-            reset_noise_scale = initial_noise_scale * 0.8
-            self.noise_scale_var.assign(tf.cast(reset_noise_scale, tf.float32))
-            self.args.noise_scale = reset_noise_scale
-            
-            # 同步更新向量化OU噪声
-            if hasattr(self, 'vectorized_ou_noise') and self.vectorized_ou_noise is not None:
-                try:
-                    updated_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                    updated_std_const = tf.constant(float(updated_std.numpy()), dtype=tf.float32)
-                    self.vectorized_ou_noise._std_dev.assign(updated_std_const)
-                except Exception:
-                    pass
-            
-            print(f"噪声和学习率已重置: 噪声={reset_noise_scale:.4f}, Actor LR={reset_actor_lr:.6f}, Critic LR={reset_critic_lr:.6f}")
-        
         # 维持 XLA Global 的固定状态（不在此处尝试切换或延迟切换）
-    
-    def _partial_reset_networks(self, reset_weight_scale=0.1):
-        """部分重置网络权重，跳出局部最优（借鉴旧版本paper3d_train）"""
-        print("开始部分重置网络权重...")
-        self.adaptive_learning['network_reset_flag'] = True
-        
-        for i, agent in enumerate(self.agents):
-            print(f"部分重置智能体 {i} 的网络权重...")
-            
-            # 重置Actor网络高层权重
-            actor_weights = agent['actor'].get_weights()
-            total_layers = len(actor_weights)
-            
-            # 仅重置后半部分网络的权重
-            reset_start_idx = total_layers // 2
-            
-            for j in range(reset_start_idx, total_layers):
-                if j % 2 == 0:  # 权重层（通常是偶数索引）
-                    shape = actor_weights[j].shape
-                    # 倒数第二层权重完全重置
-                    if j == total_layers - 2:
-                        actor_weights[j] = np.random.normal(0, reset_weight_scale, shape)
-                    # 其他层部分重置
-                    else:
-                        # 保留原始权重的比例逐渐降低
-                        retain_ratio = 0.8 - 0.2 * (j - reset_start_idx) / (total_layers - reset_start_idx)
-                        retain_ratio = max(0.2, retain_ratio)  # 至少保留20%
-                        actor_weights[j] = (actor_weights[j] * retain_ratio + 
-                                          np.random.normal(0, reset_weight_scale/2, shape) * (1 - retain_ratio))
-            
-            # 应用重置后的Actor网络权重
-            agent['actor'].set_weights(actor_weights)
-            
-            # 重置Critic网络高层权重
-            critic_weights = agent['critic'].get_weights()
-            total_layers = len(critic_weights)
-            reset_start_idx = total_layers // 2
-            
-            for j in range(reset_start_idx, total_layers):
-                if j % 2 == 0:  # 权重层
-                    shape = critic_weights[j].shape
-                    if j == total_layers - 2:
-                        critic_weights[j] = np.random.normal(0, reset_weight_scale, shape)
-                    else:
-                        retain_ratio = 0.8 - 0.2 * (j - reset_start_idx) / (total_layers - reset_start_idx)
-                        retain_ratio = max(0.2, retain_ratio)
-                        critic_weights[j] = (critic_weights[j] * retain_ratio + 
-                                           np.random.normal(0, reset_weight_scale/2, shape) * (1 - retain_ratio))
-            
-            agent['critic'].set_weights(critic_weights)
-            
-            # 更新目标网络
-            agent['target_actor'].set_weights(agent['actor'].get_weights())
-            agent['target_critic'].set_weights(agent['critic'].get_weights())
-        
-        print("网络权重部分重置完成")
     
     def select_action(self, agent_idx, state, add_noise=True):
         """选择动作（移除tf.function避免变量创建冲突）- 已修复"""
@@ -6181,7 +6007,10 @@ class OptimizedMADDPG:
             - pf_features_current: (num_envs, n_agents, 3) 当前状态的 base PF 特征
         """
         # 统一张量类型与形状，避免 retracing
-        states = tf.convert_to_tensor(states, dtype=tf.float32)
+        if not tf.is_tensor(states):
+            states = tf.convert_to_tensor(states, dtype=tf.float32)
+        elif states.dtype != tf.float32:
+            states = tf.cast(states, tf.float32)
         states = tf.ensure_shape(states, [None, self.n_agents, None])
         num_envs = tf.shape(states)[0]
         num_envs_int = self.num_envs_int  # 🔧 XLA修复：使用预先计算的常量，避免getattr
@@ -6235,7 +6064,6 @@ class OptimizedMADDPG:
             pf_forces_computed,  # ✅ 基于base PF参数计算的PF力
             pf_forces_zero
         )
-        
         # 计算网络动作（对所有智能体都计算，即使会被随机动作覆盖）
         actions_per_agent = []
         for i in range(self.n_agents):
@@ -9642,9 +9470,6 @@ class OptimizedMATD3:
             'min_learning_rate': float(os.getenv('ADAPTIVE_MIN_LR', '2e-5')),  # 🔧 修复：提高最小学习率（1e-5 → 2e-5），保持学习能力
             'noise_boost_factor': 1.2,  # 🔧 修复噪声过大：降低噪声提升因子（1.5→1.2），减缓噪声增长
             'max_noise_scale': 2.0,  # 最大噪声尺度（硬上限，通常由ADAPTIVE_NOISE_MAX限制）
-            'reset_threshold': 15,  # 网络重置阈值
-            'consecutive_adaptations': 0,  # 连续自适应调整次数
-            'network_reset_flag': False,  # 网络重置标志
             'xla_reenable_pending': False,  # 🔧 XLA 延迟重新启用标志
             'xla_suspended': False          # 🔧 自适应阶段挂起XLA开关
         }
@@ -10464,7 +10289,10 @@ class OptimizedMATD3:
             - pf_features_current: (num_envs, n_agents, 3) 当前状态的 base PF 特征
         """
         # 统一张量类型与形状，避免 retracing
-        states = tf.convert_to_tensor(states, dtype=tf.float32)
+        if not tf.is_tensor(states):
+            states = tf.convert_to_tensor(states, dtype=tf.float32)
+        elif states.dtype != tf.float32:
+            states = tf.cast(states, tf.float32)
         # 🔧 修复：移除tf.ensure_shape，因为在@tf.function中可能导致AutoGraph转换错误
         # states = tf.ensure_shape(states, [None, self.n_agents, None])
         num_envs = tf.shape(states)[0]
@@ -10845,6 +10673,13 @@ class OptimizedMATD3:
         next_act_corrected_valid = bool(
             next_act_corrected_batch is not None and getattr(replay_buffer, 'stores_next_act_corrected', False)
         )
+        next_pf_geometry_cache_np = None
+        if getattr(replay_buffer, 'stores_next_pf_geometry_cache', False) and next_pf_geometry_cache_batch is not None:
+            next_pf_geometry_cache_np = _coerce_pf_geometry_cache_batch_numpy(
+                next_pf_geometry_cache_batch,
+                act_n.shape[0],
+                self.n_agents,
+            )
 
         next_obs_valid_inputs = None
         next_obs_geometry_context = None
@@ -10863,7 +10698,16 @@ class OptimizedMATD3:
         )
         if detail_enabled:
             _t_target_sub = _upd_perf_counter()
-        if need_shared_next_context:
+        if next_pf_geometry_cache_np is not None and shared_next_pf_supported:
+            try:
+                packed_next_pf_geometry_tensor = tf.convert_to_tensor(next_pf_geometry_cache_np, dtype=tf.float32)
+                next_obs_valid_inputs, next_obs_geometry_context = self._unpack_pf_geometry_cache_tf(
+                    packed_next_pf_geometry_tensor
+                )
+            except Exception:
+                next_obs_valid_inputs = None
+                next_obs_geometry_context = None
+        elif need_shared_next_context:
             try:
                 correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else tf.shape(all_next_obs[0])[1]
                 next_obs_stacked = next_obs_n_tensor[:, :, :correct_obs_dim]
@@ -11626,8 +11470,6 @@ class OptimizedMATD3:
         # 🔧 XLA修复：使用tf.Variable存储和更新参数，避免触发XLA重新编译
         # 保持 XLA Global 状态不变，避免在训练中途切换导致的编译/缓存不一致
         
-        self.adaptive_learning['consecutive_adaptations'] += 1
-        
         # 调整每个智能体的学习率和噪声
         for i, agent in enumerate(self.agents):
             # 🔧 XLA修复：从Variable读取当前学习率
@@ -11748,96 +11590,7 @@ class OptimizedMATD3:
                 if not quiet_output:
                     print(f"⚠️  更新向量化OU噪声std_dev失败: {e}")
         
-        # 检查是否需要网络重置
-        if self.adaptive_learning['consecutive_adaptations'] >= self.adaptive_learning['reset_threshold']:
-            print(f"连续{self.adaptive_learning['consecutive_adaptations']}次自适应调整，触发网络部分重置...")
-            self._partial_network_reset()
-            self.adaptive_learning['consecutive_adaptations'] = 0
-            
-            # 🚨 关键修复：网络重置时，也重置噪声和学习率，形成完整的循环（MATD3版本）
-            # 问题：网络重置后，噪声和学习率还保持在调整后的值，无法形成完整的重置循环
-            # 解决方案：重置噪声和学习率到初始值或合理的中等值
-            print("重置噪声和学习率，形成完整的自适应循环...")
-            
-            # 定义局部函数用于更新优化器学习率
-            def _safe_set_lr(opt, lr_var):
-                """使用Variable更新优化器学习率"""
-                base_opt = getattr(opt, 'inner_optimizer', getattr(opt, '_optimizer', opt))
-                try:
-                    lr_attr = getattr(base_opt, 'learning_rate', None)
-                    if hasattr(lr_attr, 'assign'):
-                        lr_attr.assign(lr_var)
-                    else:
-                        try:
-                            setattr(base_opt, 'learning_rate', lr_var)
-                        except Exception:
-                            setattr(base_opt, 'learning_rate', float(lr_var.numpy()))
-                except Exception:
-                    try:
-                        setattr(base_opt, 'lr', lr_var)
-                    except Exception:
-                        try:
-                            setattr(base_opt, 'lr', float(lr_var.numpy()))
-                        except Exception:
-                            pass
-            
-            for i, agent in enumerate(self.agents):
-                # 重置学习率到初始值（或中等值）
-                initial_actor_lr = float(getattr(self.args, 'actor_lr', 0.00025))
-                initial_critic_lr = float(getattr(self.args, 'critic_lr', 0.0035))
-                # 使用初始值的80%，避免完全重置导致训练不稳定
-                reset_actor_lr = initial_actor_lr * 0.8
-                reset_critic_lr = initial_critic_lr * 0.8
-                
-                agent['actor_lr_var'].assign(tf.cast(reset_actor_lr, tf.float32))
-                agent['critic_lr_var'].assign(tf.cast(reset_critic_lr, tf.float32))
-                agent['actor_lr'] = reset_actor_lr
-                agent['critic_lr'] = reset_critic_lr
-                
-                # 🚨 标准MATD3：同时更新Actor和两个Critic优化器的学习率
-                _safe_set_lr(agent['actor_optimizer'], agent['actor_lr_var'])
-                _safe_set_lr(agent['critic1_optimizer'], agent['critic_lr_var'])
-                _safe_set_lr(agent['critic2_optimizer'], agent['critic_lr_var'])
-            
-            # 重置噪声到初始值（或中等值）
-            initial_noise_scale = max(float(getattr(self.args, 'noise_scale', 0.3)), float(getattr(self.args, 'noise_min', 0.0)))
-            # 使用初始值的80%，避免完全重置导致训练不稳定
-            reset_noise_scale = initial_noise_scale * 0.8
-            self.noise_scale_var.assign(tf.cast(reset_noise_scale, tf.float32))
-            self.args.noise_scale = reset_noise_scale
-            
-            # 同步更新向量化OU噪声
-            if hasattr(self, 'vectorized_ou_noise') and self.vectorized_ou_noise is not None:
-                try:
-                    updated_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                    updated_std_const = tf.constant(float(updated_std.numpy()), dtype=tf.float32)
-                    self.vectorized_ou_noise._std_dev.assign(updated_std_const)
-                except Exception:
-                    pass
-            
-            print(f"噪声和学习率已重置: 噪声={reset_noise_scale:.4f}, Actor LR={reset_actor_lr:.6f}, Critic LR={reset_critic_lr:.6f}")
-        
         # 维持 XLA Global 的固定状态（不在此处尝试切换或延迟切换）
-    
-    def _partial_network_reset(self):
-        """🚨 标准MATD3：部分网络重置（与MADDPG保持一致，但使用Twin Critic）"""
-        self.adaptive_learning['network_reset_flag'] = True
-        print("执行部分网络重置...")
-        
-        # 重置每个智能体的目标网络权重
-        for i, agent in enumerate(self.agents):
-            # 重置目标Actor网络
-            agent['target_actor'].set_weights(agent['actor'].get_weights())
-            # 🚨 标准MATD3：重置两个独立的目标Critic网络
-            agent['target_critic1'].set_weights(agent['critic1'].get_weights())
-            agent['target_critic2'].set_weights(agent['critic2'].get_weights())
-            
-            print(f"智能体{i}: 目标网络权重已重置（标准MATD3 Twin Critic）")
-        
-        # 重置自适应学习状态
-        self.adaptive_learning['consecutive_no_improve'] = 0
-        self.adaptive_learning['consecutive_adaptations'] = 0
-        self.adaptive_learning['network_reset_flag'] = False
     
     @tf.function(reduce_retracing=True)
     def train_step_optimized(self, agent_idx, obs_batch, next_obs_batch, action_batch, reward_batch, done_batch,
@@ -15674,6 +15427,10 @@ def train(args):
     last_actor_outputs_history = None  # [timestep][agent][7_dim_output]
     first_actor_outputs_history = None # [timestep][agent][7_dim_output]
     try:
+        fast_artifacts_mode = os.getenv('FAST_ARTIFACTS', '0').lower() in ('1','true','yes','on')
+    except Exception:
+        fast_artifacts_mode = False
+    try:
         enable_best_traj = os.getenv('SAVE_BEST_TRAJ', '1').lower() in ('1','true','yes','on')
     except Exception:
         enable_best_traj = True
@@ -15702,6 +15459,12 @@ def train(args):
         enable_episode_traj = os.getenv('SAVE_EPISODE_TRAJ', '0').lower() in ('1','true','yes','on')
     except Exception:
         enable_episode_traj = False
+    if fast_artifacts_mode:
+        enable_best_traj = False
+        enable_prerandom_best = False
+        enable_episode_traj = False
+        os.environ['SAVE_INTERACTIVE_TRAJ'] = '0'
+        os.environ['SAVE_INTERACTIVE_TRAJ_INDEPENDENT'] = '0'
     # 收集所有回合的轨迹用于叠加图
     if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
         print(f"\n开始训练: {args.train_episodes}个回合")
@@ -16705,9 +16468,21 @@ def train(args):
             # 🔧 性能优化：训练主线固定使用向量化多返回值接口
             if _profiling_enabled:
                 with tf.profiler.experimental.Trace('action_select', step_num=step, _r=1):
-                    actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor, raw_actor_outputs_tensor, current_pf_features_tensor = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
+                    (
+                        actions_for_storage_tensor,
+                        actions_for_execution_tensor,
+                        pf_forces_tensor,
+                        raw_actor_outputs_tensor,
+                        current_pf_features_tensor,
+                    ) = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
             else:
-                actions_for_storage_tensor, actions_for_execution_tensor, pf_forces_tensor, raw_actor_outputs_tensor, current_pf_features_tensor = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
+                (
+                    actions_for_storage_tensor,
+                    actions_for_execution_tensor,
+                    pf_forces_tensor,
+                    raw_actor_outputs_tensor,
+                    current_pf_features_tensor,
+                ) = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
             if timing_enabled:
                 _dt_action = _perf_counter() - _t_action_start
                 timing_ep['action'] += _dt_action
@@ -17333,7 +17108,9 @@ def train(args):
                                     pending_single_transition['next_obs_n'],
                                     pending_single_transition['fr_value'],
                                 )
-                        _flush_pending_single_transition(next_pf_features_override=next_pf_features_single)
+                        _flush_pending_single_transition(
+                            next_pf_features_override=next_pf_features_single,
+                        )
                     except Exception as e:
                         raise RuntimeError(f"当前训练主线的单环境延迟回放写入失败: {e}") from e
                 if not (already_done_mask_len > 0 and already_done_mask[0]):
@@ -19178,6 +18955,16 @@ def train(args):
         maddpg.save_models(os.path.join("models", args.exp_name, "final"))
         # 🔧 新增：保存最终检查点
         save_checkpoint(len(episode_rewards), "checkpoint")
+    if fast_artifacts_mode:
+        best_trajectory_time_major = None
+        first_trajectory_time_major = None
+        last_trajectory_time_major = None
+        best_vis_context = None
+        first_vis_context = None
+        last_vis_context = None
+        best_actor_outputs_history = None
+        first_actor_outputs_history = None
+        last_actor_outputs_history = None
     # 训练结束：输出"最佳回合"和"最后一回合"两套轨迹图与交互图（均使用对应回合快照，避免错配）
     try:
         # 检查最佳回合和最后一回合是否相同，如果是则确保使用不同的轨迹数据
@@ -19502,24 +19289,25 @@ def train(args):
 
     terrain_snapshot_artifacts = {}
     try:
-        snapshot_specs = (
-            ("best_episode", best_vis_context),
-            ("first_episode", first_vis_context),
-            ("last_episode", last_vis_context),
-        )
-        for prefix, vis_ctx in snapshot_specs:
-            if isinstance(vis_ctx, dict) and vis_ctx.get("terrain") is not None:
-                terrain_snapshot_artifacts[prefix] = _save_vis_context_snapshot_artifacts(
-                    run_dir,
-                    prefix,
-                    vis_ctx,
-                )
+        if not fast_artifacts_mode:
+            snapshot_specs = (
+                ("best_episode", best_vis_context),
+                ("first_episode", first_vis_context),
+                ("last_episode", last_vis_context),
+            )
+            for prefix, vis_ctx in snapshot_specs:
+                if isinstance(vis_ctx, dict) and vis_ctx.get("terrain") is not None:
+                    terrain_snapshot_artifacts[prefix] = _save_vis_context_snapshot_artifacts(
+                        run_dir,
+                        prefix,
+                        vis_ctx,
+                    )
     except Exception as e:
         if not quiet_output:
             print(f"[WARN] 地形快照保存失败: {e}")
 
     # 绘制奖励曲线图（包含碰撞次数和min_distance_to_obstacle）
-    if episode_rewards is not None and len(episode_rewards) > 0:
+    if (not fast_artifacts_mode) and episode_rewards is not None and len(episode_rewards) > 0:
         try:
             plt = get_plt()
             setup_english_fonts()
@@ -19776,7 +19564,7 @@ def train(args):
         team_success_flags = getattr(maddpg, '_episode_team_success_flags', [])
         min_distances = getattr(maddpg, '_episode_min_distances', [])
         
-        if (agent_success_flags or team_success_flags) and min_distances:
+        if (not fast_artifacts_mode) and (agent_success_flags or team_success_flags) and min_distances:
             plt = get_plt()
             setup_english_fonts()
             
@@ -19937,7 +19725,7 @@ def train(args):
     
     # 绘制 Loss 曲线图（为首回合、最佳回合、最后回合分别生成）
     loss_history_for_plot = getattr(maddpg, '_loss_history', None)
-    if loss_history_for_plot and len(loss_history_for_plot) > 0:
+    if (not fast_artifacts_mode) and loss_history_for_plot and len(loss_history_for_plot) > 0:
         try:
             plt = get_plt()
             setup_english_fonts()
@@ -20072,7 +19860,7 @@ def train(args):
     
     # 若未进入随机地形且启用了开关，则在尾声兜底保一次"切换前最佳图"
     try:
-        if enable_prerandom_best and (not pre_random_best_saved):
+        if (not fast_artifacts_mode) and enable_prerandom_best and (not pre_random_best_saved):
             if best_trajectory_time_major and len(best_trajectory_time_major) > 0:
                 viz = TrajectoryVisualizer(verbose=not quiet_output)
                 save_dir = run_dir
@@ -20122,17 +19910,20 @@ def train(args):
         last_eff = _compute_effective_steps_time_major(last_trajectory_time_major) if last_trajectory_time_major else 0
         first_eff = _compute_effective_steps_time_major(first_trajectory_time_major) if first_trajectory_time_major else 0
         print(f"可视化输出目录: {run_dir}")
-        # 计算总步数
-        best_total = len(best_trajectory_time_major) if best_trajectory_time_major else 0
-        last_total = len(last_trajectory_time_major) if last_trajectory_time_major else 0
-        first_total = len(first_trajectory_time_major) if first_trajectory_time_major else 0
-        best_agents = len(best_trajectory_time_major[0]) if best_trajectory_time_major and len(best_trajectory_time_major) > 0 else 0
-        last_agents = len(last_trajectory_time_major[0]) if last_trajectory_time_major and len(last_trajectory_time_major) > 0 else 0
-        first_agents = len(first_trajectory_time_major[0]) if first_trajectory_time_major and len(first_trajectory_time_major) > 0 else 0
+        if fast_artifacts_mode:
+            print("FAST_ARTIFACTS=1：已跳过末尾轨迹与图表生成")
+        else:
+            # 计算总步数
+            best_total = len(best_trajectory_time_major) if best_trajectory_time_major else 0
+            last_total = len(last_trajectory_time_major) if last_trajectory_time_major else 0
+            first_total = len(first_trajectory_time_major) if first_trajectory_time_major else 0
+            best_agents = len(best_trajectory_time_major[0]) if best_trajectory_time_major and len(best_trajectory_time_major) > 0 else 0
+            last_agents = len(last_trajectory_time_major[0]) if last_trajectory_time_major and len(last_trajectory_time_major) > 0 else 0
+            first_agents = len(first_trajectory_time_major[0]) if first_trajectory_time_major and len(first_trajectory_time_major) > 0 else 0
 
-        print(f"有效步长: 首回合≈{first_eff} | 最佳回合≈{best_eff} | 最后回合≈{last_eff}")
-        print(f"总步数: 首回合={first_total} | 最佳回合={best_total} | 最后回合={last_total}")
-        print(f"轨迹详情: 首回合轨迹长度={first_total}, 智能体数量={first_agents} | 最佳回合轨迹长度={best_total}, 智能体数量={best_agents} | 最后回合轨迹长度={last_total}, 智能体数量={last_agents}")
+            print(f"有效步长: 首回合≈{first_eff} | 最佳回合≈{best_eff} | 最后回合≈{last_eff}")
+            print(f"总步数: 首回合={first_total} | 最佳回合={best_total} | 最后回合={last_total}")
+            print(f"轨迹详情: 首回合轨迹长度={first_total}, 智能体数量={first_agents} | 最佳回合轨迹长度={best_total}, 智能体数量={best_agents} | 最后回合轨迹长度={last_total}, 智能体数量={last_agents}")
     except Exception:
         pass
 

@@ -1166,6 +1166,9 @@ def setup_base_env_vars(positions_file: Path, gpu_id: int = None) -> dict:
     env.setdefault("CPU_THREADS", "12")  # 默认12线程
     env.setdefault("TQDM_DISABLE", "1")  # 完全禁用tqdm进度条
     env.setdefault("QUIET_OUTPUT", "0")  # 🔧 关键：启用详细输出，确保数据记录正确（0=详细，1=安静）
+    env.setdefault("HEARTBEAT_ENABLE", "0")
+    # 训练收尾可视化默认沿用 run_optimized.sh 的标准行为；
+    # 正式消融不再默认启用 FAST_ARTIFACTS 轻量模式，避免结果目录缺少轨迹图/损失图/HTML。
     env.setdefault("SUPPRESS_MA_PROMPT", "1")  # 抑制多智能体环境交互式提示
     env.setdefault("SUPPRESS_TERRAIN_OUTPUT", "1")  # 抑制地形生成冗余输出
     for key in (
