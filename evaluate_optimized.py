@@ -3988,38 +3988,54 @@ class ModelEvaluator:
             visualization_artifacts['best_reward_control_diagnostics'] = best_control_diag_alias
 
         if save_team_success_html and best_success_episode_data is not None and not self.args.disable_visualization:
-            print(
-                f"\n🌐 正在生成最佳团队成功回合HTML "
-                f"(Episode {best_success_episode + 1}, Reward = {best_success_reward:.2f})..."
+            reuse_best_reward_visualization = (
+                bool(best_generated_files)
+                and best_episode_data is not None
+                and best_episode is not None
+                and best_success_episode is not None
+                and int(best_episode) == int(best_success_episode)
             )
+            if reuse_best_reward_visualization:
+                print(
+                    f"\n♻️  最佳奖励回合同时也是最佳团队成功回合 "
+                    f"(Episode {best_success_episode + 1})，复用已有可视化..."
+                )
+            else:
+                print(
+                    f"\n🌐 正在生成最佳团队成功回合HTML "
+                    f"(Episode {best_success_episode + 1}, Reward = {best_success_reward:.2f})..."
+                )
             try:
-                best_success_episode_for_viz = best_success_episode_data.copy()
-                best_success_episode_for_viz['trajectory'] = best_success_trajectory
-                if best_success_actor_outputs_history is not None:
-                    best_success_episode_for_viz['actions_history'] = best_success_actor_outputs_history
-                if save_all_episode_visualizations:
-                    best_success_episode_num = int(best_success_episode_for_viz.get('episode', 0)) + 1
-                    success_image_path = os.path.join(
-                        self.args.save_viz_path,
-                        f"trajectory_ep{best_success_episode_num}_level{best_success_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_success_episode_for_viz['reward']:.0f}.png"
-                    )
-                    generated_success_files = {
-                        'image_path': success_image_path,
-                        'html_path': os.path.join(
-                            self.args.save_viz_path,
-                            f"trajectory_ep{best_success_episode_num}_interactive.html"
-                        ),
-                        'actor_sequence_path': os.path.join(
-                            self.args.save_viz_path,
-                            f"trajectory_ep{best_success_episode_num}_level{best_success_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_success_episode_for_viz['reward']:.0f}_actor_sequence.png"
-                        ),
-                        'control_diagnostics_path': os.path.join(
-                            self.args.save_viz_path,
-                            f"trajectory_ep{best_success_episode_num}_control_diagnostics.png"
-                        ),
-                    }
+                if reuse_best_reward_visualization:
+                    generated_success_files = dict(best_generated_files)
                 else:
-                    generated_success_files = self.generate_visualization(best_success_episode_for_viz, is_best=False) or {}
+                    best_success_episode_for_viz = best_success_episode_data.copy()
+                    best_success_episode_for_viz['trajectory'] = best_success_trajectory
+                    if best_success_actor_outputs_history is not None:
+                        best_success_episode_for_viz['actions_history'] = best_success_actor_outputs_history
+                    if save_all_episode_visualizations:
+                        best_success_episode_num = int(best_success_episode_for_viz.get('episode', 0)) + 1
+                        success_image_path = os.path.join(
+                            self.args.save_viz_path,
+                            f"trajectory_ep{best_success_episode_num}_level{best_success_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_success_episode_for_viz['reward']:.0f}.png"
+                        )
+                        generated_success_files = {
+                            'image_path': success_image_path,
+                            'html_path': os.path.join(
+                                self.args.save_viz_path,
+                                f"trajectory_ep{best_success_episode_num}_interactive.html"
+                            ),
+                            'actor_sequence_path': os.path.join(
+                                self.args.save_viz_path,
+                                f"trajectory_ep{best_success_episode_num}_level{best_success_episode_for_viz.get('terrain_complexity_level', 'unknown')}_r{best_success_episode_for_viz['reward']:.0f}_actor_sequence.png"
+                            ),
+                            'control_diagnostics_path': os.path.join(
+                                self.args.save_viz_path,
+                                f"trajectory_ep{best_success_episode_num}_control_diagnostics.png"
+                            ),
+                        }
+                    else:
+                        generated_success_files = self.generate_visualization(best_success_episode_for_viz, is_best=False) or {}
                 success_html_path = generated_success_files.get('html_path')
                 success_png_path = generated_success_files.get('image_path')
                 success_actor_sequence_path = generated_success_files.get('actor_sequence_path')

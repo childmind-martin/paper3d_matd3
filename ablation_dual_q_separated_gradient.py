@@ -3393,6 +3393,39 @@ def _resolve_model_variant_dir(model_root: Path, model_variant: str) -> Tuple[Op
     return None, None
 
 
+_POST_EVAL_MODEL_SIGNATURE_CACHE: Dict[str, Optional[str]] = {}
+
+
+def _compute_post_eval_model_signature(model_dir: Path) -> Optional[str]:
+    try:
+        resolved_dir = Path(model_dir).resolve()
+    except Exception:
+        resolved_dir = Path(model_dir)
+    cache_key = str(resolved_dir)
+    if cache_key in _POST_EVAL_MODEL_SIGNATURE_CACHE:
+        return _POST_EVAL_MODEL_SIGNATURE_CACHE[cache_key]
+
+    signature: Optional[str] = None
+    try:
+        weight_files = sorted(resolved_dir.glob("actor_*.weights.h5"))
+        if weight_files:
+            hasher = hashlib.sha1()
+            for weight_path in weight_files:
+                hasher.update(weight_path.name.encode("utf-8", errors="ignore"))
+                with open(weight_path, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+            signature = hasher.hexdigest()
+    except Exception:
+        signature = None
+
+    _POST_EVAL_MODEL_SIGNATURE_CACHE[cache_key] = signature
+    return signature
+
+
 def _build_matched_validation_spec(
     base_post_eval_spec: Dict[str, Any],
     args,
@@ -3518,8 +3551,9 @@ def _execute_post_eval_run(
         env["DISABLE_TRAJECTORY_RECORDING"] = "0" if need_trajectory_artifacts else "1"
         env["DEBUG_EPISODE_SUMMARY"] = "0"
         env["DEBUG_COLLISION_SUMMARY"] = "0"
-        env["TQDM_DISABLE"] = "0"
-        env["TQDM_TO_STDOUT"] = "1"
+        quiet_output_enabled = _to_bool(env.get("QUIET_OUTPUT", "0"))
+        env.setdefault("TQDM_DISABLE", "1" if quiet_output_enabled else "0")
+        env.setdefault("TQDM_TO_STDOUT", "0" if _to_bool(env.get("TQDM_DISABLE", "0")) else "1")
         env.setdefault("TQDM_MININTERVAL", "2.0")
         env.setdefault("TQDM_MINITERS", "200")
         env.setdefault("PF_JIT", "1")
@@ -3722,7 +3756,28 @@ def _select_post_eval_checkpoint_with_matched_validation(
 
     scored_candidates: List[Dict[str, Any]] = []
     failed_candidates: List[Dict[str, Any]] = []
+    evaluated_candidates_by_signature: Dict[str, Dict[str, Any]] = {}
     for order_idx, candidate in enumerate(candidates):
+        candidate_signature = _compute_post_eval_model_signature(Path(candidate["model_path"]))
+        if candidate_signature and candidate_signature in evaluated_candidates_by_signature:
+            cached_candidate = evaluated_candidates_by_signature[candidate_signature]
+            print(
+                f"[验证选模-{label}] 复用候选 {candidate['candidate_alias']} 的验证结果 "
+                f"(与 {cached_candidate['candidate_alias']} 权重一致)"
+            )
+            scored_candidates.append(
+                {
+                    **candidate,
+                    "order": int(order_idx),
+                    "eval_record": cached_candidate["eval_record"],
+                    "summary": cached_candidate["summary"],
+                    "score": list(cached_candidate["score"]),
+                    "model_signature": candidate_signature,
+                    "reused_validation_from_candidate": str(cached_candidate["candidate_alias"]),
+                }
+            )
+            continue
+
         candidate_spec = dict(validation_base_spec)
         candidate_spec["model_variant"] = str(candidate["candidate_alias"])
         candidate_spec["candidate_alias"] = str(candidate["candidate_alias"])
@@ -3752,6 +3807,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                 {
                     **candidate,
                     "order": int(order_idx),
+                    "model_signature": candidate_signature,
                     "failure_reason": failure_reason,
                     "eval_dir": str(candidate_eval_dir),
                 }
@@ -3763,15 +3819,22 @@ def _select_post_eval_checkpoint_with_matched_validation(
             else {}
         )
         score = _score_post_eval_summary(summary if isinstance(summary, dict) else {})
-        scored_candidates.append(
-            {
-                **candidate,
-                "order": int(order_idx),
+        scored_entry = {
+            **candidate,
+            "order": int(order_idx),
+            "eval_record": eval_record,
+            "summary": summary,
+            "score": list(score),
+            "model_signature": candidate_signature,
+        }
+        scored_candidates.append(scored_entry)
+        if candidate_signature:
+            evaluated_candidates_by_signature[candidate_signature] = {
+                "candidate_alias": str(candidate["candidate_alias"]),
                 "eval_record": eval_record,
                 "summary": summary,
                 "score": list(score),
             }
-        )
 
     if not scored_candidates:
         failure_details = " | ".join(
@@ -3798,6 +3861,8 @@ def _select_post_eval_checkpoint_with_matched_validation(
                 "candidate_alias": item["candidate_alias"],
                 "resolved_variant": item["resolved_variant"],
                 "model_path": str(item["model_path"]),
+                "model_signature": item.get("model_signature"),
+                "reused_validation_from_candidate": item.get("reused_validation_from_candidate"),
                 "score": item["score"],
                 "summary": item["summary"],
                 "eval_dir": item["eval_record"]["eval_dir"],
@@ -3810,6 +3875,8 @@ def _select_post_eval_checkpoint_with_matched_validation(
             "candidate_alias": best_candidate["candidate_alias"],
             "resolved_variant": best_candidate["resolved_variant"],
             "model_path": str(best_candidate["model_path"]),
+            "model_signature": best_candidate.get("model_signature"),
+            "reused_validation_from_candidate": best_candidate.get("reused_validation_from_candidate"),
             "score": best_candidate["score"],
             "summary": best_candidate["summary"],
             "eval_dir": best_candidate["eval_record"]["eval_dir"],
