@@ -34,7 +34,7 @@ conda activate "$ENV_NAME"
 echo "安装核心依赖 (tensorflow, gym, numpy 等)..."
 pip install -U pip
 pip install tensorflow==2.12.0 tensorboard==2.12.0 gym==0.26.2
-pip install numpy==1.23.5 scipy==1.15.2 pandas==2.3.0
+pip install numpy==1.23.5 scipy==1.15.2
 pip install matplotlib==3.10.1 plotly==5.22.0 tqdm==4.67.1
 echo "安装当前代码实际使用的运行依赖 (opencv, pygame, imageio, psutil, OpenGL/pyglet)..."
 pip install imageio imageio-ffmpeg opencv-python pygame psutil PyOpenGL pyglet

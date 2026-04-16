@@ -92,7 +92,7 @@ EPISODES=${1:-800}
 BATCH_SIZE=${2:-1024}  # 🔧 好效果复现：与 result.json 一致（1024）
 EXP_NAME=${3:-"变FR到0.1、公平权重补偿、静态障碍物、课程学习、随机角色、高球形障碍apf、复杂4_exp"}
 USE_WEIGHTED_REWARD=${4:-1}  # 新增：是否使用分项加权求和奖励机制（1=启用，0=禁用）
-ALGORITHM=${5:-"matd3"}     # 新增：选择训练算法（maddpg或matd3）
+ALGORITHM=${5:-"matd3"}     # 选择训练算法（maddpg、matd3 或 mappo）
 RESUME_MODEL=${6:-""}       # 🔧 新增：持续训练模型路径（可选，指定要恢复的模型目录）
 # 🔧 消融实验专用：仅解析并导出最终训练配置，不启动训练
 ABLATION_RESOLVE_ONLY=${ABLATION_RESOLVE_ONLY:-0}
@@ -1122,16 +1122,21 @@ export SUPPRESS_MA_PROMPT=1
 # 🔧 关键修复：抑制地形生成冗余输出（减少并行环境中的大量地形信息输出）
 export SUPPRESS_TERRAIN_OUTPUT=1
 
-# 🔧 关键修复：清理Python缓存，确保使用最新代码（81维观测）
-echo "清理Python缓存..."
-find /home/tang/Desktop/multiagent -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-find /home/tang/Desktop/multiagent -name "*.pyc" -delete 2>/dev/null || true
-find /home/tang/Desktop -name "*.pyc" -delete 2>/dev/null || true
-echo "缓存已清理"
+if ! { [ "${ABLATION_RESOLVE_ONLY}" = "1" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "true" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "yes" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "on" ]; }; then
+    # 🔧 关键修复：清理Python缓存，确保使用最新代码（81维观测）
+    echo "清理Python缓存..."
+    find "$SCRIPT_DIR/multiagent" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    find "$SCRIPT_DIR/multiagent" -name "*.pyc" -delete 2>/dev/null || true
+    find "$SCRIPT_DIR" -name "*.pyc" -delete 2>/dev/null || true
+    echo "缓存已清理"
 
-# 运行优化后的训练
-echo "开始训练..."
-echo "======================================"
+    # 运行优化后的训练
+    echo "开始训练..."
+    echo "======================================"
+else
+    echo "[消融解析模式] 跳过缓存清理与训练启动，仅导出最终解析配置"
+    echo "======================================"
+fi
 
 # 组装训练参数并标注影响说明（不改变原有默认取值）
 # 根据参数选择场景
@@ -1309,6 +1314,20 @@ fi
 if [ "$ALGORITHM" = "maddpg" ]; then
     ARGS+=(--maddpg-use-dual-q "${MADDPG_USE_DUAL_Q:-false}" --maddpg-use-separated-gradient "${MADDPG_USE_SEPARATED_GRADIENT:-true}")
 fi
+if [ "$ALGORITHM" = "mappo" ]; then
+    ARGS+=(
+        --rollout-length "${MAPPO_ROLLOUT_LENGTH:-1024}"
+        --ppo-epochs "${MAPPO_PPO_EPOCHS:-4}"
+        --mini-batch-size "${MAPPO_MINI_BATCH_SIZE:-512}"
+        --clip-ratio "${MAPPO_CLIP_RATIO:-0.2}"
+        --gae-lambda "${MAPPO_GAE_LAMBDA:-0.95}"
+        --entropy-coef "${MAPPO_ENTROPY_COEF:-0.01}"
+        --value-coef "${MAPPO_VALUE_COEF:-0.5}"
+        --target-kl "${MAPPO_TARGET_KL:-0.03}"
+        --max-grad-norm "${MAPPO_MAX_GRAD_NORM:-10.0}"
+        --mappo-use-separated-gradient "${MAPPO_USE_SEPARATED_GRADIENT:-false}"
+    )
+fi
 
 # 若提供了分段日程，则将其追加到参数中
 # 🔧 修复：如果 ACTION_FORCE_RATIO_SCHEDULE_PCT 为 "DISABLED" 或空字符串，则不传递给训练脚本
@@ -1480,7 +1499,11 @@ fi
 # Key fix: Ensure XLA_FLAGS is completely cleared before Python starts - prevent inheritance from parent shell
 # Python script already handles XLA_FLAGS cleanup, here just ensure SUPPRESS_MA_PROMPT is set
 # 🔧 修复：使用显式路径和引号，避免文件名被错误解析
-PYTHON_SCRIPT="paper3d_train_optimized.py"
+if [ "$ALGORITHM" = "mappo" ]; then
+    PYTHON_SCRIPT="train_mappo_strict.py"
+else
+    PYTHON_SCRIPT="paper3d_train_optimized.py"
+fi
 if [ ! -f "$PYTHON_SCRIPT" ]; then
     echo "❌ 错误: 找不到训练脚本 $PYTHON_SCRIPT" >&2
     exit 1

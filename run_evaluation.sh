@@ -6,15 +6,43 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+resolve_default_model_path() {
+    if [ -n "${MODEL_PATH:-}" ]; then
+        printf '%s\n' "$MODEL_PATH"
+        return
+    fi
+
+    local candidate=""
+    local latest_exp=""
+
+    while IFS= read -r exp_dir; do
+        [ -z "$exp_dir" ] && continue
+        latest_exp="$exp_dir"
+        break
+    done < <(find models -mindepth 1 -maxdepth 1 -type d \
+        \( -name "*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]" -o -name "optimized_exp*" \) \
+        2>/dev/null | sort -r)
+
+    if [ -n "$latest_exp" ]; then
+        candidate="$latest_exp"
+    elif [ -d "models/optimized_exp" ]; then
+        candidate="models/optimized_exp"
+    else
+        candidate="models/optimized_exp"
+    fi
+
+    printf '%s\n' "$candidate"
+}
+
 # 设置默认参数
-MODEL_PATH=${1:-"models/变FR到0.1、公平权重补偿、静态障碍物、课程学习、随机角色、高球形障碍apf、复杂4_exp_20260323_230233/best_by_team_sr"}
+MODEL_PATH=${1:-"$(resolve_default_model_path)"}
 EVAL_EPISODES=${2:-3}
 MODEL_VARIANT=${MODEL_VARIANT:-auto}  # auto|final|best|best_by_team_sr|latest_ep
 
 # 🔧 关键修复：规范化模型路径，移除多余的斜杠
 MODEL_PATH=$(echo "$MODEL_PATH" | sed 's|//|/|g' | sed 's|/$||')
 SAVE_PATH=${3:-"evaluation_results/$(basename "$MODEL_PATH")_$(date +%Y%m%d_%H%M%S)"}
-POSITIONS_FILE=${4:-"./saved_positions/default_positions.json"}
+POSITIONS_FILE=${4:-"./saved_positions/5.json"}
 USE_FIXED_POSITIONS=${5:-false}
 DISABLE_EARLY_TERMINATION=${6:-false}  # 默认允许提前终止，避免日常测试硬跑满全长
 # 严格验证模式：默认开启。要求评估关键参数必须与训练配置一致，否则退出
@@ -460,7 +488,9 @@ fi
 if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
     if [ -z "$RESULTS_JSON_PATH" ] || [ ! -f "$RESULTS_JSON_PATH" ]; then
         echo "❌ 严格模式：未找到训练配置 results.json，拒绝评估。"
-        echo "   请确认模型目录对应的 logs 下存在 results.json。"
+        echo "   请至少提供以下任一位置的训练配置："
+        echo "   - $MODEL_PARENT_DIR/results.json"
+        echo "   - logs/<exp_name>/<timestamp>/results.json"
         exit 1
     fi
 fi
@@ -935,7 +965,10 @@ CMD_ARGS="$CMD_ARGS --reward-neg-scale $REWARD_NEG_SCALE"
 # 确保评估时使用的势场参数与训练时完全一致
 
 # ACTION_FORCE_RATIO
-if [ -n "$TRAINING_FR" ]; then
+if [ -n "${FORCE_EVAL_ACTION_FORCE_RATIO}" ]; then
+    export ACTION_FORCE_RATIO=$FORCE_EVAL_ACTION_FORCE_RATIO
+    echo "⚠️  控制实验：强制使用ACTION_FORCE_RATIO: $ACTION_FORCE_RATIO"
+elif [ -n "$TRAINING_FR" ]; then
     export ACTION_FORCE_RATIO=$TRAINING_FR
     echo "✅ 使用训练时的ACTION_FORCE_RATIO: $ACTION_FORCE_RATIO"
 elif [ -n "${ACTION_FORCE_RATIO}" ]; then
@@ -1012,6 +1045,9 @@ elif [ -z "${DELTA_RADIUS}" ]; then
 fi
 
 CMD_ARGS="$CMD_ARGS --action-force-ratio $ACTION_FORCE_RATIO"
+if [ -n "${FORCE_EVAL_ACTION_FORCE_RATIO}" ]; then
+    CMD_ARGS="$CMD_ARGS --force-action-force-ratio $FORCE_EVAL_ACTION_FORCE_RATIO"
+fi
 CMD_ARGS="$CMD_ARGS --use-tf-potential-field $USE_TF_POTENTIAL_FIELD"
 CMD_ARGS="$CMD_ARGS --use-fr-feature $USE_FR_FEATURE"
 CMD_ARGS="$CMD_ARGS --use-pf-feature $USE_PF_FEATURE"
@@ -1185,9 +1221,132 @@ if [ "${DISABLE_GIF:-0}" = "1" ] || [ "${DISABLE_GIF,,}" = "true" ] || [ "${DISA
 fi
 
 # 运行评估
-# 🔧 关键修复：使用eval正确展开CMD_ARGS中的引号，确保路径中的特殊字符被正确处理
-echo "正在执行: $EVAL_PYTHON_BIN evaluate_optimized.py $CMD_ARGS"
-eval "\"$EVAL_PYTHON_BIN\" evaluate_optimized.py $CMD_ARGS"
+# 🔧 关键修复：使用参数数组执行，避免 CMD_ARGS 字符串中的引号/空格导致 shell 收尾误报失败
+if [ "${ALGORITHM}" = "mappo" ]; then
+    EVAL_SCRIPT="evaluate_mappo.py"
+else
+    EVAL_SCRIPT="evaluate_optimized.py"
+fi
+
+append_split_args() {
+    local option_name="$1"
+    local raw_value="$2"
+    local parsed_values=()
+    if [ -n "$raw_value" ]; then
+        # 这些参数语义上就是“若干个以空格分隔的数值”，按空白拆分后再安全入数组。
+        read -r -a parsed_values <<< "$raw_value"
+        if [ ${#parsed_values[@]} -gt 0 ]; then
+            EVAL_CMD+=("$option_name" "${parsed_values[@]}")
+        fi
+    fi
+}
+
+EVAL_CMD=(
+    "$EVAL_PYTHON_BIN"
+    "$EVAL_SCRIPT"
+    --load-model-path "$MODEL_PATH"
+    --eval-episodes "$EVAL_EPISODES"
+    --save-viz-path "$SAVE_PATH"
+    --scenario-name "$SCENARIO_NAME"
+    --episode-length "$EPISODE_LENGTH"
+    --algorithm "$ALGORITHM"
+    --gravity "$GRAVITY"
+    --control-accel-gain "$CONTROL_ACCEL_GAIN"
+    --agent-max-speed "$AGENT_MAX_SPEED"
+    --agent-accel "$AGENT_ACCEL"
+    --action-range-x "$ACTION_RANGE_X"
+    --action-range-y "$ACTION_RANGE_Y"
+    --action-range-z "$ACTION_RANGE_Z"
+    --damping "$DAMPING"
+    --simulation-dt "$SIMULATION_DT"
+    --z-action-bias "$Z_ACTION_BIAS"
+    --use-quadrotor-dynamics "$USE_QUADROTOR_DYNAMICS"
+    --quadrotor-attitude-response-time "$QUADROTOR_ATTITUDE_RESPONSE_TIME"
+    --quadrotor-psi-cmd "$QUADROTOR_PSI_CMD"
+    --reward-pos-scale "$REWARD_POS_SCALE"
+    --reward-neg-scale "$REWARD_NEG_SCALE"
+    --action-force-ratio "$ACTION_FORCE_RATIO"
+    --use-tf-potential-field "$USE_TF_POTENTIAL_FIELD"
+    --use-fr-feature "$USE_FR_FEATURE"
+    --use-pf-feature "$USE_PF_FEATURE"
+    --terrain-sensing-mode "$TERRAIN_SENSING_MODE"
+    --goal-attraction "$GOAL_ATTRACTION"
+    --lambda-1-base "$LAMBDA_1_BASE"
+    --terrain-repulsion "$TERRAIN_REPULSION"
+    --agent-influence-range "$AGENT_INFLUENCE_RANGE"
+    --delta-k-att "$DELTA_K_ATT"
+    --delta-lambda-1 "$DELTA_LAMBDA_1"
+    --delta-k-rep "$DELTA_K_REP"
+    --delta-radius "$DELTA_RADIUS"
+    --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
+    --distance-weight "$DISTANCE_WEIGHT"
+    --exploration-weight "$EXPLORATION_WEIGHT"
+    --stationary-weight "$STATIONARY_WEIGHT"
+    --direction-weight "$DIRECTION_WEIGHT"
+    --deviation-weight "$DEVIATION_WEIGHT"
+    --start-area-weight "$START_AREA_WEIGHT"
+    --approach-weight "$APPROACH_WEIGHT"
+    --energy-weight "$ENERGY_WEIGHT"
+    --height-weight "$HEIGHT_WEIGHT"
+    --height-reward-enabled "$HEIGHT_REWARD_ENABLED"
+    --height-ideal-min "$HEIGHT_IDEAL_MIN"
+    --height-ideal-max "$HEIGHT_IDEAL_MAX"
+    --lateral-weight "$LATERAL_WEIGHT"
+    --clearance-weight "$CLEARANCE_WEIGHT"
+    --clearance-d-max "$CLEARANCE_D_MAX"
+    --success-weight "$SUCCESS_WEIGHT"
+    --collision-weight "$COLLISION_WEIGHT"
+    --collision-reduction-weight "$COLLISION_REDUCTION_WEIGHT"
+    --global-weight "$GLOBAL_WEIGHT"
+    --shaping-weight "$SHAPING_WEIGHT"
+    --max-reward "$MAX_REWARD"
+    --min-reward "$MIN_REWARD"
+    --success-reward-value "$SUCCESS_REWARD_VALUE"
+    --no-collision-reward-value "$NO_COLLISION_REWARD_VALUE"
+    --success-distance-threshold "$SUCCESS_DISTANCE_THRESHOLD"
+    --collision-penalty-value "$COLLISION_PENALTY_VALUE"
+    --collision-distance-threshold "$COLLISION_DISTANCE_THRESHOLD"
+    --global-reward-mode "$GLOBAL_REWARD_MODE"
+    --shaping-gamma "$SHAPING_GAMMA"
+)
+
+if [ -n "${FORCE_EVAL_ACTION_FORCE_RATIO}" ]; then
+    EVAL_CMD+=(--force-action-force-ratio "$FORCE_EVAL_ACTION_FORCE_RATIO")
+fi
+
+append_split_args --force-param-goal-attraction-range "$FORCE_PARAM_GOAL_ATTRACTION_RANGE"
+append_split_args --force-param-lambda-1-range "$FORCE_PARAM_LAMBDA_1_RANGE"
+append_split_args --force-param-terrain-repulsion-range "$FORCE_PARAM_TERRAIN_REPULSION_RANGE"
+append_split_args --force-param-detection-radius-range "$FORCE_PARAM_DETECTION_RADIUS_RANGE"
+
+if [ "${RANDOM_TERRAIN,,}" = "1" ] || [ "${RANDOM_TERRAIN,,}" = "true" ] || [ "${RANDOM_TERRAIN,,}" = "yes" ] || [ "${RANDOM_TERRAIN,,}" = "on" ]; then
+    EVAL_CMD+=(--random-terrain)
+fi
+if [ -n "$ACTOR_HIDDEN" ]; then
+    EVAL_CMD+=(--actor-hidden "$ACTOR_HIDDEN")
+fi
+if [ -n "$CRITIC_HIDDEN" ]; then
+    EVAL_CMD+=(--critic-hidden "$CRITIC_HIDDEN")
+fi
+if [ "$USE_FIXED_POSITIONS" = "true" ] || [ "$USE_FIXED_POSITIONS" = "1" ] || [ "${USE_FIXED_POSITIONS,,}" = "yes" ] || [ "${USE_FIXED_POSITIONS,,}" = "on" ]; then
+    if [ -f "$POSITIONS_FILE" ]; then
+        EVAL_CMD+=(--use-fixed-positions --positions-file "$POSITIONS_FILE")
+    fi
+fi
+if [ "$DISABLE_EARLY_TERMINATION" = "true" ]; then
+    EVAL_CMD+=(--disable-early-termination)
+fi
+if [ "${ENABLE_OVERLAY}" = "1" ] || [ "${ENABLE_OVERLAY,,}" = "true" ] || [ "${ENABLE_OVERLAY,,}" = "yes" ] || [ "${ENABLE_OVERLAY,,}" = "on" ]; then
+    EVAL_CMD+=(--enable-overlay)
+fi
+if [ "${DISABLE_GIF:-0}" = "1" ] || [ "${DISABLE_GIF,,}" = "true" ] || [ "${DISABLE_GIF,,}" = "yes" ] || [ "${DISABLE_GIF,,}" = "on" ]; then
+    EVAL_CMD+=(--disable-gif)
+fi
+
+printf '正在执行:'
+printf ' %q' "${EVAL_CMD[@]}"
+printf '\n'
+"${EVAL_CMD[@]}"
 
 EVAL_EXIT_CODE=$?
 

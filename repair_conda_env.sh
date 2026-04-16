@@ -58,7 +58,6 @@ pip install --upgrade --force-reinstall \
     gym==0.26.2 \
     numpy==1.23.5 \
     scipy==1.15.2 \
-    pandas==2.3.0 \
     matplotlib==3.10.1 \
     plotly==5.22.0 \
     tqdm==4.67.1

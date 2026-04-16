@@ -143,6 +143,82 @@ def _broadcast_force_ratio(force_ratio, batch_size):
             fr_tensor = tf.gather(fr_tensor, gather_indices)
     return tf.clip_by_value(fr_tensor, 0.0, 1.0)
 
+
+def _compute_force_ratio_schedule_value(args, episode_idx, resume_start_episode=0):
+    """Compute action_force_ratio for the current episode.
+
+    For fresh training, schedule progress is computed against the full training
+    horizon. For resumed training, we intentionally reset FR to its initial
+    state and re-parameterize the remaining schedule over the remaining horizon.
+    This keeps the resumed phase learnable when replay buffer / optimizer state
+    are not restored.
+    """
+    if not hasattr(args, '_base_action_force_ratio'):
+        try:
+            args._base_action_force_ratio = float(getattr(args, 'action_force_ratio', 0.0))
+        except Exception:
+            args._base_action_force_ratio = 0.0
+
+    pct_str = getattr(args, 'action_force_ratio_schedule_pct', None)
+    if (pct_str is None) or (str(pct_str).strip() == ''):
+        try:
+            pct_str_env = os.getenv('ACTION_FORCE_RATIO_SCHEDULE_PCT', '').strip()
+            if pct_str_env and pct_str_env.upper() != 'DISABLED':
+                pct_str = pct_str_env
+                setattr(args, 'action_force_ratio_schedule_pct', pct_str)
+            else:
+                pct_str = None
+        except Exception:
+            pct_str = None
+
+    if not pct_str or str(pct_str).strip().upper() == 'DISABLED':
+        return float(getattr(args, '_base_action_force_ratio', getattr(args, 'action_force_ratio', 0.0)))
+
+    pairs = [p.strip() for p in str(pct_str).split(',') if p.strip()]
+    schedule_points = []
+    for kv in pairs:
+        if ':' not in kv:
+            continue
+        k, v = kv.split(':', 1)
+        ks = k.strip().rstrip('%')
+        try:
+            kp = float(ks)
+            if '%' in k:
+                kp = kp / 100.0
+            schedule_points.append((kp, float(v)))
+        except Exception:
+            pass
+
+    if not schedule_points:
+        return float(getattr(args, '_base_action_force_ratio', getattr(args, 'action_force_ratio', 0.0)))
+
+    schedule_points.sort(key=lambda x: x[0])
+    total_episodes = max(1, int(getattr(args, 'train_episodes', 1)))
+    resume_start_episode = max(0, int(resume_start_episode or 0))
+    if resume_start_episode > 0:
+        remaining = max(1, total_episodes - resume_start_episode)
+        local_index = max(0, int(episode_idx) - resume_start_episode)
+        progress = float(local_index + 1) / float(remaining)
+    else:
+        progress = float(int(episode_idx) + 1) / float(total_episodes)
+    progress = max(0.0, min(1.0, progress))
+
+    if progress <= schedule_points[0][0]:
+        return float(schedule_points[0][1])
+    if progress >= schedule_points[-1][0]:
+        return float(schedule_points[-1][1])
+
+    left = schedule_points[0]
+    right = schedule_points[-1]
+    for idx in range(1, len(schedule_points)):
+        if schedule_points[idx][0] >= progress:
+            left = schedule_points[idx - 1]
+            right = schedule_points[idx]
+            break
+    span = max(right[0] - left[0], 1e-6)
+    t = (progress - left[0]) / span
+    return float(left[1] + t * (right[1] - left[1]))
+
 # 多进程GPU稳定性：在任何GPU上下文创建前切换为spawn，避免XLA/AMP下fork引发的非法访问
 try:
     mp.set_start_method('spawn', force=True)
@@ -823,6 +899,46 @@ def _worker(remote, parent_remote, env_fn):
                     # 任意异常都不影响主流程
                     pass
                 remote.send(obs_n)
+            elif cmd == 'prime_resume_env_sequence':
+                completed_episodes = int(data or 0)
+                try:
+                    if completed_episodes > 0:
+                        world = getattr(env, 'world', None)
+                        scenario = getattr(env, 'scenario', None)
+                        env_id = 0
+                        try:
+                            env_id = int(getattr(world, 'env_id', getattr(scenario, 'current_episode_env_id', 0)) or 0)
+                        except Exception:
+                            env_id = 0
+                        if world is not None:
+                            try:
+                                world._episode_index_counter = int(completed_episodes)
+                            except Exception:
+                                pass
+                            try:
+                                world.episode_index = max(0, int(completed_episodes) - 1)
+                            except Exception:
+                                pass
+                        if scenario is not None:
+                            try:
+                                scenario.current_episode_index = int(completed_episodes)
+                            except Exception:
+                                pass
+                            try:
+                                scenario.current_episode_env_id = int(env_id)
+                            except Exception:
+                                pass
+                            if (
+                                bool(getattr(scenario, 'use_dynamic_obstacles', False))
+                                and not bool(getattr(scenario, 'deterministic_train_env_sequence', False))
+                            ):
+                                try:
+                                    scenario._obstacle_reset_count = int(completed_episodes)
+                                except Exception:
+                                    pass
+                    remote.send(True)
+                except Exception:
+                    remote.send(False)
             elif cmd == 'update_collision_params':
                 try:
                     weight_val, penalty_val = data
@@ -1210,6 +1326,17 @@ class ParallelEnv:
         except Exception:
             return {}
 
+    def prime_resume_env_sequence_state(self, completed_episodes: int):
+        """在首次 reset 前对齐各子环境的续训场景序列状态。"""
+        payload = int(completed_episodes)
+        for remote in self.remotes:
+            remote.send(('prime_resume_env_sequence', payload))
+        for remote in self.remotes:
+            try:
+                remote.recv()
+            except EOFError:
+                pass
+
     def close(self):
         """关闭所有环境和工作进程。"""
         for remote in self.remotes:
@@ -1313,6 +1440,45 @@ class SingleEnvWrapper:
                     scenario_ref.collision_penalty_value = float(penalty)
         except Exception:
             pass
+
+    def prime_resume_env_sequence_state(self, completed_episodes: int):
+        """在首次 reset 前对齐单环境续训场景序列状态。"""
+        completed_episodes = int(completed_episodes or 0)
+        if completed_episodes <= 0:
+            return
+        world = getattr(self.env, 'world', None)
+        scenario = getattr(self.env, 'scenario', None)
+        env_id = 0
+        try:
+            env_id = int(getattr(world, 'env_id', getattr(scenario, 'current_episode_env_id', 0)) or 0)
+        except Exception:
+            env_id = 0
+        if world is not None:
+            try:
+                world._episode_index_counter = int(completed_episodes)
+            except Exception:
+                pass
+            try:
+                world.episode_index = max(0, int(completed_episodes) - 1)
+            except Exception:
+                pass
+        if scenario is not None:
+            try:
+                scenario.current_episode_index = int(completed_episodes)
+            except Exception:
+                pass
+            try:
+                scenario.current_episode_env_id = int(env_id)
+            except Exception:
+                pass
+            if (
+                bool(getattr(scenario, 'use_dynamic_obstacles', False))
+                and not bool(getattr(scenario, 'deterministic_train_env_sequence', False))
+            ):
+                try:
+                    scenario._obstacle_reset_count = int(completed_episodes)
+                except Exception:
+                    pass
 
     def get_vis_bundle(self, env_idx: int = 0):
         """一次性拉取地形/尺寸/中央目标/各自目标/seed，避免跨调用漂移。"""
@@ -4935,6 +5101,10 @@ class OptimizedMADDPG:
         # 双Q头/分离梯度开关（MADDPG）
         self.use_dual_q = bool(getattr(self.args, 'maddpg_use_dual_q', False))
         self.use_separated_gradient = bool(getattr(self.args, 'maddpg_use_separated_gradient', True))
+        # MATD3 的 hybrid actor objective 不属于当前 MADDPG 消融线；这里显式置为关闭，
+        # 避免 separated MADDPG 复用共享 train_step 分支时访问未初始化属性。
+        self.use_hybrid_actor_objective = False
+        self.hybrid_actor_alpha = 0.0
         if not self.use_dual_q and self.use_separated_gradient:
             self.use_separated_gradient = False
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
@@ -9215,28 +9385,31 @@ class OptimizedMADDPG:
             agent['critic'].save_weights(os.path.join(path, f'critic_{i}.weights.h5'))
 
     def load_models(self, path):
-        """加载模型（包含架构兼容性检查）"""
+        """加载模型。
+
+        旧实现用“层名里是否包含 concatenate”来猜 Critic 架构，但当前实际层名是
+        `state_action_fusion` / `shared_base_fusion` / `concat_all_agent_*`，会把可兼容
+        的权重误判成“旧架构”，从而直接跳过 Critic 加载。这里改成：
+        1. 仅把当前 Critic 的结构信息作为提示打印；
+        2. 实际是否兼容，以 `load_weights()` 的结果为准。
+        """
         print(f"\n{'='*80}")
         print(f"[模型加载] 检查模型路径: {path}")
-        
-        # 检查Critic网络架构是否为新版本（每个Agent独立特征提取）
-        # 新版本特征：Critic的第二层是Concatenate层（拼接每个Agent的独立特征）
+
+        # 打印当前Critic结构提示信息（仅提示，不再作为是否跳过加载的依据）
         sample_critic = self.agents[0]['critic']
-        has_new_architecture = False
-        for layer in sample_critic.layers:
-            if 'concatenate' in layer.name.lower() and layer.name != sample_critic.layers[0].name:
-                has_new_architecture = True
-                break
-        
-        if has_new_architecture:
-            print(f"[模型加载] ✅ 检测到新Critic架构（每个Agent独立特征提取）")
+        layer_names = [str(layer.name).lower() for layer in sample_critic.layers]
+        if any(name in layer_names for name in ("shared_base_fusion", "concat_all_agent_head_features", "concat_all_agent_tail_features")):
+            print(f"[模型加载] ✅ 当前Critic结构: 双Q/PF分离式Critic")
+        elif "state_action_fusion" in layer_names:
+            print(f"[模型加载] ✅ 当前Critic结构: 标准MADDPG单Q Critic")
         else:
-            print(f"[模型加载] ⚠️  当前使用旧Critic架构")
-        
+            print(f"[模型加载] ⚠️  当前Critic结构: 未识别（将直接尝试加载权重）")
+
         for i, agent in enumerate(self.agents):
             actor_path = os.path.join(path, f'actor_{i}.weights.h5')
             critic_path = os.path.join(path, f'critic_{i}.weights.h5')
-            
+
             if os.path.exists(actor_path):
                 try:
                     agent['actor'].load_weights(actor_path)
@@ -9244,20 +9417,18 @@ class OptimizedMADDPG:
                     print(f"[模型加载] ✅ Agent{i} Actor加载成功")
                 except Exception as e:
                     print(f"[模型加载] ❌ Agent{i} Actor加载失败: {e}")
-            
+
             if os.path.exists(critic_path):
-                if not has_new_architecture:
-                    print(f"[模型加载] ⚠️  Agent{i} Critic跳过加载（旧架构权重不兼容新架构）")
-                    print(f"[模型加载] 💡 将使用随机初始化的新Critic网络")
-                else:
-                    try:
-                        agent['critic'].load_weights(critic_path)
-                        agent['target_critic'].set_weights(agent['critic'].get_weights())
-                        print(f"[模型加载] ✅ Agent{i} Critic加载成功")
-                    except Exception as e:
-                        print(f"[模型加载] ❌ Agent{i} Critic加载失败: {e}")
-                        print(f"[模型加载] 💡 将使用随机初始化的Critic网络")
-        
+                try:
+                    agent['critic'].load_weights(critic_path)
+                    agent['target_critic'].set_weights(agent['critic'].get_weights())
+                    print(f"[模型加载] ✅ Agent{i} Critic加载成功")
+                except Exception as e:
+                    print(f"[模型加载] ❌ Agent{i} Critic加载失败: {e}")
+                    print(f"[模型加载] 💡 将使用随机初始化的Critic网络")
+            else:
+                print(f"[模型加载] ⚠️  Agent{i} Critic权重文件不存在: {critic_path}")
+
         print(f"{'='*80}\n")
 
 
@@ -15472,6 +15643,7 @@ def train(args):
     
     # 🔧 新增：检查点恢复功能（必须在progress_bar创建之前）
     start_episode = 0
+    resume_completed_episodes = 0
     checkpoint_path = getattr(args, 'checkpoint', None)
     resume_training = getattr(args, 'resume', False)
     
@@ -15531,9 +15703,42 @@ def train(args):
                     maddpg._episode_team_success_flags = list(restored_team_success_flags)
                     total_success_count = int(sum(restored_team_success_flags)) if restored_team_success_flags else 0
                     
+                    completed_episode_candidates = [int(start_episode)]
+                    for seq in (
+                        episode_rewards,
+                        episode_force_ratios,
+                        restored_team_success_flags,
+                        restored_success_flags,
+                    ):
+                        try:
+                            completed_episode_candidates.append(len(seq))
+                        except Exception:
+                            pass
+                    resume_completed_episodes = max(0, max(completed_episode_candidates))
+                    if resume_completed_episodes != int(start_episode):
+                        print(
+                            f"   - 续训对齐: 以已完成回合数 {resume_completed_episodes} 作为起始回合 "
+                            f"(checkpoint episode={start_episode})"
+                        )
+                        start_episode = int(resume_completed_episodes)
+                    else:
+                        resume_completed_episodes = int(start_episode)
+                    if resume_completed_episodes > 0:
+                        setattr(args, '_resume_fr_schedule_start_episode', int(resume_completed_episodes))
+                        try:
+                            args.action_force_ratio = float(
+                                getattr(args, '_base_action_force_ratio', getattr(args, 'action_force_ratio', 0.0))
+                            )
+                        except Exception:
+                            pass
+
                     print(f"✅ 成功加载检查点状态:")
                     print(f"   - 起始回合: {start_episode}")
-                    print(f"   - 已完成回合数: {len(episode_rewards)}")
+                    print(f"   - 已完成回合数: {resume_completed_episodes}")
+                    if resume_completed_episodes > 0:
+                        print(
+                            f"   - FR续训策略: 从初始值重启，并按剩余 {max(1, int(args.train_episodes) - resume_completed_episodes)} 回合重新调度"
+                        )
                     print(f"   - 最佳奖励: {best_reward:.2f} (第{best_episode+1}回合)")
                     if best_team_sr_episode >= 0:
                         print(
@@ -15552,6 +15757,7 @@ def train(args):
                     print(f"❌ 加载检查点状态失败: {e}")
                     print(f"   将从episode 0开始训练")
                     start_episode = 0
+                    resume_completed_episodes = 0
             
             # 加载模型权重
             try:
@@ -15645,19 +15851,24 @@ def train(args):
         use_light_progress = os.getenv('USE_LIGHT_PROGRESS', '1').lower() in ('1','true','yes','on')
     except Exception:
         use_light_progress = True
+    progress_output_file = sys.stdout if use_light_progress else tqdm_file
     if use_light_progress:
         import sys as _sys, time as _time
         class _LightProgress:
-            def __init__(self, total, desc="", ncols=100, mininterval=0.5):
+            def __init__(self, total, desc="", ncols=100, mininterval=0.5, initial=0, file_obj=None):
                 self.total = int(total)
                 self.desc = desc
                 self.ncols = int(ncols)
                 self.mininterval = float(mininterval)
+                self.current = max(0, min(int(initial), self.total))
                 self._last = 0.0
                 self._t0 = _time.time()
                 self._postfix = ""
+                self._file = file_obj or _sys.stdout
+
             def set_postfix_str(self, s):
                 self._postfix = s if isinstance(s, str) else str(s)
+
             def _fmt(self, sec):
                 sec = max(0, int(sec))
                 h = sec // 3600
@@ -15666,53 +15877,53 @@ def train(args):
                 if h > 0:
                     return f"{h}:{m:02d}:{s:02d}"
                 return f"{m:02d}:{s:02d}"
-            def _draw(self, i):
+
+            def _draw(self, force=False):
                 now = _time.time()
-                if (now - self._last) < self.mininterval:
+                if (not force) and ((now - self._last) < self.mininterval):
                     return
                 self._last = now
-                frac = (i + 1) / max(self.total, 1)
+                frac = self.current / max(self.total, 1)
                 bar_len = max(min(self.ncols - 30, 50), 10)
                 fill = int(bar_len * frac)
                 bar = "#" * fill + "-" * (bar_len - fill)
-                elapsed = now - self._t0
-                per_ep = elapsed / max(1, (i + 1))
-                remaining = per_ep * max(0, self.total - (i + 1))
+                elapsed = max(0.0, now - self._t0)
+                per_ep = elapsed / max(1, self.current)
+                remaining = per_ep * max(0, self.total - self.current)
                 total_est = per_ep * self.total
                 eta_str = f"{self._fmt(elapsed)}<{self._fmt(remaining)} | total {self._fmt(total_est)}"
-                msg = f"\r{self.desc} [{bar}] {i+1}/{self.total} ({eta_str}) {self._postfix}"
-                _sys.stdout.write(msg)
-                _sys.stdout.flush()
-            def __iter__(self):
-                for i in range(self.total):
-                    self._draw(i if i > 0 else 0)
-                    yield i
-                # 终止时强制刷新完成态并换行
-                self._draw(self.total - 1)
-                _sys.stdout.write("\n")
-                _sys.stdout.flush()
+                msg = f"\r{self.desc} [{bar}] {self.current}/{self.total} ({eta_str}) {self._postfix}"
+                self._file.write(msg)
+                self._file.flush()
+
+            def update(self, n=1):
+                self.current = min(self.total, self.current + int(n))
+                self._draw(force=False)
+
             def close(self):
-                pass
-        # 🔧 修复：支持从检查点恢复训练
-        episode_range = range(start_episode, args.train_episodes) if start_episode > 0 else range(args.train_episodes)
+                self._draw(force=True)
+                self._file.write("\n")
+                self._file.flush()
+
+        episode_range = range(start_episode, int(args.train_episodes))
         progress_bar = _LightProgress(
-            total=args.train_episodes,
+            total=int(args.train_episodes),
             desc="训练进度",
             ncols=tqdm_ncols,
-            mininterval=tqdm_mininterval
+            mininterval=tqdm_mininterval,
+            initial=start_episode,
+            file_obj=progress_output_file,
         )
-        # 手动设置初始值（_LightProgress不支持initial参数）
-        if start_episode > 0:
-            for _ in range(start_episode):
-                progress_bar._draw(start_episode)
     else:
-        # 🔧 修复：支持从检查点恢复训练
-        episode_range = range(start_episode, args.train_episodes) if start_episode > 0 else range(args.train_episodes)
+        episode_range = range(start_episode, int(args.train_episodes))
         progress_bar = tqdm(
-            episode_range, position=0, leave=True, desc="训练进度",
+            total=int(args.train_episodes),
+            initial=start_episode,
+            position=0,
+            leave=True,
+            desc="训练进度",
             ncols=tqdm_ncols, mininterval=tqdm_mininterval, dynamic_ncols=True,
             file=tqdm_file, disable=tqdm_disable, unit='ep', bar_format=tqdm_bar_format,
-            initial=start_episode if start_episode > 0 else 0, total=args.train_episodes
         )
     # 诊断与监控开关
     mem_debug = os.getenv('MEM_DEBUG', '0').lower() in ('1','true','yes','on') or bool(getattr(args, 'mem_debug', False))
@@ -16106,10 +16317,74 @@ def train(args):
             for i, w in enumerate(maddpg._initial_weights):
                 print(f"  智能体{i}: {w:.8f}")
     # 当前训练主路径已移除学习预热与 PF 元优化，直接进入标准训练循环。
+
+    def _prime_resume_env_sequence_state(training_env, completed_episodes):
+        """在首次 reset 前对齐续训场景序列，保证 episode/障碍序列从断点接上。"""
+        completed_episodes = int(completed_episodes or 0)
+        if completed_episodes <= 0 or training_env is None:
+            return
+
+        def _apply(single_env):
+            if single_env is None:
+                return
+            world = getattr(single_env, 'world', None)
+            scenario = getattr(single_env, 'scenario', None)
+            env_id = 0
+            try:
+                env_id = int(getattr(world, 'env_id', getattr(scenario, 'current_episode_env_id', 0)) or 0)
+            except Exception:
+                env_id = 0
+
+            if world is not None:
+                try:
+                    world._episode_index_counter = int(completed_episodes)
+                except Exception:
+                    pass
+                try:
+                    world.episode_index = max(0, int(completed_episodes) - 1)
+                except Exception:
+                    pass
+            if scenario is not None:
+                try:
+                    scenario.current_episode_index = int(completed_episodes)
+                except Exception:
+                    pass
+                try:
+                    scenario.current_episode_env_id = int(env_id)
+                except Exception:
+                    pass
+                if (
+                    bool(getattr(scenario, 'use_dynamic_obstacles', False))
+                    and not bool(getattr(scenario, 'deterministic_train_env_sequence', False))
+                ):
+                    try:
+                        scenario._obstacle_reset_count = int(completed_episodes)
+                    except Exception:
+                        pass
+
+        try:
+            if hasattr(training_env, 'envs'):
+                for single_env in list(getattr(training_env, 'envs', []) or []):
+                    _apply(single_env)
+            elif hasattr(training_env, 'env'):
+                _apply(getattr(training_env, 'env', None))
+            else:
+                _apply(training_env)
+            if not quiet_output:
+                tqdm.write(
+                    f"🔁 续训场景序列已对齐到 episode={completed_episodes} "
+                    f"(首次新回合将从该索引继续)",
+                    file=tqdm_file,
+                )
+        except Exception as resume_env_exc:
+            if not quiet_output:
+                tqdm.write(f"[WARN] 续训场景序列对齐失败: {resume_env_exc}", file=tqdm_file)
     
     # 初始化环境观察
+    if resume_completed_episodes > 0:
+        _prime_resume_env_sequence_state(env, resume_completed_episodes)
     obs_n = env.reset()
-    for episode in progress_bar:
+    for episode in episode_range:
         # 【调试】每100个回合检查一次权重变化（优化：进一步降低频率以提升性能）
         if episode % 100 == 0 and episode > 0 and not quiet_output:
             print(f"\n{'='*80}")
@@ -16185,66 +16460,15 @@ def train(args):
 
         # 在每个回合开始时（无论是否静默输出）都应用按百分比的 action_force_ratio 日程
         try:
-            # 记录初始混合比例，供整个训练过程中的 schedule 使用
-            if not hasattr(args, '_base_action_force_ratio'):
-                try:
-                    args._base_action_force_ratio = float(getattr(args, 'action_force_ratio', 0.0))
-                except Exception:
-                    args._base_action_force_ratio = 0.0
-
-            # 兼容：从CLI参数读取，若为空再从环境变量读取
-            pct_str = getattr(args, 'action_force_ratio_schedule_pct', None)
-            if (pct_str is None) or (str(pct_str).strip() == ''):
-                try:
-                    pct_str_env = os.getenv('ACTION_FORCE_RATIO_SCHEDULE_PCT', '').strip()
-                    # 🔧 修复：如果环境变量为 "DISABLED"，则跳过schedule
-                    if pct_str_env and pct_str_env.upper() != 'DISABLED':
-                        pct_str = pct_str_env
-                        setattr(args, 'action_force_ratio_schedule_pct', pct_str)
-                    else:
-                        pct_str = None
-                except Exception:
-                    pct_str = None
-
-            # 🔧 修复：如果 pct_str 为 "DISABLED"，则跳过schedule
-            if pct_str and str(pct_str).strip().upper() != 'DISABLED':
-                pairs = [p.strip() for p in str(pct_str).split(',') if p.strip()]
-                schedule_points = []
-                for kv in pairs:
-                    if ':' not in kv:
-                        continue
-                    k, v = kv.split(':', 1)
-                    ks = k.strip().rstrip('%')
-                    try:
-                        kp = float(ks)
-                        if '%' in k:
-                            kp = kp / 100.0
-                        schedule_points.append((kp, float(v)))
-                    except Exception:
-                        pass
-                if schedule_points:
-                    schedule_points.sort(key=lambda x: x[0])
-                    progress = (episode + 1) / max(1, int(getattr(args, 'train_episodes', 1)))
-                    progress = max(0.0, min(1.0, progress))
-                    if progress <= schedule_points[0][0]:
-                        new_ratio = schedule_points[0][1]
-                    elif progress >= schedule_points[-1][0]:
-                        new_ratio = schedule_points[-1][1]
-                    else:
-                        left = schedule_points[0]
-                        right = schedule_points[-1]
-                        for idx in range(1, len(schedule_points)):
-                            if schedule_points[idx][0] >= progress:
-                                left = schedule_points[idx - 1]
-                                right = schedule_points[idx]
-                                break
-                        span = max(right[0] - left[0], 1e-6)
-                        t = (progress - left[0]) / span
-                        new_ratio = left[1] + t * (right[1] - left[1])
-                    args.action_force_ratio = float(new_ratio)
-                    # 🔧 修复：及时更新FR缓存，确保训练时使用的FR值与实际FR值一致
-                    if hasattr(maddpg, 'action_force_ratio_cached'):
-                        maddpg.action_force_ratio_cached = float(new_ratio)
+            resume_fr_start_episode = int(getattr(args, '_resume_fr_schedule_start_episode', 0) or 0)
+            new_ratio = _compute_force_ratio_schedule_value(
+                args,
+                episode_idx=episode,
+                resume_start_episode=resume_fr_start_episode,
+            )
+            args.action_force_ratio = float(new_ratio)
+            if hasattr(maddpg, 'action_force_ratio_cached'):
+                maddpg.action_force_ratio_cached = float(new_ratio)
         except Exception:
             pass
 
@@ -18492,6 +18716,8 @@ def train(args):
                 maddpg.flush_pending_per_updates(replay_buffer)
         except Exception:
             pass
+        if hasattr(progress_bar, 'update'):
+            progress_bar.update(1)
         if timing_enabled:
             if timing_interval_steps > 0 and timing_window_steps > 0:
                 _emit_timing(f"ep{episode+1} tail", timing_window, timing_window_steps)
@@ -19902,6 +20128,11 @@ def train(args):
                 pre_random_best_saved = True
     except Exception:
         pass
+    try:
+        if hasattr(progress_bar, 'close'):
+            progress_bar.close()
+    except Exception:
+        pass
     # 关闭环境
     env.close()
     # 终端输出可视化目录与有效步长统计
@@ -20467,11 +20698,22 @@ if __name__ == "__main__":
             'args': results_args
         }
         
-        with open(os.path.join(run_dir, "results.json"), 'w') as f:
-            json.dump(_make_json_safe(results), f, indent=2)
-        
+        safe_results = _make_json_safe(results)
+        results_json_path = os.path.join(run_dir, "results.json")
+        with open(results_json_path, 'w') as f:
+            json.dump(safe_results, f, indent=2)
+
+        model_results_path = os.path.join("models", args.exp_name, "results.json")
+        try:
+            os.makedirs(os.path.dirname(model_results_path), exist_ok=True)
+            with open(model_results_path, 'w', encoding='utf-8') as f_model:
+                json.dump(safe_results, f_model, indent=2, ensure_ascii=False)
+        except Exception as mirror_exc:
+            print(f"⚠️  镜像训练配置到模型目录失败: {mirror_exc}")
+
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-            print(f"训练结果已保存: {os.path.join(run_dir, 'results.json')}")
+            print(f"训练结果已保存: {results_json_path}")
+            print(f"模型目录配置已同步: {model_results_path}")
         
     except Exception as e:
         print(f"训练出错: {e}")

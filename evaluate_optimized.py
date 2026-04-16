@@ -40,6 +40,10 @@ from paper3d_train_optimized import (
     build_continuous_critic_network_matd3,
     _save_vis_context_snapshot_artifacts,
 )
+try:
+    from algorithms.mappo import OptimizedMAPPO
+except ModuleNotFoundError:
+    OptimizedMAPPO = None
 from visualization.trajectory_visualizer import TrajectoryVisualizer
 from utils.observation_processor import ObservationProcessor
 
@@ -150,11 +154,35 @@ def _coerce_optional_float(value):
         return None
 
 
+def _is_model_variant_dir_name(name):
+    model_leaf = os.path.basename(os.path.normpath(name or ""))
+    return model_leaf in (
+        'final',
+        'best',
+        'best_by_team_sr',
+        'best_by_strict_success',
+        'checkpoint',
+        'latest_ep',
+    ) or model_leaf.startswith('ep')
+
+
+def _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed_sequence):
+    if terrain_variant_seed_sequence:
+        return True
+    if not terrain_seed_sequence:
+        return False
+    try:
+        normalized = [int(seed) for seed in terrain_seed_sequence if seed is not None]
+    except Exception:
+        normalized = [seed for seed in terrain_seed_sequence if seed is not None]
+    return len(set(normalized)) > 1
+
+
 def _iter_results_json_paths(model_path):
     if not model_path:
         return
     model_leaf = os.path.basename(os.path.normpath(model_path))
-    if model_leaf in ('final', 'best', 'best_by_team_sr', 'best_by_strict_success') or model_leaf.startswith('ep'):
+    if _is_model_variant_dir_name(model_leaf):
         model_base_dir = os.path.dirname(model_path)
     else:
         model_base_dir = model_path
@@ -863,6 +891,12 @@ class ModelEvaluator:
             info_callback=None,
             shared_viewer=False
         )
+        try:
+            if hasattr(self.env, 'world') and self.env.world is not None:
+                self.env.world.episode_length = int(getattr(self.args, 'episode_length', 2200) or 2200)
+                self.env.world.current_step = 0
+        except Exception:
+            pass
         # 应用动作范围映射（仅在显式提供任一轴时覆盖）
         try:
             ax = getattr(self.args, 'action_range_x', None)
@@ -898,7 +932,7 @@ class ModelEvaluator:
                 model_path = self.args.load_model_path
                 # 移除 final/best/epXXX 等子目录
                 model_leaf = os.path.basename(os.path.normpath(model_path))
-                if model_leaf in ('final', 'best', 'best_by_team_sr', 'best_by_strict_success') or model_leaf.startswith('ep'):
+                if _is_model_variant_dir_name(model_leaf):
                     model_base_dir = os.path.dirname(model_path)
                 else:
                     model_base_dir = model_path
@@ -1030,6 +1064,12 @@ class ModelEvaluator:
             info_callback=None,
             shared_viewer=False
         )
+        try:
+            if hasattr(self.env, 'world') and self.env.world is not None:
+                self.env.world.episode_length = int(getattr(self.args, 'episode_length', 2200) or 2200)
+                self.env.world.current_step = 0
+        except Exception:
+            pass
 
         try:
             ax = getattr(self.args, 'action_range_x', None)
@@ -1150,8 +1190,7 @@ class ModelEvaluator:
             quiet_output = True
         use_random_terrain = (
             bool(getattr(self.args, 'random_terrain', False))
-            or bool(terrain_seed_sequence)
-            or bool(terrain_variant_seed_sequence)
+            or _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed_sequence)
         )
         if not use_random_terrain:
             obstacle_seed = None
@@ -1538,7 +1577,7 @@ class ModelEvaluator:
         model_path = self.args.load_model_path
         model_leaf_dir = os.path.basename(os.path.normpath(model_path))
         # 移除 final/best/epXXX 等子目录
-        if model_leaf_dir in ('final', 'best', 'best_by_team_sr', 'best_by_strict_success') or model_leaf_dir.startswith('ep'):
+        if _is_model_variant_dir_name(model_leaf_dir):
             model_base_dir = os.path.dirname(model_path)
         else:
             model_base_dir = model_path
@@ -1828,7 +1867,23 @@ class ModelEvaluator:
         use_fr_feature = training_use_fr if training_use_fr is not None else int(os.getenv('USE_FR_FEATURE', getattr(self.args, 'use_fr_feature', 1))) > 0
         use_pf_feature = training_use_pf if training_use_pf is not None else int(os.getenv('USE_PF_FEATURE', getattr(self.args, 'use_pf_feature', 1))) > 0
         
-        if selected_force_ratio is not None:
+        forced_eval_action_force_ratio = getattr(self.args, 'force_action_force_ratio', None)
+        if forced_eval_action_force_ratio is not None:
+            eval_action_force_ratio = float(forced_eval_action_force_ratio)
+            if selected_force_ratio is not None:
+                label = selected_force_ratio_label or "对应回合"
+                ep_str = (
+                    f"回合 {selected_force_ratio_episode}"
+                    if selected_force_ratio_episode is not None
+                    else label
+                )
+                print(
+                    f"⚠️  控制实验：强制覆盖ACTION_FORCE_RATIO={eval_action_force_ratio} "
+                    f"(原{label}FR={selected_force_ratio}, {ep_str})"
+                )
+            else:
+                print(f"⚠️  控制实验：强制覆盖ACTION_FORCE_RATIO={eval_action_force_ratio}")
+        elif selected_force_ratio is not None:
             eval_action_force_ratio = selected_force_ratio
             label = selected_force_ratio_label or "对应回合"
             ep_str = (
@@ -1849,6 +1904,15 @@ class ModelEvaluator:
         
         # 更新args中的action_force_ratio，确保后续使用
         self.args.action_force_ratio = eval_action_force_ratio
+        self._selected_checkpoint_force_ratio = (
+            float(selected_force_ratio) if selected_force_ratio is not None else None
+        )
+        self._selected_checkpoint_force_ratio_label = selected_force_ratio_label
+        self._forced_eval_action_force_ratio = (
+            float(forced_eval_action_force_ratio)
+            if forced_eval_action_force_ratio is not None
+            else None
+        )
         
         # 🔧 关键修复：必须使用训练时的动作范围参数实际值，不允许使用默认值
         # 如果找不到训练配置中的参数，报错并退出
@@ -1961,6 +2025,18 @@ class ModelEvaluator:
             print(error_msg)
             raise ValueError(f"无法找到训练配置中的物理参数: {', '.join(missing_params)}，评估无法继续。")
 
+        runtime_use_quadrotor_dynamics = None
+        runtime_use_quadrotor_env = str(os.getenv("USE_QUADROTOR_DYNAMICS", "")).strip()
+        if runtime_use_quadrotor_env:
+            runtime_use_quadrotor_dynamics = runtime_use_quadrotor_env.lower() in ("1", "true", "yes", "on")
+        else:
+            try:
+                current_use_quadrotor_dynamics = getattr(self.args, "use_quadrotor_dynamics", None)
+            except Exception:
+                current_use_quadrotor_dynamics = None
+            if current_use_quadrotor_dynamics is not None:
+                runtime_use_quadrotor_dynamics = bool(current_use_quadrotor_dynamics)
+
         hidden_runtime_params = (
             ("simulation_dt", training_simulation_dt, "SIMULATION_DT"),
             ("z_action_bias", training_z_action_bias, "Z_ACTION_BIAS"),
@@ -1973,8 +2049,20 @@ class ModelEvaluator:
             setattr(self.args, attr_name, value)
             print(f"✅ 使用训练时的{label}: {value}")
         if training_use_quadrotor_dynamics is not None:
-            self.args.use_quadrotor_dynamics = bool(training_use_quadrotor_dynamics)
-            print(f"✅ 使用训练时的USE_QUADROTOR_DYNAMICS: {self.args.use_quadrotor_dynamics}")
+            training_use_quadrotor_dynamics = bool(training_use_quadrotor_dynamics)
+            if (
+                runtime_use_quadrotor_dynamics is not None
+                and runtime_use_quadrotor_dynamics != training_use_quadrotor_dynamics
+            ):
+                self.args.use_quadrotor_dynamics = bool(runtime_use_quadrotor_dynamics)
+                print(
+                    "⚠️ USE_QUADROTOR_DYNAMICS 与训练配置记录不一致，"
+                    f"保留当前运行时值: {self.args.use_quadrotor_dynamics} "
+                    f"(训练记录为 {training_use_quadrotor_dynamics})"
+                )
+            else:
+                self.args.use_quadrotor_dynamics = training_use_quadrotor_dynamics
+                print(f"✅ 使用训练时的USE_QUADROTOR_DYNAMICS: {self.args.use_quadrotor_dynamics}")
         if self.training_alignment:
             _apply_training_alignment_to_args(self.args, self.training_alignment, quiet=True)
         _apply_runtime_env_overrides_from_args(self.args)
@@ -2058,6 +2146,12 @@ class ModelEvaluator:
             info_callback=None,
             shared_viewer=False
         )
+        try:
+            if hasattr(eval_env, 'world') and eval_env.world is not None:
+                eval_env.world.episode_length = int(getattr(self.args, 'episode_length', 2200) or 2200)
+                eval_env.world.current_step = 0
+        except Exception:
+            pass
         # 将scenario引用挂到world（与训练路径保持一致）
         try:
             self.world.scenario = self.scenario
@@ -2078,6 +2172,14 @@ class ModelEvaluator:
         algorithm = getattr(self.args, 'algorithm', 'matd3').lower()
         if algorithm == 'matd3':
             self.maddpg = OptimizedMATD3(self.n_agents, self.obs_shapes, self.action_dims, maddpg_args)
+        elif algorithm == 'mappo':
+            if OptimizedMAPPO is None:
+                raise ImportError(
+                    "当前仓库缺少 algorithms/mappo 模块，无法执行 MAPPO 评估。"
+                    " 如果只复现 MATD3/MADDPG，可保持 --algorithm matd3；"
+                    " 如果需要 MAPPO，请先将 algorithms/mappo/、train_mappo_strict.py、evaluate_mappo.py 提交到 GitHub。"
+                )
+            self.maddpg = OptimizedMAPPO(self.n_agents, self.obs_shapes, self.action_dims, maddpg_args)
         else:
             self.maddpg = OptimizedMADDPG(self.n_agents, self.obs_shapes, self.action_dims, maddpg_args)
         
@@ -2123,6 +2225,8 @@ class ModelEvaluator:
                             cp_old = os.path.join(dir_path, f"critic_{i}.weights.h5")
                             if not os.path.isfile(cp_old) or os.path.getsize(cp_old) <= 0:
                                 return False
+                    elif algorithm == 'mappo':
+                        continue
                     else:
                         # MADDPG：单个Critic网络
                         cp = os.path.join(dir_path, f"critic_{i}.weights.h5")
@@ -2228,6 +2332,14 @@ class ModelEvaluator:
                             f"MATD3 Critic1应该输出两个Q值，实际输出: {type(critic1_output)}"
                         assert isinstance(critic2_output, (list, tuple)) and len(critic2_output) == 2, \
                             f"MATD3 Critic2应该输出两个Q值，实际输出: {type(critic2_output)}"
+                elif algorithm == 'mappo':
+                    if i == 0:
+                        value_inputs = [dummy_state]
+                        if use_fr:
+                            value_inputs.append(tf.zeros((1, 1), dtype=tf.float32))
+                        if use_pf:
+                            value_inputs.append(tf.zeros((1, pf_feature_dim * self.n_agents), dtype=tf.float32))
+                        _ = self.maddpg.value_critic(value_inputs, training=False)
                 else:
                     # MADDPG：单个Critic网络
                     critic_output = self.maddpg.agents[i]['critic'](critic_inputs, training=False)
@@ -2304,6 +2416,14 @@ class ModelEvaluator:
         ok = True
         total_loaded_vars = 0
         total_vars = 0
+
+        if algorithm == 'mappo':
+            try:
+                self.maddpg.load_models(model_dir)
+                print("✅ MAPPO 模型加载完成!")
+                return
+            except Exception as e:
+                raise RuntimeError(f"MAPPO模型加载失败: {e}") from e
         
         for i in range(self.n_agents):
             a_path = os.path.join(model_dir, f"actor_{i}.weights.h5")
@@ -3699,10 +3819,26 @@ class ModelEvaluator:
         position_family_override = os.getenv('POST_EVAL_POSITION_FAMILY', '').strip()
         runtime_random_terrain = (
             _env_flag('RANDOM_TERRAIN', bool(getattr(self.args, 'random_terrain', False)))
-            or bool(terrain_seed_sequence)
-            or bool(terrain_variant_seed_sequence)
+            or _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed_sequence)
         )
         setup_semi_random_terrain = _env_flag('SEMI_RANDOM_TERRAIN', False)
+        effective_use_quadrotor_dynamics = getattr(self.args, 'use_quadrotor_dynamics', None)
+        if effective_use_quadrotor_dynamics is None:
+            effective_use_quadrotor_dynamics = _env_flag('USE_QUADROTOR_DYNAMICS', False)
+        effective_simulation_dt = _finite_float_or_none(getattr(self.args, 'simulation_dt', None))
+        if effective_simulation_dt is None:
+            effective_simulation_dt = _env_float('SIMULATION_DT', 0.08)
+        effective_z_action_bias = _finite_float_or_none(getattr(self.args, 'z_action_bias', None))
+        if effective_z_action_bias is None:
+            effective_z_action_bias = _env_float('Z_ACTION_BIAS', 0.0)
+        effective_quadrotor_attitude_response_time = _finite_float_or_none(
+            getattr(self.args, 'quadrotor_attitude_response_time', None)
+        )
+        if effective_quadrotor_attitude_response_time is None:
+            effective_quadrotor_attitude_response_time = _env_float('QUADROTOR_ATTITUDE_RESPONSE_TIME', 0.0)
+        effective_quadrotor_psi_cmd = _finite_float_or_none(getattr(self.args, 'quadrotor_psi_cmd', None))
+        if effective_quadrotor_psi_cmd is None:
+            effective_quadrotor_psi_cmd = _env_float('QUADROTOR_PSI_CMD', 0.0)
         evaluation_setup = {
             'terrain_family': terrain_family_override or (
                 'similar_unseen' if setup_semi_random_terrain else (
@@ -3734,7 +3870,7 @@ class ModelEvaluator:
             'random_terrain': bool(runtime_random_terrain),
             'shared_obstacle_seed_sequence': bool(obstacle_seed_sequence),
             'use_dynamic_obstacles': _env_flag('USE_DYNAMIC_OBSTACLES', True),
-            'use_quadrotor_dynamics': _env_flag('USE_QUADROTOR_DYNAMICS', False),
+            'use_quadrotor_dynamics': bool(effective_use_quadrotor_dynamics),
             'gravity': _finite_float_or_none(getattr(self.args, 'gravity', None)),
             'control_accel_gain': _finite_float_or_none(getattr(self.args, 'control_accel_gain', None)),
             'damping': _finite_float_or_none(getattr(self.args, 'damping', None)),
@@ -3743,20 +3879,29 @@ class ModelEvaluator:
             'action_range_x': _finite_float_or_none(getattr(self.args, 'action_range_x', None)),
             'action_range_y': _finite_float_or_none(getattr(self.args, 'action_range_y', None)),
             'action_range_z': _finite_float_or_none(getattr(self.args, 'action_range_z', None)),
-            'simulation_dt': _env_float('SIMULATION_DT', getattr(self.args, 'simulation_dt', 0.08)),
-            'z_action_bias': _env_float('Z_ACTION_BIAS', getattr(self.args, 'z_action_bias', 0.0)),
-            'quadrotor_attitude_response_time': _env_float(
-                'QUADROTOR_ATTITUDE_RESPONSE_TIME',
-                getattr(self.args, 'quadrotor_attitude_response_time', 0.0),
-            ),
-            'quadrotor_psi_cmd': _env_float(
-                'QUADROTOR_PSI_CMD',
-                getattr(self.args, 'quadrotor_psi_cmd', 0.0),
-            ),
+            'simulation_dt': effective_simulation_dt,
+            'z_action_bias': effective_z_action_bias,
+            'quadrotor_attitude_response_time': effective_quadrotor_attitude_response_time,
+            'quadrotor_psi_cmd': effective_quadrotor_psi_cmd,
             'episode_length': _safe_int(getattr(self.args, 'episode_length', None)),
             'requested_episode_length_multiplier': _env_float(
                 'EVAL_EPISODE_LENGTH_MULTIPLIER',
                 _env_float('POST_EVAL_EPISODE_LENGTH_MULTIPLIER', 1.0),
+            ),
+            'action_force_ratio': _finite_float_or_none(getattr(self.args, 'action_force_ratio', None)),
+            'action_force_ratio_source': (
+                'forced_override'
+                if getattr(self.args, 'force_action_force_ratio', None) is not None
+                else (
+                    getattr(self, '_selected_checkpoint_force_ratio_label', None)
+                    or 'checkpoint_variant'
+                )
+            ),
+            'checkpoint_action_force_ratio': _finite_float_or_none(
+                getattr(self, '_selected_checkpoint_force_ratio', None)
+            ),
+            'forced_action_force_ratio': _finite_float_or_none(
+                getattr(self, '_forced_eval_action_force_ratio', None)
             ),
         }
         
@@ -4496,6 +4641,12 @@ HTML交互式轨迹图功能:
     # 网络动作和势场动作混合比例
     parser.add_argument("--action-force-ratio", type=float, default=0.75, 
                        help="网络动作和势场动作的混合比例 (0.0=完全网络动作, 1.0=完全势场动作, 默认0.75=75%%势场+25%%网络)")
+    parser.add_argument(
+        "--force-action-force-ratio",
+        type=float,
+        default=None,
+        help="可选：强制覆盖评估时使用的FR，仅用于敏感性/控制实验；默认仍按checkpoint对应FR评估",
+    )
     
     # 势场修正版本选择
     parser.add_argument("--use-tf-potential-field", type=lambda x: (str(x).lower() in ('1','true','yes','on')), default=True,
@@ -4523,8 +4674,8 @@ HTML交互式轨迹图功能:
     parser.add_argument("--delta-radius", type=float, default=5.0, help="Delta Radius，默认5.0")
     
     # 🔧 新增：算法选择
-    parser.add_argument("--algorithm", type=str, default="matd3", choices=["maddpg", "matd3"],
-                       help="Training algorithm selection (maddpg or matd3)")
+    parser.add_argument("--algorithm", type=str, default="matd3", choices=["maddpg", "matd3", "mappo"],
+                       help="Training algorithm selection (maddpg, matd3 or mappo)")
     
     # 分项加权奖励参数（如果使用加权场景）
     parser.add_argument("--distance-weight", type=float, default=None, help="距离奖励权重")
@@ -4558,7 +4709,7 @@ HTML交互式轨迹图功能:
     parser.add_argument("--shaping-gamma", type=float, default=None, help="潜势函数 gamma")
     
     # 模型和保存路径
-    default_model_path = os.getenv('MODEL_PATH', 'models/optimized_exp/best')
+    default_model_path = os.getenv('MODEL_PATH', 'models/optimized_exp')
     parser.add_argument("--load-model-path", type=str, default=default_model_path,
                        help="要加载的模型权重文件夹路径（默认从环境变量MODEL_PATH或models/optimized_exp/best）")
     parser.add_argument("--save-viz-path", type=str, default="evaluation_results", 
@@ -4579,7 +4730,7 @@ HTML交互式轨迹图功能:
     # 场景兼容性参数（为了与原版兼容）
     parser.add_argument("--terrain-seed", type=int, default=None, help="地形种子")
     parser.add_argument("--use-fixed-positions", action="store_true", help="使用固定位置")
-    parser.add_argument("--positions-file", type=str, default="./saved_positions/default_positions.json", 
+    parser.add_argument("--positions-file", type=str, default="./saved_positions/5.json", 
                        help="固定位置文件路径")
     parser.add_argument("--dynamic-first-time", action="store_true", help="动态首次运行")
     parser.add_argument("--disable-early-termination", action="store_true", 

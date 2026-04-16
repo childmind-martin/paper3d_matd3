@@ -85,7 +85,7 @@ def print_remediation(env_name: str) -> None:
     print(
         "  - pip install --upgrade --force-reinstall "
         "tensorflow==2.12.0 tensorboard==2.12.0 gym==0.26.2 "
-        "numpy==1.23.5 scipy==1.15.2 pandas==2.3.0 "
+        "numpy==1.23.5 scipy==1.15.2 "
         "matplotlib==3.10.1 plotly==5.22.0 tqdm==4.67.1"
     )
 
