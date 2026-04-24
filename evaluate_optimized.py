@@ -558,6 +558,41 @@ def _extract_agent_goal_positions(world, scenario):
     return goal_positions
 
 
+def _compute_inter_agent_collision_snapshot(agents):
+    agents = list(agents or [])
+    positions = _capture_agent_positions(agents)
+    per_agent_counts = [0] * len(agents)
+    pair_count = 0
+    min_clearance = None
+
+    for i in range(len(agents)):
+        pos_i = positions[i]
+        if pos_i is None:
+            continue
+        try:
+            size_i = float(getattr(agents[i], "size", 0.0) or 0.0)
+        except Exception:
+            size_i = 0.0
+        for j in range(i + 1, len(agents)):
+            pos_j = positions[j]
+            if pos_j is None:
+                continue
+            try:
+                size_j = float(getattr(agents[j], "size", 0.0) or 0.0)
+            except Exception:
+                size_j = 0.0
+            center_dist = float(np.linalg.norm(pos_i - pos_j))
+            clearance = center_dist - (size_i + size_j)
+            if min_clearance is None or clearance < min_clearance:
+                min_clearance = float(clearance)
+            if clearance < 0.0:
+                pair_count += 1
+                per_agent_counts[i] += 1
+                per_agent_counts[j] += 1
+
+    return pair_count, per_agent_counts, min_clearance
+
+
 def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance_threshold=None):
     summary = {
         "episodes": int(len(all_episodes_data)),
@@ -573,8 +608,16 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
         "avg_collision_count": None,
         "std_collision_count": None,
         "collision_free_rate": None,
+        "avg_terrain_collision_count": None,
+        "std_terrain_collision_count": None,
+        "avg_obstacle_collision_count": None,
+        "std_obstacle_collision_count": None,
+        "avg_inter_agent_collision_count": None,
+        "std_inter_agent_collision_count": None,
+        "inter_agent_collision_free_rate": None,
         "avg_min_clearance_mean": None,
         "avg_min_clearance_min": None,
+        "avg_min_inter_agent_clearance": None,
         "clearance_violation_rate": None,
         "clearance_violation_threshold": _finite_float_or_none(collision_distance_threshold),
         "avg_arrival_step_success_only": None,
@@ -607,6 +650,9 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
     team_success_flags = [int(ep.get("team_success", ep.get("success", 0))) for ep in all_episodes_data]
     step_values = [ep.get("steps") for ep in all_episodes_data]
     collision_counts = [ep.get("collision_count", 0) for ep in all_episodes_data]
+    terrain_collision_counts = [ep.get("terrain_collision_count", 0) for ep in all_episodes_data]
+    obstacle_collision_counts = [ep.get("obstacle_collision_count", 0) for ep in all_episodes_data]
+    inter_agent_collision_counts = [ep.get("inter_agent_collision_count", 0) for ep in all_episodes_data]
     team_path_lengths = [ep.get("path_length") for ep in all_episodes_data]
     team_path_lengths_success = [ep.get("path_length") for ep in all_episodes_data if ep.get("success", 0)]
     team_path_efficiencies = [ep.get("path_efficiency") for ep in all_episodes_data]
@@ -620,9 +666,11 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
 
     min_distance_means = []
     min_distance_mins = []
+    min_inter_agent_clearances = []
     penetration_counts = []
     penetration_depths = []
     collision_free_count = 0
+    inter_agent_collision_free_count = 0
     violation_count = 0
 
     agent_success_lists = []
@@ -651,6 +699,17 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
                 collision_free_count += 1
         except Exception:
             pass
+
+        inter_agent_collision_count = ep.get("inter_agent_collision_count", 0)
+        try:
+            if int(inter_agent_collision_count) <= 0:
+                inter_agent_collision_free_count += 1
+        except Exception:
+            pass
+
+        min_inter_agent_clearance = _finite_float_or_none(ep.get("min_inter_agent_clearance"))
+        if min_inter_agent_clearance is not None:
+            min_inter_agent_clearances.append(min_inter_agent_clearance)
 
         penetration_stat = ep.get("penetration_stat")
         if isinstance(penetration_stat, dict):
@@ -733,8 +792,18 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
             "collision_free_rate": (
                 float(collision_free_count / len(all_episodes_data)) if all_episodes_data else None
             ),
+            "avg_terrain_collision_count": _safe_mean(terrain_collision_counts),
+            "std_terrain_collision_count": _safe_std(terrain_collision_counts),
+            "avg_obstacle_collision_count": _safe_mean(obstacle_collision_counts),
+            "std_obstacle_collision_count": _safe_std(obstacle_collision_counts),
+            "avg_inter_agent_collision_count": _safe_mean(inter_agent_collision_counts),
+            "std_inter_agent_collision_count": _safe_std(inter_agent_collision_counts),
+            "inter_agent_collision_free_rate": (
+                float(inter_agent_collision_free_count / len(all_episodes_data)) if all_episodes_data else None
+            ),
             "avg_min_clearance_mean": _safe_mean(min_distance_means),
             "avg_min_clearance_min": _safe_mean(min_distance_mins),
+            "avg_min_inter_agent_clearance": _safe_mean(min_inter_agent_clearances),
             "clearance_violation_rate": (
                 float(violation_count / len(min_distance_mins)) if min_distance_mins else None
             ),
@@ -775,6 +844,138 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
     summary["avg_agent_min_goal_distance"] = _safe_mean(flattened_min_goal_distances)
 
     return summary
+
+
+def _generate_evaluation_summary_plot(all_episodes_data, summary, save_path):
+    if not all_episodes_data:
+        return None
+
+    episodes = [int(ep.get("episode", idx)) + 1 for idx, ep in enumerate(all_episodes_data)]
+    rewards = [_finite_float_or_none(ep.get("reward")) for ep in all_episodes_data]
+    team_success = [int(ep.get("team_success", ep.get("success", 0)) or 0) for ep in all_episodes_data]
+    collision_counts = [_finite_float_or_none(ep.get("collision_count", 0)) for ep in all_episodes_data]
+    terrain_collision_counts = [_finite_float_or_none(ep.get("terrain_collision_count", 0)) for ep in all_episodes_data]
+    obstacle_collision_counts = [_finite_float_or_none(ep.get("obstacle_collision_count", 0)) for ep in all_episodes_data]
+    inter_agent_collision_counts = [
+        _finite_float_or_none(ep.get("inter_agent_collision_count", 0)) for ep in all_episodes_data
+    ]
+    final_goal_distances = [_finite_float_or_none(ep.get("final_goal_distance")) for ep in all_episodes_data]
+    min_inter_agent_clearances = [
+        _finite_float_or_none(ep.get("min_inter_agent_clearance")) for ep in all_episodes_data
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    ax_reward, ax_collision, ax_goal, ax_summary = axes.flatten()
+
+    x = np.arange(len(episodes), dtype=np.int32)
+
+    reward_values = [r if r is not None else np.nan for r in rewards]
+    ax_reward.plot(episodes, reward_values, color="#1f77b4", linewidth=2.0, marker="o", markersize=4)
+    success_idx = [idx for idx, flag in enumerate(team_success) if flag == 1]
+    if success_idx:
+        ax_reward.scatter(
+            [episodes[idx] for idx in success_idx],
+            [reward_values[idx] for idx in success_idx],
+            color="#2ca02c",
+            s=40,
+            zorder=3,
+            label="Team Success",
+        )
+        ax_reward.legend(loc="best")
+    ax_reward.set_title("Reward Per Episode")
+    ax_reward.set_xlabel("Episode")
+    ax_reward.set_ylabel("Reward")
+    ax_reward.grid(True, ls="--", alpha=0.3)
+
+    collision_vals = [v if v is not None else 0.0 for v in collision_counts]
+    terrain_vals = [v if v is not None else 0.0 for v in terrain_collision_counts]
+    obstacle_vals = [v if v is not None else 0.0 for v in obstacle_collision_counts]
+    inter_agent_vals = [v if v is not None else 0.0 for v in inter_agent_collision_counts]
+    ax_collision.bar(
+        x - 0.2,
+        terrain_vals,
+        width=0.38,
+        color="#8c564b",
+        alpha=0.85,
+        label="Terrain Collision Count",
+    )
+    ax_collision.bar(
+        x - 0.2,
+        obstacle_vals,
+        width=0.38,
+        bottom=terrain_vals,
+        color="#ff7f0e",
+        alpha=0.85,
+        label="Obstacle Collision Count",
+    )
+    ax_collision.bar(
+        x + 0.2,
+        inter_agent_vals,
+        width=0.4,
+        color="#d62728",
+        alpha=0.85,
+        label="Inter-Agent Collision Count",
+    )
+    ax_collision.set_xticks(x)
+    ax_collision.set_xticklabels(episodes)
+    ax_collision.set_title("Collision Statistics")
+    ax_collision.set_xlabel("Episode")
+    ax_collision.set_ylabel("Count")
+    ax_collision.grid(True, axis="y", ls="--", alpha=0.3)
+    ax_collision.legend(loc="best")
+
+    goal_vals = [v if v is not None else np.nan for v in final_goal_distances]
+    clearance_vals = [v if v is not None else np.nan for v in min_inter_agent_clearances]
+    ax_goal.plot(episodes, goal_vals, color="#9467bd", linewidth=2.0, marker="o", markersize=4, label="Team Final Goal Distance")
+    ax_goal.set_title("Goal Distance / Inter-Agent Clearance")
+    ax_goal.set_xlabel("Episode")
+    ax_goal.set_ylabel("Goal Distance")
+    ax_goal.grid(True, ls="--", alpha=0.3)
+    ax_goal_2 = ax_goal.twinx()
+    ax_goal_2.plot(
+        episodes,
+        clearance_vals,
+        color="#2ca02c",
+        linewidth=2.0,
+        marker="s",
+        markersize=4,
+        label="Min Inter-Agent Clearance",
+    )
+    ax_goal_2.set_ylabel("Min Inter-Agent Clearance")
+    lines_1, labels_1 = ax_goal.get_legend_handles_labels()
+    lines_2, labels_2 = ax_goal_2.get_legend_handles_labels()
+    ax_goal.legend(lines_1 + lines_2, labels_1 + labels_2, loc="best")
+
+    ax_summary.axis("off")
+    summary_lines = [
+        "Official Evaluation Summary",
+        f"Episodes: {summary.get('episodes')}",
+        f"Team success rate: {summary.get('team_success_rate'):.3f}" if summary.get("team_success_rate") is not None else "Team success rate: N/A",
+        f"Avg reward: {summary.get('avg_reward'):.2f}" if summary.get("avg_reward") is not None else "Avg reward: N/A",
+        f"Avg collision count: {summary.get('avg_collision_count'):.2f}" if summary.get("avg_collision_count") is not None else "Avg collision count: N/A",
+        f"Avg terrain collision count: {summary.get('avg_terrain_collision_count'):.2f}" if summary.get("avg_terrain_collision_count") is not None else "Avg terrain collision count: N/A",
+        f"Avg obstacle collision count: {summary.get('avg_obstacle_collision_count'):.2f}" if summary.get("avg_obstacle_collision_count") is not None else "Avg obstacle collision count: N/A",
+        f"Avg inter-agent collision count: {summary.get('avg_inter_agent_collision_count'):.2f}" if summary.get("avg_inter_agent_collision_count") is not None else "Avg inter-agent collision count: N/A",
+        f"Inter-agent collision-free rate: {summary.get('inter_agent_collision_free_rate'):.3f}" if summary.get("inter_agent_collision_free_rate") is not None else "Inter-agent collision-free rate: N/A",
+        f"Avg team final goal distance: {summary.get('avg_team_final_goal_distance'):.2f}" if summary.get("avg_team_final_goal_distance") is not None else "Avg team final goal distance: N/A",
+        f"Avg min inter-agent clearance: {summary.get('avg_min_inter_agent_clearance'):.2f}" if summary.get("avg_min_inter_agent_clearance") is not None else "Avg min inter-agent clearance: N/A",
+    ]
+    ax_summary.text(
+        0.02,
+        0.98,
+        "\n".join(summary_lines),
+        va="top",
+        ha="left",
+        fontsize=11,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#f7f7f7", edgecolor="#cccccc"),
+    )
+
+    fig.suptitle("Official Evaluation Statistics", fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(save_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
 
 class ModelEvaluator:
     """模型评估器，仿照1.0版本的评估逻辑"""
@@ -2649,6 +2850,9 @@ class ModelEvaluator:
         episode_velocity_history = []  # 记录每步速度向量，判断是否“推不起来”
         episode_goal_distance_history = []  # 记录每步到目标距离，判断是否持续推进
         step_count = 0
+        episode_inter_agent_collision_counts = [0] * len(getattr(self.env, 'agents', []) or [])
+        episode_inter_agent_collision_pair_count = 0
+        episode_min_inter_agent_clearance = None
 
         # 与产物需求对齐：若本轮不生成任何轨迹类文件，则连环境内部轨迹也一起关闭。
         try:
@@ -2889,6 +3093,26 @@ class ModelEvaluator:
                     agent_path_lengths[agent_idx] += step_distance
             prev_positions = [pos.copy() if pos is not None else None for pos in current_positions]
 
+            try:
+                pair_count_step, per_agent_step_counts, min_clearance_step = _compute_inter_agent_collision_snapshot(
+                    getattr(self.env, 'agents', [])
+                )
+                episode_inter_agent_collision_pair_count += int(pair_count_step)
+                if min_clearance_step is not None:
+                    if (
+                        episode_min_inter_agent_clearance is None
+                        or min_clearance_step < episode_min_inter_agent_clearance
+                    ):
+                        episode_min_inter_agent_clearance = float(min_clearance_step)
+                if len(episode_inter_agent_collision_counts) < len(per_agent_step_counts):
+                    episode_inter_agent_collision_counts.extend(
+                        [0] * (len(per_agent_step_counts) - len(episode_inter_agent_collision_counts))
+                    )
+                for idx, per_agent_count in enumerate(per_agent_step_counts):
+                    episode_inter_agent_collision_counts[idx] += int(per_agent_count)
+            except Exception:
+                pass
+
             if agent_goal_positions and current_positions:
                 team_reached_now = True
                 valid_reach_checks = 0
@@ -2951,6 +3175,8 @@ class ModelEvaluator:
         # 两者应该同步更新，但优先使用 debug_info['total_penetration_count']（与训练脚本一致）
         episode_collision_counts = []
         episode_min_distances = []
+        episode_terrain_total = 0
+        episode_obstacle_total = 0
         try:
             if hasattr(self.env, 'world') and hasattr(self.env.world, 'agents'):
                 for agent in self.env.world.agents:
@@ -2975,6 +3201,24 @@ class ModelEvaluator:
                         penetration_count = 0
                     
                     episode_collision_counts.append(penetration_count)
+
+                    terrain_collision_count = 0
+                    obstacle_collision_count = 0
+                    try:
+                        if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                            terrain_collision_count = agent.debug_info.get('terrain_penetration_count', 0)
+                            obstacle_collision_count = agent.debug_info.get('obstacle_collision_count', 0)
+                        terrain_collision_count = (
+                            int(terrain_collision_count) if np.isfinite(terrain_collision_count) else 0
+                        )
+                        obstacle_collision_count = (
+                            int(obstacle_collision_count) if np.isfinite(obstacle_collision_count) else 0
+                        )
+                    except (ValueError, TypeError, OverflowError):
+                        terrain_collision_count = 0
+                        obstacle_collision_count = 0
+                    episode_terrain_total += terrain_collision_count
+                    episode_obstacle_total += obstacle_collision_count
                     
                     # 收集min_distance_to_obstacle
                     min_dist = None
@@ -3196,7 +3440,15 @@ class ModelEvaluator:
             print(f"   - 步数: {step_count}/{episode_length} (完成度: {step_count/episode_length*100:.1f}%)")
             print(f"   - 用时: {episode_duration:.2f}秒")
             print(f"   - 平均步时: {avg_step_time:.4f}秒/步")
-            print(f"   - 碰撞次数: {total_collisions} (智能体: {episode_collision_counts})")
+            print(
+                f"   - 碰撞次数: {total_collisions} "
+                f"(地形={episode_terrain_total}, 障碍物={episode_obstacle_total}; "
+                f"智能体: {episode_collision_counts})"
+            )
+            print(
+                f"   - 队间碰撞: 成对计数={episode_inter_agent_collision_pair_count} "
+                f"(智能体: {episode_inter_agent_collision_counts})"
+            )
             print(f"   - 成功率: 团队={success_flag}, 智能体={agent_success_flags}")
             if arrival_step is not None:
                 print(f"   - 成功首达步数: {arrival_step}")
@@ -3211,6 +3463,8 @@ class ModelEvaluator:
                 print(f"   - 回合最小目标距离: 团队={min_goal_distance:.2f}, 智能体={['{:.2f}'.format(v) if v is not None else 'N/A' for v in agent_min_goal_distances]}")
             if min_distance_stat is not None:
                 print(f"   - 最小净空距离: 均值={min_distance_stat['mean']:.2f}, 最小值={min_distance_stat['min']:.2f}")
+            if episode_min_inter_agent_clearance is not None:
+                print(f"   - 最小队间净空: {episode_min_inter_agent_clearance:.2f}")
             if penetration_stat is not None:
                 print(f"   - 穿透统计: 次数={penetration_stat['count']}, 最大深度={penetration_stat['max_depth']:.2f}, 平均深度={penetration_stat['mean_depth']:.2f}")
             if step_count < episode_length:
@@ -3230,7 +3484,14 @@ class ModelEvaluator:
             'duration': episode_duration,
             # 🔧 新增：返回碰撞和成功指标（与训练脚本一致）
             'collision_count': total_collisions,
+            'terrain_collision_count': int(episode_terrain_total),
+            'obstacle_collision_count': int(episode_obstacle_total),
             'agent_collision_counts': episode_collision_counts,
+            'inter_agent_collision_count': int(episode_inter_agent_collision_pair_count),
+            'agent_inter_agent_collision_counts': [int(v) for v in episode_inter_agent_collision_counts],
+            'min_inter_agent_clearance': (
+                float(episode_min_inter_agent_clearance) if episode_min_inter_agent_clearance is not None else None
+            ),
             'min_distance': min_distance_stat,
             'success': success_flag,
             'agent_success_flags': agent_success_flags,
@@ -4078,10 +4339,32 @@ class ModelEvaluator:
             print(f"成功回合平均首达步数: {summary['avg_arrival_step_success_only']:.1f}")
         if summary.get('avg_collision_count') is not None:
             print(f"平均碰撞次数: {summary['avg_collision_count']:.2f}")
+        if summary.get('avg_terrain_collision_count') is not None:
+            print(f"平均地形碰撞次数: {summary['avg_terrain_collision_count']:.2f}")
+        if summary.get('avg_obstacle_collision_count') is not None:
+            print(f"平均障碍物碰撞次数: {summary['avg_obstacle_collision_count']:.2f}")
+        if summary.get('avg_inter_agent_collision_count') is not None:
+            print(f"平均队间碰撞次数: {summary['avg_inter_agent_collision_count']:.2f}")
+        if summary.get('avg_min_inter_agent_clearance') is not None:
+            print(f"平均最小队间净空: {summary['avg_min_inter_agent_clearance']:.2f}")
+        print(f"统计图: {os.path.join(self.args.save_viz_path, 'evaluation_summary.png')}")
 
         visualization_artifacts = {
             'episode_visualizations': episode_visualizations,
         }
+        summary_plot_path = None
+        try:
+            summary_plot_path = _generate_evaluation_summary_plot(
+                all_episodes_data,
+                summary,
+                os.path.join(self.args.save_viz_path, 'evaluation_summary.png'),
+            )
+        except Exception as summary_plot_err:
+            print(f"⚠️  评估统计图生成失败: {summary_plot_err}")
+            traceback.print_exc()
+            summary_plot_path = None
+        if summary_plot_path and os.path.exists(summary_plot_path):
+            visualization_artifacts['evaluation_summary_plot'] = summary_plot_path
         best_generated_files = {}
         if best_episode_data is not None and not self.args.disable_visualization and (save_all_episode_visualizations or enable_best_traj):
             try:
@@ -4234,7 +4517,12 @@ class ModelEvaluator:
                     'trajectory': ep.get('trajectory', []) if persist_episode_trajectories else [],
                     # 🔧 新增：保存碰撞和成功指标（与训练脚本一致）
                     'collision_count': ep.get('collision_count', 0),
+                    'terrain_collision_count': ep.get('terrain_collision_count', 0),
+                    'obstacle_collision_count': ep.get('obstacle_collision_count', 0),
                     'agent_collision_counts': ep.get('agent_collision_counts', []),
+                    'inter_agent_collision_count': ep.get('inter_agent_collision_count', 0),
+                    'agent_inter_agent_collision_counts': ep.get('agent_inter_agent_collision_counts', []),
+                    'min_inter_agent_clearance': ep.get('min_inter_agent_clearance', None),
                     'min_distance': ep.get('min_distance', None),
                     'success': ep.get('success', 0),
                     'agent_success_flags': ep.get('agent_success_flags', []),

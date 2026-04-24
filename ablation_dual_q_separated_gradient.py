@@ -54,6 +54,7 @@ except ImportError:
 from algorithm_ablation_colors import (
     ALGORITHM_ABLATION_COLOR_BY_LABEL,
     get_algorithm_ablation_color,
+    get_algorithm_ablation_style,
 )
 
 # 🔧 新增：导入批次管理器
@@ -67,8 +68,12 @@ try:
     import matplotlib
     matplotlib.use('Agg')  # 无GUI后端
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     from scipy.ndimage import uniform_filter1d
+    try:
+        from scipy.io import savemat
+    except ImportError:
+        savemat = None
     HAS_MATPLOTLIB = True
     
     # 🔧 关键修复：在导入后立即设置英文字体，避免所有文本显示为方框
@@ -113,12 +118,16 @@ STRICT_CORE_EXPERIMENT_LABELS = [
 
 SUPPLEMENTAL_EXPERIMENT_LABELS = [
     "matd3_separated_hybrid_actor",
+    "matd3_separated_hybrid_actor_alpha20",
 ]
 
 OPTIONAL_REFERENCE_EXPERIMENT_LABELS = [
     "maddpg_separated_gradient",
     "maddpg_dual_q",
     "maddpg_baseline",
+    "mappo_baseline",
+    "mappo_fusion_only",
+    "mappo_separated_gradient",
 ]
 # 兼容旧变量名，避免影响现有命令行和批次配置读取逻辑。
 EXPLORATORY_EXPERIMENT_LABELS = OPTIONAL_REFERENCE_EXPERIMENT_LABELS
@@ -140,10 +149,14 @@ AUDIT_REFERENCE_LABEL_BY_EXPERIMENT = {
     "matd3_separated_gradient": "matd3_separated_gradient",
     "matd3_dual_q": "matd3_separated_gradient",
     "matd3_separated_hybrid_actor": "matd3_separated_gradient",
+    "matd3_separated_hybrid_actor_alpha20": "matd3_separated_gradient",
     "matd3_single_q": "matd3_separated_gradient",
     "maddpg_separated_gradient": "maddpg_separated_gradient",
     "maddpg_dual_q": "maddpg_separated_gradient",
     "maddpg_baseline": "maddpg_separated_gradient",
+    "mappo_baseline": "mappo_baseline",
+    "mappo_fusion_only": "mappo_baseline",
+    "mappo_separated_gradient": "mappo_fusion_only",
 }
 
 AUTO_POSITIONS_FILE_SENTINEL = "__AUTO_STRICT_POSITIONS__"
@@ -163,6 +176,9 @@ DEFAULT_POST_EVAL_VALIDATION_CANDIDATES = (
     "latest_ep",
 )
 POST_EVAL_SELECTION_PROTOCOL_CHOICES = ("fixed", "matched_validation")
+DEFAULT_UNIFIED_ACTION_FORCE_RATIO = 0.50
+DEFAULT_UNIFIED_ACTION_FORCE_RATIO_SCHEDULE_PCT = "0%:0.50,25%:0.48,50%:0.45,70%:0.40,85%:0.35,100%:0.32"
+DEFAULT_FORCE_EVAL_ACTION_FORCE_RATIO = 0.50
 POST_EVAL_MODE_ALIAS_MAP = {
     "shared_match_train_env": DEFAULT_POST_EVAL_MODE,
     "heldout_shared": DEFAULT_POST_EVAL_MODE,
@@ -177,10 +193,14 @@ EXPERIMENT_ABBR_BY_LABEL = {
     "matd3_separated_gradient": "M3-Sep",
     "matd3_dual_q": "M3-Uni",
     "matd3_separated_hybrid_actor": "M3-Hyb",
+    "matd3_separated_hybrid_actor_alpha20": "M3-H20",
     "matd3_single_q": "M3-Base",
     "maddpg_separated_gradient": "DPG-Sep",
     "maddpg_dual_q": "DPG-Uni",
     "maddpg_baseline": "DPG-Base",
+    "mappo_baseline": "PPO-Std",
+    "mappo_fusion_only": "PPO-Fus",
+    "mappo_separated_gradient": "PPO-Sep",
 }
 POST_EVAL_SUMMARY_SPECS = [
     ("team_success_rate", "Team Success Rate", True, False),
@@ -190,9 +210,7 @@ POST_EVAL_SUMMARY_SPECS = [
     ("avg_team_total_path_length", "Average Team Path Length (m)", False, True),
     ("avg_arrival_step_success_only", "Success Arrival Step", False, True),
 ]
-POST_EVAL_FALLBACK_KEYS = {
-    "avg_arrival_step_success_only": "avg_first_reach_step",
-}
+POST_EVAL_FALLBACK_KEYS = {}
 
 # 严格环境隔离：仅保留子进程运行所需的基础环境变量，避免继承父进程训练参数
 RUNTIME_ENV_ALLOWLIST = {
@@ -233,6 +251,7 @@ ALLOWED_MANIFEST_ENV_DIFF_KEYS = {
     "MATD3_USE_SEPARATED_GRADIENT",
     "MADDPG_USE_DUAL_Q",
     "MADDPG_USE_SEPARATED_GRADIENT",
+    "MAPPO_USE_SEPARATED_GRADIENT",
     # 这些键只影响训练期产物/日志/运行时缓存位置，不改变算法语义。
     # 允许它们在不同配置或旧批次重跑时存在差异，避免把性能开关误判为消融配置漂移。
     "FAST_ARTIFACTS",
@@ -253,6 +272,7 @@ ALLOWED_MANIFEST_ARG_DIFF_KEYS = {
     "--matd3-use-separated-gradient",
     "--maddpg-use-dual-q",
     "--maddpg-use-separated-gradient",
+    "--mappo-use-separated-gradient",
 }
 
 
@@ -587,8 +607,17 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
         args.seeds = ",".join(str(seed) for seed in saved_seeds)
 
     cli_disable_post_eval_specified = bool(getattr(args, "cli_disable_post_eval_specified", False))
+    cli_force_post_eval_requested = bool(
+        getattr(args, "force_post_eval_rerun", False)
+        or getattr(args, "force_post_eval_testset_regen", False)
+    )
     if "post_eval_enabled" in parent_config and not cli_disable_post_eval_specified:
-        args.disable_post_eval = not bool(parent_config.get("post_eval_enabled"))
+        # If the user explicitly asks to rerun or regenerate post-eval assets while
+        # resuming an old parent batch, do not re-inherit the historical disabled state.
+        if cli_force_post_eval_requested:
+            args.disable_post_eval = False
+        else:
+            args.disable_post_eval = not bool(parent_config.get("post_eval_enabled"))
     cli_post_eval_mode_specified = bool(getattr(args, "cli_post_eval_mode_specified", False))
     if cli_post_eval_mode_specified:
         pass
@@ -667,6 +696,7 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
         else:
             args.post_eval_validation_candidates = str(saved_validation_candidates)
     saved_post_eval_variant = parent_config.get("post_eval_model_variant", None)
+    saved_requested_post_eval_variant = parent_config.get("post_eval_requested_model_variant", None)
     cli_variant_specified = bool(getattr(args, "cli_post_eval_model_variant_specified", False))
     if cli_variant_specified:
         pass
@@ -675,10 +705,25 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
     else:
         saved_variant = str(saved_post_eval_variant).strip()
         current_variant = str(getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT)).strip()
+        requested_saved_variant = str(saved_requested_post_eval_variant or "").strip()
+        valid_requested_variants = {
+            "auto",
+            "final",
+            "best",
+            "best_by_team_sr",
+            "latest_ep",
+            "checkpoint",
+        }
+        if requested_saved_variant not in valid_requested_variants:
+            requested_saved_variant = ""
         # 兼容旧批次：历史配置里大量写死为 final，这会覆盖掉当前“按最大 team SR 选择 checkpoint”的默认行为。
         # 如果用户没有显式传 --post-eval-model-variant，则优先保留新的默认值 best_by_team_sr。
         if saved_variant.lower() == "final" and current_variant == DEFAULT_POST_EVAL_MODEL_VARIANT:
             args.post_eval_model_variant = DEFAULT_POST_EVAL_MODEL_VARIANT
+        # 兼容误写入/内部存储值：matched_validation 是 post-eval 结果目录变体，不是合法的 CLI checkpoint 选择项。
+        # 恢复历史父批次时应优先回退到记录下来的 requested checkpoint 变体，否则使用当前默认值。
+        elif saved_variant == MATCHED_VALIDATION_POST_EVAL_VARIANT:
+            args.post_eval_model_variant = requested_saved_variant or DEFAULT_POST_EVAL_MODEL_VARIANT
         else:
             args.post_eval_model_variant = saved_variant
     for arg_name, config_key, default_value in (
@@ -1150,6 +1195,7 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "--terrain-base-seed",
         "--training-env-sequence-seed",
     }
+    allowed_argv_changed = set()
     allowed_env_only_in_cur = {
         "DETERMINISTIC_TRAIN_ENV_SEQUENCE",
         "ENABLE_RANDOM_TERRAIN_COMPLEXITY_PROGRESSION",
@@ -1164,19 +1210,23 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
     allowed_env_changed = {
         "LD_LIBRARY_PATH",
         "TRAIN_PYTHON_BIN",
+        "XLA_COMPILE_PARALLELISM",
     }
 
-    if cur_label == "matd3_separated_hybrid_actor":
+    if str(cur_label).startswith("matd3_separated_hybrid_actor"):
         allowed_env_only_in_cur.update(
             {
                 "MATD3_USE_HYBRID_ACTOR_OBJECTIVE",
                 "MATD3_HYBRID_ACTOR_ALPHA",
             }
         )
+    if cur_label == "mappo_fusion_only" and ref_label == "mappo_baseline":
+        allowed_argv_changed.add("--use-pf-feature")
+        allowed_env_changed.add("USE_PF_FEATURE")
 
     unexpected_argv_only_in_ref = list(argv_only_in_ref)
     unexpected_argv_only_in_cur = sorted(key for key in argv_only_in_cur if key not in allowed_argv_only_in_cur)
-    unexpected_argv_changed = list(argv_changed)
+    unexpected_argv_changed = sorted(key for key in argv_changed if key not in allowed_argv_changed)
     unexpected_env_only_in_ref = list(env_only_in_ref)
     unexpected_env_only_in_cur = sorted(key for key in env_only_in_cur if key not in allowed_env_only_in_cur)
     unexpected_env_changed = sorted(key for key in env_changed if key not in allowed_env_changed)
@@ -1207,6 +1257,7 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "env_only_in_cur": env_only_in_cur,
         "env_changed": {key: {"ref": env_ref.get(key), "cur": env_cur.get(key)} for key in env_changed},
         "allowed_argv_only_in_cur": sorted(allowed_argv_only_in_cur),
+        "allowed_argv_changed": sorted(allowed_argv_changed),
         "allowed_env_only_in_cur": sorted(allowed_env_only_in_cur),
         "allowed_env_changed": sorted(allowed_env_changed),
         "unexpected_argv_only_in_ref": unexpected_argv_only_in_ref,
@@ -1266,6 +1317,9 @@ def _expected_algo_flags(cfg: Dict[str, Any], batch_seed: int = None) -> Dict[st
     if algo == "matd3":
         dual_q = _to_bool(env_cfg.get("MATD3_USE_DUAL_Q", "1"))
         sep_grad = _to_bool(env_cfg.get("MATD3_USE_SEPARATED_GRADIENT", "1"))
+    elif algo == "mappo":
+        dual_q = False
+        sep_grad = _to_bool(env_cfg.get("MAPPO_USE_SEPARATED_GRADIENT", "0"))
     else:
         dual_q = _to_bool(env_cfg.get("MADDPG_USE_DUAL_Q", "0"))
         sep_grad = _to_bool(env_cfg.get("MADDPG_USE_SEPARATED_GRADIENT", "1"))
@@ -1274,6 +1328,8 @@ def _expected_algo_flags(cfg: Dict[str, Any], batch_seed: int = None) -> Dict[st
         "algo": algo,
         "dual_q": dual_q,
         "separated_gradient": sep_grad,
+        "use_pf_feature": _to_bool(env_cfg.get("USE_PF_FEATURE")) if "USE_PF_FEATURE" in env_cfg else None,
+        "use_tf_potential_field": _to_bool(env_cfg.get("USE_TF_POTENTIAL_FIELD")) if "USE_TF_POTENTIAL_FIELD" in env_cfg else None,
         "seed": expected_seed,
     }
 
@@ -2165,16 +2221,23 @@ def _existing_episode_positions_need_regen(
     spec: Dict[str, Any],
     candidate_files: Sequence[Path],
 ) -> Tuple[bool, Optional[str]]:
-    if str(spec.get("position_family", "")).strip().lower() != "same_region":
-        return False, None
+    position_family = str(spec.get("position_family", "")).strip().lower()
+    expected_terrain_seed_sequence = [_safe_int(seed) for seed in (spec.get("terrain_seed_sequence", []) or [])]
+    expected_terrain_variant_seed_sequence = [
+        _safe_int(seed) for seed in (spec.get("terrain_variant_seed_sequence", []) or [])
+    ]
+    expected_obstacle_seed_sequence = [_safe_int(seed) for seed in (spec.get("obstacle_seed_sequence", []) or [])]
 
-    ref_agents = _load_reference_agents_for_post_eval(spec.get("reference_positions_file"))
-    reference_min_spacing = _pairwise_xy_min(ref_agents) if ref_agents is not None else None
-    if reference_min_spacing is None:
-        return False, None
+    reference_min_spacing = None
+    compatibility_floor = None
+    if position_family == "same_region":
+        ref_agents = _load_reference_agents_for_post_eval(spec.get("reference_positions_file"))
+        reference_min_spacing = _pairwise_xy_min(ref_agents) if ref_agents is not None else None
+        if reference_min_spacing is None:
+            return False, None
+        target_spacing = max(10.0, float(reference_min_spacing) * 0.85)
+        compatibility_floor = target_spacing * 0.7
 
-    target_spacing = max(10.0, float(reference_min_spacing) * 0.85)
-    compatibility_floor = target_spacing * 0.7
     expected_terrain_setup = {
         "semi_random_terrain": bool(spec.get("semi_random_terrain", False)),
         "terrain_base_seed": _safe_int(spec.get("terrain_base_seed")),
@@ -2195,9 +2258,51 @@ def _existing_episode_positions_need_regen(
         try:
             with open(candidate, "r", encoding="utf-8") as f:
                 data = json.load(f)
+
+            episode_idx = _safe_int(data.get("episode"))
+            if episode_idx is None:
+                episode_idx = _safe_int("".join(ch for ch in candidate.stem if ch.isdigit()))
+            if episode_idx is None:
+                return True, f"{candidate.name} 缺少有效 episode 索引"
+
+            if expected_terrain_seed_sequence:
+                expected_seed = expected_terrain_seed_sequence[episode_idx] if episode_idx < len(expected_terrain_seed_sequence) else None
+                actual_seed = _safe_int(data.get("terrain_seed"))
+                if expected_seed is None or actual_seed != int(expected_seed):
+                    return True, f"{candidate.name} terrain_seed 不匹配"
+
+            if expected_terrain_variant_seed_sequence:
+                expected_variant_seed = (
+                    expected_terrain_variant_seed_sequence[episode_idx]
+                    if episode_idx < len(expected_terrain_variant_seed_sequence)
+                    else None
+                )
+                actual_variant_seed = _safe_int(data.get("terrain_variant_seed"))
+                if expected_variant_seed is None or actual_variant_seed != int(expected_variant_seed):
+                    return True, f"{candidate.name} terrain_variant_seed 不匹配"
+            elif data.get("terrain_variant_seed") is not None:
+                return True, f"{candidate.name} terrain_variant_seed 应为空"
+
+            if expected_obstacle_seed_sequence:
+                expected_obstacle_seed = (
+                    expected_obstacle_seed_sequence[episode_idx]
+                    if episode_idx < len(expected_obstacle_seed_sequence)
+                    else None
+                )
+                actual_obstacle_seed = _safe_int(data.get("obstacle_seed"))
+                if expected_obstacle_seed is None or actual_obstacle_seed != int(expected_obstacle_seed):
+                    return True, f"{candidate.name} obstacle_seed 不匹配"
+
+            shared_testset_mode = str(data.get("shared_testset_mode", "")).strip()
+            if shared_testset_mode and shared_testset_mode != DEFAULT_POST_EVAL_MODE:
+                return True, f"{candidate.name} shared_testset_mode 不匹配"
+
+            if position_family != "same_region":
+                continue
+
             agents = np.asarray(data.get("agents", []), dtype=np.float32)
             assigned_min_spacing = _pairwise_xy_min(agents)
-            if assigned_min_spacing is None or assigned_min_spacing < compatibility_floor:
+            if assigned_min_spacing is None or compatibility_floor is None or assigned_min_spacing < compatibility_floor:
                 return (
                     True,
                     (
@@ -2366,6 +2471,43 @@ def _generate_post_eval_terrain_seeds(seed: int, episodes: int) -> List[int]:
     return _generate_post_eval_sequence_seeds(seed, episodes, "terrain")
 
 
+def _build_post_eval_sequence_fields(spec: Dict[str, Any]) -> Dict[str, List[int]]:
+    episodes = max(0, int(spec.get("episodes", 0) or 0))
+    sequence_seed = int(spec.get("seed", spec.get("scenario_seed", 0)) or 0)
+    terrain_seed = int(spec.get("terrain_seed", spec.get("scenario_seed", 0)) or 0)
+    terrain_base_seed = int(spec.get("terrain_base_seed", terrain_seed) or terrain_seed)
+
+    if bool(spec.get("semi_random_terrain", False)):
+        terrain_seed_sequence = [int(terrain_base_seed)] * episodes
+        terrain_variant_seed_sequence = _generate_post_eval_terrain_variant_seeds(
+            seed=sequence_seed,
+            episodes=episodes,
+            hold_mode=str(spec.get("semi_random_hold_mode", "episode") or "episode").strip().lower(),
+            hold_episodes=int(spec.get("semi_random_hold_episodes", 1) or 1),
+            hold_min_episodes=int(spec.get("semi_random_hold_min_episodes", 1) or 1),
+            hold_max_episodes=int(
+                spec.get("semi_random_hold_max_episodes", spec.get("semi_random_hold_min_episodes", 1)) or 1
+            ),
+        )
+    elif bool(spec.get("random_terrain", False)):
+        terrain_seed_sequence = _generate_post_eval_terrain_seeds(sequence_seed, episodes)
+        terrain_variant_seed_sequence = []
+    else:
+        terrain_seed_sequence = [int(terrain_seed)] * episodes
+        terrain_variant_seed_sequence = []
+
+    obstacle_seed_sequence = (
+        _generate_post_eval_obstacle_seeds(sequence_seed, episodes)
+        if bool(spec.get("use_dynamic_obstacles", False))
+        else [0] * episodes
+    )
+    return {
+        "terrain_seed_sequence": [int(seed) for seed in terrain_seed_sequence],
+        "terrain_variant_seed_sequence": [int(seed) for seed in terrain_variant_seed_sequence],
+        "obstacle_seed_sequence": [int(seed) for seed in obstacle_seed_sequence],
+    }
+
+
 def _generate_post_eval_testset_tag(spec: Dict[str, Any]) -> str:
     terrain_kind = "semi_random" if bool(spec.get("semi_random_terrain", False)) else (
         "random" if bool(spec.get("random_terrain", False)) else "fixed"
@@ -2468,10 +2610,11 @@ def _validate_loaded_result(
         structured_training_setup = _normalize_training_environment_record(
             results_payload.get("training_environment")
         )
-    if require_explicit_training_environment:
-        if not isinstance(structured_training_setup, dict) or not structured_training_setup:
-            errors.append("results.json 缺少结构化 training_environment")
-        else:
+    explicit_training_setup_available = bool(
+        isinstance(structured_training_setup, dict) and structured_training_setup
+    )
+    if require_explicit_training_environment and explicit_training_setup_available:
+        if isinstance(structured_training_setup, dict):
             required_keys = (
                 "use_fixed_positions",
                 "use_dynamic_obstacles",
@@ -2523,7 +2666,11 @@ def _validate_loaded_result(
         manifest_training_setup,
         structured_training_setup,
     )
-    if require_explicit_training_environment and isinstance(structured_training_setup, dict):
+    if require_explicit_training_environment and not explicit_training_setup_available:
+        if not isinstance(actual_training_setup, dict) or not actual_training_setup:
+            errors.append("results.json 缺少结构化 training_environment，且无法从历史参数推断")
+
+    if require_explicit_training_environment and explicit_training_setup_available and isinstance(structured_training_setup, dict):
         if not isinstance(manifest_training_setup, dict) or not manifest_training_setup:
             errors.append("manifest 缺少结构化 training_environment")
         else:
@@ -2566,6 +2713,9 @@ def _validate_loaded_result(
     if expected["algo"] == "matd3":
         got_dual_q = _to_bool(run_args.get("matd3_use_dual_q", False))
         got_sep = _to_bool(run_args.get("matd3_use_separated_gradient", False))
+    elif expected["algo"] == "mappo":
+        got_dual_q = False
+        got_sep = _to_bool(run_args.get("mappo_use_separated_gradient", False))
     else:
         got_dual_q = _to_bool(run_args.get("maddpg_use_dual_q", False))
         got_sep = _to_bool(run_args.get("maddpg_use_separated_gradient", False))
@@ -2575,6 +2725,20 @@ def _validate_loaded_result(
         errors.append(
             f"Separated-Gradient 开关不匹配: got={got_sep}, expected={expected['separated_gradient']}"
         )
+    expected_use_pf_feature = expected.get("use_pf_feature", None)
+    if expected_use_pf_feature is not None:
+        got_use_pf_feature = _to_bool(run_args.get("use_pf_feature", False))
+        if got_use_pf_feature != bool(expected_use_pf_feature):
+            errors.append(
+                f"use_pf_feature 不匹配: got={got_use_pf_feature}, expected={bool(expected_use_pf_feature)}"
+            )
+    expected_use_tf_pf = expected.get("use_tf_potential_field", None)
+    if expected_use_tf_pf is not None:
+        got_use_tf_pf = _to_bool(run_args.get("use_tf_potential_field", False))
+        if got_use_tf_pf != bool(expected_use_tf_pf):
+            errors.append(
+                f"use_tf_potential_field 不匹配: got={got_use_tf_pf}, expected={bool(expected_use_tf_pf)}"
+            )
 
     try:
         got_seed = int(run_args.get("seed"))
@@ -2784,27 +2948,6 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
     spec_terrain_variant_noise_ratio = float(match_train_variant_noise_ratio)
     spec_use_dynamic_obstacles = bool(match_train_use_dynamic_obstacles)
     episodes = int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES))
-    if spec_semi_random_terrain:
-        terrain_seed_sequence = [int(spec_terrain_base_seed)] * episodes
-        terrain_variant_seed_sequence = _generate_post_eval_terrain_variant_seeds(
-            seed=post_eval_seed,
-            episodes=episodes,
-            hold_mode=match_train_hold_mode,
-            hold_episodes=match_train_hold_episodes,
-            hold_min_episodes=match_train_hold_min_episodes,
-            hold_max_episodes=match_train_hold_max_episodes,
-        )
-    elif spec_random_terrain:
-        terrain_seed_sequence = _generate_post_eval_terrain_seeds(post_eval_seed, episodes)
-        terrain_variant_seed_sequence = []
-    else:
-        terrain_seed_sequence = [int(spec_terrain_seed)] * episodes
-        terrain_variant_seed_sequence = []
-    obstacle_seed_sequence = (
-        _generate_post_eval_obstacle_seeds(post_eval_seed, episodes)
-        if spec_use_dynamic_obstacles
-        else [0] * episodes
-    )
     spec = {
         "version": 10,
         "enabled": True,
@@ -2843,9 +2986,6 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         "use_fixed_positions": True,
         "shared_positions_file": str(positions_file),
         "default_positions_file": str(positions_file),
-        "terrain_seed_sequence": [int(seed) for seed in terrain_seed_sequence],
-        "terrain_variant_seed_sequence": [int(seed) for seed in terrain_variant_seed_sequence],
-        "obstacle_seed_sequence": [int(seed) for seed in obstacle_seed_sequence],
         "semi_random_hold_mode": str(match_train_hold_mode),
         "semi_random_hold_episodes": int(match_train_hold_episodes),
         "semi_random_hold_min_episodes": int(match_train_hold_min_episodes),
@@ -2854,6 +2994,7 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         "artifact_policy": artifact_policy,
         "testset_prepared": bool(post_eval_testset_prepared),
     }
+    spec.update(_build_post_eval_sequence_fields(spec))
 
     testset_tag = _generate_post_eval_testset_tag(spec)
     episode_positions_dir = batch_dir / "results" / "post_eval_testset" / testset_tag / "episode_positions"
@@ -3434,6 +3575,7 @@ def _build_matched_validation_spec(
     spec = dict(base_post_eval_spec)
     spec["episodes"] = int(_resolve_post_eval_validation_episodes(args))
     spec["seed"] = int(_resolve_post_eval_validation_seed(args))
+    spec.update(_build_post_eval_sequence_fields(spec))
     spec["artifact_policy"] = _post_eval_validation_artifact_policy()
     spec["validation_role"] = "checkpoint_selection"
     spec["testset_prepared"] = False
@@ -3592,6 +3734,17 @@ def _execute_post_eval_run(
         env["NOISE_SCALE"] = "0.0"
         env["RANDOM_ACTION_PROB"] = "0.0"
         env["RANDOM_ACTION_PROB_TRAINING"] = "0.0"
+        env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = ""
+        force_eval_action_force_ratio = getattr(args, "force_eval_action_force_ratio", None)
+        if force_eval_action_force_ratio is not None:
+            env["FORCE_EVAL_ACTION_FORCE_RATIO"] = str(float(force_eval_action_force_ratio))
+            env["ACTION_FORCE_RATIO"] = str(float(force_eval_action_force_ratio))
+        elif getattr(args, "action_force_ratio", None) is not None:
+            env["ACTION_FORCE_RATIO"] = str(float(args.action_force_ratio))
+            env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
+        else:
+            env.pop("ACTION_FORCE_RATIO", None)
+            env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
         env["USE_SCENARIO_SEED"] = "1"
         env["SCENARIO_SEED"] = str(spec.get("terrain_seed", spec["scenario_seed"]))
         env["TERRAIN_COMPLEXITY_LEVEL"] = str(spec["terrain_complexity"])
@@ -3902,11 +4055,26 @@ def _run_post_training_evaluation(
 
     label = cfg["label"]
     force_rerun = bool(getattr(args, "force_post_eval_rerun", False))
-    inherited_runtime_env = _load_post_eval_runtime_env(result)
+    allow_without_train_success = bool(getattr(args, "allow_post_eval_without_train_success", False))
+    runtime_source_result = result
+    if not str(result.get("manifest_path", "")).strip():
+        fallback_manifest_path = batch_dir / "manifests" / f"{label}_resolved_manifest.json"
+        if fallback_manifest_path.exists():
+            runtime_source_result = dict(result)
+            runtime_source_result["manifest_path"] = str(fallback_manifest_path)
+    inherited_runtime_env = _load_post_eval_runtime_env(runtime_source_result)
     training_feasible, feasibility_detail = _training_team_success_feasibility(result)
-    result["post_eval_eligible"] = bool(training_feasible)
-    result["post_eval_eligibility_detail"] = dict(feasibility_detail)
-    if not training_feasible:
+    eligibility_detail = dict(feasibility_detail)
+    if allow_without_train_success and not training_feasible:
+        eligibility_detail["forced_without_train_success"] = True
+        eligibility_detail["forced_by_flag"] = "--allow-post-eval-without-train-success"
+        print(
+            f"[后评估-{label}] 训练期无团队成功，按显式开关继续执行 post-eval "
+            f"| detail={feasibility_detail}"
+        )
+    result["post_eval_eligible"] = bool(training_feasible or allow_without_train_success)
+    result["post_eval_eligibility_detail"] = eligibility_detail
+    if not training_feasible and not allow_without_train_success:
         model_variant = str(post_eval_spec["model_variant"])
         eval_dir = batch_dir / "results" / "post_eval" / label / model_variant
         eval_spec_path = eval_dir / "post_eval_spec.json"
@@ -4124,6 +4292,22 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
             "confounded": False,
             "description": "跨家族参考：MATD3 主线 vs MADDPG baseline",
         },
+        {
+            "name": "mappo_fusion_vs_standard_reference",
+            "lhs": "mappo_baseline",
+            "rhs": "mappo_fusion_only",
+            "required": False,
+            "confounded": False,
+            "description": "MAPPO 家族内部对照：在相同外部 APF correction 下，引入 APF-enhanced fusion 相对标准 MAPPO baseline 的增益",
+        },
+        {
+            "name": "mappo_separated_vs_fusion_reference",
+            "lhs": "mappo_fusion_only",
+            "rhs": "mappo_separated_gradient",
+            "required": False,
+            "confounded": False,
+            "description": "MAPPO 家族内部对照：在相同 APF-enhanced fusion 下，separated PPO actor objective 相对 fusion-only MAPPO 的增益",
+        },
     ]
 
     evaluated = []
@@ -4195,12 +4379,14 @@ def plot_comparison_rewards_dualq(series, title, output_path, smooth_window=10, 
         episodes = range(1, len(rewards) + 1)
         rewards_array = np.array(rewards)
         
-        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
+        style = get_algorithm_ablation_style(item.get("label"), idx=idx)
+        color = style["color"]
+        linestyle = style.get("linestyle", "-")
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         
         # 原始曲线
         ax.plot(episodes, rewards, label=f"{name_en} (Raw)", 
-                color=color, alpha=0.3, linewidth=1, linestyle='-')
+                color=color, alpha=0.22, linewidth=1, linestyle=linestyle)
         
         # 拟合曲线
         smoothed = smooth_curve(rewards_array, method=fit_method, window=smooth_window)
@@ -4208,10 +4394,10 @@ def plot_comparison_rewards_dualq(series, title, output_path, smooth_window=10, 
             offset = (len(rewards) - len(smoothed)) // 2
             smooth_episodes = range(1 + offset, 1 + offset + len(smoothed))
             ax.plot(smooth_episodes, smoothed, label=f"{name_en} (Fitted)", 
-                    color=color, alpha=0.9, linewidth=2.5, linestyle='-')
+                    color=color, alpha=0.95, linewidth=2.5, linestyle=linestyle)
         else:
             ax.plot(episodes, smoothed, label=f"{name_en} (Fitted)", 
-                    color=color, alpha=0.9, linewidth=2.5, linestyle='-')
+                    color=color, alpha=0.95, linewidth=2.5, linestyle=linestyle)
     
     if has_data:
         ax.set_title(f"{title}\n(Fit Method: {fit_method}, Window: {smooth_window})", 
@@ -4250,18 +4436,20 @@ def plot_comparison_losses_dualq(series, title, output_path):
         critic_steps, critic_values = _extract_loss_curve(history, "critic_loss")
         actor_steps, actor_values = _extract_loss_curve(history, "actor_loss")
 
-        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
+        style = get_algorithm_ablation_style(item.get("label"), idx=idx)
+        color = style["color"]
+        linestyle = style.get("linestyle", "-")
         name_en = item.get('name_en') or item.get('label', 'Unknown')
 
         if critic_values.size:
             has_data = True
             axes[0].plot(critic_steps, critic_values, label=f"{name_en} (Critic)",
-                        color=color, linewidth=2.5, alpha=0.9)
+                        color=color, linewidth=2.5, alpha=0.92, linestyle=linestyle)
 
         if actor_values.size:
             has_data = True
             axes[1].plot(actor_steps, actor_values, label=f"{name_en} (Actor)",
-                        color=color, linewidth=2.5, alpha=0.9)
+                        color=color, linewidth=2.5, alpha=0.92, linestyle=linestyle)
     
     if has_data:
         axes[0].set_title("Critic Loss", fontsize=14, fontweight='bold')
@@ -4333,12 +4521,16 @@ def _build_plot_label_entries(series: List[Dict[str, Any]]) -> List[Dict[str, An
     entries: List[Dict[str, Any]] = []
     for idx, item in enumerate(series):
         label = str(item.get("label", f"exp_{idx + 1}"))
+        style = get_algorithm_ablation_style(label, idx=idx)
         entries.append(
             {
                 "label": label,
                 "abbr": _get_experiment_abbreviation(label, fallback_idx=idx),
                 "full_name": str(item.get("name_en", item.get("name", label))),
-                "color": get_algorithm_ablation_color(label, idx=idx),
+                "color": style["color"],
+                "linestyle": style.get("linestyle", "-"),
+                "marker": style.get("marker", "o"),
+                "hatch": style.get("hatch", ""),
             }
         )
     return entries
@@ -4355,6 +4547,20 @@ def _format_plot_label_mapping(entries: List[Dict[str, Any]], entries_per_line: 
     return "\n".join(lines)
 
 
+def _write_plot_label_mapping_text(
+    entries: List[Dict[str, Any]],
+    output_path: Path,
+    *,
+    title: str = "Algorithm Abbreviation Key",
+) -> None:
+    if not entries:
+        return
+    lines = [title, "=" * len(title), ""]
+    for entry in entries:
+        lines.append(f"{entry['abbr']}: {entry['full_name']}")
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _add_plot_label_legend(
     fig,
     entries: List[Dict[str, Any]],
@@ -4365,7 +4571,21 @@ def _add_plot_label_legend(
 ) -> None:
     if not entries:
         return
-    handles = [Patch(facecolor=entry["color"], edgecolor="none", label=entry["abbr"]) for entry in entries]
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=entry["color"],
+            linestyle=entry.get("linestyle", "-"),
+            linewidth=2.8,
+            marker=entry.get("marker", "o"),
+            markersize=7,
+            markerfacecolor=entry["color"],
+            markeredgecolor=entry["color"],
+            label=entry["abbr"],
+        )
+        for entry in entries
+    ]
     legend = fig.legend(
         handles=handles,
         loc=loc,
@@ -4385,6 +4605,32 @@ def _add_plot_label_legend(
         title_text.set_fontfamily("DejaVu Sans")
 
 
+def _style_bars_with_algorithm_entries(bars, entries: List[Dict[str, Any]]) -> None:
+    for bar, entry in zip(bars, entries):
+        hatch = str(entry.get("hatch", "") or "")
+        if hatch:
+            bar.set_hatch(hatch)
+        bar.set_edgecolor("#333333")
+        bar.set_linewidth(0.7)
+
+
+def _find_latest_existing_plot_name(output_dir: Path, prefix: str, suffix: str = ".png") -> Optional[str]:
+    candidates = sorted(output_dir.glob(f"{prefix}_*{suffix}"))
+    if not candidates:
+        return None
+    return candidates[-1].name
+
+
+def _post_eval_only_refresh_requested(args) -> bool:
+    return bool(
+        getattr(args, "reuse_only", False)
+        and (
+            getattr(args, "force_post_eval_rerun", False)
+            or getattr(args, "force_post_eval_testset_regen", False)
+        )
+    )
+
+
 def _annotate_bar_value(
     ax,
     x_center: float,
@@ -4402,7 +4648,591 @@ def _annotate_bar_value(
     else:
         y = value - offset
         va = "top"
-    ax.text(x_center, y, text, ha="center", va=va, fontsize=9)
+    lower_guard = ymin + span * 0.03
+    upper_guard = ymax - span * 0.03
+    if y < lower_guard:
+        y = lower_guard
+        va = "bottom"
+    elif y > upper_guard:
+        y = upper_guard
+        va = "top"
+    ax.text(x_center, y, text, ha="center", va=va, fontsize=8, clip_on=True)
+
+
+def _format_plot_metric_value(value: Optional[float], is_percent: bool = False) -> str:
+    if value is None:
+        return "N/A"
+    if is_percent:
+        return f"{value * 100:.1f}%"
+    abs_value = abs(float(value))
+    if abs_value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if abs_value >= 10_000:
+        return f"{value / 1_000:.1f}k"
+    if abs_value >= 1_000:
+        return f"{value:,.0f}"
+    return f"{value:.2f}"
+
+
+def _resolve_bar_axis_ylim(valid_values: Sequence[float], *, is_percent: bool = False) -> Optional[Tuple[float, float]]:
+    values = np.asarray([float(v) for v in valid_values if v is not None and np.isfinite(v)], dtype=np.float64)
+    if values.size == 0:
+        return None
+    if is_percent:
+        return (0.0, max(1.0, float(np.max(values)) * 1.2))
+
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+    span = max(vmax - vmin, max(abs(vmin), abs(vmax), 1.0))
+    pad = span * 0.12
+
+    if vmin >= 0.0:
+        return (0.0, vmax + pad)
+    if vmax <= 0.0:
+        return (vmin - pad, pad)
+    return (vmin - pad, vmax + pad)
+
+
+def _apply_bar_xticklabels(ax, x: np.ndarray, labels: Sequence[str], *, show_labels: bool) -> None:
+    ax.set_xticks(x)
+    if show_labels:
+        ax.set_xticklabels(labels, rotation=28, ha='right')
+        ax.tick_params(axis='x', labelsize=9, pad=1)
+    else:
+        ax.set_xticklabels([])
+        ax.tick_params(axis='x', length=0)
+
+
+def _hex_to_rgb01(color: str) -> Tuple[float, float, float]:
+    color = str(color or "").strip()
+    if color.startswith("#") and len(color) == 7:
+        return (
+            int(color[1:3], 16) / 255.0,
+            int(color[3:5], 16) / 255.0,
+            int(color[5:7], 16) / 255.0,
+        )
+    return (0.25, 0.25, 0.25)
+
+
+def _pad_curve_matrix(curves: Sequence[np.ndarray]) -> np.ndarray:
+    if not curves:
+        return np.zeros((0, 0), dtype=np.float64)
+    max_len = max(int(curve.size) for curve in curves)
+    matrix = np.full((len(curves), max_len), np.nan, dtype=np.float64)
+    for idx, curve in enumerate(curves):
+        arr = np.asarray(curve, dtype=np.float64).reshape(-1)
+        if arr.size:
+            matrix[idx, : arr.size] = arr
+    return matrix
+
+
+def _matlab_quote(value: str) -> str:
+    return str(value or "").replace("'", "''")
+
+
+def _matlab_linestyle(style: Any) -> str:
+    if isinstance(style, str):
+        normalized = style.strip()
+        if normalized in {"-", "--", ":", "-."}:
+            return normalized
+        return "-"
+    if isinstance(style, (tuple, list)) and len(style) >= 2 and isinstance(style[1], (tuple, list)):
+        pattern = tuple(style[1])
+        if len(pattern) >= 4:
+            return "-."
+        if len(pattern) >= 2:
+            return "--"
+    return "-"
+
+
+def _matlab_marker(marker: Any) -> str:
+    mapping = {
+        "o": "o",
+        "s": "s",
+        "D": "d",
+        "d": "d",
+        "^": "^",
+        "v": "v",
+        "<": "<",
+        ">": ">",
+        "P": "p",
+        "p": "p",
+    }
+    return mapping.get(str(marker or "").strip(), "o")
+
+
+def _write_matlab_multi_seed_training_script(script_path: Path, data_mat_name: str) -> None:
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "% Auto-generated by ablation_dual_q_separated_gradient.py",
+        "% Recreates the multi-seed training overview as editable MATLAB figures.",
+        "",
+        "baseDir = fileparts(mfilename('fullpath'));",
+        f"dataPath = fullfile(baseDir, '{_matlab_quote(data_mat_name)}');",
+        "S = load(dataPath);",
+        "",
+        "abbrs = cellstr(S.experiment_abbrs);",
+        "colors = S.experiment_colors_rgb;",
+        "lineStyles = cellstr(S.experiment_matlab_linestyles);",
+        "metricKeys = {'reward', 'success', 'collision', 'clearance'};",
+        "metricTitles = {'Reward', 'Team Success Rate', 'Collision Count', 'Average Clearance (m)'};",
+        "yLabels = {'Reward', 'Success Rate', 'Collisions', 'Clearance (m)'};",
+        "xLabels = {'Episode', 'Episode', 'Episode', 'Episode'};",
+        "",
+        "fig = figure('Color', 'w', 'Position', [80, 80, 1520, 980]);",
+        "tiledlayout(2, 2, 'Padding', 'compact', 'TileSpacing', 'compact');",
+        "legendHandles = gobjects(numel(abbrs), 1);",
+        "",
+        "for metricIdx = 1:numel(metricKeys)",
+        "    ax = nexttile;",
+        "    hold(ax, 'on');",
+        "    box(ax, 'on');",
+        "    xMat = S.([metricKeys{metricIdx} '_x']);",
+        "    meanMat = S.([metricKeys{metricIdx} '_mean']);",
+        "    stdMat = S.([metricKeys{metricIdx} '_std']);",
+        "    for expIdx = 1:numel(abbrs)",
+        "        x = reshape(xMat(expIdx, :), 1, []);",
+        "        y = reshape(meanMat(expIdx, :), 1, []);",
+        "        e = reshape(stdMat(expIdx, :), 1, []);",
+        "        valid = isfinite(x) & isfinite(y);",
+        "        if ~any(valid)",
+        "            continue;",
+        "        end",
+        "        x = x(valid);",
+        "        y = y(valid);",
+        "        e = e(valid);",
+        "        lower = y - e;",
+        "        upper = y + e;",
+        "        patch(ax, [x, fliplr(x)], [lower, fliplr(upper)], colors(expIdx, :), ...",
+        "            'FaceAlpha', 0.10, 'EdgeColor', 'none', 'HandleVisibility', 'off');",
+        "        h = plot(ax, x, y, 'Color', colors(expIdx, :), 'LineWidth', 1.8, ...",
+        "            'LineStyle', lineStyles{expIdx}, 'DisplayName', abbrs{expIdx});",
+        "        if metricIdx == 1",
+        "            legendHandles(expIdx) = h;",
+        "        end",
+        "    end",
+        "    title(ax, metricTitles{metricIdx}, 'FontWeight', 'bold');",
+        "    xlabel(ax, xLabels{metricIdx});",
+        "    ylabel(ax, yLabels{metricIdx});",
+        "    grid(ax, 'on');",
+        "    ax.GridAlpha = 0.25;",
+        "end",
+        "",
+        "validLegend = isgraphics(legendHandles);",
+        "legend(legendHandles(validLegend), abbrs(validLegend), 'Location', 'eastoutside');",
+        "",
+        "% Optional: save editable MATLAB figure",
+        "% savefig(fig, fullfile(baseDir, 'multi_seed_training_curves_editable.fig'));",
+        "% exportgraphics(fig, fullfile(baseDir, 'multi_seed_training_curves_editable.png'), 'Resolution', 200);",
+        "",
+    ]
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+
+def _export_multi_seed_post_eval_data(
+    aggregates: Dict[str, Dict[str, Any]],
+    output_mat_path: Path,
+    output_csv_path: Path,
+    output_json_path: Path,
+) -> None:
+    labels = [
+        label
+        for label in EXPERIMENT_DISPLAY_ORDER
+        if label in aggregates and isinstance(aggregates[label].get("post_eval_metric_stats"), dict)
+    ]
+    if not labels:
+        return
+
+    label_entries = _build_plot_label_entries(
+        [
+            {
+                "label": label,
+                "name_en": aggregates[label].get("name_en", label),
+                "name": aggregates[label].get("name", label),
+            }
+            for label in labels
+        ]
+    )
+    style_by_label = {entry["label"]: entry for entry in label_entries}
+
+    metric_keys = [metric_key for metric_key, _, _, _ in POST_EVAL_SUMMARY_SPECS]
+    metric_titles = [metric_title for _, metric_title, _, _ in POST_EVAL_SUMMARY_SPECS]
+    metric_is_percent = [bool(is_percent) for _, _, is_percent, _ in POST_EVAL_SUMMARY_SPECS]
+    metric_lower_better = [bool(lower_better) for _, _, _, lower_better in POST_EVAL_SUMMARY_SPECS]
+
+    metric_mean = np.full((len(labels), len(metric_keys)), np.nan, dtype=np.float64)
+    metric_std = np.full((len(labels), len(metric_keys)), np.nan, dtype=np.float64)
+    metric_count = np.full((len(labels), len(metric_keys)), np.nan, dtype=np.float64)
+
+    export_json = {
+        "labels": labels,
+        "abbrs": [style_by_label[label]["abbr"] for label in labels],
+        "names": [aggregates[label].get("name_en", aggregates[label].get("name", label)) for label in labels],
+        "styles": [
+            {
+                "label": label,
+                "abbr": style_by_label[label]["abbr"],
+                "color": style_by_label[label]["color"],
+                "linestyle": _matlab_linestyle(style_by_label[label].get("linestyle", "-")),
+                "marker": _matlab_marker(style_by_label[label].get("marker", "o")),
+            }
+            for label in labels
+        ],
+        "metrics": [],
+    }
+    csv_rows: List[Dict[str, Any]] = []
+
+    for metric_idx, (metric_key, metric_title, is_percent, lower_better) in enumerate(POST_EVAL_SUMMARY_SPECS):
+        metric_export = {
+            "key": metric_key,
+            "title": metric_title,
+            "is_percent": bool(is_percent),
+            "lower_better": bool(lower_better),
+            "values": [],
+        }
+        for label_idx, label in enumerate(labels):
+            stats = aggregates[label].get("post_eval_metric_stats", {}).get(metric_key, {})
+            mean_value = _safe_float(stats.get("mean"))
+            std_value = _safe_float(stats.get("std"))
+            count_value = _safe_float(stats.get("count"))
+            if mean_value is not None:
+                metric_mean[label_idx, metric_idx] = mean_value
+            if std_value is not None:
+                metric_std[label_idx, metric_idx] = std_value
+            if count_value is not None:
+                metric_count[label_idx, metric_idx] = count_value
+            metric_export["values"].append(
+                {
+                    "label": label,
+                    "abbr": style_by_label[label]["abbr"],
+                    "mean": mean_value,
+                    "std": std_value,
+                    "count": count_value,
+                }
+            )
+            csv_rows.append(
+                {
+                    "label": label,
+                    "abbr": style_by_label[label]["abbr"],
+                    "name": aggregates[label].get("name_en", aggregates[label].get("name", label)),
+                    "metric": metric_key,
+                    "metric_title": metric_title,
+                    "mean": mean_value,
+                    "std": std_value,
+                    "count": count_value,
+                    "is_percent": bool(is_percent),
+                    "lower_better": bool(lower_better),
+                }
+            )
+        export_json["metrics"].append(metric_export)
+
+    _save_json(output_json_path, export_json)
+
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    import csv
+
+    with open(output_csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["label", "abbr", "name", "metric", "metric_title", "mean", "std", "count", "is_percent", "lower_better"],
+        )
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    if savemat is not None:
+        output_mat_path.parent.mkdir(parents=True, exist_ok=True)
+        savemat(
+            str(output_mat_path),
+            {
+                "experiment_labels": np.asarray(labels, dtype=object),
+                "experiment_abbrs": np.asarray([style_by_label[label]["abbr"] for label in labels], dtype=object),
+                "experiment_names": np.asarray(
+                    [aggregates[label].get("name_en", aggregates[label].get("name", label)) for label in labels],
+                    dtype=object,
+                ),
+                "experiment_colors_rgb": np.asarray(
+                    [_hex_to_rgb01(style_by_label[label]["color"]) for label in labels],
+                    dtype=np.float64,
+                ),
+                "experiment_matlab_linestyles": np.asarray(
+                    [_matlab_linestyle(style_by_label[label].get("linestyle", "-")) for label in labels],
+                    dtype=object,
+                ),
+                "experiment_matlab_markers": np.asarray(
+                    [_matlab_marker(style_by_label[label].get("marker", "o")) for label in labels],
+                    dtype=object,
+                ),
+                "metric_keys": np.asarray(metric_keys, dtype=object),
+                "metric_titles": np.asarray(metric_titles, dtype=object),
+                "metric_is_percent": np.asarray(metric_is_percent, dtype=np.uint8),
+                "metric_lower_better": np.asarray(metric_lower_better, dtype=np.uint8),
+                "metric_mean": metric_mean,
+                "metric_std": metric_std,
+                "metric_count": metric_count,
+            },
+            do_compression=True,
+        )
+
+
+def _write_matlab_multi_seed_post_eval_script(script_path: Path, data_mat_name: str) -> None:
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "% Auto-generated by ablation_dual_q_separated_gradient.py",
+        "% Recreates the multi-seed post-eval dashboard as editable MATLAB figures.",
+        "",
+        "baseDir = fileparts(mfilename('fullpath'));",
+        f"dataPath = fullfile(baseDir, '{_matlab_quote(data_mat_name)}');",
+        "S = load(dataPath);",
+        "",
+        "abbrs = cellstr(S.experiment_abbrs);",
+        "colors = S.experiment_colors_rgb;",
+        "metricTitles = cellstr(S.metric_titles);",
+        "metricIsPercent = logical(S.metric_is_percent(:));",
+        "metricMean = S.metric_mean;",
+        "metricStd = S.metric_std;",
+        "",
+        "fig = figure('Color', 'w', 'Position', [80, 80, 1600, 980]);",
+        "tiledlayout(2, 3, 'Padding', 'compact', 'TileSpacing', 'compact');",
+        "",
+        "for metricIdx = 1:numel(metricTitles)",
+        "    ax = nexttile;",
+        "    hold(ax, 'on');",
+        "    box(ax, 'on');",
+        "    values = metricMean(:, metricIdx);",
+        "    errors = metricStd(:, metricIdx);",
+        "    valid = isfinite(values);",
+        "    xAll = 1:numel(abbrs);",
+        "    if any(valid)",
+        "        bar(ax, xAll(valid), values(valid), 0.72, 'FaceColor', 'flat', 'CData', colors(valid, :), ...",
+        "            'EdgeColor', [0.25, 0.25, 0.25], 'LineWidth', 0.8);",
+        "        errorbar(ax, xAll(valid), values(valid), errors(valid), 'k.', 'LineWidth', 1.0, 'CapSize', 8);",
+        "    end",
+        "    title(ax, metricTitles{metricIdx}, 'FontWeight', 'bold');",
+        "    showLabels = metricIdx > 3;",
+        "    set(ax, 'XTick', xAll);",
+        "    if showLabels",
+        "        set(ax, 'XTickLabel', abbrs, 'XTickLabelRotation', 28);",
+        "    else",
+        "        set(ax, 'XTickLabel', repmat({''}, size(abbrs)));",
+        "    end",
+        "    grid(ax, 'on');",
+        "    ax.GridAlpha = 0.25;",
+        "    ylimAuto = ylim(ax);",
+        "    pad = max(1e-6, 0.08 * max(abs(ylimAuto)));",
+        "    ylim(ax, [ylimAuto(1), ylimAuto(2) + pad]);",
+        "    for expIdx = 1:numel(abbrs)",
+        "        if ~valid(expIdx)",
+        "            yNa = ylim(ax);",
+        "            text(ax, xAll(expIdx), yNa(2), 'N/A', 'HorizontalAlignment', 'center', ...",
+        "                'VerticalAlignment', 'top', 'FontSize', 10, 'Color', [0.45, 0.45, 0.45]);",
+        "            continue;",
+        "        end",
+        "        txt = localFormatValue(values(expIdx), metricIsPercent(metricIdx));",
+        "        y = values(expIdx);",
+        "        yOffset = 0.02 * range(ylim(ax));",
+        "        if ~isfinite(yOffset) || yOffset == 0",
+        "            yOffset = 0.02;",
+        "        end",
+        "        if y >= 0",
+        "            text(ax, xAll(expIdx), y + yOffset, txt, 'HorizontalAlignment', 'center', 'FontSize', 10);",
+        "        else",
+        "            text(ax, xAll(expIdx), y - yOffset, txt, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'top', 'FontSize', 10);",
+        "        end",
+        "    end",
+        "    if metricIdx == numel(metricTitles)",
+        "        xlabel(ax, 'Algorithm');",
+        "    end",
+        "end",
+        "",
+        "% Optional: save editable MATLAB figure",
+        "% savefig(fig, fullfile(baseDir, 'multi_seed_post_eval_editable.fig'));",
+        "% exportgraphics(fig, fullfile(baseDir, 'multi_seed_post_eval_editable.png'), 'Resolution', 200);",
+        "",
+        "function txt = localFormatValue(value, isPercent)",
+        "if ~isfinite(value)",
+        "    txt = 'N/A';",
+        "elseif isPercent",
+        "    txt = sprintf('%.1f%%', 100 * value);",
+        "elseif abs(value) >= 1000",
+        "    txt = sprintf('%.1fk', value / 1000);",
+        "else",
+        "    txt = sprintf('%.2f', value);",
+        "end",
+        "end",
+        "",
+    ]
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+
+def _export_multi_seed_reward_curve_mat(
+    aggregates: Dict[str, Dict[str, Any]],
+    output_mat_path: Path,
+    *,
+    smooth_window: int,
+    fit_method: str,
+) -> None:
+    labels = [label for label in EXPERIMENT_DISPLAY_ORDER if label in aggregates]
+    if not labels or savemat is None:
+        return
+
+    label_entries = _build_plot_label_entries(
+        [
+            {
+                "label": label,
+                "name_en": aggregates[label].get("name_en", label),
+                "name": aggregates[label].get("name", label),
+            }
+            for label in labels
+        ]
+    )
+    style_by_label = {entry["label"]: entry for entry in label_entries}
+
+    mat_payload: Dict[str, Any] = {
+        "experiment_labels": np.asarray(labels, dtype=object),
+        "experiment_abbrs": np.asarray([style_by_label[label]["abbr"] for label in labels], dtype=object),
+        "experiment_names": np.asarray(
+            [aggregates[label].get("name_en", aggregates[label].get("name", label)) for label in labels],
+            dtype=object,
+        ),
+        "experiment_colors_rgb": np.asarray(
+            [_hex_to_rgb01(style_by_label[label]["color"]) for label in labels],
+            dtype=np.float64,
+        ),
+        "experiment_linestyles": np.asarray(
+            [str(style_by_label[label].get("linestyle", "-")) for label in labels],
+            dtype=object,
+        ),
+        "experiment_matlab_linestyles": np.asarray(
+            [_matlab_linestyle(style_by_label[label].get("linestyle", "-")) for label in labels],
+            dtype=object,
+        ),
+        "experiment_matlab_markers": np.asarray(
+            [_matlab_marker(style_by_label[label].get("marker", "o")) for label in labels],
+            dtype=object,
+        ),
+        "smooth_window": int(smooth_window),
+        "fit_method": str(fit_method),
+        "seed_counts": np.asarray([int(aggregates[label].get("seed_count", 0)) for label in labels], dtype=np.int32),
+    }
+    reward_mean_curves: List[np.ndarray] = []
+    reward_std_curves: List[np.ndarray] = []
+    reward_x_curves: List[np.ndarray] = []
+    reward_tail100_means: List[float] = []
+
+    for label in labels:
+        stats = aggregates[label].get("curve_stats", {})
+        mean_curve = np.asarray(stats.get("reward_mean", []), dtype=np.float64).reshape(-1)
+        std_curve = np.asarray(stats.get("reward_std", []), dtype=np.float64).reshape(-1)
+        x_curve = np.arange(1, mean_curve.size + 1, dtype=np.float64)
+        if mean_curve.size:
+            mean_curve = _smooth_curve(mean_curve, method=fit_method, window=smooth_window)
+            std_curve = _smooth_curve(std_curve, method=fit_method, window=smooth_window)
+        reward_mean_curves.append(mean_curve)
+        reward_std_curves.append(std_curve)
+        reward_x_curves.append(x_curve)
+        tail_mean = aggregates[label].get("tail100_reward_mean")
+        reward_tail100_means.append(float(tail_mean) if tail_mean is not None else np.nan)
+
+    mat_payload["reward_mean"] = _pad_curve_matrix(reward_mean_curves)
+    mat_payload["reward_std"] = _pad_curve_matrix(reward_std_curves)
+    mat_payload["reward_x"] = _pad_curve_matrix(reward_x_curves)
+    mat_payload["reward_tail100_mean"] = np.asarray(reward_tail100_means, dtype=np.float64)
+
+    output_mat_path.parent.mkdir(parents=True, exist_ok=True)
+    savemat(str(output_mat_path), mat_payload, do_compression=True)
+
+
+def _resolve_reward_detail_window(reward_curves: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    usable = []
+    for item in reward_curves:
+        curve = np.asarray(item.get("curve", []), dtype=np.float64)
+        if curve.size < 8 or not np.any(np.isfinite(curve)):
+            continue
+        usable.append({**item, "curve": curve})
+    if len(usable) < 2:
+        return None
+
+    min_len = min(int(item["curve"].size) for item in usable)
+    if min_len < 8:
+        return None
+
+    x_start_idx = min(max(int(min_len * 0.30), 0), max(0, min_len - 2))
+    tail_start_idx = min(max(int(min_len * 0.80), 0), max(0, min_len - 1))
+    tail_scores = []
+    for item in usable:
+        tail_segment = item["curve"][tail_start_idx:min_len]
+        tail_segment = tail_segment[np.isfinite(tail_segment)]
+        if tail_segment.size == 0:
+            tail_scores.append(float("-inf"))
+        else:
+            tail_scores.append(float(np.mean(tail_segment)))
+    tail_scores_arr = np.asarray(tail_scores, dtype=np.float64)
+    if tail_scores_arr.size == 0 or not np.any(np.isfinite(tail_scores_arr)):
+        return None
+
+    focused = [
+        item
+        for _, item in sorted(
+            zip(tail_scores, usable),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )[: min(5, len(usable))]
+    ]
+
+    segment = np.concatenate([item["curve"][x_start_idx:min_len] for item in focused if item["curve"][x_start_idx:min_len].size])
+    segment = segment[np.isfinite(segment)]
+    if segment.size == 0:
+        return None
+
+    y_low = float(np.quantile(segment, 0.02))
+    y_high = float(np.quantile(segment, 0.98))
+    if not np.isfinite(y_low) or not np.isfinite(y_high):
+        return None
+    if y_high <= y_low:
+        y_low = float(np.min(segment))
+        y_high = float(np.max(segment))
+    span = max(y_high - y_low, 1.0)
+    pad = span * 0.12
+
+    return {
+        "xlim": (x_start_idx + 1, min_len),
+        "ylim": (y_low - pad, y_high + pad),
+    }
+
+
+def _add_reward_detail_inset(ax, reward_curves: List[Dict[str, Any]]) -> None:
+    zoom = _resolve_reward_detail_window(reward_curves)
+    if not zoom:
+        return
+
+    inset_ax = ax.inset_axes([0.05, 0.58, 0.42, 0.34])
+    for item in reward_curves:
+        curve = np.asarray(item.get("curve", []), dtype=np.float64)
+        if curve.size == 0:
+            continue
+        xs = np.arange(1, curve.size + 1)
+        inset_ax.plot(
+            xs,
+            curve,
+            color=item["color"],
+            linewidth=2.0,
+            alpha=0.95,
+            linestyle=item.get("linestyle", "-"),
+        )
+
+    inset_ax.set_xlim(*zoom["xlim"])
+    inset_ax.set_ylim(*zoom["ylim"])
+    inset_ax.grid(True, alpha=0.22, linestyle="--")
+    inset_ax.tick_params(axis="both", labelsize=8, pad=1)
+    inset_ax.set_title("Reward Detail", fontsize=9, pad=2.5, fontweight="bold")
+    try:
+        ax.indicate_inset_zoom(inset_ax, edgecolor="#666666", alpha=0.8)
+    except Exception:
+        pass
 
 
 def _plot_post_eval_summary_dashboard(series: List[Dict[str, Any]], title: str, output_path: Path) -> None:
@@ -4418,7 +5248,10 @@ def _plot_post_eval_summary_dashboard(series: List[Dict[str, Any]], title: str, 
     labels = [entry["abbr"] for entry in label_entries]
     colors = [entry["color"] for entry in label_entries]
 
-    for ax, (metric_key, metric_title, is_percent, lower_better) in zip(axes, POST_EVAL_SUMMARY_SPECS):
+    total_axes = len(POST_EVAL_SUMMARY_SPECS)
+    n_cols = 3
+    n_rows = int(np.ceil(total_axes / float(n_cols)))
+    for plot_idx, (ax, (metric_key, metric_title, is_percent, lower_better)) in enumerate(zip(axes, POST_EVAL_SUMMARY_SPECS)):
         values = [_post_eval_summary_value(item.get("summary", {}), metric_key) for item in series]
         valid_values = [value for value in values if value is not None]
         if not valid_values:
@@ -4427,19 +5260,16 @@ def _plot_post_eval_summary_dashboard(series: List[Dict[str, Any]], title: str, 
         x = np.arange(len(series))
         bar_values = [value if value is not None else 0.0 for value in values]
         bars = ax.bar(x, bar_values, color=colors, alpha=0.9)
+        _style_bars_with_algorithm_entries(bars, label_entries)
         ax.set_title(metric_title, fontsize=12, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=0, ha='center')
+        show_xticklabels = plot_idx >= (n_rows - 1) * n_cols
+        _apply_bar_xticklabels(ax, x, labels, show_labels=show_xticklabels)
         ax.grid(True, axis='y', alpha=0.25, linestyle='--')
-        ax.tick_params(axis='x', labelsize=10)
         if is_percent:
             ax.set_ylabel("Rate")
-            ax.set_ylim(bottom=0.0, top=max(1.0, max(valid_values) * 1.15))
-        else:
-            ymin = min(0.0, min(valid_values) * (0.9 if not lower_better else 1.1))
-            ymax = max(valid_values) * 1.15 if max(valid_values) > 0 else 1.0
-            if np.isfinite(ymin) and np.isfinite(ymax) and ymin < ymax:
-                ax.set_ylim(ymin, ymax)
+        ylim = _resolve_bar_axis_ylim(valid_values, is_percent=is_percent)
+        if ylim is not None and np.isfinite(ylim[0]) and np.isfinite(ylim[1]) and ylim[0] < ylim[1]:
+            ax.set_ylim(*ylim)
         for idx, bar in enumerate(bars):
             value = values[idx]
             if value is None:
@@ -4448,26 +5278,14 @@ def _plot_post_eval_summary_dashboard(series: List[Dict[str, Any]], title: str, 
                 ax,
                 bar.get_x() + bar.get_width() / 2.0,
                 float(value),
-                _format_post_eval_value(value, is_percent=is_percent),
+                _format_plot_metric_value(value, is_percent=is_percent),
                 is_percent=is_percent,
             )
 
-    mapping_text = _format_plot_label_mapping(label_entries, entries_per_line=2)
     _add_plot_label_legend(fig, label_entries, loc="upper right", bbox_to_anchor=(0.985, 0.975))
-    if mapping_text:
-        fig.text(
-            0.5,
-            0.03,
-            mapping_text,
-            ha="center",
-            va="bottom",
-            fontsize=9,
-            linespacing=1.25,
-            fontfamily="DejaVu Sans",
-        )
 
     fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
-    fig.tight_layout(rect=[0.03, 0.10, 0.97, 0.92])
+    fig.tight_layout(rect=[0.03, 0.06, 0.97, 0.92])
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
@@ -4484,7 +5302,8 @@ def _plot_post_eval_arrival_path_comparison(series: List[Dict[str, Any]], title:
 
     for idx, item in enumerate(series):
         metrics = item["metrics"]
-        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
+        style = get_algorithm_ablation_style(item.get("label"), idx=idx)
+        color = style["color"]
         name_en = item.get("name_en", item["label"])
 
         first_reach_steps = metrics.get("first_reach_steps") or metrics.get("arrival_steps", [])
@@ -4497,13 +5316,37 @@ def _plot_post_eval_arrival_path_comparison(series: List[Dict[str, Any]], title:
 
         if first_reach_steps:
             y = [np.nan if value is None else float(value) for value in first_reach_steps]
-            axes[0].plot(range(1, len(y) + 1), y, label=name_en, color=color, linewidth=2.2, alpha=0.9)
+            axes[0].plot(
+                range(1, len(y) + 1),
+                y,
+                label=name_en,
+                color=color,
+                linewidth=2.2,
+                alpha=0.9,
+                linestyle=style.get("linestyle", "-"),
+            )
         if path_lengths:
             y = [np.nan if value is None else float(value) for value in path_lengths]
-            axes[1].plot(range(1, len(y) + 1), y, label=name_en, color=color, linewidth=2.2, alpha=0.9)
+            axes[1].plot(
+                range(1, len(y) + 1),
+                y,
+                label=name_en,
+                color=color,
+                linewidth=2.2,
+                alpha=0.9,
+                linestyle=style.get("linestyle", "-"),
+            )
         if path_efficiencies:
             y = [np.nan if value is None else float(value) for value in path_efficiencies]
-            axes[2].plot(range(1, len(y) + 1), y, label=name_en, color=color, linewidth=2.2, alpha=0.9)
+            axes[2].plot(
+                range(1, len(y) + 1),
+                y,
+                label=name_en,
+                color=color,
+                linewidth=2.2,
+                alpha=0.9,
+                linestyle=style.get("linestyle", "-"),
+            )
 
     if not has_data:
         plt.close(fig)
@@ -4575,13 +5418,13 @@ def _plot_multi_seed_post_eval_dashboard(
     setup_english_fonts()
     n_cols = min(3, max(1, len(resolved_metric_specs)))
     n_rows = int(np.ceil(len(resolved_metric_specs) / float(n_cols)))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5.5 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.6 * n_cols, 5.7 * n_rows))
     axes = np.atleast_1d(axes).flatten()
     label_entries = _build_plot_label_entries(items)
     labels = [entry["abbr"] for entry in label_entries]
     colors = [entry["color"] for entry in label_entries]
 
-    for ax, (metric_key, metric_title, is_percent, lower_better) in zip(axes, resolved_metric_specs):
+    for plot_idx, (ax, (metric_key, metric_title, is_percent, lower_better)) in enumerate(zip(axes, resolved_metric_specs)):
         metric_rows = [item.get("post_eval_metric_stats", {}).get(metric_key, {}) for item in items]
         values = [_safe_float(row.get("mean")) for row in metric_rows]
         errors = [_safe_float(row.get("std")) or 0.0 for row in metric_rows]
@@ -4592,18 +5435,14 @@ def _plot_multi_seed_post_eval_dashboard(
         x = np.arange(len(items))
         bar_values = [value if value is not None else 0.0 for value in values]
         bars = ax.bar(x, bar_values, yerr=errors, color=colors, alpha=0.9, capsize=4)
+        _style_bars_with_algorithm_entries(bars, label_entries)
         ax.set_title(metric_title, fontsize=12, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=0, ha='center')
+        show_xticklabels = plot_idx >= (n_rows - 1) * n_cols
+        _apply_bar_xticklabels(ax, x, labels, show_labels=show_xticklabels)
         ax.grid(True, axis='y', alpha=0.25, linestyle='--')
-        ax.tick_params(axis='x', labelsize=10)
-        if is_percent:
-            ax.set_ylim(bottom=0.0, top=max(1.0, max(valid_values) * 1.2))
-        else:
-            ymin = min(0.0, min(valid_values) * (0.9 if not lower_better else 1.1))
-            ymax = max(valid_values) * 1.2 if max(valid_values) > 0 else 1.0
-            if np.isfinite(ymin) and np.isfinite(ymax) and ymin < ymax:
-                ax.set_ylim(ymin, ymax)
+        ylim = _resolve_bar_axis_ylim(valid_values, is_percent=is_percent)
+        if ylim is not None and np.isfinite(ylim[0]) and np.isfinite(ylim[1]) and ylim[0] < ylim[1]:
+            ax.set_ylim(*ylim)
         for idx, bar in enumerate(bars):
             if values[idx] is None:
                 continue
@@ -4611,29 +5450,17 @@ def _plot_multi_seed_post_eval_dashboard(
                 ax,
                 bar.get_x() + bar.get_width() / 2.0,
                 float(values[idx]),
-                _format_post_eval_value(values[idx], is_percent=is_percent),
+                _format_plot_metric_value(values[idx], is_percent=is_percent),
                 is_percent=is_percent,
             )
 
     for ax in axes[len(resolved_metric_specs):]:
         ax.set_visible(False)
 
-    mapping_text = _format_plot_label_mapping(label_entries, entries_per_line=2)
     _add_plot_label_legend(fig, label_entries, loc="upper right", bbox_to_anchor=(0.985, 0.975))
-    if mapping_text:
-        fig.text(
-            0.5,
-            0.03,
-            mapping_text,
-            ha="center",
-            va="bottom",
-            fontsize=9,
-            linespacing=1.25,
-            fontfamily="DejaVu Sans",
-        )
 
     fig.suptitle(title, fontsize=16, fontweight='bold', y=0.98)
-    fig.tight_layout(rect=[0.03, 0.10, 0.97, 0.92])
+    fig.tight_layout(rect=[0.03, 0.07, 0.97, 0.92])
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
@@ -4883,6 +5710,11 @@ def _load_experiment_series_from_artifacts(
                 "manifest_path": exp.get("manifest_path", ""),
                 "metrics": metrics,
                 "success": True,
+                "post_eval_eligible": post_eval.get("eligible", None),
+                "post_eval_status": post_eval.get("status", ""),
+                "post_eval_skipped": bool(post_eval.get("skipped", False)),
+                "post_eval_skip_reason": post_eval.get("skip_reason", ""),
+                "post_eval_eligibility_detail": post_eval.get("eligibility_detail"),
                 "post_eval_dir": post_eval.get("eval_dir", ""),
                 "post_eval_log_path": post_eval.get("log_path", ""),
                 "post_eval_results_path": results_path,
@@ -4890,6 +5722,10 @@ def _load_experiment_series_from_artifacts(
                 "post_eval_spec": post_eval_spec,
                 "post_eval_summary": post_eval.get("summary"),
                 "post_eval_episode_count": post_eval.get("episodes"),
+                "post_eval_selected_model_candidate": post_eval.get("selected_model_candidate"),
+                "post_eval_selected_model_variant": post_eval.get("selected_model_variant"),
+                "post_eval_selected_model_path": post_eval.get("selected_model_path"),
+                "post_eval_validation_selection_summary_path": post_eval.get("validation_selection_summary_path"),
             }
         )
 
@@ -5442,6 +6278,18 @@ def _evaluate_multi_seed_claims(aggregated: Dict[str, Dict[str, Any]], selected_
             "rhs": "matd3_dual_q",
             "required": True,
         },
+        {
+            "name": "mappo_fusion_vs_standard_reference",
+            "lhs": "mappo_baseline",
+            "rhs": "mappo_fusion_only",
+            "required": False,
+        },
+        {
+            "name": "mappo_separated_vs_fusion_reference",
+            "lhs": "mappo_fusion_only",
+            "rhs": "mappo_separated_gradient",
+            "required": False,
+        },
     ]
 
     evaluated = []
@@ -5556,6 +6404,17 @@ def plot_multi_seed_mean_ablation_comparison(
 
     setup_english_fonts()
     fig, axes = plt.subplots(2, 2, figsize=(18, 12), sharex=False)
+    legend_items = [
+        {
+            "label": label,
+            "name_en": aggregates[label].get("name_en", label),
+            "name": aggregates[label].get("name", label),
+        }
+        for label in labels
+    ]
+    label_entries = _build_plot_label_entries(legend_items)
+    line_width = 2.4 if len(labels) <= 7 else 2.0
+    band_alpha = 0.12 if len(labels) <= 7 else 0.08
     specs = [
         ("reward", "Reward", axes[0, 0]),
         ("success", "Team Success Rate", axes[0, 1]),
@@ -5565,7 +6424,9 @@ def plot_multi_seed_mean_ablation_comparison(
 
     for label in labels:
         item = aggregates[label]
-        color = get_algorithm_ablation_color(label)
+        style = get_algorithm_ablation_style(label)
+        color = style["color"]
+        linestyle = style.get("linestyle", "-")
         name_en = item.get("name_en", label)
         stats = item.get("curve_stats", {})
         for metric_name, title, ax in specs:
@@ -5577,8 +6438,8 @@ def plot_multi_seed_mean_ablation_comparison(
                 mean_curve = _smooth_curve(mean_curve, method=fit_method, window=smooth_window)
                 std_curve = _smooth_curve(std_curve, method=fit_method, window=smooth_window)
             xs = np.arange(1, mean_curve.size + 1)
-            ax.plot(xs, mean_curve, color=color, linewidth=2.5, alpha=0.95, label=name_en)
-            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15)
+            ax.plot(xs, mean_curve, color=color, linewidth=line_width, alpha=0.95, linestyle=linestyle)
+            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=band_alpha)
             ax.set_title(title, fontsize=13, fontweight="bold")
             ax.set_xlabel("Episode")
             ax.grid(True, alpha=0.3, linestyle="--")
@@ -5589,11 +6450,10 @@ def plot_multi_seed_mean_ablation_comparison(
     axes[0, 1].set_ylabel("Success Rate")
     axes[1, 0].set_ylabel("Collisions")
     axes[1, 1].set_ylabel("Clearance (m)")
-    for ax in axes.flat:
-        ax.legend(loc="best", fontsize=9)
+    _add_plot_label_legend(fig, label_entries, loc="upper right", bbox_to_anchor=(0.985, 0.975))
 
     fig.suptitle("Multi-seed Mean Ablation Comparison (mean ± std)", fontsize=16, fontweight="bold", y=0.995)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0.02, 0.04, 0.82, 0.96])
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -5621,6 +6481,15 @@ def plot_multi_seed_loss_comparison(
 
     setup_english_fonts()
     fig, axes = plt.subplots(2, 1, figsize=(16, 11), sharex=False)
+    legend_items = [
+        {
+            "label": label,
+            "name_en": aggregates[label].get("name_en", label),
+            "name": aggregates[label].get("name", label),
+        }
+        for label in labels
+    ]
+    label_entries = _build_plot_label_entries(legend_items)
     specs = [
         ("critic_loss", "Critic Loss", axes[0]),
         ("actor_loss", "Actor Loss", axes[1]),
@@ -5628,7 +6497,9 @@ def plot_multi_seed_loss_comparison(
 
     for label in labels:
         item = aggregates[label]
-        color = get_algorithm_ablation_color(label)
+        style = get_algorithm_ablation_style(label)
+        color = style["color"]
+        linestyle = style.get("linestyle", "-")
         name_en = item.get("name_en", label)
         stats = item.get("curve_stats", {})
 
@@ -5642,18 +6513,24 @@ def plot_multi_seed_loss_comparison(
                 step_curve = np.arange(1, mean_curve.size + 1, dtype=np.float64)
             mean_curve = _smooth_curve(mean_curve, method=fit_method, window=smooth_window)
             std_curve = _smooth_curve(std_curve, method=fit_method, window=smooth_window)
-            ax.plot(step_curve, mean_curve, color=color, linewidth=2.5, alpha=0.95, label=name_en)
-            ax.fill_between(step_curve, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15)
+            ax.plot(
+                step_curve,
+                mean_curve,
+                color=color,
+                linewidth=2.5,
+                alpha=0.95,
+                linestyle=linestyle,
+            )
+            ax.fill_between(step_curve, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.12)
             ax.set_title(title, fontsize=13, fontweight="bold")
             ax.set_ylabel("Loss")
             ax.grid(True, alpha=0.3, linestyle="--")
 
-    axes[0].legend(loc="best", fontsize=9)
-    axes[1].legend(loc="best", fontsize=9)
     axes[1].set_xlabel("Update Step")
+    _add_plot_label_legend(fig, label_entries, loc="upper right", bbox_to_anchor=(0.985, 0.975))
 
     fig.suptitle("Multi-seed Training Loss Comparison (mean ± std)", fontsize=16, fontweight="bold", y=0.995)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0.03, 0.04, 0.82, 0.96])
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -5677,12 +6554,26 @@ def plot_multi_seed_focus_metric_curves(
         return
 
     setup_english_fonts()
-    fig, axes = plt.subplots(1, len(resolved_metric_specs), figsize=(8 * len(resolved_metric_specs), 6), squeeze=False)
+    n_metrics = len(resolved_metric_specs)
+    n_cols = 1 if n_metrics == 1 else min(2, n_metrics)
+    n_rows = int(np.ceil(n_metrics / float(n_cols)))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 5.5 * n_rows), squeeze=False)
     axes = axes.flatten()
+    legend_items = [
+        {
+            "label": label,
+            "name_en": aggregates[label].get("name_en", label),
+            "name": aggregates[label].get("name", label),
+        }
+        for label in present_labels
+    ]
+    label_entries = _build_plot_label_entries(legend_items)
 
     for label in present_labels:
         item = aggregates[label]
-        color = get_algorithm_ablation_color(label)
+        style = get_algorithm_ablation_style(label)
+        color = style["color"]
+        linestyle = style.get("linestyle", "-")
         name_en = item.get("name_en", label)
         stats = item.get("curve_stats", {})
         for ax, (metric_name, metric_title, y_label, is_rate) in zip(axes, resolved_metric_specs):
@@ -5694,8 +6585,8 @@ def plot_multi_seed_focus_metric_curves(
                 mean_curve = _smooth_curve(mean_curve, method=fit_method, window=smooth_window)
                 std_curve = _smooth_curve(std_curve, method=fit_method, window=smooth_window)
             xs = np.arange(1, mean_curve.size + 1)
-            ax.plot(xs, mean_curve, color=color, linewidth=2.5, alpha=0.95, label=name_en)
-            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.15)
+            ax.plot(xs, mean_curve, color=color, linewidth=2.5, alpha=0.95, linestyle=linestyle)
+            ax.fill_between(xs, mean_curve - std_curve, mean_curve + std_curve, color=color, alpha=0.12)
             ax.set_title(metric_title, fontsize=13, fontweight="bold")
             ax.set_xlabel("Episode")
             ax.set_ylabel(y_label)
@@ -5703,11 +6594,13 @@ def plot_multi_seed_focus_metric_curves(
             if is_rate:
                 ax.set_ylim([0.0, 1.05])
 
-    for ax in axes:
-        ax.legend(loc="best", fontsize=10)
+    for ax in axes[len(resolved_metric_specs):]:
+        ax.set_visible(False)
+
+    _add_plot_label_legend(fig, label_entries, loc="upper right", bbox_to_anchor=(0.985, 0.975))
 
     fig.suptitle(title, fontsize=16, fontweight="bold", y=0.98)
-    fig.tight_layout(rect=[0.02, 0.04, 0.98, 0.94])
+    fig.tight_layout(rect=[0.02, 0.04, 0.84, 0.94])
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
@@ -5764,6 +6657,20 @@ EXPERIMENT_CONFIGS = [
         }
     },
     {
+        "label": "matd3_separated_hybrid_actor_alpha20",
+        "name": "MATD3 Hybrid (Alpha 0.20) - Separated Skeleton + Hybrid Actor Objective",
+        "name_en": "MATD3 Hybrid (Alpha 0.20) - Separated Skeleton + Hybrid Actor Objective",
+        "description": "Hybrid variant on the same separated update skeleton with a more unified-leaning blend: separated actor loss weight alpha=0.20 and unified total-Q actor loss weight 0.80",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "1",
+            "MATD3_HYBRID_ACTOR_ALPHA": "0.20",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
         "label": "matd3_single_q",
         "name": "MATD3 Baseline",
         "name_en": "MATD3 Baseline",
@@ -5808,6 +6715,42 @@ EXPERIMENT_CONFIGS = [
             "ALGORITHM": "maddpg",
             "MADDPG_USE_DUAL_Q": "0",
             "MADDPG_USE_SEPARATED_GRADIENT": "0",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "mappo_baseline",
+        "name": "MAPPO Standard Baseline",
+        "name_en": "MAPPO Standard Baseline",
+        "description": "Standard cooperative CTDE MAPPO baseline under the same 7D raw-action interface and external APF correction execution chain, without APF feature fusion",
+        "env": {
+            "ALGORITHM": "mappo",
+            "MAPPO_USE_SEPARATED_GRADIENT": "0",
+            "USE_PF_FEATURE": "0",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "mappo_fusion_only",
+        "name": "MAPPO Reference - APF Fusion Only",
+        "name_en": "MAPPO Reference - APF Fusion Only",
+        "description": "Reference variant: standard cooperative CTDE MAPPO with APF-enhanced PF feature fusion enabled, but without separated actor optimization",
+        "env": {
+            "ALGORITHM": "mappo",
+            "MAPPO_USE_SEPARATED_GRADIENT": "0",
+            "USE_PF_FEATURE": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "mappo_separated_gradient",
+        "name": "MAPPO Reference - Separated Actor Objective",
+        "name_en": "MAPPO Reference - Separated Actor Objective",
+        "description": "Exploratory reference: APF-enhanced MAPPO with the same PF feature fusion as MAPPO fusion-only, plus a head/tail-separated PPO actor objective",
+        "env": {
+            "ALGORITHM": "mappo",
+            "MAPPO_USE_SEPARATED_GRADIENT": "1",
+            "USE_PF_FEATURE": "1",
             "USE_TF_POTENTIAL_FIELD": "1",
         }
     }
@@ -5926,6 +6869,24 @@ def parse_args():
         default=None,
         help="覆盖课程解锁阈值：奖励停滞回合数（0表示禁用解锁，None表示沿用配置模式默认值）",
     )
+    parser.add_argument(
+        "--action-force-ratio",
+        type=float,
+        default=DEFAULT_UNIFIED_ACTION_FORCE_RATIO,
+        help="统一训练 FR 初值；所有算法共享同一 ACTION_FORCE_RATIO",
+    )
+    parser.add_argument(
+        "--action-force-ratio-schedule-pct",
+        type=str,
+        default=DEFAULT_UNIFIED_ACTION_FORCE_RATIO_SCHEDULE_PCT,
+        help="统一训练 FR 日程（百分比调度字符串），所有算法共享同一 schedule",
+    )
+    parser.add_argument(
+        "--force-eval-action-force-ratio",
+        type=float,
+        default=DEFAULT_FORCE_EVAL_ACTION_FORCE_RATIO,
+        help="后评估/验证集选模时强制使用的固定 FR；默认与统一训练口径对齐为 0.50",
+    )
     parser.add_argument("--output-dir", type=str, default="ablation_dual_q_outputs", help="图表输出目录")
     parser.add_argument("--logs-root", type=str, default="logs", help="训练日志根目录")
     parser.add_argument("--reuse", action="store_true", help="若检测到同名实验已存在，则跳过重新训练")
@@ -5941,6 +6902,11 @@ def parse_args():
     parser.add_argument("--disable-post-eval", action="store_true", help="关闭训练完成后的共享测试集评估")
     parser.add_argument("--force-post-eval-rerun", action="store_true", help="仅重跑后评估结果，不复用旧 post-eval 产物")
     parser.add_argument("--force-post-eval-testset-regen", action="store_true", help="强制重建共享 train-match 测试集位置文件")
+    parser.add_argument(
+        "--allow-post-eval-without-train-success",
+        action="store_true",
+        help="即使训练阶段未出现团队成功回合，也强制进入 post-eval；默认关闭以保持原审计口径",
+    )
     parser.add_argument("--post-eval-episodes", type=int, default=DEFAULT_POST_EVAL_EPISODES, help="训练完成后共享测试集评估的回合数")
     parser.add_argument(
         "--post-eval-episode-length-multiplier",
@@ -6540,10 +7506,15 @@ def _ensure_seed_batch_scaffold(
         args.manifest_dir = str(manifest_dir)
 
         reference_path = manifest_dir / "_reference_manifest.json"
-        if not reference_path.exists() and configs_to_run:
+        if configs_to_run:
+            resolved_manifests: Dict[str, Dict[str, Any]] = {}
+            for cfg in list(configs_to_run):
+                manifest, _ = _resolve_experiment_manifest(cfg, positions_file, args, manifest_dir)
+                resolved_manifests[str(cfg["label"])] = manifest
             ref_cfg = list(configs_to_run)[0]
-            ref_manifest, _ = _resolve_experiment_manifest(ref_cfg, positions_file, args, manifest_dir)
-            _save_json(reference_path, ref_manifest)
+            ref_manifest = resolved_manifests.get(str(ref_cfg["label"]))
+            if isinstance(ref_manifest, dict):
+                _save_json(reference_path, ref_manifest)
 
         _build_post_eval_spec(args, batch_dir, positions_file)
         return batch_dir, output_dir, manifest_dir
@@ -6815,6 +7786,11 @@ def _runtime_override_summary(args) -> Dict[str, Any]:
         "tf_sync_on_finish": None if getattr(args, "tf_sync_on_finish", None) is None else int(args.tf_sync_on_finish),
         "xla_compile_parallelism": None if getattr(args, "xla_compile_parallelism", None) is None else max(1, int(args.xla_compile_parallelism)),
         "worker_launch_stagger_seconds": float(getattr(args, "worker_launch_stagger_seconds", 0.0) or 0.0),
+        "action_force_ratio": None if getattr(args, "action_force_ratio", None) is None else float(args.action_force_ratio),
+        "action_force_ratio_schedule_pct": str(getattr(args, "action_force_ratio_schedule_pct", "") or ""),
+        "force_eval_action_force_ratio": (
+            None if getattr(args, "force_eval_action_force_ratio", None) is None else float(args.force_eval_action_force_ratio)
+        ),
     }
 
 
@@ -6836,6 +7812,18 @@ def _apply_runtime_env_overrides(env: Dict[str, str], args) -> Dict[str, str]:
         env["XLA_COMPILE_PARALLELISM"] = str(max(1, int(args.xla_compile_parallelism)))
     else:
         env.pop("XLA_COMPILE_PARALLELISM", None)
+    if getattr(args, "action_force_ratio", None) is not None:
+        env["ACTION_FORCE_RATIO"] = str(float(args.action_force_ratio))
+    else:
+        env.pop("ACTION_FORCE_RATIO", None)
+    if getattr(args, "action_force_ratio_schedule_pct", None) is not None:
+        env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = str(getattr(args, "action_force_ratio_schedule_pct", "") or "")
+    else:
+        env.pop("ACTION_FORCE_RATIO_SCHEDULE_PCT", None)
+    if getattr(args, "force_eval_action_force_ratio", None) is not None:
+        env["FORCE_EVAL_ACTION_FORCE_RATIO"] = str(float(args.force_eval_action_force_ratio))
+    else:
+        env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
     return env
 
 
@@ -6851,6 +7839,12 @@ def _append_runtime_override_args(command: List[str], args) -> None:
             command.extend([flag, str(int(value))])
     if getattr(args, "force_outer_jit_compile", False):
         command.append("--force-outer-jit-compile")
+    if getattr(args, "action_force_ratio", None) is not None:
+        command.extend(["--action-force-ratio", str(float(args.action_force_ratio))])
+    if getattr(args, "action_force_ratio_schedule_pct", None) is not None:
+        command.extend(["--action-force-ratio-schedule-pct", str(getattr(args, "action_force_ratio_schedule_pct", "") or "")])
+    if getattr(args, "force_eval_action_force_ratio", None) is not None:
+        command.extend(["--force-eval-action-force-ratio", str(float(args.force_eval_action_force_ratio))])
 
 
 def _resolve_experiment_manifest(
@@ -7146,6 +8140,7 @@ def run_experiment(
                 "name_en": cfg.get("name_en", cfg.get("name", label)),
                 "description": cfg.get("description", ""),
                 "log_dir": log_dir,
+                "manifest_path": str(reuse_manifest_path) if reuse_manifest_path is not None else "",
                 "metrics": metrics,
                 "success": True
             }
@@ -7166,8 +8161,15 @@ def run_experiment(
     algorithm = str(manifest.get("meta", {}).get("algorithm", "matd3")).strip().lower()
 
     exec_env = dict(manifest.get("exec_env", {}))
-    dual_q_flag = exec_env.get("MATD3_USE_DUAL_Q") if algorithm == "matd3" else exec_env.get("MADDPG_USE_DUAL_Q")
-    sep_grad_flag = exec_env.get("MATD3_USE_SEPARATED_GRADIENT") if algorithm == "matd3" else exec_env.get("MADDPG_USE_SEPARATED_GRADIENT")
+    if algorithm == "matd3":
+        dual_q_flag = exec_env.get("MATD3_USE_DUAL_Q")
+        sep_grad_flag = exec_env.get("MATD3_USE_SEPARATED_GRADIENT")
+    elif algorithm == "mappo":
+        dual_q_flag = "n/a"
+        sep_grad_flag = exec_env.get("MAPPO_USE_SEPARATED_GRADIENT", "0")
+    else:
+        dual_q_flag = exec_env.get("MADDPG_USE_DUAL_Q")
+        sep_grad_flag = exec_env.get("MADDPG_USE_SEPARATED_GRADIENT")
 
     reference_manifest, reference_label = _resolve_audit_reference_manifest(
         current_label=label,
@@ -7531,6 +8533,8 @@ def _build_single_seed_experiment_job(
         command.append("--force-post-eval-rerun")
     if getattr(args, "force_post_eval_testset_regen", False):
         command.append("--force-post-eval-testset-regen")
+    if getattr(args, "allow_post_eval_without_train_success", False):
+        command.append("--allow-post-eval-without-train-success")
     if args.disable_strict_validity:
         command.append("--disable-strict-validity")
     if args.disable_post_eval:
@@ -7666,10 +8670,30 @@ def _write_multi_seed_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     output_files: Dict[str, str] = {}
+    post_eval_only_refresh = _post_eval_only_refresh_requested(args)
+    label_items = [
+        {
+            "label": label,
+            "name_en": aggregates[label].get("name_en", label),
+            "name": aggregates[label].get("name", label),
+        }
+        for label in EXPERIMENT_DISPLAY_ORDER
+        if label in aggregates
+    ]
+    label_entries = _build_plot_label_entries(label_items)
     if audit_report_path is not None:
         output_files["multi_seed_audit_report"] = str(audit_report_path)
 
-    if bool(_resolve_post_eval_artifact_policy(args).get("enable_overlay", False)):
+    if label_entries and not post_eval_only_refresh:
+        label_key_path = output_dir / f"multi_seed_algorithm_key_{timestamp}.txt"
+        _write_plot_label_mapping_text(label_entries, label_key_path)
+        output_files["multi_seed_algorithm_key"] = label_key_path.name
+    elif label_entries and post_eval_only_refresh:
+        existing_label_key = _find_latest_existing_plot_name(output_dir, "multi_seed_algorithm_key", suffix=".txt")
+        if existing_label_key:
+            output_files["multi_seed_algorithm_key"] = existing_label_key
+
+    if bool(_resolve_post_eval_artifact_policy(args).get("enable_overlay", False)) and not post_eval_only_refresh:
         overlay_png = output_dir / f"seed_overlay_by_experiment_{timestamp}.png"
         plot_seed_overlay_by_experiment(
             aggregates,
@@ -7678,22 +8702,50 @@ def _write_multi_seed_outputs(
             fit_method=args.fit_method,
         )
         output_files["seed_overlay_by_experiment"] = overlay_png.name
+    elif post_eval_only_refresh:
+        existing_overlay = _find_latest_existing_plot_name(output_dir, "seed_overlay_by_experiment")
+        if existing_overlay:
+            output_files["seed_overlay_by_experiment"] = existing_overlay
 
-    mean_png = output_dir / f"multi_seed_mean_ablation_comparison_{timestamp}.png"
-    plot_multi_seed_mean_ablation_comparison(
-        aggregates,
-        mean_png,
-        smooth_window=args.smooth_window,
-        fit_method=args.fit_method,
-    )
-    output_files["multi_seed_mean_ablation_comparison"] = mean_png.name
+    if not post_eval_only_refresh:
+        mean_png = output_dir / f"multi_seed_mean_ablation_comparison_{timestamp}.png"
+        plot_multi_seed_mean_ablation_comparison(
+            aggregates,
+            mean_png,
+            smooth_window=args.smooth_window,
+            fit_method=args.fit_method,
+        )
+        output_files["multi_seed_mean_ablation_comparison"] = mean_png.name
+    else:
+        existing_mean = _find_latest_existing_plot_name(output_dir, "multi_seed_mean_ablation_comparison")
+        if existing_mean:
+            output_files["multi_seed_mean_ablation_comparison"] = existing_mean
+
+    if not post_eval_only_refresh:
+        reward_mat = output_dir / f"multi_seed_reward_curve_data_{timestamp}.mat"
+        _export_multi_seed_reward_curve_mat(
+            aggregates,
+            reward_mat,
+            smooth_window=args.smooth_window,
+            fit_method=args.fit_method,
+        )
+        if reward_mat.exists():
+            output_files["multi_seed_reward_curve_mat"] = reward_mat.name
+    else:
+        existing_reward_mat = _find_latest_existing_plot_name(output_dir, "multi_seed_reward_curve_data", suffix=".mat")
+        if existing_reward_mat:
+            output_files["multi_seed_reward_curve_mat"] = existing_reward_mat
+        else:
+            legacy_curve_mat = _find_latest_existing_plot_name(output_dir, "multi_seed_curve_data", suffix=".mat")
+            if legacy_curve_mat:
+                output_files["multi_seed_reward_curve_mat"] = legacy_curve_mat
 
     has_loss = any(
         np.asarray(item.get("curve_stats", {}).get("critic_loss_mean", []), dtype=np.float64).size
         or np.asarray(item.get("curve_stats", {}).get("actor_loss_mean", []), dtype=np.float64).size
         for item in aggregates.values()
     )
-    if has_loss:
+    if has_loss and not post_eval_only_refresh:
         loss_png = output_dir / f"multi_seed_loss_comparison_{timestamp}.png"
         plot_multi_seed_loss_comparison(
             aggregates,
@@ -7702,6 +8754,10 @@ def _write_multi_seed_outputs(
             fit_method=args.fit_method,
         )
         output_files["multi_seed_loss_comparison"] = loss_png.name
+    elif has_loss and post_eval_only_refresh:
+        existing_loss = _find_latest_existing_plot_name(output_dir, "multi_seed_loss_comparison")
+        if existing_loss:
+            output_files["multi_seed_loss_comparison"] = existing_loss
 
     has_post_eval = any(item.get("post_eval_metric_stats") for item in aggregates.values())
     if has_post_eval:
@@ -7710,7 +8766,7 @@ def _write_multi_seed_outputs(
         output_files["multi_seed_post_eval_summary"] = post_eval_png.name
 
     has_matd3_trio = all(label in aggregates for label in MATD3_TRIO_EXPERIMENT_LABELS)
-    if has_matd3_trio:
+    if has_matd3_trio and not post_eval_only_refresh:
         trio_train_png = output_dir / f"matd3_trio_train_reward_success_{timestamp}.png"
         plot_multi_seed_focus_metric_curves(
             aggregates,
@@ -7725,20 +8781,24 @@ def _write_multi_seed_outputs(
             fit_method=args.fit_method,
         )
         output_files["matd3_trio_train_reward_success"] = trio_train_png.name
+    elif has_matd3_trio and post_eval_only_refresh:
+        existing_trio_train = _find_latest_existing_plot_name(output_dir, "matd3_trio_train_reward_success")
+        if existing_trio_train:
+            output_files["matd3_trio_train_reward_success"] = existing_trio_train
 
-        if has_post_eval:
-            trio_post_eval_png = output_dir / f"matd3_trio_post_eval_reward_success_{timestamp}.png"
-            _plot_multi_seed_post_eval_dashboard(
-                aggregates,
-                trio_post_eval_png,
-                labels=MATD3_TRIO_EXPERIMENT_LABELS,
-                metric_specs=[
-                    ("avg_reward", "Average Reward", False, False),
-                    ("team_success_rate", "Team Success Rate", True, False),
-                ],
-                title="MATD3 Trio Post-training Evaluation",
-            )
-            output_files["matd3_trio_post_eval_reward_success"] = trio_post_eval_png.name
+    if has_matd3_trio and has_post_eval:
+        trio_post_eval_png = output_dir / f"matd3_trio_post_eval_reward_success_{timestamp}.png"
+        _plot_multi_seed_post_eval_dashboard(
+            aggregates,
+            trio_post_eval_png,
+            labels=MATD3_TRIO_EXPERIMENT_LABELS,
+            metric_specs=[
+                ("avg_reward", "Average Reward", False, False),
+                ("team_success_rate", "Team Success Rate", True, False),
+            ],
+            title="MATD3 Trio Post-training Evaluation",
+        )
+        output_files["matd3_trio_post_eval_reward_success"] = trio_post_eval_png.name
 
     aggregated_rows = []
     for label in EXPERIMENT_DISPLAY_ORDER:
@@ -7794,6 +8854,13 @@ def _write_multi_seed_outputs(
             }
         )
 
+    resolved_output_files = {}
+    for key, filename in output_files.items():
+        resolved_path = Path(str(filename))
+        if not resolved_path.is_absolute():
+            resolved_path = output_dir / str(filename)
+        resolved_output_files[key] = str(resolved_path)
+
     summary = {
         "summary_mode": "multi_seed_parent",
         "timestamp": timestamp,
@@ -7818,6 +8885,7 @@ def _write_multi_seed_outputs(
         "audit_report": audit_report,
         "audit_report_path": str(audit_report_path) if audit_report_path is not None else "",
         "output_files": output_files,
+        "output_files_absolute": resolved_output_files,
     }
 
     summary_path = output_dir / f"summary_{timestamp}.json"
@@ -7830,7 +8898,7 @@ def _write_multi_seed_outputs(
     print(f"Output directory: {output_dir}")
     print(f"Summary file: {summary_path}")
     print(f"Latest summary: {latest_summary_path}")
-    for key, filename in output_files.items():
+    for key, filename in resolved_output_files.items():
         print(f"{key}: {filename}")
     print(f"{'='*70}")
     return summary
@@ -7912,13 +8980,24 @@ def run_single_seed_batch(args) -> int:
     manifest_dir.mkdir(parents=True, exist_ok=True)
     args.manifest_dir = str(manifest_dir)
     reference_path = manifest_dir / "_reference_manifest.json"
-    if reference_path.exists():
+    args.reference_manifest = None
+    args.reference_manifest_label = None
+    if configs_to_run:
+        resolved_manifests: Dict[str, Dict[str, Any]] = {}
+        for cfg in configs_to_run:
+            manifest, _ = _resolve_experiment_manifest(cfg, positions_file, args, manifest_dir)
+            resolved_manifests[str(cfg["label"])] = manifest
+        ref_cfg = configs_to_run[0]
+        ref_manifest = resolved_manifests.get(str(ref_cfg["label"]))
+        if isinstance(ref_manifest, dict):
+            _save_json(reference_path, ref_manifest)
+            args.reference_manifest = ref_manifest
+            ref_meta = ref_manifest.get("meta", {}) if isinstance(ref_manifest.get("meta"), dict) else {}
+            args.reference_manifest_label = str(ref_meta.get("label", ref_cfg["label"]))
+    elif reference_path.exists():
         args.reference_manifest = _load_manifest(reference_path)
         ref_meta = args.reference_manifest.get("meta", {}) if isinstance(args.reference_manifest.get("meta"), dict) else {}
         args.reference_manifest_label = str(ref_meta.get("label", "reference"))
-    else:
-        args.reference_manifest = None
-        args.reference_manifest_label = None
     post_eval_spec = _build_post_eval_spec(args, batch_dir, positions_file)
     enable_parallel_experiments = (
         not getattr(args, "experiment_worker", False)
@@ -7926,14 +9005,6 @@ def run_single_seed_batch(args) -> int:
         and len(configs_to_run) > 1
         and int(getattr(args, "experiment_max_parallel", 1) or 1) != 1
     )
-    if enable_parallel_experiments:
-        reference_path = manifest_dir / "_reference_manifest.json"
-        if not reference_path.exists() and configs_to_run:
-            ref_cfg = configs_to_run[0]
-            ref_manifest, _ = _resolve_experiment_manifest(ref_cfg, positions_file, args, manifest_dir)
-            _save_json(reference_path, ref_manifest)
-            args.reference_manifest = ref_manifest
-            args.reference_manifest_label = ref_cfg["label"]
 
     print(f"\n{'='*70}")
     print("MATD3 Separated-Skeleton / Actor-Objective Ablation")
@@ -8347,6 +9418,8 @@ def run_multi_seed_parent(args) -> int:
             command.append("--force-post-eval-rerun")
         if getattr(args, "force_post_eval_testset_regen", False):
             command.append("--force-post-eval-testset-regen")
+        if getattr(args, "allow_post_eval_without_train_success", False):
+            command.append("--allow-post-eval-without-train-success")
         if args.disable_strict_validity:
             command.append("--disable-strict-validity")
         if args.disable_post_eval:
@@ -8505,6 +9578,8 @@ def run_multi_seed_parent(args) -> int:
             bootstrap_command.append("--force-post-eval-rerun")
         if getattr(args, "force_post_eval_testset_regen", False):
             bootstrap_command.append("--force-post-eval-testset-regen")
+        if getattr(args, "allow_post_eval_without_train_success", False):
+            bootstrap_command.append("--allow-post-eval-without-train-success")
         if args.disable_strict_validity:
             bootstrap_command.append("--disable-strict-validity")
         if args.disable_post_eval:

@@ -4897,6 +4897,24 @@ def make_env_init(rank: int, args_dict: dict):
             except Exception:
                 scenario.training_env_sequence_seed = int(getattr(args, 'terrain_seed', 67) or 67)
             setattr(args, 'training_env_sequence_seed', int(scenario.training_env_sequence_seed))
+            train_obstacle_sequence_mode = str(
+                getattr(args, 'train_obstacle_sequence_mode', None)
+                if getattr(args, 'train_obstacle_sequence_mode', None) is not None
+                else os.getenv('TRAIN_OBSTACLE_SEQUENCE_MODE', 'legacy_linear')
+            ).strip().lower()
+            if train_obstacle_sequence_mode not in ('legacy_linear', 'post_eval_family'):
+                train_obstacle_sequence_mode = 'legacy_linear'
+            scenario.train_obstacle_sequence_mode = train_obstacle_sequence_mode
+            setattr(args, 'train_obstacle_sequence_mode', str(train_obstacle_sequence_mode))
+            train_obstacle_sequence_namespace = str(
+                getattr(args, 'train_obstacle_sequence_namespace', None)
+                if getattr(args, 'train_obstacle_sequence_namespace', None) is not None
+                else os.getenv('TRAIN_OBSTACLE_SEQUENCE_NAMESPACE', 'train_obstacle')
+            ).strip()
+            if not train_obstacle_sequence_namespace:
+                train_obstacle_sequence_namespace = 'train_obstacle'
+            scenario.train_obstacle_sequence_namespace = train_obstacle_sequence_namespace
+            setattr(args, 'train_obstacle_sequence_namespace', str(train_obstacle_sequence_namespace))
             try:
                 scenario.terrain_base_seed = int(
                     getattr(args, 'terrain_base_seed', None)
@@ -15044,6 +15062,8 @@ def train(args):
             'terrain_seed': int(configured_terrain_seed),
             'terrain_base_seed': int(terrain_base_seed),
             'training_env_sequence_seed': int(training_env_sequence_seed),
+            'train_obstacle_sequence_mode': str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_MODE', str(getattr(args, 'train_obstacle_sequence_mode', 'legacy_linear') or 'legacy_linear'))),
+            'train_obstacle_sequence_namespace': str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_NAMESPACE', str(getattr(args, 'train_obstacle_sequence_namespace', 'train_obstacle') or 'train_obstacle'))),
             'peak_jitter_range': _env_float('PEAK_JITTER_RANGE', getattr(args, 'peak_jitter_range', 0.0) or 0.0),
             'peak_center_jitter_range': _env_float('PEAK_CENTER_JITTER_RANGE', getattr(args, 'peak_center_jitter_range', 0.0) or 0.0),
             'peak_height_jitter_ratio_min': _env_float('PEAK_HEIGHT_JITTER_RATIO_MIN', getattr(args, 'peak_height_jitter_ratio_min', 0.0) or 0.0),
@@ -17928,6 +17948,7 @@ def train(args):
             agent_success_flags = []  # 每个智能体的成功标志
             agent_reach_flags = []    # 每个智能体的到达目标标志（用于详细打印）
             agent_safe_flags = []     # 每个智能体的无碰撞标志（用于详细打印）
+            agent_goal_distances = [] # 每个智能体终止帧到各自目标点的距离（用于失败诊断）
             team_success_flag = 1  # 跨子环境聚合：任一智能体失败则 0
             
             for env_idx, single_env in envs_to_check:
@@ -17963,6 +17984,27 @@ def train(args):
                     agent_success_flags.append(c_i)
                     if c_i == 0:
                         team_success_flag = 0
+
+                world_agents = list(getattr(world, 'agents', []) or [])
+                scenario_ref = getattr(base_env, 'scenario', None)
+                for i, agent in enumerate(world_agents):
+                    goal_pos = None
+                    try:
+                        if hasattr(agent, 'goal_a') and agent.goal_a is not None:
+                            goal_pos = getattr(getattr(agent.goal_a, 'state', None), 'p_pos', None)
+                        elif scenario_ref is not None and getattr(scenario_ref, 'goal_pos', None) is not None:
+                            goal_pos = scenario_ref.goal_pos
+                    except Exception:
+                        goal_pos = None
+                    pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
+                    if goal_pos is None or pos is None:
+                        agent_goal_distances.append(None)
+                        continue
+                    try:
+                        dist = float(np.linalg.norm(np.asarray(pos, dtype=np.float32) - np.asarray(goal_pos, dtype=np.float32)))
+                    except Exception:
+                        dist = None
+                    agent_goal_distances.append(dist)
 
             # 未处理到任何智能体时视为本回合失败
             if len(agent_success_flags) == 0:
@@ -18032,6 +18074,29 @@ def train(args):
                             print(f"  [说明] 所有智能体都无碰撞但未成功（原因：未到达目标），成功定义=到达目标∧无碰撞")
                         elif not all_reached and not all_safe:
                             print(f"  [说明] 部分智能体未到达目标或有碰撞，成功定义=到达目标∧无碰撞")
+                        if not all_reached:
+                            dist_parts = []
+                            unreached_distances = []
+                            for i in range(len(agent_success_flags)):
+                                dist_val = agent_goal_distances[i] if i < len(agent_goal_distances) else None
+                                reach_i = agent_reach_flags[i] if i < len(agent_reach_flags) else 0
+                                if dist_val is None or not np.isfinite(dist_val):
+                                    dist_repr = "NA"
+                                else:
+                                    dist_repr = f"{dist_val:.2f}m"
+                                    if not reach_i:
+                                        unreached_distances.append(float(dist_val))
+                                suffix = "" if reach_i else "(未到达)"
+                                dist_parts.append(f"Agent{i}={dist_repr}{suffix}")
+                            if unreached_distances:
+                                avg_unreached_dist = float(np.mean(unreached_distances))
+                                max_unreached_dist = float(np.max(unreached_distances))
+                                min_unreached_dist = float(np.min(unreached_distances))
+                                print(
+                                    f"[目标距离] 回合 {episode+1}: 各智能体终点距目标=[{', '.join(dist_parts)}], "
+                                    f"未到达智能体距离统计=min={min_unreached_dist:.2f}m, "
+                                    f"mean={avg_unreached_dist:.2f}m, max={max_unreached_dist:.2f}m"
+                                )
                 except Exception as e:
                     # 如果打印失败，使用简化版本
                     print(f"[成功记录] 回合{episode+1}: 团队成功={episode_success}, 智能体成功={agent_success_flags}, total_success_count={total_success_count}")
@@ -20583,6 +20648,8 @@ if __name__ == "__main__":
                 "terrain_seed": int(os.getenv('SCENARIO_SEED', str(getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67)))),
                 "terrain_base_seed": int(os.getenv('TERRAIN_BASE_SEED', str(getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67)))),
                 "training_env_sequence_seed": int(os.getenv('TRAIN_ENV_SEQUENCE_SEED', str(getattr(args, 'training_env_sequence_seed', getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67))))),
+                "train_obstacle_sequence_mode": str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_MODE', str(getattr(args, 'train_obstacle_sequence_mode', 'legacy_linear') or 'legacy_linear'))),
+                "train_obstacle_sequence_namespace": str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_NAMESPACE', str(getattr(args, 'train_obstacle_sequence_namespace', 'train_obstacle') or 'train_obstacle'))),
                 "peak_jitter_range": float(os.getenv('PEAK_JITTER_RANGE', str(getattr(args, 'peak_jitter_range', 0.0) or 0.0))),
                 "peak_center_jitter_range": float(os.getenv('PEAK_CENTER_JITTER_RANGE', str(getattr(args, 'peak_center_jitter_range', 0.0) or 0.0))),
                 "peak_height_jitter_ratio_min": float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', str(getattr(args, 'peak_height_jitter_ratio_min', 0.0) or 0.0))),
@@ -20607,6 +20674,8 @@ if __name__ == "__main__":
             ("peak_height_max_scale", "PEAK_HEIGHT_MAX_SCALE", float),
             ("terrain_variant_noise_ratio", "TERRAIN_VARIANT_NOISE_RATIO", float),
             ("training_env_sequence_seed", "TRAIN_ENV_SEQUENCE_SEED", int),
+            ("train_obstacle_sequence_mode", "TRAIN_OBSTACLE_SEQUENCE_MODE", str),
+            ("train_obstacle_sequence_namespace", "TRAIN_OBSTACLE_SEQUENCE_NAMESPACE", str),
             ("semi_random_hold_episodes", "SEMI_RANDOM_TERRAIN_HOLD_EPISODES", int),
             ("semi_random_hold_min_episodes", "SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES", int),
             ("semi_random_hold_max_episodes", "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES", int),
@@ -20655,6 +20724,8 @@ if __name__ == "__main__":
         results_args["terrain_seed"] = int(training_environment.get("terrain_seed", results_args.get("terrain_seed", 67) or 67))
         results_args["terrain_base_seed"] = int(training_environment.get("terrain_base_seed", results_args.get("terrain_base_seed", results_args["terrain_seed"])))
         results_args["training_env_sequence_seed"] = int(training_environment.get("training_env_sequence_seed", results_args.get("training_env_sequence_seed", results_args["terrain_base_seed"])))
+        results_args["train_obstacle_sequence_mode"] = str(training_environment.get("train_obstacle_sequence_mode", results_args.get("train_obstacle_sequence_mode", "legacy_linear")))
+        results_args["train_obstacle_sequence_namespace"] = str(training_environment.get("train_obstacle_sequence_namespace", results_args.get("train_obstacle_sequence_namespace", "train_obstacle")))
         results_args["semi_random_terrain"] = bool(training_environment.get("semi_random_terrain", results_args.get("semi_random_terrain", False)))
         results_args["deterministic_train_env_sequence"] = bool(training_environment.get("deterministic_env_sequence", results_args.get("deterministic_train_env_sequence", False)))
         results_args["random_terrain"] = bool(training_environment.get("random_terrain", results_args.get("random_terrain", False)))

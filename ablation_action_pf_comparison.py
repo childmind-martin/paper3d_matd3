@@ -39,6 +39,55 @@ import time
 from ablation_batch_manager import AblationBatchManager
 from algorithm_ablation_colors import get_algorithm_ablation_color
 
+
+ALGORITHM_DISPLAY_NAMES = {
+    "matd3": "MATD3",
+    "maddpg": "MADDPG",
+    "mappo": "MAPPO",
+}
+
+ACTION_PF_LINE_LABELS = [
+    "action_only",
+    "apf_traditional",
+    "action_apf_fusion",
+]
+
+ACTION_PF_CROSS_ALGO_COLOR_MAP = {
+    ("matd3", "action_only"): "#1F77B4",
+    ("matd3", "apf_traditional"): "#2CA02C",
+    ("matd3", "action_apf_fusion"): "#D62728",
+    ("matd3", "apf_learnable"): "#FF7F0E",
+    ("mappo", "action_only"): "#4C78A8",
+    ("mappo", "apf_traditional"): "#72B7B2",
+    ("mappo", "action_apf_fusion"): "#D81B60",
+    ("mappo", "apf_learnable"): "#9467BD",
+    ("maddpg", "action_only"): "#17BECF",
+    ("maddpg", "apf_traditional"): "#BCBD22",
+    ("maddpg", "action_apf_fusion"): "#E45756",
+    ("maddpg", "apf_learnable"): "#7F7F7F",
+}
+
+ACTION_PF_BASE_LINESTYLE_MAP = {
+    "action_only": "-",
+    "apf_traditional": "--",
+    "action_apf_fusion": "-.",
+    "apf_learnable": ":",
+}
+
+ACTION_PF_BASE_MARKER_MAP = {
+    "action_only": "o",
+    "apf_traditional": "s",
+    "action_apf_fusion": "D",
+    "apf_learnable": "^",
+}
+
+ACTION_PF_BASE_HATCH_MAP = {
+    "action_only": "",
+    "apf_traditional": "//",
+    "action_apf_fusion": "xx",
+    "apf_learnable": "..",
+}
+
 try:
     import matplotlib
     matplotlib.use('Agg')  # 无GUI后端
@@ -285,14 +334,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="动作与势场修正消融对比实验、地形复杂度3、无随机动作判断穿透原因是否是随机动作导致的")
     parser.add_argument("--script", type=str, default="./run_optimized.sh",
                         help="训练启动脚本路径 (默认 ./run_optimized.sh)")
-    parser.add_argument("--episodes", type=int, default=800,
+    parser.add_argument("--episodes", type=int, default=400,
                         help="每个实验的训练回合数（默认5）")
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="训练批次大小")
     parser.add_argument("--use-weighted-reward", type=int, default=1, choices=[0, 1],
                         help="是否使用分项加权奖励")
-    parser.add_argument("--algorithm", type=str, default="matd3", choices=["maddpg", "matd3"],
+    parser.add_argument("--algorithm", type=str, default="matd3", choices=["maddpg", "matd3", "mappo"],
                         help="训练算法选择")
+    parser.add_argument("--algorithms", type=str, nargs="+", default=None, choices=["maddpg", "matd3", "mappo"],
+                        help="一次运行多个算法，自动展开为跨算法对比")
     parser.add_argument("--output-dir", type=str, default="ablation_action_pf_outputs",
                         help="图表输出目录")
     parser.add_argument("--logs-root", type=str, default="logs",
@@ -318,6 +369,8 @@ def parse_args():
                         help="选择要运行的实验（默认运行所有实验）。可选: action_only, apf_traditional, apf_learnable, action_apf_fusion")
     parser.add_argument("--quick-comparison", action="store_true",
                         help="快速对比模式：运行 apf_traditional、apf_learnable 和 action_apf_fusion 三个实验")
+    parser.add_argument("--cross-family-line-comparison", action="store_true",
+                        help="跨算法动作-PF线对比：默认比较 MATD3 和 MAPPO 的 action_only / apf_traditional / action_apf_fusion")
     parser.add_argument("--config-file", type=str, default=None,
                         help="从文件加载实验配置（JSON格式，由 reproduce_from_results.py 生成）")
     parser.add_argument("--eval-script", type=str, default="./run_evaluation.sh",
@@ -470,6 +523,49 @@ def build_runtime_env_overrides(env: Dict[str, str]) -> Dict[str, str]:
 
 
 sync_experiment_configs_with_standard_defaults()
+
+
+def resolve_algorithm_list(args) -> List[str]:
+    if getattr(args, "algorithms", None):
+        algos = [str(algo).strip().lower() for algo in args.algorithms if str(algo).strip()]
+    elif getattr(args, "cross_family_line_comparison", False):
+        algos = ["matd3", "mappo"]
+    else:
+        algos = [str(getattr(args, "algorithm", "matd3")).strip().lower()]
+    seen = set()
+    ordered = []
+    for algo in algos:
+        if algo in ALGORITHM_DISPLAY_NAMES and algo not in seen:
+            ordered.append(algo)
+            seen.add(algo)
+    return ordered or ["matd3"]
+
+
+def expand_configs_for_algorithms(configs: List[Dict], algorithms: List[str]) -> List[Dict]:
+    multi_algorithm = len(algorithms) > 1
+    expanded = []
+    for algo in algorithms:
+        algo_name = ALGORITHM_DISPLAY_NAMES.get(algo, algo.upper())
+        for cfg in configs:
+            base_label = str(cfg.get("label"))
+            needs_algo_prefix = multi_algorithm or algo != "matd3"
+            label = f"{algo}_{base_label}" if needs_algo_prefix else base_label
+            name_en = str(cfg.get("name_en", cfg.get("name", base_label)))
+            name = str(cfg.get("name", name_en))
+            description = str(cfg.get("description", ""))
+            expanded.append(
+                {
+                    **cfg,
+                    "label": label,
+                    "base_label": base_label,
+                    "algorithm": algo,
+                    "name": f"{algo_name} - {name}" if needs_algo_prefix else name,
+                    "name_en": f"{algo_name} - {name_en}" if needs_algo_prefix else name_en,
+                    "description": f"{algo_name} | {description}" if needs_algo_prefix else description,
+                    "env": dict(cfg.get("env", {})),
+                }
+            )
+    return expanded
 
 
 def _is_timestamp_token(value: str) -> bool:
@@ -907,7 +1003,37 @@ def get_display_name(item: Dict) -> str:
 
 
 def get_series_color(item: Dict, idx: int) -> str:
-    return get_algorithm_ablation_color(item.get("label"), idx=idx)
+    return get_series_style(item, idx)["color"]
+
+
+def get_series_style(item: Dict, idx: int) -> Dict[str, str]:
+    algo = str(item.get("algorithm", "")).strip().lower()
+    base_label = str(item.get("base_label", item.get("label", ""))).strip()
+    color = ACTION_PF_CROSS_ALGO_COLOR_MAP.get((algo, base_label))
+    if not color:
+        color = get_algorithm_ablation_color(item.get("label"), idx=idx)
+    return {
+        "color": color,
+        "linestyle": ACTION_PF_BASE_LINESTYLE_MAP.get(base_label, "-"),
+        "marker": ACTION_PF_BASE_MARKER_MAP.get(base_label, "o"),
+        "hatch": ACTION_PF_BASE_HATCH_MAP.get(base_label, ""),
+        "plotly_dash": {
+            "-": "solid",
+            "--": "dash",
+            "-.": "dashdot",
+            ":": "dot",
+        }.get(ACTION_PF_BASE_LINESTYLE_MAP.get(base_label, "-"), "solid"),
+    }
+
+
+def _style_bars_with_series(series: List[Dict], bars) -> None:
+    for idx, bar in enumerate(bars):
+        style = get_series_style(series[idx], idx)
+        hatch = str(style.get("hatch", "") or "")
+        if hatch:
+            bar.set_hatch(hatch)
+        bar.set_edgecolor("black")
+        bar.set_linewidth(0.6)
 
 
 def build_collision_threshold_specs(series: List[Dict]) -> List[Dict]:
@@ -1374,6 +1500,7 @@ def run_experiment_worker(args_tuple):
     cfg, positions_file, script, episodes, batch_size, use_weighted_reward, algorithm, logs_root, gpu_id, batch_dir = args_tuple
     
     label = cfg["label"]
+    base_label = cfg.get("base_label", label)
     # 🔧 关键修复：使用公共函数设置基础环境变量，消除代码冗余
     env = setup_base_env_vars(positions_file, gpu_id)
     
@@ -1401,7 +1528,7 @@ def run_experiment_worker(args_tuple):
     # 🔧 关键修复：处理 ACTION_FORCE_RATIO_SCHEDULE_PCT，确保行为一致
     # 对于 action_apf_fusion，如果配置中未设置 ACTION_FORCE_RATIO_SCHEDULE_PCT，
     # 则完全删除该环境变量（包括从父进程继承的），让 run_optimized.sh 检测到变量未设置并使用默认 schedule
-    if label == "action_apf_fusion":
+    if base_label == "action_apf_fusion":
         if "ACTION_FORCE_RATIO_SCHEDULE_PCT" not in cfg.get("env", {}):
             # 删除可能从父进程继承的值，确保 run_optimized.sh 检测到变量未设置并使用默认 schedule
             if "ACTION_FORCE_RATIO_SCHEDULE_PCT" in env:
@@ -1419,7 +1546,7 @@ def run_experiment_worker(args_tuple):
     # 传统APF特点：ACTION_FORCE_RATIO=1.0 且 DELTA_*=0.0
     # 因为网络动作被忽略，网络参数不影响势场，所以网络训练是无效的
     is_traditional_apf = (
-        label == "apf_traditional" or
+        base_label == "apf_traditional" or
         (env.get("ACTION_FORCE_RATIO") == "1.0" and
          env.get("DELTA_K_ATT") == "0.0" and
          env.get("DELTA_LAMBDA_1") == "0.0" and
@@ -1499,6 +1626,8 @@ def run_experiment_worker(args_tuple):
             "name": cfg.get("name", label),
             "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
+            "algorithm": algorithm,
+            "base_label": base_label,
             "log_dir": log_dir,
             "model_root": model_root,
             "runtime_env_overrides": build_runtime_env_overrides(env),
@@ -1513,6 +1642,8 @@ def run_experiment_worker(args_tuple):
             "name": cfg.get("name", label),
             "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
+            "algorithm": algorithm,
+            "base_label": base_label,
             "log_dir": None,
             "metrics": {},
             "success": False
@@ -1525,6 +1656,8 @@ def run_experiment_worker(args_tuple):
             "name": cfg.get("name", label),
             "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
+            "algorithm": algorithm,
+            "base_label": base_label,
             "log_dir": None,
             "metrics": {},
             "success": False
@@ -1538,6 +1671,8 @@ def run_experiment_worker(args_tuple):
             "name": cfg.get("name", label),
             "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
+            "algorithm": algorithm,
+            "base_label": base_label,
             "log_dir": None,
             "metrics": {},
             "success": False
@@ -1547,6 +1682,8 @@ def run_experiment_worker(args_tuple):
 def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict], gpu_id: int = None) -> Dict:
     """运行单个实验配置（串行模式）"""
     label = cfg["label"]
+    base_label = cfg.get("base_label", label)
+    algorithm = cfg.get("algorithm", getattr(args, "algorithm", "matd3"))
     
     if args.reuse and label in cache:
         print(f"[复用] {label}")
@@ -1569,7 +1706,7 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     # 🔧 关键修复：处理 ACTION_FORCE_RATIO_SCHEDULE_PCT，确保行为一致
     # 对于 action_apf_fusion，如果配置中未设置 ACTION_FORCE_RATIO_SCHEDULE_PCT，
     # 则完全删除该环境变量（包括从父进程继承的），让 run_optimized.sh 检测到变量未设置并使用默认 schedule
-    if label == "action_apf_fusion":
+    if base_label == "action_apf_fusion":
         if "ACTION_FORCE_RATIO_SCHEDULE_PCT" not in cfg.get("env", {}):
             # 删除可能从父进程继承的值，确保 run_optimized.sh 检测到变量未设置并使用默认 schedule
             if "ACTION_FORCE_RATIO_SCHEDULE_PCT" in env:
@@ -1587,7 +1724,7 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
     # 传统APF特点：ACTION_FORCE_RATIO=1.0 且 DELTA_*=0.0
     # 因为网络动作被忽略，网络参数不影响势场，所以网络训练是无效的
     is_traditional_apf = (
-        label == "apf_traditional" or
+        base_label == "apf_traditional" or
         (env.get("ACTION_FORCE_RATIO") == "1.0" and
          env.get("DELTA_K_ATT") == "0.0" and
          env.get("DELTA_LAMBDA_1") == "0.0" and
@@ -1615,7 +1752,7 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
         str(args.batch_size),
         label,
         str(args.use_weighted_reward),
-        args.algorithm,
+        str(algorithm),
     ]
     
     print(f"\n{'='*70}")
@@ -1654,6 +1791,8 @@ def run_experiment(cfg: Dict, positions_file: Path, args, cache: Dict[str, Dict]
             "name": cfg.get("name", label),
             "name_en": cfg.get("name_en", cfg.get("name", label)),
             "description": cfg.get("description", ""),
+            "algorithm": str(algorithm),
+            "base_label": base_label,
             "log_dir": log_dir,
             "model_root": model_root,
             "runtime_env_overrides": build_runtime_env_overrides(env),
@@ -1733,7 +1872,8 @@ def plot_comparison_rewards(series: List[Dict], title: str, output_path: Path,
         rewards_array = np.array(rewards)
         
         # 原始曲线（半透明，细线）
-        color = get_series_color(item, idx)
+        style = get_series_style(item, idx)
+        color = style["color"]
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         # 如果name_en仍然是中文（包含中文字符），使用label作为回退
@@ -1744,7 +1884,7 @@ def plot_comparison_rewards(series: List[Dict], title: str, output_path: Path,
                 color=color, 
                 alpha=0.3, 
                 linewidth=1,
-                linestyle='-')
+                linestyle=style["linestyle"])
         
         # 拟合曲线（实线，粗线，确保对比明显）
         smoothed = smooth_curve(rewards_array, method=fit_method, window=smooth_window)
@@ -1753,7 +1893,7 @@ def plot_comparison_rewards(series: List[Dict], title: str, output_path: Path,
                 color=color, 
                 alpha=0.9, 
                 linewidth=2.5,
-                linestyle='-')  # 🔧 所有拟合曲线使用实线
+                linestyle=style["linestyle"])
     
     if has_data:
         # 🔧 关键修复：显式指定字体族，确保图例文本正确显示
@@ -1795,8 +1935,9 @@ def plot_comparison_success_collision_clearance(series: List[Dict], title: str, 
         # 如果name_en仍然是中文（包含中文字符），使用label作为回退
         if name_en and any('\u4e00' <= char <= '\u9fff' for char in str(name_en)):
             name_en = item.get('label', 'Unknown')
-        color = get_series_color(item, idx)
-        linestyle = '-'  # 🔧 所有曲线使用实线
+        style = get_series_style(item, idx)
+        color = style["color"]
+        linestyle = style["linestyle"]
         
         # 1. 成功率（滑动窗口平均）
         success_flags = metrics.get("success_flags", [])
@@ -1955,8 +2096,9 @@ def plot_comparison_success_rate_and_clearance(series: List[Dict], title: str, o
     for idx, item in enumerate(series):
         metrics = item["metrics"]
         name_en = get_display_name(item)
-        color = get_series_color(item, idx)
-        linestyle = '-'
+        style = get_series_style(item, idx)
+        color = style["color"]
+        linestyle = style["linestyle"]
         
         # === 1. Team Success Rate (SR_team) only ===
         team_success_flags = metrics.get("team_success_flags", [])
@@ -2161,7 +2303,7 @@ def plot_evaluation_metrics_dashboard(series: List[Dict], title: str, output_pat
 
     display_names = [get_display_name(item) for item in series]
     x_positions = np.arange(len(series))
-    colors = [get_series_color(item, idx) for idx, item in enumerate(series)]
+    colors = [get_series_style(item, idx)["color"] for idx, item in enumerate(series)]
 
     for ax, (metric_key, metric_title, is_rate) in zip(axes, metric_specs):
         values = []
@@ -2180,6 +2322,7 @@ def plot_evaluation_metrics_dashboard(series: List[Dict], title: str, output_pat
                 has_data = True
 
         bars = ax.bar(x_positions, values, color=colors, alpha=0.85, edgecolor="black", linewidth=0.6)
+        _style_bars_with_series(series, bars)
         for idx in missing_indices:
             bars[idx].set_hatch("//")
             bars[idx].set_alpha(0.35)
@@ -2236,13 +2379,14 @@ def plot_comparison_losses(series: List[Dict], title: str, output_path: Path):
         steps = [entry.get("step", idx) for idx, entry in enumerate(history)]
         critic = [entry.get("critic_loss", 0) for entry in history]
         actor = [entry.get("actor_loss", 0) for entry in history]
-        color = get_series_color(item, idx)
+        style = get_series_style(item, idx)
+        color = style["color"]
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
         name_en = item.get('name_en') or item.get('label', 'Unknown')
         # 如果name_en仍然是中文（包含中文字符），使用label作为回退
         if name_en and any('\u4e00' <= char <= '\u9fff' for char in str(name_en)):
             name_en = item.get('label', 'Unknown')
-        linestyle = '-'  # 🔧 所有曲线使用实线
+        linestyle = style["linestyle"]
         
         axes[0].plot(steps, critic, label=f"{name_en} (Critic)", 
                     color=color, linewidth=2.5, alpha=0.9, linestyle=linestyle)
@@ -2298,7 +2442,8 @@ def generate_interactive_comparison(series: List[Dict], title: str, output_path:
         has_data = True
         episodes = list(range(1, len(rewards) + 1))
         rewards_array = np.array(rewards)
-        color = get_series_color(item, idx)
+        style = get_series_style(item, idx)
+        color = style["color"]
         
         # 原始数据（半透明）
         # 🔧 关键修复：确保使用英文标签，避免回退到中文name
@@ -2311,7 +2456,7 @@ def generate_interactive_comparison(series: List[Dict], title: str, output_path:
             y=rewards,
             mode='lines',
             name=f"{name_en} (Raw)",
-            line=dict(width=1, color=color),
+            line=dict(width=1, color=color, dash=style["plotly_dash"]),
             opacity=0.3,
             showlegend=True
         ))
@@ -2323,7 +2468,7 @@ def generate_interactive_comparison(series: List[Dict], title: str, output_path:
             y=smoothed,
             mode='lines',
             name=f"{name_en} (Fitted)",
-            line=dict(width=3, color=color),
+            line=dict(width=3, color=color, dash=style["plotly_dash"]),
             showlegend=True
         ))
     
@@ -2386,10 +2531,11 @@ def main():
     # 🔧 新增：创建批次管理器和批次目录（在位置文件生成之后）
     # 批次目录用于组织消融实验的结果，确保所有实验使用相同的位置文件
     manager = AblationBatchManager()
+    algorithms_to_run = resolve_algorithm_list(args)
     batch_config = {
         "episodes": args.episodes,
         "batch_size": args.batch_size,
-        "algorithm": args.algorithm,
+        "algorithm": algorithms_to_run if len(algorithms_to_run) > 1 else algorithms_to_run[0],
         "use_weighted_reward": args.use_weighted_reward,
         "seed": TRAINING_SEED,  # 使用统一常量
         "scenario_seed": SCENARIO_SEED,  # 使用统一常量
@@ -2414,29 +2560,39 @@ def main():
     series = []
     
     # 根据参数过滤要运行的实验
-    if args.quick_comparison:
+    if args.cross_family_line_comparison:
+        labels_order = ACTION_PF_LINE_LABELS
+        base_configs = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in labels_order]
+        base_configs = sorted(base_configs, key=lambda x: labels_order.index(x["label"]))
+        configs_to_run = expand_configs_for_algorithms(base_configs, algorithms_to_run)
+        print(f"[Info] Cross-family line comparison mode: algorithms={algorithms_to_run}, labels={labels_order}")
+    elif args.quick_comparison:
         # 快速对比模式：运行 apf_traditional、apf_learnable 和 action_apf_fusion（三者对比）
         # 🚨 关键修复：确保可学习APF先运行，避免传统APF的DELTA_*=0.0覆盖环境变量
         # 虽然每个实验是独立进程，但为了保险起见，将可学习APF放在前面
         labels_order = ["apf_learnable", "apf_traditional", "action_apf_fusion"]
-        configs_to_run = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in labels_order]
+        base_configs = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in labels_order]
         # 按照指定顺序排序
-        configs_to_run = sorted(configs_to_run, key=lambda x: labels_order.index(x["label"]))
+        base_configs = sorted(base_configs, key=lambda x: labels_order.index(x["label"]))
+        configs_to_run = expand_configs_for_algorithms(base_configs, algorithms_to_run)
         print(f"[Info] Quick comparison mode: Running apf_learnable, apf_traditional, and action_apf_fusion (three-way comparison, learnable APF prioritized)")
     elif args.experiments:
-        configs_to_run = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in args.experiments]
-        if not configs_to_run:
+        base_configs = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in args.experiments]
+        if not base_configs:
             print(f"[错误] 未找到指定的实验: {args.experiments}")
             sys.exit(1)
+        configs_to_run = expand_configs_for_algorithms(base_configs, algorithms_to_run)
         print(f"[信息] 仅运行指定实验: {[cfg['name'] for cfg in configs_to_run]}")
     else:
         # 🚨 关键修复：确保可学习APF先运行，避免传统APF的DELTA_*=0.0覆盖环境变量
         # 虽然每个实验是独立进程，但为了保险起见，将可学习APF放在前面
-        configs_to_run = sorted(EXPERIMENT_CONFIGS, key=lambda x: (x["label"] != "apf_learnable", x["label"]))
+        base_configs = sorted(EXPERIMENT_CONFIGS, key=lambda x: (x["label"] != "apf_learnable", x["label"]))
+        configs_to_run = expand_configs_for_algorithms(base_configs, algorithms_to_run)
         print(f"[Info] Experiment execution order (learnable APF prioritized): {[cfg['label'] for cfg in configs_to_run]}")
     
     print(f"\n{'='*70}")
     print(f"动作与势场修正消融对比实验")
+    print(f"算法: {', '.join(ALGORITHM_DISPLAY_NAMES.get(algo, algo.upper()) for algo in algorithms_to_run)}")
     print(f"实验数量: {len(configs_to_run)}")
     for cfg in configs_to_run:
         print(f"  - {cfg['name']}: {cfg['description']}")
@@ -2455,8 +2611,8 @@ def main():
         gpu_ids_list = None
         if args.gpu_ids:
             gpu_ids_list = [int(x.strip()) for x in args.gpu_ids.split(',')]
-            if len(gpu_ids_list) != len(EXPERIMENT_CONFIGS):
-                print(f"[Info] GPU ID count ({len(gpu_ids_list)}) does not match experiment count ({len(EXPERIMENT_CONFIGS)}), will cycle through GPUs")
+            if len(gpu_ids_list) != len(configs_to_run):
+                print(f"[Info] GPU ID count ({len(gpu_ids_list)}) does not match experiment count ({len(configs_to_run)}), will cycle through GPUs")
         else:
             # 检测可用GPU数量
             try:
@@ -2480,9 +2636,11 @@ def main():
                 args.episodes,
                 args.batch_size,
                 args.use_weighted_reward,
-                args.algorithm,
+                cfg.get("algorithm", args.algorithm),
                 args.logs_root,
                 gpu_id
+                ,
+                batch_dir,
             )
             tasks.append(task)
         
@@ -2690,7 +2848,11 @@ def main():
         print("[信息] 已跳过标准化测试汇总（--skip-eval 或 --eval-episodes=0）\n")
     
     # 生成图表
-    title = "Action vs APF Correction Ablation Comparison"
+    if len(algorithms_to_run) > 1:
+        algo_title = " vs ".join(ALGORITHM_DISPLAY_NAMES.get(algo, algo.upper()) for algo in algorithms_to_run)
+        title = f"Action/APF Line Comparison ({algo_title})"
+    else:
+        title = f"Action vs APF Correction Ablation Comparison ({ALGORITHM_DISPLAY_NAMES.get(algorithms_to_run[0], algorithms_to_run[0].upper())})"
     
     # 🔧 修复：添加时间戳，避免覆盖之前的实验结果
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
@@ -2745,6 +2907,8 @@ def main():
         "experiments": [
             {
                 "label": item["label"],
+                "base_label": item.get("base_label", item["label"]),
+                "algorithm": item.get("algorithm", algorithms_to_run[0]),
                 "name": item["name"],
                 "name_en": item.get("name_en", item.get("label", "Unknown")),  # 🔧 关键修复：确保包含name_en字段
                 "description": item.get("description", ""),
@@ -2782,6 +2946,7 @@ def main():
             }
             for item in series
         ],
+        "algorithms": algorithms_to_run,
         "output_files": {  # 🔧 新增：记录输出文件路径
             "reward_comparison": str(reward_png.name),
             "loss_comparison": str(loss_png.name),

@@ -128,6 +128,7 @@ echo "  - 实验名称: $EXP_NAME"
 echo "  - 带时间戳的实验名称: $EXP_NAME_WITH_TIMESTAMP"
 echo "  - 使用分项加权奖励: $USE_WEIGHTED_REWARD"
 echo "  - 训练算法: $ALGORITHM"
+echo "  - 训练障碍序列: ${TRAIN_OBSTACLE_SEQUENCE_MODE:-legacy_linear} (namespace=${TRAIN_OBSTACLE_SEQUENCE_NAMESPACE:-train_obstacle})"
 echo "  - 随机角色(Role Shuffle): ${ENABLE_ROLE_SHUFFLE:-1}"
 echo "  - 随机种子: $SEED ($SEED_SOURCE)"
 if [ -n "$RESUME_MODEL" ]; then
@@ -1309,7 +1310,12 @@ ARGS=(
 # 直接运行本脚本时未设置则默认 MATD3 Separated（dual Q + separated gradient）；
 # 消融实验通过环境变量 MATD3_USE_DUAL_Q / MATD3_USE_SEPARATED_GRADIENT 区分 Single Q / Dual Q / Separated
 if [ "$ALGORITHM" = "matd3" ]; then
-    ARGS+=(--matd3-use-dual-q "${MATD3_USE_DUAL_Q:-true}" --matd3-use-separated-gradient "${MATD3_USE_SEPARATED_GRADIENT:-true}")
+    ARGS+=(
+        --matd3-use-dual-q "${MATD3_USE_DUAL_Q:-true}"
+        --matd3-use-separated-gradient "${MATD3_USE_SEPARATED_GRADIENT:-true}"
+        --matd3-use-hybrid-actor-objective "${MATD3_USE_HYBRID_ACTOR_OBJECTIVE:-false}"
+        --matd3-hybrid-actor-alpha "${MATD3_HYBRID_ACTOR_ALPHA:-0.80}"
+    )
 fi
 if [ "$ALGORITHM" = "maddpg" ]; then
     ARGS+=(--maddpg-use-dual-q "${MADDPG_USE_DUAL_Q:-false}" --maddpg-use-separated-gradient "${MADDPG_USE_SEPARATED_GRADIENT:-true}")
@@ -1654,13 +1660,32 @@ echo ""
 # 检查是否启用自动评估（可通过环境变量控制）
 AUTO_EVAL=${AUTO_EVAL:-0}  # 默认启用自动评估
 EVAL_EPISODES=${EVAL_EPISODES:-5}  # 默认评估5个回合
+AUTO_EVAL_MODE=${AUTO_EVAL_MODE:-legacy}  # legacy=原有FR扫掠评估；official_spec=按官方spec做正式测试
+OFFICIAL_POST_EVAL_SPEC=${OFFICIAL_POST_EVAL_SPEC:-}
+OFFICIAL_POST_EVAL_OUTPUT_DIR=${OFFICIAL_POST_EVAL_OUTPUT_DIR:-}
+OFFICIAL_POST_EVAL_MODEL_VARIANT=${OFFICIAL_POST_EVAL_MODEL_VARIANT:-}
+OFFICIAL_POST_EVAL_SELECTION_PROTOCOL=${OFFICIAL_POST_EVAL_SELECTION_PROTOCOL:-matched_validation}
+OFFICIAL_POST_EVAL_VALIDATION_EPISODES=${OFFICIAL_POST_EVAL_VALIDATION_EPISODES:-10}
+OFFICIAL_POST_EVAL_VALIDATION_SEED=${OFFICIAL_POST_EVAL_VALIDATION_SEED:-}
+OFFICIAL_POST_EVAL_VALIDATION_CANDIDATES=${OFFICIAL_POST_EVAL_VALIDATION_CANDIDATES:-best_by_team_sr,best,checkpoint,final,latest_ep}
+OFFICIAL_POST_EVAL_FORCE_RERUN=${OFFICIAL_POST_EVAL_FORCE_RERUN:-0}
+OFFICIAL_EVAL_QUIET=${OFFICIAL_EVAL_QUIET:-1}
 
 if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,}" = "yes" ] || [ "${AUTO_EVAL,,}" = "on" ]; then
     echo "======================================"
     echo "🔬 开始自动测试评估（使用相同环境配置）"
     echo "======================================"
     
-    # 确定要评估的模型（优先使用final，如果不存在则使用best）
+    MODEL_ROOT_TO_EVAL=""
+    if [ -d "models/$EXP_NAME_WITH_TIMESTAMP" ]; then
+        MODEL_ROOT_TO_EVAL="models/$EXP_NAME_WITH_TIMESTAMP"
+        echo "✅ 使用实验模型目录: $MODEL_ROOT_TO_EVAL"
+    else
+        echo "⚠️  警告: 未找到实验模型目录 models/$EXP_NAME_WITH_TIMESTAMP"
+        echo "   跳过自动评估"
+    fi
+
+    # legacy 自动评估仍沿用旧的直接模型目录优先级。
     MODEL_TO_EVAL=""
     if [ -d "models/$EXP_NAME_WITH_TIMESTAMP/final" ]; then
         MODEL_TO_EVAL="models/$EXP_NAME_WITH_TIMESTAMP/final"
@@ -1668,13 +1693,76 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
     elif [ -d "models/$EXP_NAME_WITH_TIMESTAMP/best" ]; then
         MODEL_TO_EVAL="models/$EXP_NAME_WITH_TIMESTAMP/best"
         echo "✅ 使用最佳模型: $MODEL_TO_EVAL"
-    else
-        echo "⚠️  警告: 未找到可评估的模型（final 或 best）"
-        echo "   跳过自动评估"
-        MODEL_TO_EVAL=""
+    elif [ -d "models/$EXP_NAME_WITH_TIMESTAMP/best_by_team_sr" ]; then
+        MODEL_TO_EVAL="models/$EXP_NAME_WITH_TIMESTAMP/best_by_team_sr"
+        echo "✅ 使用 Team SR 最佳模型: $MODEL_TO_EVAL"
     fi
     
-    if [ -n "$MODEL_TO_EVAL" ]; then
+    if [ -n "$MODEL_ROOT_TO_EVAL" ]; then
+        AUTO_EVAL_MODE_NORMALIZED="${AUTO_EVAL_MODE,,}"
+        if [ "$AUTO_EVAL_MODE_NORMALIZED" = "official_spec" ]; then
+            if [ -z "$OFFICIAL_POST_EVAL_SPEC" ] || [ ! -f "$OFFICIAL_POST_EVAL_SPEC" ]; then
+                echo "⚠️  官方测试模式需要有效的 OFFICIAL_POST_EVAL_SPEC 文件"
+                echo "   当前值: ${OFFICIAL_POST_EVAL_SPEC:-<empty>}"
+                EVAL_STATUS=2
+            else
+                EVAL_SAVE_PATH="${OFFICIAL_POST_EVAL_OUTPUT_DIR:-logs/$EXP_NAME_WITH_TIMESTAMP/evaluation_official}"
+                mkdir -p "$EVAL_SAVE_PATH"
+                EVAL_PYTHON_BIN_RESOLVED="${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-python3}}"
+
+                REQUESTED_MODEL_VARIANT="${OFFICIAL_POST_EVAL_MODEL_VARIANT:-best_by_team_sr}"
+                OFFICIAL_EVAL_HELPER="${SCRIPT_DIR}/official_eval_with_matched_validation.py"
+
+                echo ""
+                echo "官方评估配置:"
+                echo "  - 模型根目录: $MODEL_ROOT_TO_EVAL"
+                echo "  - 官方spec: $OFFICIAL_POST_EVAL_SPEC"
+                echo "  - 保存路径: $EVAL_SAVE_PATH"
+                echo "  - 请求模型变体: $REQUESTED_MODEL_VARIANT"
+                echo "  - 选模协议: ${OFFICIAL_POST_EVAL_SELECTION_PROTOCOL}"
+                echo "  - 验证回合数: ${OFFICIAL_POST_EVAL_VALIDATION_EPISODES}"
+                echo "  - 验证候选: ${OFFICIAL_POST_EVAL_VALIDATION_CANDIDATES}"
+                if [ -n "${OFFICIAL_POST_EVAL_VALIDATION_SEED}" ]; then
+                    echo "  - 验证seed: ${OFFICIAL_POST_EVAL_VALIDATION_SEED}"
+                fi
+                echo ""
+
+                EVAL_CMD=(
+                    "$EVAL_PYTHON_BIN_RESOLVED"
+                    "$OFFICIAL_EVAL_HELPER"
+                    "--experiment-root" "$MODEL_ROOT_TO_EVAL"
+                    "--official-spec" "$OFFICIAL_POST_EVAL_SPEC"
+                    "--output-dir" "$EVAL_SAVE_PATH"
+                    "--model-variant" "$REQUESTED_MODEL_VARIANT"
+                    "--selection-protocol" "$OFFICIAL_POST_EVAL_SELECTION_PROTOCOL"
+                    "--validation-episodes" "$OFFICIAL_POST_EVAL_VALIDATION_EPISODES"
+                    "--validation-candidates" "$OFFICIAL_POST_EVAL_VALIDATION_CANDIDATES"
+                    "--quiet-output" "$OFFICIAL_EVAL_QUIET"
+                    "--python-bin" "$EVAL_PYTHON_BIN_RESOLVED"
+                )
+                if [ -n "${OFFICIAL_POST_EVAL_VALIDATION_SEED}" ]; then
+                    EVAL_CMD+=("--validation-seed" "$OFFICIAL_POST_EVAL_VALIDATION_SEED")
+                fi
+                if _truthy "${OFFICIAL_POST_EVAL_FORCE_RERUN}"; then
+                    EVAL_CMD+=("--force-rerun")
+                fi
+
+                "${EVAL_CMD[@]}"
+                EVAL_STATUS=$?
+
+                echo ""
+                echo "======================================"
+                if [ "${EVAL_STATUS:-0}" -eq 0 ]; then
+                    echo "✅ 官方自动评估完成!"
+                    echo "  - 结果目录: $EVAL_SAVE_PATH"
+                    echo "  - 评估统计: $EVAL_SAVE_PATH/evaluation_results.json"
+                else
+                    echo "⚠️  官方自动评估失败，退出码: ${EVAL_STATUS}"
+                fi
+                echo "======================================"
+                echo ""
+            fi
+        elif [ -n "$MODEL_TO_EVAL" ]; then
         # 设置评估结果保存路径（保存到相同的logs目录）
         EVAL_SAVE_PATH="logs/$EXP_NAME_WITH_TIMESTAMP/evaluation"
         mkdir -p "$EVAL_SAVE_PATH"
@@ -1707,6 +1795,9 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
             if [ -n "${POSITIONS_FILE}" ]; then
                 EVAL_ENV+=("POSITIONS_FILE=${POSITIONS_FILE}")
             fi
+        else
+            echo "⚠️  legacy 自动评估未找到可直接评估的模型目录（final/best/best_by_team_sr）"
+            echo "   跳过自动评估"
         fi
         
         # 地形配置（与训练一致）
@@ -1927,7 +2018,7 @@ PYTHON_EOF
             echo ""
             
             # 运行评估脚本
-            "$EVAL_CMD" "${EVAL_CMD_ARGS[@]}"
+            bash "$EVAL_CMD" "${EVAL_CMD_ARGS[@]}"
             EPISODE_STATUS=$?
             
             if [ "${EPISODE_STATUS:-0}" -ne 0 ]; then
@@ -1993,6 +2084,7 @@ PYTHON_EOF
         fi
         echo "======================================"
         echo ""
+        fi
     fi
 else
     echo "ℹ️  自动评估已禁用（设置 AUTO_EVAL=1 启用）"
@@ -2030,6 +2122,9 @@ echo "  AUTO_EVAL=0 ./run_optimized.sh 200 2048 \"no_auto_eval_exp\" 1"
 echo ""
 echo "  # 自定义评估回合数"
 echo "  EVAL_EPISODES=10 ./run_optimized.sh 200 2048 \"custom_eval_exp\" 1"
+echo ""
+echo "  # 使用官方post-eval spec做正式测试"
+echo "  AUTO_EVAL=1 AUTO_EVAL_MODE=official_spec OFFICIAL_POST_EVAL_SPEC=/path/to/post_eval_shared_spec.json ./run_optimized.sh 400 1024 \"official_eval_exp\" 1 matd3"
 echo "======================================"
 
 # 🔧 关键修复：显式退出脚本，防止意外继续执行

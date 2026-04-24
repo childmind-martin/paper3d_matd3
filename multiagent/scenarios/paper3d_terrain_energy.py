@@ -283,11 +283,32 @@ class Scenario(BaseScenario):
             )
         except Exception:
             self.training_env_sequence_seed = int(self.terrain_base_seed)
+        try:
+            train_obstacle_sequence_mode_kw = kwargs.get('train_obstacle_sequence_mode', None)
+            self.train_obstacle_sequence_mode = str(
+                os.getenv('TRAIN_OBSTACLE_SEQUENCE_MODE', 'legacy_linear')
+                if train_obstacle_sequence_mode_kw is None else train_obstacle_sequence_mode_kw
+            ).strip().lower()
+        except Exception:
+            self.train_obstacle_sequence_mode = 'legacy_linear'
+        if self.train_obstacle_sequence_mode not in ('legacy_linear', 'post_eval_family'):
+            self.train_obstacle_sequence_mode = 'legacy_linear'
+        try:
+            train_obstacle_sequence_namespace_kw = kwargs.get('train_obstacle_sequence_namespace', None)
+            self.train_obstacle_sequence_namespace = str(
+                os.getenv('TRAIN_OBSTACLE_SEQUENCE_NAMESPACE', 'train_obstacle')
+                if train_obstacle_sequence_namespace_kw is None else train_obstacle_sequence_namespace_kw
+            ).strip()
+        except Exception:
+            self.train_obstacle_sequence_namespace = 'train_obstacle'
+        if not self.train_obstacle_sequence_namespace:
+            self.train_obstacle_sequence_namespace = 'train_obstacle'
         self.current_episode_index = 0
         self.current_episode_env_id = 0
         self.current_episode_rng_seed = None
         self.current_episode_obstacle_seed = None
         self.current_episode_obstacle_seed_override = None
+        self._train_obstacle_sequence_cache = {}
         
         # 🔧 关键修复：跟踪当前地形种子，用于检测地形变化
         # 当地形种子变化时，重置位置初始化标记，使每个新地图都动态生成位置
@@ -562,6 +583,36 @@ class Scenario(BaseScenario):
         digest = hashlib.blake2b(payload.encode('utf-8'), digest_size=8).digest()
         seed = int.from_bytes(digest, 'little') % 2147483647
         return int(seed if seed > 0 else 1)
+
+    def _make_train_obstacle_family_seed(self, episode_idx, env_id=0):
+        base_sequence_seed = int(
+            getattr(
+                self,
+                'training_env_sequence_seed',
+                getattr(self, 'terrain_base_seed', self.seed if self.seed is not None else 67),
+            )
+        )
+        namespace = str(
+            getattr(self, 'train_obstacle_sequence_namespace', 'train_obstacle')
+        ).strip() or 'train_obstacle'
+        cache_key = (int(base_sequence_seed), str(namespace), int(env_id))
+        cache = getattr(self, '_train_obstacle_sequence_cache', None)
+        if cache is None:
+            cache = {}
+            self._train_obstacle_sequence_cache = cache
+        entry = cache.get(cache_key)
+        if entry is None:
+            entry = {
+                'rng': random.Random(f"{int(base_sequence_seed)}::{namespace}::env{int(env_id)}"),
+                'values': [],
+            }
+            cache[cache_key] = entry
+        values = entry['values']
+        rng = entry['rng']
+        target_idx = max(0, int(episode_idx))
+        while len(values) <= target_idx:
+            values.append(int(rng.randint(1000, 99999)))
+        return int(values[target_idx])
 
     def _make_hold_block_length(self, block_idx, env_id=0):
         hold_mode = str(getattr(self, 'semi_random_hold_mode', 'episode')).strip().lower()
@@ -2921,8 +2972,13 @@ class Scenario(BaseScenario):
         if obstacle_seed_override is not None:
             obstacle_seed = int(obstacle_seed_override)
         elif dynamic_obstacles:
-            if self._use_deterministic_train_env_sequence():
-                episode_idx, env_id = self._resolve_episode_context(world)
+            episode_idx, env_id = self._resolve_episode_context(world)
+            obstacle_sequence_mode = str(
+                getattr(self, 'train_obstacle_sequence_mode', 'legacy_linear')
+            ).strip().lower()
+            if obstacle_sequence_mode == 'post_eval_family':
+                obstacle_seed = self._make_train_obstacle_family_seed(episode_idx, env_id)
+            elif self._use_deterministic_train_env_sequence():
                 obstacle_seed = self._make_deterministic_episode_seed('obstacle', episode_idx, env_id)
             else:
                 if not hasattr(self, '_obstacle_reset_count'):

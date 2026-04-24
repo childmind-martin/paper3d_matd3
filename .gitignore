@@ -20,8 +20,12 @@ Thumbs.db
 venv/
 env/
 .env
+.codex
+.codex/
+.mplcache/
 
 logs/
+parallel_logs/
 models/
 evaluation_results/
 terrain_sensing_experiments/
@@ -30,6 +34,10 @@ ablation_action_pf_outputs/
 ablation_fixed_fr_outputs/
 results/
 seed_sweeps/
+diagnostics/
+hma_layout_check/
+terrain_previews_groupb/
+terrain_previews_paper/
 
 *.log
 *.weights.h5
@@ -39,6 +47,8 @@ seed_sweeps/
 *.pt
 
 Miniconda3-latest-Linux-x86_64.sh
+paper3d_train_optimized_backup.py
+tempCodeRunnerFile.py
 tempCodeRunnerFile.sh
 2024 TD3基础改进的强化学习算法.pdf
 自适应旋转势场.pdf

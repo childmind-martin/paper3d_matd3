@@ -473,12 +473,25 @@ done
 if [ ${#MATCHED_RESULTS_JSON[@]} -gt 0 ]; then
     RESULTS_JSON_PATH="${MATCHED_RESULTS_JSON[0]}"
     if [ ${#MATCHED_RESULTS_JSON[@]} -gt 1 ] && ([ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]); then
-        echo "❌ 严格模式：发现多个与 exp_name=$EXPECTED_EXP_NAME 精确匹配的 results.json，存在歧义："
-        for p in "${MATCHED_RESULTS_JSON[@]}"; do
-            echo "   - $p"
-        done
-        echo "   请保留唯一匹配文件后重试。"
-        exit 1
+        MODEL_RESULTS_JSON="$MODEL_PARENT_DIR/results.json"
+        if [ -f "$MODEL_RESULTS_JSON" ]; then
+            for p in "${MATCHED_RESULTS_JSON[@]}"; do
+                if [ "$p" = "$MODEL_RESULTS_JSON" ]; then
+                    RESULTS_JSON_PATH="$MODEL_RESULTS_JSON"
+                    break
+                fi
+            done
+        fi
+        if [ "$RESULTS_JSON_PATH" != "$MODEL_RESULTS_JSON" ]; then
+            echo "❌ 严格模式：发现多个与 exp_name=$EXPECTED_EXP_NAME 精确匹配的 results.json，存在歧义："
+            for p in "${MATCHED_RESULTS_JSON[@]}"; do
+                echo "   - $p"
+            done
+            echo "   请保留唯一匹配文件后重试。"
+            exit 1
+        else
+            echo "ℹ️  严格模式：发现多个精确匹配的 results.json，优先使用模型目录旁配置: $RESULTS_JSON_PATH"
+        fi
     fi
 elif [ ${#UNIQUE_RESULTS_JSON_CANDIDATES[@]} -gt 0 ] && ! ([ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]); then
     # 非严格模式下回退到第一个候选
