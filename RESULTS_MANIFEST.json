@@ -1,0 +1,132 @@
+{
+  "schema_version": "2.0",
+  "artifact_name": "matd3_dual_semantic_apf_reviewer_artifact",
+  "purpose": "Map paper results to result directories, source files, scripts, and evidence roles without implying full multi-seed retraining reproducibility.",
+  "submission_version": {
+    "type": "release_tag",
+    "commit": null,
+    "release_tag": "reviewer-artifact-2026-05-07"
+  },
+  "paper": {
+    "manuscript_path": "../paper/cas-dc-sample.tex",
+    "availability_section": "Code and Data Availability"
+  },
+  "entries": {
+    "Table_5_semantic_ablation": {
+      "paper_item": "Table 5 / tab:semantic_ablation",
+      "evidence_role": "core mechanism evidence",
+      "scientific_question": "Does preserving raw/corrected action roles after APF-corrected execution matter for the dual-semantic learning mechanism?",
+      "result_dir": "level2_dual_semantics_partial_summary_20260427_141546/",
+      "raw_csv": "level2_dual_semantics_partial_summary_20260427_141546/official_eval_multiseed_all_runs.csv",
+      "aggregate_csv": "level2_dual_semantics_partial_summary_20260427_141546/official_eval_multiseed_aggregated.csv",
+      "summary_json": "level2_dual_semantics_partial_summary_20260427_141546/official_eval_multiseed_summary.json",
+      "plotting_artifact": "level2_dual_semantics_partial_summary_20260427_141546/official_eval_multiseed_dashboard.png",
+      "source_files": [
+        "level2_dual_semantics_partial_summary_20260427_141546/official_eval_cross_algo_summary.csv",
+        "level2_dual_semantics_partial_summary_20260427_141546/official_eval_cross_algo_summary.json",
+        "level2_dual_semantics_partial_summary_20260427_141546/official_eval_cross_algo_summary.png"
+      ],
+      "script_hint": "Use the Level-2 official/semantic summary scripts, especially summarize_level2_official_eval_multiseed.py or summarize_level2_dual_semantics_eval_sweep.py; scripts should check available files in result_dir before assuming filenames.",
+      "protocol_summary": "Focused Level-2 semantic-ablation summary under checkpoint-FR evaluation; compares full dual-semantic preservation against collapsed replay and target-side variants.",
+      "used_for_main_claim": true,
+      "notes": "This is the core mechanism evidence for whether raw/corrected action roles should be preserved after APF-corrected execution."
+    },
+    "Table_6_level2_checkpoint_fr": {
+      "paper_item": "Table 6 / tab:level2-official-summary",
+      "evidence_role": "primary deployment evidence",
+      "scientific_question": "How do the reported algorithm families behave under the primary Level-2 checkpoint-FR deployment protocol with stochastic obstacles?",
+      "result_dir": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/",
+      "raw_csv": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_all_runs_model_fr.csv",
+      "aggregate_csv": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_aggregated_model_fr.csv",
+      "summary_json": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_summary_model_fr.json",
+      "plotting_artifact": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_dashboard_model_fr.png",
+      "source_files": [
+        "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_all_runs_model_fr.csv",
+        "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_aggregated_model_fr.csv",
+        "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_summary_model_fr.json",
+        "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_dashboard_model_fr.png"
+      ],
+      "script_hint": "Use summarize_level2_official_eval_multiseed.py for the multiseed model-FR summary. Any/Two arrival values are derived from episode_details[].agent_success_flags in the evaluation_results.json files referenced by official_eval_multiseed_all_runs_model_fr.csv.",
+      "protocol_summary": "Level-2 fixed-terrain, stochastic-obstacle checkpoint-FR model-FR evaluation across contextual MATD3-, MADDPG-, and MAPPO-family variants.",
+      "used_for_main_claim": true,
+      "notes": "This is the primary deployment evidence used by the current paper Table 6. It should be interpreted with Table 5 rather than as a universal MARL ranking."
+    },
+    "Figure_5_level2_dashboard": {
+      "paper_item": "Figure 5 / fig:l2-full-main",
+      "evidence_role": "primary deployment evidence",
+      "scientific_question": "What visual dashboard accompanies the Level-2 checkpoint-FR deployment summary?",
+      "result_dir": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/",
+      "raw_csv": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_all_runs_model_fr.csv",
+      "aggregate_csv": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_aggregated_model_fr.csv",
+      "summary_json": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_summary_model_fr.json",
+      "plotting_artifact": "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_dashboard_model_fr.png",
+      "source_files": [
+        "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_dashboard_model_fr.png"
+      ],
+      "script_hint": "Use the plotting path associated with summarize_level2_official_eval_multiseed.py; scripts should check available files in result_dir before assuming filenames.",
+      "protocol_summary": "Diagnostic visual companion to the Level-2 checkpoint-FR numerical summary.",
+      "used_for_main_claim": false,
+      "notes": "The figure is a dashboard companion. Numerical claims should be checked against Table 6 and its CSV/JSON summaries."
+    },
+    "Table_7_level1_fixed_map": {
+      "paper_item": "Table 7 / tab:level1_summary",
+      "evidence_role": "supporting low-variability validation",
+      "scientific_question": "Does the dual-semantic scaffold behave sensibly in the lower-variability fixed-map setting?",
+      "result_dir": "ablation_experiments/multi_seed_groupA_20260412_205350/",
+      "raw_csv": null,
+      "aggregate_csv": null,
+      "summary_json": "ablation_experiments/multi_seed_groupA_20260412_205350/plots/summary_20260414_221440.json",
+      "plotting_artifact": "ablation_experiments/multi_seed_groupA_20260412_205350/plots/multi_seed_mean_ablation_comparison_20260414_221440.png",
+      "source_files": [
+        "ablation_experiments/multi_seed_groupA_20260412_205350/config.json",
+        "ablation_experiments/multi_seed_groupA_20260412_205350/results/multi_seed_audit_20260414_221436.json",
+        "ablation_experiments/multi_seed_groupA_20260412_205350/results/latest_multi_seed_audit.json",
+        "ablation_experiments/multi_seed_groupA_20260412_205350/plots/multi_seed_post_eval_summary_20260414_221440.png"
+      ],
+      "script_hint": "Use the multi-seed plotting/summary utilities such as generate_complete_batch_plots.py, regenerate_complete_ablation_plots.py, or regenerate_ablation_plots.py; scripts should scan result_dir because no exact CSV file is present in this directory.",
+      "protocol_summary": "Level-1 fixed-map, lower-variability support case using the Group-A multiseed batch.",
+      "used_for_main_claim": false,
+      "notes": "No exact CSV file was found in this result directory; summary values are represented through JSON and plotting/audit artifacts."
+    },
+    "Table_8_level3_terrain_family": {
+      "paper_item": "Table 8 / tab:highvar-results",
+      "evidence_role": "supporting terrain-family analysis",
+      "scientific_question": "How does objective-family behavior change under semi-random terrain-family stress?",
+      "result_dir": "ablation_experiments/multi_seed_groupB_20260406_230829/",
+      "raw_csv": null,
+      "aggregate_csv": null,
+      "summary_json": "ablation_experiments/multi_seed_groupB_20260406_230829/plots/summary_20260414_234950.json",
+      "plotting_artifact": "ablation_experiments/multi_seed_groupB_20260406_230829/plots/multi_seed_mean_ablation_comparison_20260414_234950.png",
+      "source_files": [
+        "ablation_experiments/multi_seed_groupB_20260406_230829/config.json",
+        "ablation_experiments/multi_seed_groupB_20260406_230829/results/multi_seed_audit_20260414_234945.json",
+        "ablation_experiments/multi_seed_groupB_20260406_230829/results/latest_multi_seed_audit.json",
+        "ablation_experiments/multi_seed_groupB_20260406_230829/plots/matd3_trio_train_reward_success_20260414_234950.png"
+      ],
+      "script_hint": "Use the multi-seed plotting/summary utilities such as generate_complete_batch_plots.py, regenerate_complete_ablation_plots.py, or regenerate_ablation_plots.py; scripts should scan result_dir because no exact CSV file is present in this directory.",
+      "protocol_summary": "Level-3 semi-random terrain-family support analysis using the Group-B multiseed batch.",
+      "used_for_main_claim": false,
+      "notes": "No exact CSV file was found in this result directory. This item supports terrain-family interpretation and is not used as a second main benchmark universe."
+    },
+    "Appendix_H3_apf_fusion_sanity": {
+      "paper_item": "Appendix Table H.3 / tab:apf-results",
+      "evidence_role": "supplementary sanity/reference evidence",
+      "scientific_question": "Do learned motion proposals and APF correction provide complementary signals in a controlled APF-fusion sanity check?",
+      "result_dir": "ablation_experiments/batch_20260403_132242/",
+      "raw_csv": null,
+      "aggregate_csv": null,
+      "summary_json": "ablation_experiments/batch_20260403_132242/plots/summary_20260403_221128.json",
+      "plotting_artifact": "ablation_experiments/batch_20260403_132242/plots/success_collision_clearance_comparison_20260403_221128.png",
+      "source_files": [
+        "ablation_experiments/batch_20260403_132242/config.json",
+        "ablation_experiments/batch_20260403_132242/plots/latest_summary.json",
+        "ablation_experiments/batch_20260403_132242/plots/reward_comparison_20260403_221128.png",
+        "ablation_experiments/batch_20260403_132242/plots/success_rate_and_clearance_comparison_20260403_221128.png"
+      ],
+      "script_hint": "Use ablation_action_pf_comparison.py for the original batch and regenerate_action_pf_plots.py for plots if available; scripts should check available files because no exact CSV file is present in this directory.",
+      "protocol_summary": "Supplementary single-run APF-only/action-only/action-plus-APF sanity/reference check under a fixed layout.",
+      "used_for_main_claim": false,
+      "notes": "Not used to establish the necessity of dual-semantic replay, critic construction, target reconstruction, or separated-gradient routing. No exact CSV file was found in this result directory."
+    }
+  }
+}
