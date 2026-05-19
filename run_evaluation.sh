@@ -48,6 +48,8 @@ DISABLE_EARLY_TERMINATION=${6:-false}  # 默认允许提前终止，避免日常
 # 严格验证模式：默认开启。要求评估关键参数必须与训练配置一致，否则退出
 STRICT_EVAL_MATCH=${STRICT_EVAL_MATCH:-1}
 EVAL_EPISODE_LENGTH_MULTIPLIER=${EVAL_EPISODE_LENGTH_MULTIPLIER:-${POST_EVAL_EPISODE_LENGTH_MULTIPLIER:-1}}
+EVAL_EPISODE_PARALLELISM=${EVAL_EPISODE_PARALLELISM:-1}
+EVAL_ENV_STEP_THREADS=${EVAL_ENV_STEP_THREADS:-1}
 
 echo ""
 echo "评估参数:"
@@ -59,6 +61,8 @@ echo "  - 固定位置文件: $POSITIONS_FILE"
 echo "  - 使用固定位置: $USE_FIXED_POSITIONS"
 echo "  - 禁用提前终止: $DISABLE_EARLY_TERMINATION"
 echo "  - 严格对齐训练配置: $STRICT_EVAL_MATCH"
+echo "  - Episode内并行(方案A): $EVAL_EPISODE_PARALLELISM"
+echo "  - env.step线程数(方案A): $EVAL_ENV_STEP_THREADS"
 echo ""
 
 # 🔧 关键修复：确保路径变量正确引用，支持中文路径
@@ -446,7 +450,7 @@ done
 # 优先选择 exp_name 精确匹配的 results.json
 declare -a MATCHED_RESULTS_JSON
 for p in "${UNIQUE_RESULTS_JSON_CANDIDATES[@]}"; do
-    is_match=$(python3 - <<PYTHON_EOF
+    is_match=$("$EVAL_PYTHON_BIN" - <<PYTHON_EOF
 import json
 import sys
 path = r"""$p"""
@@ -512,7 +516,7 @@ fi
 # 优先使用训练时的参数值，确保评估与训练完全一致
 if [ -n "$RESULTS_JSON_PATH" ] && [ -f "$RESULTS_JSON_PATH" ]; then
     # 使用Python读取results.json中的所有势场参数
-    TRAINING_PARAMS=$(python3 <<PYTHON_EOF
+    TRAINING_PARAMS=$("$EVAL_PYTHON_BIN" <<PYTHON_EOF
 import json
 import sys
 try:
@@ -525,6 +529,9 @@ try:
         args = results['args']
     elif isinstance(results, dict):
         args = results
+    training_environment = results.get('training_environment', {}) if isinstance(results, dict) else {}
+    if not isinstance(training_environment, dict):
+        training_environment = {}
     
     if args is not None:
         params = {}
@@ -536,6 +543,10 @@ try:
             'algo',
             'episode_length',
             'action_force_ratio',
+            'gravity',
+            'control_accel_gain',
+            'agent_max_speed',
+            'agent_accel',
             'goal_attraction',
             'lambda_1_base',
             'terrain_repulsion',
@@ -550,6 +561,7 @@ try:
             'damping',
             'simulation_dt',
             'z_action_bias',
+            'use_quadrotor_dynamics',
             'quadrotor_attitude_response_time',
             'quadrotor_psi_cmd',
             'reward_pos_scale',
@@ -599,6 +611,8 @@ try:
         for param_name in param_names:
             if param_name in args:
                 params[param_name] = args[param_name]
+            elif param_name in training_environment:
+                params[param_name] = training_environment[param_name]
             elif isinstance(results, dict) and param_name in results:
                 params[param_name] = results[param_name]
         
@@ -615,7 +629,7 @@ PYTHON_EOF
 if [ -n "$TRAINING_PARAMS" ]; then
         json_get_from_training_params() {
             local key="$1"
-            echo "$TRAINING_PARAMS" | python3 -c "import sys, json; d=json.load(sys.stdin); v=d.get('$key', ''); print('' if v is None else v)" 2>/dev/null
+            echo "$TRAINING_PARAMS" | "$EVAL_PYTHON_BIN" -c "import sys, json; d=json.load(sys.stdin); v=d.get('$key', ''); print('' if v is None else v)" 2>/dev/null
         }
 
         # 解析JSON并设置环境变量
@@ -850,7 +864,7 @@ fi
 # - 场景/算法在严格模式下必须从训练配置读取，禁止回退（防止口径漂移）
 if [ -z "$TRAINING_TERRAIN_CONTACT_EPS" ]; then
     export TERRAIN_CONTACT_EPS=${TERRAIN_CONTACT_EPS:-0.2}
-    echo "⚠️  训练配置缺少 terrain_contact_eps，回退使用: $TERRAIN_CONTACT_EPS"
+    echo "ℹ️  训练配置缺少 terrain_contact_eps（旧结果常见），使用统一训练默认: $TERRAIN_CONTACT_EPS"
 fi
 
 # ===== 严格对齐训练地形生成参数（随机模式/seed/复杂度/地图尺寸）=====
@@ -1095,6 +1109,7 @@ fi
 
 # 设置默认地形复杂度等级（与训练脚本保持一致）
 export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3}  # 🔧 修复：与训练脚本一致的地形复杂度
+CMD_ARGS="$CMD_ARGS --terrain-contact-eps $TERRAIN_CONTACT_EPS"
 CMD_ARGS="$CMD_ARGS --terrain-complexity-level $TERRAIN_COMPLEXITY_LEVEL"
 
 # 🔧 修复：奖励参数优先完全回读训练配置，其次才使用外部环境变量/脚本默认值
@@ -1205,7 +1220,34 @@ else
     echo ""
 fi
 
+_eval_truthy() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 默认可视化策略：只保留最佳奖励/最佳成功回合结果，避免每个episode都生成PNG/HTML拖慢评估
+if _eval_truthy "${FAST_ARTIFACTS:-0}"; then
+    : "${SAVE_INTERACTIVE_TRAJ:=0}"
+    : "${SAVE_EVAL_ALL_EPISODES:=0}"
+    : "${SAVE_BEST_TRAJ:=0}"
+    : "${SAVE_TEAM_SUCCESS_HTML:=0}"
+    : "${SAVE_EVAL_TRAJECTORY_JSON:=0}"
+    : "${SAVE_EVAL_TRAJECTORY_PNG:=0}"
+    : "${SAVE_EVAL_ACTOR_SEQUENCE:=0}"
+    : "${SAVE_EVAL_CONTROL_DIAGNOSTICS:=0}"
+    : "${DISABLE_TRAJECTORY_RECORDING:=1}"
+    : "${EVAL_LIGHT_ACTION_PATH:=1}"
+    : "${EVAL_LIGHT_INFO:=1}"
+    : "${EVAL_ACTOR_ONLY:=1}"
+    : "${EVAL_VERIFY_WEIGHT_COVERAGE:=0}"
+    : "${TIMING_DETAIL:=0}"
+    : "${TIMING_LEVEL:=1}"
+    : "${DEBUG_EPISODE_SUMMARY:=0}"
+    : "${DEBUG_COLLISION_SUMMARY:=0}"
+    echo "⚡ FAST_ARTIFACTS=1：默认关闭评估轨迹/HTML/诊断artifact（显式设置的变量会保留）"
+fi
 export SAVE_INTERACTIVE_TRAJ=${SAVE_INTERACTIVE_TRAJ:-1}
 export SAVE_EVAL_ALL_EPISODES=${SAVE_EVAL_ALL_EPISODES:-0}
 export SAVE_BEST_TRAJ=${SAVE_BEST_TRAJ:-1}
@@ -1214,6 +1256,15 @@ export SAVE_EVAL_TRAJECTORY_JSON=${SAVE_EVAL_TRAJECTORY_JSON:-0}
 export SAVE_EVAL_TRAJECTORY_PNG=${SAVE_EVAL_TRAJECTORY_PNG:-0}
 export SAVE_EVAL_ACTOR_SEQUENCE=${SAVE_EVAL_ACTOR_SEQUENCE:-1}
 export SAVE_EVAL_CONTROL_DIAGNOSTICS=${SAVE_EVAL_CONTROL_DIAGNOSTICS:-0}
+export DISABLE_TRAJECTORY_RECORDING=${DISABLE_TRAJECTORY_RECORDING:-0}
+export EVAL_LIGHT_ACTION_PATH=${EVAL_LIGHT_ACTION_PATH:-0}
+export EVAL_LIGHT_INFO=${EVAL_LIGHT_INFO:-0}
+export EVAL_ACTOR_ONLY=${EVAL_ACTOR_ONLY:-0}
+export EVAL_VERIFY_WEIGHT_COVERAGE=${EVAL_VERIFY_WEIGHT_COVERAGE:-0}
+export TIMING_DETAIL=${TIMING_DETAIL:-0}
+export TIMING_LEVEL=${TIMING_LEVEL:-1}
+export DEBUG_EPISODE_SUMMARY=${DEBUG_EPISODE_SUMMARY:-1}
+export DEBUG_COLLISION_SUMMARY=${DEBUG_COLLISION_SUMMARY:-1}
 export QUIET_OUTPUT=${QUIET_OUTPUT:-1}
 export TQDM_DISABLE=${TQDM_DISABLE:-1}
 export ENABLE_OVERLAY=${ENABLE_OVERLAY:-0}
@@ -1259,6 +1310,8 @@ EVAL_CMD=(
     "$EVAL_SCRIPT"
     --load-model-path "$MODEL_PATH"
     --eval-episodes "$EVAL_EPISODES"
+    --eval-episode-parallelism "$EVAL_EPISODE_PARALLELISM"
+    --eval-env-step-threads "$EVAL_ENV_STEP_THREADS"
     --save-viz-path "$SAVE_PATH"
     --scenario-name "$SCENARIO_NAME"
     --episode-length "$EPISODE_LENGTH"
@@ -1291,6 +1344,7 @@ EVAL_CMD=(
     --delta-lambda-1 "$DELTA_LAMBDA_1"
     --delta-k-rep "$DELTA_K_REP"
     --delta-radius "$DELTA_RADIUS"
+    --terrain-contact-eps "$TERRAIN_CONTACT_EPS"
     --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
     --distance-weight "$DISTANCE_WEIGHT"
     --exploration-weight "$EXPLORATION_WEIGHT"

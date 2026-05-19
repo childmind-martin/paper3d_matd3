@@ -4788,6 +4788,20 @@ def make_env_init(rank: int, args_dict: dict):
     scenario = load_scenario_module(args.scenario, args)
     if scenario is None:
         raise RuntimeError(f"无法加载场景: {args.scenario}")
+    try:
+        import os
+        terrain_contact_eps = getattr(args, 'terrain_contact_eps', None)
+        if terrain_contact_eps is None:
+            terrain_contact_eps = os.getenv('TERRAIN_CONTACT_EPS', '0.2')
+        terrain_contact_eps = float(terrain_contact_eps)
+        os.environ['TERRAIN_CONTACT_EPS'] = str(terrain_contact_eps)
+        setattr(args, 'terrain_contact_eps', terrain_contact_eps)
+        if hasattr(scenario, '_terrain_contact_eps'):
+            scenario._terrain_contact_eps = terrain_contact_eps
+        if hasattr(scenario, 'terrain_contact_eps'):
+            scenario.terrain_contact_eps = terrain_contact_eps
+    except Exception:
+        pass
     world = scenario.make_world()
     try:
         world.env_id = rank
@@ -5076,6 +5090,7 @@ class OptimizedMADDPG:
         self.obs_shapes = obs_shapes
         self.action_dims = action_dims
         self.args = args
+        self.eval_actor_only = bool(getattr(args, 'eval_actor_only', False))
         self.base_obs_shapes = list(getattr(self.args, 'base_obs_shapes', obs_shapes))
         # 🔧 新增：存储scenario和world引用（用于评估时的Oracle模式）
         self.scenario_ref = None
@@ -5159,8 +5174,9 @@ class OptimizedMADDPG:
         self.agents = []
         self._init_networks()
         
-        # 初始化优化器
-        self._init_optimizers()
+        # 评估 rollout 只需要 Actor；跳过 Critic/Target/Optimizer 可显著降低多进程内存峰值。
+        if not self.eval_actor_only:
+            self._init_optimizers()
         
         # 初始化观察处理器（使用向量化NumPy处理）
         use_vectorization = getattr(args, 'use_vectorization', True)
@@ -5245,11 +5261,12 @@ class OptimizedMADDPG:
         }
         
         # 预热优化器以避免tf.function问题（在网络和优化器都初始化后）
-        if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-            print("正在预热优化器...")
-        self._initialize_optimizers()
-        if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-            print("优化器预热完成")
+        if not self.eval_actor_only:
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                print("正在预热优化器...")
+            self._initialize_optimizers()
+            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
+                print("优化器预热完成")
         
         # === 动作缩放辅助（已废弃，保留定义以避免错误）：
         # 注意：此函数已不再使用。训练端现在直接使用"真实动作"（环境映射后的动作），
@@ -5489,6 +5506,10 @@ class OptimizedMADDPG:
                         print(f"[Actor网络] 智能体{i} - 修复初始化：X/Y轴偏置=0.0，Z轴偏置={z_bias_value:.4f}（已取消偏置）")
                 except Exception as e:
                     print(f"[Actor网络] 智能体{i} - 设置偏置失败: {e}")
+
+            if self.eval_actor_only:
+                self.agents.append(agent)
+                continue
             
             agent['target_actor'] = tf.keras.models.clone_model(agent['actor'])
             agent['target_actor'].set_weights(agent['actor'].get_weights())
@@ -5510,7 +5531,10 @@ class OptimizedMADDPG:
             
             self.agents.append(agent)
         
-        print(f"[CTDE网络] 网络初始化完成 - Actor使用局部观察({self.obs_shapes[0]}维), Critic使用全局状态({sum(self.obs_shapes)}维)")
+        if self.eval_actor_only:
+            print(f"[CTDE网络] 评估轻量模式：仅初始化Actor，跳过Critic/Target/Optimizer")
+        else:
+            print(f"[CTDE网络] 网络初始化完成 - Actor使用局部观察({self.obs_shapes[0]}维), Critic使用全局状态({sum(self.obs_shapes)}维)")
         
         # 噪声状态总结：统一使用 OU 噪声
         print(f"\n{'='*80}")
@@ -9467,6 +9491,7 @@ class OptimizedMATD3:
         self.obs_shapes = obs_shapes
         self.action_dims = action_dims
         self.args = args
+        self.eval_actor_only = bool(getattr(args, 'eval_actor_only', False))
         
         # 🔧 新增：存储scenario和world引用（用于评估时的Oracle模式）
         self.scenario_ref = None
@@ -9504,6 +9529,17 @@ class OptimizedMATD3:
         self.use_separated_gradient = bool(getattr(args, 'matd3_use_separated_gradient', True))
         self.use_hybrid_actor_objective = bool(getattr(args, 'matd3_use_hybrid_actor_objective', False))
         self.hybrid_actor_alpha = float(getattr(args, 'matd3_hybrid_actor_alpha', 0.80) or 0.80)
+        self.action_semantics_mode = str(
+            getattr(args, 'matd3_action_semantics_mode', 'dual') or 'dual'
+        ).strip().lower()
+        if self.action_semantics_mode not in ('dual', 'collapsed_replay'):
+            raise ValueError(
+                f"Unsupported MATD3 action semantics mode: {self.action_semantics_mode}. "
+                "Expected one of: dual, collapsed_replay"
+            )
+        self.reconstruct_corrected_target = bool(
+            getattr(args, 'matd3_reconstruct_corrected_target', True)
+        )
         if not self.use_dual_q and self.use_separated_gradient:
             self.use_separated_gradient = False
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
@@ -9515,6 +9551,10 @@ class OptimizedMATD3:
         self.hybrid_actor_alpha = float(np.clip(self.hybrid_actor_alpha, 0.0, 1.0))
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
             print(f"[MATD3] Dual Q: {self.use_dual_q}, Separated Gradient: {self.use_separated_gradient}")
+            print(
+                f"[MATD3] Action Semantics: {self.action_semantics_mode}, "
+                f"Target Reconstruction: {self.reconstruct_corrected_target}"
+            )
             if self.use_hybrid_actor_objective:
                 print(f"[MATD3] Actor Objective: hybrid (separated_weight={self.hybrid_actor_alpha:.2f}, unified_weight={1.0 - self.hybrid_actor_alpha:.2f})")
             elif self.use_dual_q and self.use_separated_gradient:
@@ -9585,11 +9625,10 @@ class OptimizedMATD3:
         self.agents = []
         self._init_networks()
         
-        # 初始化优化器
-        self._init_optimizers()
-        
-        # 预热优化器（防止tf.function变量创建错误）
-        self._initialize_optimizers()
+        # 评估 rollout 只需要 Actor；跳过 Critic/Target/Optimizer 可显著降低多进程内存峰值。
+        if not self.eval_actor_only:
+            self._init_optimizers()
+            self._initialize_optimizers()
         
         # 初始化观察处理器（使用向量化NumPy处理）
         use_vectorization = getattr(args, 'use_vectorization', True)
@@ -9939,6 +9978,10 @@ class OptimizedMATD3:
                         print(f"[Actor网络] 智能体{i} - 修复初始化：X/Y轴偏置=0.0，Z轴偏置={z_bias_value:.4f}（已取消偏置）")
                 except Exception as e:
                     print(f"[Actor网络] 智能体{i} - 设置偏置失败: {e}")
+
+            if self.eval_actor_only:
+                self.agents.append(agent)
+                continue
             
             agent['target_actor'] = tf.keras.models.clone_model(agent['actor'])
             agent['target_actor'].set_weights(agent['actor'].get_weights())
@@ -10859,8 +10902,11 @@ class OptimizedMATD3:
         # 注意：这个循环是必要的，因为每个智能体的target_actor网络是独立的
         # 性能优化：确保所有tensor转换在循环外完成，减少重复转换
         fr_next = fr_batch_column
+        reconstruct_corrected_target = bool(getattr(self, 'reconstruct_corrected_target', True))
         next_act_corrected_valid = bool(
-            next_act_corrected_batch is not None and getattr(replay_buffer, 'stores_next_act_corrected', False)
+            reconstruct_corrected_target
+            and next_act_corrected_batch is not None
+            and getattr(replay_buffer, 'stores_next_act_corrected', False)
         )
         next_pf_geometry_cache_np = None
         if getattr(replay_buffer, 'stores_next_pf_geometry_cache', False) and next_pf_geometry_cache_batch is not None:
@@ -10882,7 +10928,13 @@ class OptimizedMATD3:
         need_shared_next_context = bool(
             (
                 (self.use_pf_feature_flag and next_pf_features_np is None and shared_next_pf_supported)
-                or (use_tf_potential_field and fr_positive and (not next_act_corrected_valid) and shared_next_correction_supported)
+                or (
+                    reconstruct_corrected_target
+                    and use_tf_potential_field
+                    and fr_positive
+                    and (not next_act_corrected_valid)
+                    and shared_next_correction_supported
+                )
             )
         )
         if detail_enabled:
@@ -11008,7 +11060,7 @@ class OptimizedMATD3:
                     corrected_action = next_act_corr_tensor[:, i, :action_dim]
                     smoothed_target_actions_corrected.append(corrected_action)
                     start_idx += action_dim
-        elif use_tf_potential_field and fr_positive:
+        elif reconstruct_corrected_target and use_tf_potential_field and fr_positive:
             # 🔧 向后兼容：如果 Buffer 没有 next_act_corrected，重新计算
             if next_obs_valid_inputs is not None and next_obs_geometry_context is not None and uniform_action_dims and self.action_dims[0] >= 3:
                 act_dim = self.action_dims[0]
@@ -15070,6 +15122,7 @@ def train(args):
             'peak_height_jitter_ratio_max': _env_float('PEAK_HEIGHT_JITTER_RATIO_MAX', getattr(args, 'peak_height_jitter_ratio_max', 0.0) or 0.0),
             'peak_height_max_scale': _env_float('PEAK_HEIGHT_MAX_SCALE', getattr(args, 'peak_height_max_scale', 1.0) or 1.0),
             'terrain_variant_noise_ratio': _env_float('TERRAIN_VARIANT_NOISE_RATIO', getattr(args, 'terrain_variant_noise_ratio', 0.0) or 0.0),
+            'terrain_contact_eps': _env_float('TERRAIN_CONTACT_EPS', getattr(args, 'terrain_contact_eps', 0.2) or 0.2),
             'semi_random_hold_mode': str(getattr(args, 'semi_random_hold_mode', os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', 'episode'))),
             'semi_random_hold_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', getattr(args, 'semi_random_hold_episodes', 1) or 1),
             'semi_random_hold_min_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', getattr(args, 'semi_random_hold_min_episodes', 1) or 1),
@@ -15084,16 +15137,26 @@ def train(args):
             use_separated_gradient = bool(getattr(args, "matd3_use_separated_gradient", True))
             use_hybrid_actor_objective = bool(getattr(args, "matd3_use_hybrid_actor_objective", False))
             hybrid_actor_alpha = float(getattr(args, "matd3_hybrid_actor_alpha", 0.80) or 0.80)
+            action_semantics_mode = str(
+                getattr(args, "matd3_action_semantics_mode", "dual") or "dual"
+            ).strip().lower()
+            reconstruct_corrected_target = bool(
+                getattr(args, "matd3_reconstruct_corrected_target", True)
+            )
         elif algo_name == "maddpg":
             use_dual_q = bool(getattr(args, "maddpg_use_dual_q", False))
             use_separated_gradient = bool(getattr(args, "maddpg_use_separated_gradient", True))
             use_hybrid_actor_objective = False
             hybrid_actor_alpha = 0.0
+            action_semantics_mode = "dual"
+            reconstruct_corrected_target = True
         else:
             use_dual_q = False
             use_separated_gradient = False
             use_hybrid_actor_objective = False
             hybrid_actor_alpha = 0.0
+            action_semantics_mode = "dual"
+            reconstruct_corrected_target = True
 
         if not use_dual_q:
             actor_objective_mode = "single_q_joint"
@@ -15111,6 +15174,9 @@ def train(args):
             "use_separated_gradient": bool(use_separated_gradient),
             "use_hybrid_actor_objective": bool(use_hybrid_actor_objective),
             "hybrid_actor_alpha": float(np.clip(hybrid_actor_alpha, 0.0, 1.0)),
+            "action_semantics_mode": str(action_semantics_mode),
+            "replay_action_semantics_mode": str(action_semantics_mode),
+            "reconstruct_corrected_target": bool(reconstruct_corrected_target),
         }
 
     args.training_environment_config = _capture_training_environment_config()
@@ -16686,6 +16752,18 @@ def train(args):
                 next_pf_features=next_pf_features_single,
             )
             pending_single_transition = None
+
+        replay_action_semantics_mode = "dual"
+        if str(getattr(args, 'algo', '') or '').strip().lower() == 'matd3':
+            replay_action_semantics_mode = str(
+                getattr(args, 'matd3_action_semantics_mode', 'dual') or 'dual'
+            ).strip().lower()
+
+        def _select_replay_action_channels(raw_storage_actions, corrected_execution_actions):
+            if replay_action_semantics_mode == 'collapsed_replay':
+                collapsed = np.ascontiguousarray(corrected_execution_actions, dtype=np.float32)
+                return collapsed, collapsed
+            return raw_storage_actions, corrected_execution_actions
         
         for step in range(args.episode_length):
             step_start = time.time() if _profiling_enabled else None
@@ -17334,6 +17412,11 @@ def train(args):
             else:
                 current_pf_features_np = np.zeros((num_envs, n_agents, 3), dtype=np.float32)
                 next_pf_features_np = None
+
+            replay_actions_for_storage, replay_actions_corrected = _select_replay_action_channels(
+                actions_for_storage,
+                actions,
+            )
             
             # 🔧 性能优化：在循环外预检查obs是否为Tensor，避免循环内重复检查（XLA友好）
             # 如果所有obs都是numpy数组（通常情况），跳过循环内的类型检查
@@ -17368,14 +17451,14 @@ def train(args):
                         if current_pf_features_np is not None and current_pf_features_np.shape == (1, n_agents, 3):
                             current_pf_features_single = current_pf_features_np[0]
                         act_corrected_single = None
-                        if actions is not None and actions.shape[0] == 1 and actions.shape[1] == n_agents:
-                            act_corrected_single = np.ascontiguousarray(actions[0], dtype=np.float32)
+                        if replay_actions_corrected is not None and replay_actions_corrected.shape[0] == 1 and replay_actions_corrected.shape[1] == n_agents:
+                            act_corrected_single = np.ascontiguousarray(replay_actions_corrected[0], dtype=np.float32)
                         if all_done_now:
                             terminal_next_pf_features = _compute_single_next_pf_features(next_obs_np, current_fr_value)
                             replay_buffer.add_single_aligned(
                                 obs_n=obs_np,
                                 next_obs_n=next_obs_np,
-                                act_n=actions_for_storage[0],
+                                act_n=replay_actions_for_storage[0],
                                 rew_n=rew_n[0],
                                 done_n=done_n[0],
                                 fr_value=current_fr_value,
@@ -17389,7 +17472,7 @@ def train(args):
                             pending_single_transition = {
                                 'obs_n': obs_np,
                                 'next_obs_n': next_obs_np,
-                                'act_n': actions_for_storage[0],
+                                'act_n': replay_actions_for_storage[0],
                                 'rew_n': rew_n[0],
                                 'done_n': done_n[0],
                                 'fr_value': current_fr_value,
@@ -17424,11 +17507,11 @@ def train(args):
                         if current_pf_features_np is not None and current_pf_features_np.shape[1:] == (n_agents, 3) and i < current_pf_features_np.shape[0]:
                             current_pf_features_single = current_pf_features_np[i]
                         act_corrected_single = None
-                        if actions is not None and actions.shape[1] == n_agents and i < actions.shape[0]:
-                            act_corrected_single = np.ascontiguousarray(actions[i], dtype=np.float32)
+                        if replay_actions_corrected is not None and replay_actions_corrected.shape[1] == n_agents and i < replay_actions_corrected.shape[0]:
+                            act_corrected_single = np.ascontiguousarray(replay_actions_corrected[i], dtype=np.float32)
                         obs_list.append(obs_np)
                         next_obs_list.append(next_obs_np)
-                        action_list.append(actions_for_storage[i])
+                        action_list.append(replay_actions_for_storage[i])
                         reward_list.append(rew_n[i])
                         done_list.append(done_n[i])
                         fr_list.append(current_fr_value)
@@ -19004,6 +19087,7 @@ def train(args):
         # 定期保存模型
         if args.save_model and (episode + 1) % args.save_interval == 0:
             maddpg.save_models(os.path.join("models", args.exp_name, f"ep{episode+1}"))
+            save_checkpoint(len(episode_rewards), "checkpoint")
         
         # 已移除训练阶段轨迹可视化生成
         
@@ -20337,6 +20421,19 @@ def parse_args():
         help="Hybrid actor objective 中 separated loss 的权重 alpha（默认来自MATD3_HYBRID_ACTOR_ALPHA）"
     )
     parser.add_argument(
+        "--matd3-action-semantics-mode",
+        type=str,
+        choices=["dual", "collapsed_replay"],
+        default=str(os.getenv('MATD3_ACTION_SEMANTICS_MODE', 'dual')).strip().lower(),
+        help="MATD3回放动作语义：dual=保存raw/corrected双语义；collapsed_replay=回放动作通道折叠为corrected执行动作"
+    )
+    parser.add_argument(
+        "--matd3-reconstruct-corrected-target",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('MATD3_RECONSTRUCT_CORRECTED_TARGET', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="MATD3 TD target阶段是否重构APF-corrected target action（默认来自MATD3_RECONSTRUCT_CORRECTED_TARGET）"
+    )
+    parser.add_argument(
         "--maddpg-use-dual-q",
         type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
         default=str(os.getenv('MADDPG_USE_DUAL_Q', '0')).lower() in ('true', '1', 'yes', 'on'),
@@ -20393,6 +20490,8 @@ def parse_args():
     parser.add_argument("--semi-random-hold-max-episodes", type=int, default=None, help="半随机范围保持最大回合数")
     parser.add_argument("--use-dynamic-obstacles", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
                        default=None, help="是否启用动态随机障碍物")
+    parser.add_argument("--terrain-contact-eps", type=float, default=float(os.getenv('TERRAIN_CONTACT_EPS', '0.2')),
+                       help="地形接触/碰撞高度容差，默认从TERRAIN_CONTACT_EPS读取")
     parser.add_argument("--terrain-complexity-level", type=int, default=3, choices=[1, 2, 3, 4], help="地形复杂度等级 (1-4)")
     parser.add_argument("--map-size", type=float, default=float(os.getenv('MAP_SIZE', '200')), help="地图尺寸（边长），用于观察与势场缩放")
     parser.add_argument("--save-positions", action="store_true", help="是否保存位置到文件")
@@ -20656,16 +20755,25 @@ if __name__ == "__main__":
                 "peak_height_jitter_ratio_max": float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MAX', str(getattr(args, 'peak_height_jitter_ratio_max', 0.0) or 0.0))),
                 "peak_height_max_scale": float(os.getenv('PEAK_HEIGHT_MAX_SCALE', str(getattr(args, 'peak_height_max_scale', 1.0) or 1.0))),
                 "terrain_variant_noise_ratio": float(os.getenv('TERRAIN_VARIANT_NOISE_RATIO', str(getattr(args, 'terrain_variant_noise_ratio', 0.0) or 0.0))),
+                "terrain_contact_eps": float(os.getenv('TERRAIN_CONTACT_EPS', str(getattr(args, 'terrain_contact_eps', 0.2) or 0.2))),
                 "semi_random_hold_mode": str(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MODE', str(getattr(args, 'semi_random_hold_mode', 'episode')))),
                 "semi_random_hold_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_EPISODES', str(getattr(args, 'semi_random_hold_episodes', 1) or 1))),
                 "semi_random_hold_min_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', str(getattr(args, 'semi_random_hold_min_episodes', 1) or 1))),
                 "semi_random_hold_max_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', str(getattr(args, 'semi_random_hold_max_episodes', 1) or 1))),
             }
+        if training_environment.get("terrain_contact_eps") is None:
+            try:
+                training_environment["terrain_contact_eps"] = float(
+                    os.getenv('TERRAIN_CONTACT_EPS', str(getattr(args, 'terrain_contact_eps', 0.2) or 0.2))
+                )
+            except Exception:
+                training_environment["terrain_contact_eps"] = 0.2
         runtime_fallbacks = (
             ("simulation_dt", "SIMULATION_DT", float),
             ("z_action_bias", "Z_ACTION_BIAS", float),
             ("quadrotor_attitude_response_time", "QUADROTOR_ATTITUDE_RESPONSE_TIME", float),
             ("quadrotor_psi_cmd", "QUADROTOR_PSI_CMD", float),
+            ("terrain_contact_eps", "TERRAIN_CONTACT_EPS", float),
             ("terrain_base_seed", "TERRAIN_BASE_SEED", int),
             ("peak_jitter_range", "PEAK_JITTER_RANGE", float),
             ("peak_center_jitter_range", "PEAK_CENTER_JITTER_RANGE", float),
@@ -20730,6 +20838,7 @@ if __name__ == "__main__":
         results_args["deterministic_train_env_sequence"] = bool(training_environment.get("deterministic_env_sequence", results_args.get("deterministic_train_env_sequence", False)))
         results_args["random_terrain"] = bool(training_environment.get("random_terrain", results_args.get("random_terrain", False)))
         results_args["use_dynamic_obstacles"] = bool(training_environment.get("use_dynamic_obstacles", results_args.get("use_dynamic_obstacles", False)))
+        results_args["terrain_contact_eps"] = float(training_environment.get("terrain_contact_eps", results_args.get("terrain_contact_eps", 0.2) or 0.2))
         if training_environment.get("semi_random_hold_mode") is not None:
             results_args["semi_random_hold_mode"] = str(training_environment.get("semi_random_hold_mode"))
         for key in (

@@ -22,7 +22,6 @@ Appendix H.3 is supplementary single-run or weaker-statistics evidence. It shoul
 
 ## Interpretation Boundary
 
-Appendix H.3 should not be used to claim that APF-only methods generally fail, that APF-fusion universally outperforms alternatives, or that the dual-semantic mechanism is necessary. It is not used to establish the necessity of dual-semantic replay, critic construction, target reconstruction, or separated-gradient routing.
+Appendix H.3 should not be used to claim that APF-only methods generally fail, to make broad superiority claims for APF-fusion, or to establish that the dual-semantic mechanism is necessary. It is not used to establish the necessity of dual-semantic replay, critic construction, target reconstruction, or separated-gradient routing.
 
 Its role is narrower: it documents why the paper keeps learned-action + APF correction in the execution interface before studying how that corrected execution should be represented inside actor--critic learning.
-

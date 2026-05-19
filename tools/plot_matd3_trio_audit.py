@@ -23,7 +23,7 @@ TRIO = [
 STYLE = {
     "matd3_separated_gradient": {"abbr": "M3-Sep", "color": "#1f77b4", "marker": "o"},
     "matd3_dual_q": {"abbr": "M3-Uni", "color": "#d62728", "marker": "s"},
-    "matd3_separated_hybrid_actor": {"abbr": "M3-Hyb", "color": "#ff7f0e", "marker": "D"},
+    "matd3_separated_hybrid_actor": {"abbr": "M3-H80", "color": "#ff7f0e", "marker": "D"},
 }
 
 

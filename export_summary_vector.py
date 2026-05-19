@@ -15,7 +15,7 @@ from matplotlib.patches import Rectangle
 STYLE_MAP: dict[str, dict[str, Any]] = {
     "matd3_separated_gradient": {"abbr": "Sep.", "color": "#1f77b4", "linestyle": "-", "marker": "o", "hatch": ""},
     "matd3_dual_q": {"abbr": "Uni.", "color": "#d62728", "linestyle": "--", "marker": "s", "hatch": "//"},
-    "matd3_separated_hybrid_actor": {"abbr": "Hyb.", "color": "#ff7f0e", "linestyle": "-.", "marker": "D", "hatch": "xx"},
+    "matd3_separated_hybrid_actor": {"abbr": "Hyb-0.8", "color": "#ff7f0e", "linestyle": "-.", "marker": "D", "hatch": "xx"},
     "matd3_separated_hybrid_actor_alpha20": {"abbr": "Hyb-0.2", "color": "#bcbd22", "linestyle": "--", "marker": "P", "hatch": "++"},
     "matd3_single_q": {"abbr": "Base.", "color": "#2ca02c", "linestyle": ":", "marker": "^", "hatch": ".."},
     "maddpg_separated_gradient": {"abbr": "DPG-Sep", "color": "#9467bd", "linestyle": "-", "marker": "v", "hatch": ""},
@@ -29,8 +29,8 @@ STYLE_MAP: dict[str, dict[str, Any]] = {
 MULTI_FAMILY_ABBR: dict[str, str] = {
     "matd3_separated_gradient": "M3-Sep",
     "matd3_dual_q": "M3-Uni",
-    "matd3_separated_hybrid_actor": "M3-Hyb",
-    "matd3_separated_hybrid_actor_alpha20": "M3-Hyb-0.2",
+    "matd3_separated_hybrid_actor": "M3-H80",
+    "matd3_separated_hybrid_actor_alpha20": "M3-H20",
     "matd3_single_q": "M3-Base",
     "maddpg_separated_gradient": "DPG-Sep",
     "maddpg_dual_q": "DPG-Uni",

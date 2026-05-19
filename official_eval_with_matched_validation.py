@@ -37,10 +37,23 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    return str(value)
+
+
 def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -253,6 +266,11 @@ def _validation_artifact_policy() -> Dict[str, bool]:
     }
 
 
+def _matched_validation_root(output_dir: Path) -> Path:
+    output_dir = Path(output_dir).resolve()
+    return output_dir.parent / f"{output_dir.name}_matched_validation"
+
+
 def _build_validation_spec(official_spec: Dict[str, Any], args) -> Dict[str, Any]:
     spec = dict(official_spec)
     spec["episodes"] = max(1, int(args.validation_episodes))
@@ -261,7 +279,7 @@ def _build_validation_spec(official_spec: Dict[str, Any], args) -> Dict[str, Any
     spec["artifact_policy"] = _validation_artifact_policy()
     spec["validation_role"] = "checkpoint_selection"
     spec["force_regenerate_testset"] = True
-    validation_testset_root = Path(args.output_dir).resolve() / "_matched_validation_testset"
+    validation_testset_root = _matched_validation_root(Path(args.output_dir)) / "testset"
     spec["episode_positions_dir"] = str(
         validation_testset_root / _generate_post_eval_testset_tag(spec) / "episode_positions"
     )
@@ -472,6 +490,22 @@ def _execute_eval_run(
     eval_dir.mkdir(parents=True, exist_ok=True)
     spec_path = eval_dir / "post_eval_spec.json"
     _save_json(spec_path, spec)
+    results_path = eval_dir / "evaluation_results.json"
+    log_path = eval_dir / "post_eval.log"
+    if not force_rerun and results_path.exists():
+        try:
+            results = _load_json(results_path)
+            summary = results.get("summary", {}) if isinstance(results.get("summary"), dict) else {}
+            print(f"{banner_prefix}复用已有评估结果: {results_path}")
+            return {
+                "results_path": str(results_path),
+                "log_path": str(log_path),
+                "spec_path": str(spec_path),
+                "summary": summary,
+                "results": results,
+            }
+        except Exception:
+            print(f"{banner_prefix}已有评估结果无法读取，将重新评估: {results_path}")
     env = _build_eval_env(os.environ.copy(), spec, quiet_output=quiet_output, python_bin=python_bin)
     cmd = [
         "/bin/bash",
@@ -483,7 +517,6 @@ def _execute_eval_run(
         "1",
         "false",
     ]
-    log_path = eval_dir / "post_eval.log"
     print(f"{banner_prefix}模型路径: {model_path}")
     print(f"{banner_prefix}输出目录: {eval_dir}")
     print(f"{banner_prefix}测试回合数: {spec.get('episodes')}")
@@ -494,7 +527,6 @@ def _execute_eval_run(
         log_path=log_path,
         prefix=f"{banner_prefix}",
     )
-    results_path = eval_dir / "evaluation_results.json"
     if not results_path.exists():
         raise RuntimeError(f"{banner_prefix}缺少 evaluation_results.json: {results_path}")
     results = _load_json(results_path)
@@ -525,7 +557,7 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
         }
 
     validation_spec = _build_validation_spec(official_spec, args)
-    validation_root = output_dir / "_matched_validation"
+    validation_root = _matched_validation_root(output_dir)
     validation_root.mkdir(parents=True, exist_ok=True)
 
     candidate_aliases = _normalize_candidates(args.validation_candidates)

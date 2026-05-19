@@ -40,6 +40,7 @@ terrain_previews_groupb/
 terrain_previews_paper/
 
 *.log
+nohup.out
 *.weights.h5
 *.h5
 *.ckpt

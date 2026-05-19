@@ -138,6 +138,16 @@ class MultiAgentEnv(gym.Env):
             self._debug_collision_summary_enabled = os.getenv('DEBUG_COLLISION_SUMMARY', '1').lower() in ('1', 'true', 'yes', 'on')
         except Exception:
             self._debug_collision_summary_enabled = True
+        try:
+            light_default = os.getenv('EVAL_LIGHT_MODE', '0')
+            self._eval_light_action_path = os.getenv('EVAL_LIGHT_ACTION_PATH', light_default).lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self._eval_light_action_path = False
+        try:
+            light_default = os.getenv('EVAL_LIGHT_MODE', '0')
+            self._eval_light_info = os.getenv('EVAL_LIGHT_INFO', light_default).lower() in ('1', 'true', 'yes', 'on')
+        except Exception:
+            self._eval_light_info = False
 
     def _timing_detail_enabled(self):
         cached = self._timing_detail_enabled_cache
@@ -522,20 +532,23 @@ class MultiAgentEnv(gym.Env):
                 if timing_detail_enabled:
                     _t_info_seg = _perf_counter()
                 try:
-                    base_info = self._get_info(agent)
-                    if not isinstance(base_info, dict):
+                    if self._eval_light_info:
                         base_info = {}
-                    # 附加动作通道调试：返回原始网络动作与环境最终施加的连续动作（前三维力）
-                    try:
-                        raw = agent.current_action if hasattr(agent, 'current_action') else None
-                        applied = agent.action.u if hasattr(agent, 'action') and hasattr(agent.action, 'u') else None
-                        if isinstance(raw, np.ndarray):
-                            # 🚀 性能优化：只在需要时才copy
-                            base_info['raw_action'] = raw.copy() if raw.size < 100 else raw  # 小数组才copy
-                        if isinstance(applied, np.ndarray):
-                            base_info['applied_force3'] = applied[:3].copy()
-                    except Exception:
-                        pass
+                    else:
+                        base_info = self._get_info(agent)
+                        if not isinstance(base_info, dict):
+                            base_info = {}
+                        # 附加动作通道调试：返回原始网络动作与环境最终施加的连续动作（前三维力）
+                        try:
+                            raw = None if self._eval_light_action_path else (agent.current_action if hasattr(agent, 'current_action') else None)
+                            applied = agent.action.u if hasattr(agent, 'action') and hasattr(agent.action, 'u') else None
+                            if isinstance(raw, np.ndarray):
+                                # 🚀 性能优化：只在需要时才copy
+                                base_info['raw_action'] = raw.copy() if raw.size < 100 else raw  # 小数组才copy
+                            if isinstance(applied, np.ndarray):
+                                base_info['applied_force3'] = applied[:3].copy()
+                        except Exception:
+                            pass
                     info_list.append(base_info)
                 except Exception as e:
                     if not self._quiet_output_enabled:
@@ -1309,7 +1322,7 @@ class MultiAgentEnv(gym.Env):
             continuous_action[2] = np.clip(continuous_action[2], -1.0, 1.0)
             
             # 4. 记录原始动作和处理后动作，便于调试
-            if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+            if (not self._eval_light_action_path) and hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
                 if 'action_history' not in agent.debug_info:
                     agent.debug_info['action_history'] = []
                 # 仅保留最近的100个记录
@@ -1326,7 +1339,8 @@ class MultiAgentEnv(gym.Env):
             agent.action.u = continuous_action
             
             # 6. 将动作信息传递给智能体，供奖励函数使用
-            agent.current_action = action.copy() if isinstance(action, np.ndarray) else action
+            if not self._eval_light_action_path:
+                agent.current_action = action.copy() if isinstance(action, np.ndarray) else action
             
             return
         
@@ -1354,7 +1368,8 @@ class MultiAgentEnv(gym.Env):
                     agent.action.u = temp_action
                 
                 # 将动作信息传递给智能体，供奖励函数使用
-                agent.current_action = action.copy() if isinstance(action, np.ndarray) else action
+                if not self._eval_light_action_path:
+                    agent.current_action = action.copy() if isinstance(action, np.ndarray) else action
             return
             
         # 物理控制
@@ -1403,7 +1418,8 @@ class MultiAgentEnv(gym.Env):
                             pass
             
             # 将动作信息传递给智能体，供奖励函数使用
-            agent.current_action = action.copy() if isinstance(action, np.ndarray) else action
+            if not self._eval_light_action_path:
+                agent.current_action = action.copy() if isinstance(action, np.ndarray) else action
 
         if not agent.silent:
             # communication action

@@ -22,6 +22,10 @@ Then inspect `RESULTS_MANIFEST.json` for the exact table-to-artifact mapping:
 - Table 6: Level-2 checkpoint-FR primary deployment evidence.
 - Appendix Table H.3: APF-fusion/APF-only supplementary sanity/reference evidence.
 
+Some artifact paths retain `official_eval` in historical filenames. Interpret
+those names as the repository's checkpoint-FR evaluation path, not as a claim
+that the paper uses an externally certified benchmark.
+
 ## 3. Rebuild Table 5 and Table 6 Summaries
 
 These commands rebuild processed Markdown summaries from existing CSV/JSON artifacts. They are not full retraining commands.

@@ -26,10 +26,10 @@
         "level2_dual_semantics_partial_summary_20260427_141546/official_eval_cross_algo_summary.json",
         "level2_dual_semantics_partial_summary_20260427_141546/official_eval_cross_algo_summary.png"
       ],
-      "script_hint": "Use the Level-2 official/semantic summary scripts, especially summarize_level2_official_eval_multiseed.py or summarize_level2_dual_semantics_eval_sweep.py; scripts should check available files in result_dir before assuming filenames.",
+      "script_hint": "Use the Level-2 checkpoint-FR/semantic summary scripts, especially summarize_level2_official_eval_multiseed.py or summarize_level2_dual_semantics_eval_sweep.py; scripts should check available files in result_dir before assuming filenames. Historical file and script names may retain official_eval.",
       "protocol_summary": "Focused Level-2 semantic-ablation summary under checkpoint-FR evaluation; compares full dual-semantic preservation against collapsed replay and target-side variants.",
       "used_for_main_claim": true,
-      "notes": "This is the core mechanism evidence for whether raw/corrected action roles should be preserved after APF-corrected execution."
+      "notes": "This is the core mechanism evidence for whether raw/corrected action roles should be preserved after APF-corrected execution. Historical filenames containing official_eval refer to repository evaluation outputs, not to an external benchmark authority."
     },
     "Table_6_level2_checkpoint_fr": {
       "paper_item": "Table 6 / tab:level2-official-summary",
@@ -49,7 +49,7 @@
       "script_hint": "Use summarize_level2_official_eval_multiseed.py for the multiseed model-FR summary. Any/Two arrival values are derived from episode_details[].agent_success_flags in the evaluation_results.json files referenced by official_eval_multiseed_all_runs_model_fr.csv.",
       "protocol_summary": "Level-2 fixed-terrain, stochastic-obstacle checkpoint-FR model-FR evaluation across contextual MATD3-, MADDPG-, and MAPPO-family variants.",
       "used_for_main_claim": true,
-      "notes": "This is the primary deployment evidence used by the current paper Table 6. It should be interpreted with Table 5 rather than as a universal MARL ranking."
+      "notes": "This is the primary deployment evidence used by the current paper Table 6. It should be interpreted with Table 5 rather than as a universal MARL ranking. Historical filenames containing official_eval refer to repository evaluation outputs, not to an external benchmark authority."
     },
     "Figure_5_level2_dashboard": {
       "paper_item": "Figure 5 / fig:l2-full-main",
@@ -63,7 +63,7 @@
       "source_files": [
         "diagnostics/level2_official_eval_multiseed_summary_20260428_163815/official_eval_multiseed_dashboard_model_fr.png"
       ],
-      "script_hint": "Use the plotting path associated with summarize_level2_official_eval_multiseed.py; scripts should check available files in result_dir before assuming filenames.",
+      "script_hint": "Use the plotting path associated with summarize_level2_official_eval_multiseed.py; scripts should check available files in result_dir before assuming filenames. Historical file and script names may retain official_eval.",
       "protocol_summary": "Diagnostic visual companion to the Level-2 checkpoint-FR numerical summary.",
       "used_for_main_claim": false,
       "notes": "The figure is a dashboard companion. Numerical claims should be checked against Table 6 and its CSV/JSON summaries."

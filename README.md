@@ -1,8 +1,8 @@
-# MATD3 Dual-Semantic APF Reviewer Artifact
+# Execution-Consistent Dual-Semantic APF Reviewer Artifact
 
 This repository is the reviewer-facing artifact for the paper:
 
-**A MATD3-Centered Dual-Semantic Framework with Artificial-Potential-Field Correction for Cooperative Multi-UAV Navigation**
+**Execution-Consistent Dual-Semantic Actor–Critic Learning for Artificial-Potential-Field-Corrected Multi-UAV Navigation**
 
 ## Main scientific claim
 
@@ -15,7 +15,7 @@ The proposed dual-semantic framework preserves these roles through replay storag
 
 The main mechanism evidence is the focused Level-2 semantic ablation. The Level-2 checkpoint-FR evaluation provides primary deployment evidence. APF-only/APF-fusion comparisons are retained as supplementary sanity/reference evidence only.
 
-Submission code snapshot: `5c6cc625d8d9c572bacab114ef042aeea3f2f684`
+Review artifact release tag: `reviewer-artifact-2026-05-07`
 
 ## Task
 
@@ -37,12 +37,14 @@ APF-corrected execution creates different action roles:
 - the APF-modulation tail parameterizes the local correction law,
 - the APF-corrected command is the action executed by the environment.
 
-The proposed MATD3-centered framework preserves these roles through:
+The proposed execution-consistent dual-semantic framework preserves these roles through:
 
 - dual-semantic replay records,
 - a critic that evaluates raw-intention and corrected-execution channels,
 - optional corrected target reconstruction for Bellman targets,
 - separated/unified/hybrid actor-gradient routing.
+
+The reported implementation instantiates this interface in a MATD3-style deterministic off-policy scaffold. MATD3 is the experimental host for the reported replay, critic, target, and routing designs, not the primary conceptual claim.
 
 The APF-fusion/APF-only results are not used as the main mechanism evidence. They are retained as supplementary sanity/reference evidence showing that learned motion proposals and APF correction are complementary. The main mechanism evidence is the focused semantic ablation that tests whether raw/corrected action roles should be preserved after APF-corrected execution.
 
@@ -54,6 +56,25 @@ The result manifest maps the paper tables to evidence roles, processed result fi
 - **Table 6**: primary Level-2 checkpoint-FR deployment evidence across contextual MATD3-, MADDPG-, and MAPPO-family variants.
 - **Level-1 and Level-3**: supporting fixed-map and terrain-family analyses.
 - **Appendix Table H.3**: APF-fusion/APF-only sanity/reference evidence only. It is not part of the main mechanism hierarchy.
+
+## Primary Code Paths
+
+The repository contains historical scripts, backup files, and large experiment outputs. For reviewer orientation, use the following files as the primary implementation and verification paths:
+
+- `paper3d_train_optimized.py`: main MATD3-family training host for the reported dual-semantic implementation.
+- `paper3d_train_optimized.py::LiteReplayBuffer`: active replay implementation for raw/corrected action storage in the reported training path.
+- `evaluate_optimized.py` and `official_eval_with_matched_validation.py`: evaluation and checkpoint-FR verification paths.
+- `potential_field_corrector.py` plus the optimized APF wrappers in `paper3d_train_optimized.py`: APF correction logic used by the training/evaluation path.
+- `scripts/rebuild_table5_semantic_ablation.py`, `scripts/rebuild_table6_level2_checkpoint_fr.py`, and `scripts/rebuild_appendix_h3_apf_sanity.py`: reviewer-facing processed-summary rebuild scripts.
+
+Files with names such as `*_backup.py`, `*.bak*`, `environment_backup.py`, or historical diagnostics are retained for provenance but are not the primary artifact entry points. `core/replay_buffer.py` is not the active replay-buffer implementation for the reported MATD3-family runs.
+
+The reported settings are resolved through the run scripts, manifest entries, saved configurations, and environment overrides used for the reported batches. Parser defaults in individual scripts are not the authoritative paper configuration; for example, the reported guidance-layer benchmark uses gravity disabled as stated in the manuscript and `docs/SIMULATION_BOUNDARY.md`.
+
+Some historical scripts, directories, and CSV/JSON files retain `official_eval`
+in their filenames. In the current manuscript these files correspond to the
+predefined Level-2 checkpoint-FR held-out evaluation path, not to a claim of an
+external benchmark authority.
 
 ## Quick Smoke Checks
 

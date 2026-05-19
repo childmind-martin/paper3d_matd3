@@ -15,6 +15,10 @@ This document maps the paper's result items to their evidence role and expected 
 
 The paper reports bounded, mechanism-centered evidence under the stated protocols. None of these items should be read as statistically significant universal superiority over all MARL methods.
 
+Some expected source files retain `official_eval` in historical filenames.
+These names refer to the repository's checkpoint-FR evaluation outputs and do
+not indicate an external benchmark authority or a stronger evidence hierarchy.
+
 ## Table 5: Semantic Ablation Evidence
 
 - **Question answered:** Does preserving raw/corrected action roles after APF-corrected execution matter for the dual-semantic learning mechanism?

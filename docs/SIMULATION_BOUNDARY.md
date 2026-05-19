@@ -26,9 +26,13 @@ Gravity is disabled in the reported guidance-layer benchmark. This setting is in
 
 The simulation still applies the same guidance-layer dynamics mode and parameter set across compared methods.
 
+Parser defaults in individual training scripts are not the authoritative paper
+configuration. The reported batches should be interpreted through the saved
+run configuration, manifest entries, environment overrides, and paper protocol;
+for the reported guidance-layer benchmark, gravity is disabled.
+
 ## Fairness Within the Benchmark
 
 All compared methods share the same simulation mode, terrain/obstacle protocol, dynamics parameters, and evaluation controls within each reported batch. Therefore, comparisons are fair within the reported guidance-layer benchmark.
 
 The conclusions are restricted to learning-interface effects under matched guidance-layer simulation.
-

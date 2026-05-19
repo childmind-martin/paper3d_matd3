@@ -56,7 +56,7 @@ PANEL_SPECS: list[PanelSpec] = [
     ),
     PanelSpec(
         key="traj_l2_hyb_seed202",
-        title="Level 2 / M3-Hyb",
+        title="Level 2 / M3-H80",
         html_path=ROOT
         / "matd3/logs/matd3_separated_hybrid_actor__seed202__batch_groupB_seed202_20260331_220752_20260406_230620/20260406_230623/best_trajectory_ep146_interactive.html",
     ),
@@ -74,7 +74,7 @@ PANEL_SPECS: list[PanelSpec] = [
     ),
     PanelSpec(
         key="traj_l3_hyb_seed202",
-        title="Level 3 / M3-Hyb",
+        title="Level 3 / M3-H80",
         html_path=ROOT
         / "matd3/logs/matd3_separated_hybrid_actor__seed202__batch_groupB_seed202_20260406_230829_20260408_113923/20260408_113925/best_trajectory_ep579_interactive.html",
     ),
@@ -110,7 +110,7 @@ PANEL_SPECS: list[PanelSpec] = [
     ),
     PanelSpec(
         key="traj_l3_test_hyb_seed202_ep7",
-        title="Level 3 Test / M3-Hyb",
+        title="Level 3 Test / M3-H80",
         html_path=ROOT
         / "matd3/ablation_experiments/multi_seed_groupB_20260406_230829/seed_batches/batch_groupB_seed202_20260406_230829/results/post_eval/matd3_separated_hybrid_actor/best_by_team_sr/trajectory_ep11_interactive.html",
     ),
@@ -122,7 +122,7 @@ PANEL_SPECS: list[PanelSpec] = [
     ),
     PanelSpec(
         key="traj_l3_test_hyb_ep18_seed202",
-        title="Level 3 Test E18 / M3-Hyb",
+        title="Level 3 Test E18 / M3-H80",
         html_path=ROOT
         / "matd3/ablation_experiments/multi_seed_groupB_20260406_230829/seed_batches/batch_groupB_seed202_20260406_230829/results/post_eval/matd3_separated_hybrid_actor/best_by_team_sr/trajectory_ep18_interactive.html",
     ),

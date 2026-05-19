@@ -20,6 +20,8 @@ from summarize_level2_official_eval import (
     COLOR_MAP,
     DEFAULT_LABELS,
     DISPLAY_NAME_MAP,
+    eval_config_errors,
+    _filename_suffix,
 )
 
 
@@ -34,6 +36,8 @@ RUN_METRIC_KEYS = [
     "inter_agent_collision_free_rate",
     "avg_team_final_goal_distance",
     "avg_agent_final_goal_distance",
+    "avg_team_total_path_length",
+    "avg_agent_path_length",
     "avg_min_inter_agent_clearance",
     "avg_steps",
 ]
@@ -61,9 +65,26 @@ def _display_name(label: str) -> str:
     return DISPLAY_NAME_MAP.get(label, label)
 
 
-def _find_latest_eval_result(log_root: Path, label: str, seed: int) -> Optional[Path]:
-    pattern = f"level2_retrain_{label}_seed{seed}_*/evaluation_official*/evaluation_results.json"
-    candidates = list(log_root.glob(pattern))
+def _find_latest_eval_result(log_root: Path, label: str, seed: int, run_tag: str = "") -> Optional[Path]:
+    if run_tag:
+        patterns = [
+            f"{run_tag}_{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+        ]
+    else:
+        patterns = [
+            f"level2_ms_official_{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+            f"level2_retrain_{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+            f"*{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+        ]
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for candidate in log_root.glob(pattern):
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(candidate)
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -72,12 +93,19 @@ def _find_latest_eval_result(log_root: Path, label: str, seed: int) -> Optional[
 def _load_result_row(label: str, seed: int, result_path: Path) -> Dict[str, Any]:
     data = json.loads(result_path.read_text(encoding="utf-8"))
     summary = data.get("summary", {}) if isinstance(data.get("summary"), dict) else {}
+    setup = data.get("evaluation_setup", {}) if isinstance(data.get("evaluation_setup"), dict) else {}
+    config_errors = eval_config_errors(data)
     row = {
         "label": label,
         "display_name": _display_name(label),
         "seed": seed,
         "episodes": _safe_int(summary.get("episodes", data.get("episodes"))),
         "results_path": str(result_path),
+        "config_valid": not config_errors,
+        "config_errors": "; ".join(config_errors),
+        "action_force_ratio_source": str(setup.get("action_force_ratio_source", "") or ""),
+        "use_quadrotor_dynamics": setup.get("use_quadrotor_dynamics"),
+        "use_dynamic_obstacles": setup.get("use_dynamic_obstacles"),
     }
     for key in RUN_METRIC_KEYS:
         row[key] = _safe_float(summary.get(key))
@@ -125,7 +153,20 @@ def _annotate_bars(ax: plt.Axes, bars: Iterable[Any], values: Sequence[Optional[
         if value is None or not math.isfinite(value):
             continue
         label = f"{value * 100:.1f}%" if percent else f"{value:.2f}"
-        ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), label, ha="center", va="bottom", fontsize=8)
+        height = bar.get_height()
+        va = "bottom" if height >= 0 else "top"
+        offset = 3 if height >= 0 else -3
+        ax.annotate(
+            label,
+            xy=(bar.get_x() + bar.get_width() / 2.0, height),
+            xytext=(0, offset),
+            textcoords="offset points",
+            ha="center",
+            va=va,
+            fontsize=8,
+            bbox={"boxstyle": "round,pad=0.12", "fc": "white", "ec": "none", "alpha": 0.72},
+            clip_on=False,
+        )
 
 
 def _plot_dashboard(aggregated: Sequence[Dict[str, Any]], output_path: Path) -> None:
@@ -194,26 +235,14 @@ def _plot_dashboard(aggregated: Sequence[Dict[str, Any]], output_path: Path) -> 
     axes[4].grid(True, axis="y", alpha=0.25, linestyle="--")
     _annotate_bars(axes[4], bars_clearance, inter_clearance)
 
-    ranking_rows = sorted(
-        aggregated,
-        key=lambda item: (
-            -(item.get("team_success_rate_mean") or float("-inf")),
-            -(item.get("avg_reward_mean") or float("-inf")),
-            item.get("avg_team_final_goal_distance_mean") if item.get("avg_team_final_goal_distance_mean") is not None else float("inf"),
-        ),
-    )
-    summary_lines = ["Multi-seed Ranking"]
-    for idx, item in enumerate(ranking_rows, start=1):
-        summary_lines.append(
-            f"{idx}. {item['display_name']}: "
-            f"SR={((item.get('team_success_rate_mean') or 0.0) * 100):.1f}% | "
-            f"R={item.get('avg_reward_mean') or 0.0:.1f} | "
-            f"D={item.get('avg_team_final_goal_distance_mean') or 0.0:.1f} | "
-            f"n={item.get('seed_count', 0)}"
-        )
-    axes[5].axis("off")
-    axes[5].set_title("Cross-Seed Summary", fontsize=13, fontweight="bold")
-    axes[5].text(0.02, 0.98, "\n".join(summary_lines), va="top", ha="left", fontsize=10, family="monospace")
+    path_length = [item.get("avg_team_total_path_length_mean") or 0.0 for item in aggregated]
+    path_length_err = [item.get("avg_team_total_path_length_std") or 0.0 for item in aggregated]
+    bars_path = axes[5].bar(x, path_length, yerr=path_length_err, color=colors, capsize=4, alpha=0.9)
+    axes[5].set_title("Avg Team Path Length", fontsize=13, fontweight="bold")
+    axes[5].set_xticks(x)
+    axes[5].set_xticklabels(labels, rotation=25, ha="right")
+    axes[5].grid(True, axis="y", alpha=0.25, linestyle="--")
+    _annotate_bars(axes[5], bars_path, path_length)
 
     fig.suptitle("Level2 Official Evaluation Multi-Seed Summary", fontsize=18, fontweight="bold")
     fig.tight_layout(rect=[0.02, 0.03, 0.98, 0.95])
@@ -228,6 +257,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", nargs="*", default=list(DEFAULT_LABELS))
     parser.add_argument("--log-root", type=Path, default=Path("/home/tang/matd3/logs"))
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--run-tag", default="", help="Optional log prefix, e.g. level2_ms_checkpoint_fr_eval")
+    parser.add_argument("--filename-tag", default="", help="Optional suffix for output files, e.g. model_fr")
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args()
 
@@ -244,11 +275,14 @@ def main() -> int:
     missing: List[Dict[str, Any]] = []
     for seed in args.seeds:
         for label in args.labels:
-            result_path = _find_latest_eval_result(args.log_root, label, seed)
+            result_path = _find_latest_eval_result(args.log_root, label, seed, args.run_tag)
             if result_path is None:
                 missing.append({"seed": seed, "label": label})
                 continue
-            rows.append(_load_result_row(label, seed, result_path))
+            row = _load_result_row(label, seed, result_path)
+            rows.append(row)
+            if not row.get("config_valid", False):
+                missing.append({"seed": seed, "label": label, "reason": row.get("config_errors"), "results_path": str(result_path)})
 
     if missing and args.strict:
         pairs = ", ".join(f"{item['label']}@{item['seed']}" for item in missing)
@@ -260,12 +294,25 @@ def main() -> int:
     rows.sort(key=lambda row: (int(row["seed"]), label_index.get(row["label"], 10**9)))
     aggregated = _aggregate_rows(rows, args.labels)
 
-    runs_csv = output_dir / "official_eval_multiseed_all_runs.csv"
-    agg_csv = output_dir / "official_eval_multiseed_aggregated.csv"
-    summary_json = output_dir / "official_eval_multiseed_summary.json"
-    dashboard_png = output_dir / "official_eval_multiseed_dashboard.png"
+    suffix = _filename_suffix(args.filename_tag)
+    runs_csv = output_dir / f"official_eval_multiseed_all_runs{suffix}.csv"
+    agg_csv = output_dir / f"official_eval_multiseed_aggregated{suffix}.csv"
+    summary_json = output_dir / f"official_eval_multiseed_summary{suffix}.json"
+    dashboard_png = output_dir / f"official_eval_multiseed_dashboard{suffix}.png"
 
-    run_fieldnames = ["label", "display_name", "seed", "episodes", *RUN_METRIC_KEYS, "results_path"]
+    run_fieldnames = [
+        "label",
+        "display_name",
+        "seed",
+        "episodes",
+        *RUN_METRIC_KEYS,
+        "config_valid",
+        "config_errors",
+        "action_force_ratio_source",
+        "use_quadrotor_dynamics",
+        "use_dynamic_obstacles",
+        "results_path",
+    ]
     _write_csv(rows, runs_csv, run_fieldnames)
 
     agg_fieldnames = ["label", "display_name", "seed_count", "seeds"]

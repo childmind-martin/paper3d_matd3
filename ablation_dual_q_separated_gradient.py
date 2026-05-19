@@ -116,6 +116,12 @@ STRICT_CORE_EXPERIMENT_LABELS = [
     "matd3_single_q",
 ]
 
+DUAL_SEMANTICS_EXPERIMENT_LABELS = [
+    "matd3_full_dual_semantic",
+    "matd3_collapsed_replay",
+    "matd3_no_corrected_target_reconstruction",
+]
+
 SUPPLEMENTAL_EXPERIMENT_LABELS = [
     "matd3_separated_hybrid_actor",
     "matd3_separated_hybrid_actor_alpha20",
@@ -136,6 +142,7 @@ EXPERIMENT_DISPLAY_ORDER = (
     STRICT_CORE_EXPERIMENT_LABELS[:2]
     + SUPPLEMENTAL_EXPERIMENT_LABELS
     + STRICT_CORE_EXPERIMENT_LABELS[2:]
+    + DUAL_SEMANTICS_EXPERIMENT_LABELS
     + OPTIONAL_REFERENCE_EXPERIMENT_LABELS
 )
 
@@ -151,6 +158,9 @@ AUDIT_REFERENCE_LABEL_BY_EXPERIMENT = {
     "matd3_separated_hybrid_actor": "matd3_separated_gradient",
     "matd3_separated_hybrid_actor_alpha20": "matd3_separated_gradient",
     "matd3_single_q": "matd3_separated_gradient",
+    "matd3_full_dual_semantic": "matd3_full_dual_semantic",
+    "matd3_collapsed_replay": "matd3_full_dual_semantic",
+    "matd3_no_corrected_target_reconstruction": "matd3_full_dual_semantic",
     "maddpg_separated_gradient": "maddpg_separated_gradient",
     "maddpg_dual_q": "maddpg_separated_gradient",
     "maddpg_baseline": "maddpg_separated_gradient",
@@ -192,9 +202,12 @@ LEGACY_POST_EVAL_BOOL_DEFAULTS = {
 EXPERIMENT_ABBR_BY_LABEL = {
     "matd3_separated_gradient": "M3-Sep",
     "matd3_dual_q": "M3-Uni",
-    "matd3_separated_hybrid_actor": "M3-Hyb",
+    "matd3_separated_hybrid_actor": "M3-H80",
     "matd3_separated_hybrid_actor_alpha20": "M3-H20",
     "matd3_single_q": "M3-Base",
+    "matd3_full_dual_semantic": "Full-DS",
+    "matd3_collapsed_replay": "Coll-RB",
+    "matd3_no_corrected_target_reconstruction": "No-Tgt",
     "maddpg_separated_gradient": "DPG-Sep",
     "maddpg_dual_q": "DPG-Uni",
     "maddpg_baseline": "DPG-Base",
@@ -1214,12 +1227,30 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
     }
 
     if str(cur_label).startswith("matd3_separated_hybrid_actor"):
+        allowed_argv_changed.update(
+            {
+                "--matd3-use-hybrid-actor-objective",
+                "--matd3-hybrid-actor-alpha",
+            }
+        )
         allowed_env_only_in_cur.update(
             {
                 "MATD3_USE_HYBRID_ACTOR_OBJECTIVE",
                 "MATD3_HYBRID_ACTOR_ALPHA",
             }
         )
+        allowed_env_changed.update(
+            {
+                "MATD3_USE_HYBRID_ACTOR_OBJECTIVE",
+                "MATD3_HYBRID_ACTOR_ALPHA",
+            }
+        )
+    if cur_label == "matd3_collapsed_replay" and ref_label == "matd3_full_dual_semantic":
+        allowed_argv_changed.add("--matd3-action-semantics-mode")
+        allowed_env_changed.add("MATD3_ACTION_SEMANTICS_MODE")
+    if cur_label == "matd3_no_corrected_target_reconstruction" and ref_label == "matd3_full_dual_semantic":
+        allowed_argv_changed.add("--matd3-reconstruct-corrected-target")
+        allowed_env_changed.add("MATD3_RECONSTRUCT_CORRECTED_TARGET")
     if cur_label == "mappo_fusion_only" and ref_label == "mappo_baseline":
         allowed_argv_changed.add("--use-pf-feature")
         allowed_env_changed.add("USE_PF_FEATURE")
@@ -1775,6 +1806,7 @@ def _resolve_training_environment_setup(args) -> Dict[str, Any]:
         "terrain_seed": terrain_seed,
         "terrain_base_seed": terrain_seed,
         "training_env_sequence_seed": training_env_sequence_seed,
+        "terrain_contact_eps": 0.2,
     }
     if experiment_group != "B":
         return setup
@@ -1821,6 +1853,7 @@ def _infer_training_environment_from_run_args(
         "peak_height_max_scale",
         "terrain_variant_noise_ratio",
     )
+    terrain_contact_eps = _safe_float(run_args.get("terrain_contact_eps"))
     peak_params = {
         key: _safe_float(run_args.get(key))
         for key in peak_param_keys
@@ -1874,6 +1907,7 @@ def _infer_training_environment_from_run_args(
         "terrain_seed": int(terrain_seed),
         "terrain_base_seed": int(terrain_base_seed),
         "training_env_sequence_seed": int(training_env_sequence_seed),
+        "terrain_contact_eps": terrain_contact_eps,
         "semi_random_hold_mode": hold_mode,
         "semi_random_hold_episodes": _safe_int(run_args.get("semi_random_hold_episodes")),
         "semi_random_hold_min_episodes": _safe_int(run_args.get("semi_random_hold_min_episodes")),
@@ -1940,6 +1974,7 @@ def _infer_training_environment_from_manifest(
         "peak_height_max_scale": _env_or_cli_float("PEAK_HEIGHT_MAX_SCALE", "--peak-height-max-scale"),
         "terrain_variant_noise_ratio": _env_or_cli_float("TERRAIN_VARIANT_NOISE_RATIO", "--terrain-variant-noise-ratio"),
     }
+    terrain_contact_eps = _env_or_cli_float("TERRAIN_CONTACT_EPS", "--terrain-contact-eps")
     hold_mode_raw = exec_env.get("SEMI_RANDOM_TERRAIN_HOLD_MODE", _first_cli_value("--semi-random-hold-mode"))
     hold_mode = str(hold_mode_raw).strip().lower() if hold_mode_raw is not None else None
     if hold_mode not in (None, "episode", "fixed", "range"):
@@ -1986,6 +2021,7 @@ def _infer_training_environment_from_manifest(
         "terrain_seed": int(terrain_seed),
         "terrain_base_seed": int(terrain_base_seed),
         "training_env_sequence_seed": int(training_env_sequence_seed),
+        "terrain_contact_eps": terrain_contact_eps,
         "semi_random_hold_mode": hold_mode,
         "semi_random_hold_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_EPISODES", "--semi-random-hold-episodes"),
         "semi_random_hold_min_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES", "--semi-random-hold-min-episodes"),
@@ -2037,6 +2073,7 @@ def _normalize_training_environment_record(record: Optional[Dict[str, Any]]) -> 
         "peak_height_jitter_ratio_max",
         "peak_height_max_scale",
         "terrain_variant_noise_ratio",
+        "terrain_contact_eps",
     )
     for key in bool_keys:
         if key in record and record.get(key) is not None:
@@ -2683,6 +2720,7 @@ def _validate_loaded_result(
                 "terrain_seed",
                 "terrain_base_seed",
                 "training_env_sequence_seed",
+                "terrain_contact_eps",
                 "peak_jitter_range",
                 "peak_center_jitter_range",
                 "peak_height_jitter_ratio_min",
@@ -3317,6 +3355,21 @@ def _validate_post_eval_results(
                 if expected_value is None or actual_value is None or abs(actual_value - expected_value) > 1e-6:
                     errors.append(f"{setup_key} 不匹配")
 
+        action_force_ratio_source = str(evaluation_setup.get("action_force_ratio_source", "") or "").strip()
+        force_eval_action_force_ratio = spec.get("force_eval_action_force_ratio")
+        if force_eval_action_force_ratio is None:
+            if not action_force_ratio_source:
+                errors.append("action_force_ratio_source 缺失")
+            elif action_force_ratio_source == "forced_override":
+                errors.append("action_force_ratio_source 不匹配: got=forced_override, expected=checkpoint/model FR")
+        else:
+            expected_forced_fr = _safe_float(force_eval_action_force_ratio)
+            actual_forced_fr = _safe_float(evaluation_setup.get("forced_action_force_ratio"))
+            if action_force_ratio_source != "forced_override":
+                errors.append("action_force_ratio_source 不匹配: expected=forced_override")
+            if expected_forced_fr is None or actual_forced_fr is None or abs(actual_forced_fr - expected_forced_fr) > 1e-6:
+                errors.append("forced_action_force_ratio 不匹配")
+
     if _to_bool(artifact_policy.get("save_all_episodes", False)):
         if len(episode_visualizations) != int(spec["episodes"]):
             errors.append(
@@ -3633,6 +3686,11 @@ def _execute_post_eval_run(
     spec = dict(eval_spec)
     spec["resolved_model_variant"] = str(resolved_model_variant)
     spec["selected_model_path"] = str(model_path)
+    spec["force_eval_action_force_ratio"] = (
+        None
+        if getattr(args, "force_eval_action_force_ratio", None) is None
+        else float(args.force_eval_action_force_ratio)
+    )
 
     eval_results_json = eval_dir / "evaluation_results.json"
     eval_log_path = eval_dir / "post_eval.log"
@@ -6644,9 +6702,9 @@ EXPERIMENT_CONFIGS = [
     },
     {
         "label": "matd3_separated_hybrid_actor",
-        "name": "MATD3 Hybrid - Separated Skeleton + Hybrid Actor Objective",
-        "name_en": "MATD3 Hybrid - Separated Skeleton + Hybrid Actor Objective",
-        "description": "Hybrid variant on the same separated update skeleton: keep the separated actor objective as main signal and blend in a low-weight unified total-Q actor objective",
+        "name": "MATD3 Hybrid (Alpha 0.80) - Separated Skeleton + Hybrid Actor Objective",
+        "name_en": "MATD3 Hybrid (Alpha 0.80) - Separated Skeleton + Hybrid Actor Objective",
+        "description": "Hybrid variant on the same separated update skeleton with separated actor loss weight alpha=0.80 and unified total-Q actor loss weight 0.20",
         "env": {
             "ALGORITHM": "matd3",
             "MATD3_USE_DUAL_Q": "1",
@@ -6679,6 +6737,51 @@ EXPERIMENT_CONFIGS = [
             "ALGORITHM": "matd3",
             "MATD3_USE_DUAL_Q": "0",
             "MATD3_USE_SEPARATED_GRADIENT": "0",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "matd3_full_dual_semantic",
+        "name": "MATD3 Full Dual-Semantic",
+        "name_en": "Full Dual-Semantic",
+        "description": "Focused semantic ablation control: raw policy action and corrected executed action are both preserved in replay, critic inputs, and target construction.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "matd3_collapsed_replay",
+        "name": "MATD3 Collapsed Replay",
+        "name_en": "Collapsed Replay",
+        "description": "Focused semantic ablation: replay stores corrected executed actions in both action channels, removing the raw/corrected replay distinction.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "collapsed_replay",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+        }
+    },
+    {
+        "label": "matd3_no_corrected_target_reconstruction",
+        "name": "MATD3 No Corrected Target Reconstruction",
+        "name_en": "No Corrected Target Recon",
+        "description": "Focused semantic ablation: replay keeps raw/corrected dual semantics, but TD target construction does not reconstruct APF-corrected target actions.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "0",
             "USE_TF_POTENTIAL_FIELD": "1",
         }
     },
@@ -6886,6 +6989,11 @@ def parse_args():
         type=float,
         default=DEFAULT_FORCE_EVAL_ACTION_FORCE_RATIO,
         help="后评估/验证集选模时强制使用的固定 FR；默认与统一训练口径对齐为 0.50",
+    )
+    parser.add_argument(
+        "--no-force-eval-action-force-ratio",
+        action="store_true",
+        help="后评估/验证集选模不强制固定 FR，改为使用被评估 checkpoint 对应的模型 FR",
     )
     parser.add_argument("--output-dir", type=str, default="ablation_dual_q_outputs", help="图表输出目录")
     parser.add_argument("--logs-root", type=str, default="logs", help="训练日志根目录")
@@ -7845,6 +7953,8 @@ def _append_runtime_override_args(command: List[str], args) -> None:
         command.extend(["--action-force-ratio-schedule-pct", str(getattr(args, "action_force_ratio_schedule_pct", "") or "")])
     if getattr(args, "force_eval_action_force_ratio", None) is not None:
         command.extend(["--force-eval-action-force-ratio", str(float(args.force_eval_action_force_ratio))])
+    elif getattr(args, "no_force_eval_action_force_ratio", False):
+        command.append("--no-force-eval-action-force-ratio")
 
 
 def _resolve_experiment_manifest(
@@ -7862,6 +7972,8 @@ def _resolve_experiment_manifest(
         config_mode=args.config_mode,
         scenario_seed=int(args.resolved_scenario_seed),
     )
+    if os.environ.get("SAVE_INTERVAL"):
+        env["SAVE_INTERVAL"] = os.environ["SAVE_INTERVAL"]
 
     for key, value in env_vars.items():
         env[key] = value
@@ -7874,6 +7986,7 @@ def _resolve_experiment_manifest(
     env["PER_EPISODE_TERRAIN"] = "0"
     env["USE_DYNAMIC_OBSTACLES"] = "1" if getattr(args, "use_dynamic_obstacles", False) else "0"
     training_environment = _effective_training_environment_setup(args)
+    env["TERRAIN_CONTACT_EPS"] = str(float(training_environment.get("terrain_contact_eps", env.get("TERRAIN_CONTACT_EPS", "0.2"))))
     env["RANDOM_TERRAIN"] = "1" if training_environment.get("random_terrain") else "0"
     env["SEMI_RANDOM_TERRAIN"] = "1" if training_environment.get("semi_random_terrain") else "0"
     env["DETERMINISTIC_TRAIN_ENV_SEQUENCE"] = "1" if training_environment.get("deterministic_env_sequence") else "0"
@@ -7957,6 +8070,7 @@ def _resolve_experiment_manifest(
         "SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES",
         "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES",
         "USE_DYNAMIC_OBSTACLES",
+        "TERRAIN_CONTACT_EPS",
         "SCENARIO_SEED",
         "POSITIONS_FILE",
         "USE_FIXED_POSITIONS",
@@ -8007,6 +8121,11 @@ def _resolve_experiment_manifest(
         "--training-env-sequence-seed",
         int(training_environment.get("training_env_sequence_seed", args.resolved_scenario_seed)),
     )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--terrain-contact-eps",
+        float(training_environment.get("terrain_contact_eps", 0.2)),
+    )
     for flag, key in (
         ("--peak-jitter-range", "peak_jitter_range"),
         ("--peak-center-jitter-range", "peak_center_jitter_range"),
@@ -8039,6 +8158,7 @@ def _resolve_experiment_manifest(
         "terrain_seed",
         "terrain_base_seed",
         "training_env_sequence_seed",
+        "terrain_contact_eps",
         "peak_jitter_range",
         "peak_center_jitter_range",
         "peak_height_jitter_ratio_min",
@@ -9816,6 +9936,8 @@ def run_multi_seed_parent(args) -> int:
 
 def main():
     args = parse_args()
+    if getattr(args, "no_force_eval_action_force_ratio", False):
+        args.force_eval_action_force_ratio = None
     args.post_eval_mode = _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE))
     args.cli_max_parallel_specified = ("--max-parallel" in sys.argv)
     args.cli_disable_post_eval_specified = ("--disable-post-eval" in sys.argv)

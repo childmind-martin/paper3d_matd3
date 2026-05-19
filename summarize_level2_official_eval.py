@@ -30,19 +30,28 @@ DEFAULT_LABELS = [
     "mappo_separated_gradient",
 ]
 
+DUAL_SEMANTICS_LABELS = [
+    "matd3_full_dual_semantic",
+    "matd3_collapsed_replay",
+    "matd3_no_corrected_target_reconstruction",
+]
+
 
 DISPLAY_NAME_MAP = {
     "matd3_single_q": "MATD3 Single-Q",
     "matd3_dual_q": "MATD3 Dual-Q",
     "matd3_separated_gradient": "MATD3 Sep-Grad",
-    "matd3_separated_hybrid_actor": "MATD3 Sep-Hybrid",
-    "matd3_separated_hybrid_actor_alpha20": "MATD3 Hybrid a=0.20",
+    "matd3_separated_hybrid_actor": "MATD3 Hybrid alpha=0.80",
+    "matd3_separated_hybrid_actor_alpha20": "MATD3 Hybrid alpha=0.20",
     "maddpg_baseline": "MADDPG Baseline",
     "maddpg_dual_q": "MADDPG Dual-Q",
     "maddpg_separated_gradient": "MADDPG Sep-Grad",
     "mappo_baseline": "MAPPO Baseline",
     "mappo_fusion_only": "MAPPO Fusion-Only",
     "mappo_separated_gradient": "MAPPO Sep-Grad",
+    "matd3_full_dual_semantic": "Full Dual-Semantic",
+    "matd3_collapsed_replay": "Collapsed Replay",
+    "matd3_no_corrected_target_reconstruction": "No Corrected Target Recon",
 }
 
 
@@ -58,6 +67,9 @@ COLOR_MAP = {
     "mappo_baseline": "#F58518",
     "mappo_fusion_only": "#E45756",
     "mappo_separated_gradient": "#C83E4D",
+    "matd3_full_dual_semantic": "#1F77B4",
+    "matd3_collapsed_replay": "#B279A2",
+    "matd3_no_corrected_target_reconstruction": "#E45756",
 }
 
 
@@ -82,6 +94,11 @@ CSV_FIELDNAMES = [
     "avg_agent_final_goal_distance",
     "avg_min_inter_agent_clearance",
     "avg_steps",
+    "config_valid",
+    "config_errors",
+    "action_force_ratio_source",
+    "use_quadrotor_dynamics",
+    "use_dynamic_obstacles",
     "results_path",
 ]
 
@@ -108,9 +125,85 @@ def _display_name(label: str) -> str:
     return DISPLAY_NAME_MAP.get(label, label)
 
 
-def _find_latest_eval_result(log_root: Path, label: str, seed: int) -> Optional[Path]:
-    pattern = f"level2_retrain_{label}_seed{seed}_*/evaluation_official*/evaluation_results.json"
-    candidates = list(log_root.glob(pattern))
+def _filename_suffix(tag: str) -> str:
+    clean = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in str(tag or "").strip())
+    return f"_{clean}" if clean else ""
+
+
+def _to_bool_optional(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def eval_config_errors(data: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    setup = data.get("evaluation_setup") if isinstance(data, dict) else None
+    if not isinstance(setup, dict):
+        return ["missing evaluation_setup"]
+
+    fr_source = str(setup.get("action_force_ratio_source", "") or "").strip()
+    if not fr_source:
+        errors.append("missing action_force_ratio_source")
+    elif fr_source == "forced_override":
+        errors.append("forced_override action_force_ratio_source")
+
+    use_quad = _to_bool_optional(setup.get("use_quadrotor_dynamics"))
+    if use_quad is not True:
+        errors.append(f"use_quadrotor_dynamics={setup.get('use_quadrotor_dynamics')}")
+
+    use_dynamic_obstacles = _to_bool_optional(setup.get("use_dynamic_obstacles"))
+    if use_dynamic_obstacles is not True:
+        errors.append(f"use_dynamic_obstacles={setup.get('use_dynamic_obstacles')}")
+
+    for key in (
+        "gravity",
+        "control_accel_gain",
+        "agent_max_speed",
+        "agent_accel",
+        "damping",
+        "simulation_dt",
+        "quadrotor_attitude_response_time",
+        "quadrotor_psi_cmd",
+        "action_range_x",
+        "action_range_y",
+        "action_range_z",
+    ):
+        if _safe_float(setup.get(key)) is None:
+            errors.append(f"missing {key}")
+    return errors
+
+
+def _find_latest_eval_result(log_root: Path, label: str, seed: int, run_tag: str = "") -> Optional[Path]:
+    if run_tag:
+        patterns = [
+            f"{run_tag}_{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+        ]
+    else:
+        patterns = [
+            f"level2_ms_official_{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+            f"level2_retrain_{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+            f"*{label}_seed{seed}_*/evaluation_official/evaluation_results.json",
+        ]
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for candidate in log_root.glob(pattern):
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(candidate)
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -119,6 +212,8 @@ def _find_latest_eval_result(log_root: Path, label: str, seed: int) -> Optional[
 def _load_result_row(label: str, seed: int, result_path: Path) -> Dict[str, Any]:
     data = json.loads(result_path.read_text(encoding="utf-8"))
     summary = data.get("summary", {}) if isinstance(data.get("summary"), dict) else {}
+    setup = data.get("evaluation_setup", {}) if isinstance(data.get("evaluation_setup"), dict) else {}
+    config_errors = eval_config_errors(data)
     row = {
         "label": label,
         "display_name": _display_name(label),
@@ -140,6 +235,11 @@ def _load_result_row(label: str, seed: int, result_path: Path) -> Dict[str, Any]
         "avg_agent_final_goal_distance": _safe_float(summary.get("avg_agent_final_goal_distance")),
         "avg_min_inter_agent_clearance": _safe_float(summary.get("avg_min_inter_agent_clearance")),
         "avg_steps": _safe_float(summary.get("avg_steps")),
+        "config_valid": not config_errors,
+        "config_errors": "; ".join(config_errors),
+        "action_force_ratio_source": str(setup.get("action_force_ratio_source", "") or ""),
+        "use_quadrotor_dynamics": setup.get("use_quadrotor_dynamics"),
+        "use_dynamic_obstacles": setup.get("use_dynamic_obstacles"),
         "results_path": str(result_path),
     }
     return row
@@ -306,6 +406,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-root", type=Path, default=Path("/home/tang/matd3/logs"))
     parser.add_argument("--labels", nargs="*", default=list(DEFAULT_LABELS))
     parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for csv/json/png")
+    parser.add_argument("--run-tag", default="", help="Optional log prefix, e.g. level2_ms_checkpoint_fr_eval")
+    parser.add_argument("--filename-tag", default="", help="Optional suffix for output files, e.g. model_fr")
     parser.add_argument("--strict", action="store_true", help="Fail if any label is missing")
     return parser.parse_args()
 
@@ -322,11 +424,14 @@ def main() -> int:
     rows: List[Dict[str, Any]] = []
     missing: List[str] = []
     for label in args.labels:
-        result_path = _find_latest_eval_result(args.log_root, label, args.seed)
+        result_path = _find_latest_eval_result(args.log_root, label, args.seed, args.run_tag)
         if result_path is None:
             missing.append(label)
             continue
-        rows.append(_load_result_row(label, args.seed, result_path))
+        row = _load_result_row(label, args.seed, result_path)
+        rows.append(row)
+        if not row.get("config_valid", False):
+            missing.append(f"{label}({row.get('config_errors')})")
 
     if missing and args.strict:
         raise SystemExit(f"Missing official evaluation results for: {', '.join(missing)}")
@@ -336,9 +441,10 @@ def main() -> int:
     order_index = {label: idx for idx, label in enumerate(args.labels)}
     rows.sort(key=lambda row: order_index.get(row["label"], 10**9))
 
-    csv_path = output_dir / "official_eval_cross_algo_summary.csv"
-    json_path = output_dir / "official_eval_cross_algo_summary.json"
-    png_path = output_dir / "official_eval_cross_algo_summary.png"
+    suffix = _filename_suffix(args.filename_tag)
+    csv_path = output_dir / f"official_eval_cross_algo_summary{suffix}.csv"
+    json_path = output_dir / f"official_eval_cross_algo_summary{suffix}.json"
+    png_path = output_dir / f"official_eval_cross_algo_summary{suffix}.png"
 
     _write_csv(rows, csv_path)
     _write_json(

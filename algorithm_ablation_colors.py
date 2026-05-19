@@ -40,6 +40,24 @@ ALGORITHM_ABLATION_STYLE_BY_LABEL: Dict[str, Dict[str, Any]] = {
         "marker": "^",
         "hatch": "..",
     },
+    "matd3_full_dual_semantic": {
+        "color": "#1F77B4",  # blue
+        "linestyle": "-",
+        "marker": "o",
+        "hatch": "",
+    },
+    "matd3_collapsed_replay": {
+        "color": "#B279A2",  # muted mauve
+        "linestyle": (0, (3.0, 1.5)),
+        "marker": "s",
+        "hatch": "//",
+    },
+    "matd3_no_corrected_target_reconstruction": {
+        "color": "#E45756",  # coral red
+        "linestyle": (0, (7.0, 2.0)),
+        "marker": "D",
+        "hatch": "xx",
+    },
     "maddpg_separated_gradient": {
         "color": "#9467BD",  # purple
         "linestyle": "-",

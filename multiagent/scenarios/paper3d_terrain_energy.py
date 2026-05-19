@@ -4523,13 +4523,18 @@ class Scenario(BaseScenario):
                         0.0,
                     ).astype(np.float32)
 
-                    complexity_heights = np.where(near_valid, surround_heights[:, 0::2], np.nan)
                     complexity_valid_counts = np.sum(near_valid, axis=1)
                     terrain_complexity = np.zeros((num_agents,), dtype=np.float32)
                     valid_complexity_rows = complexity_valid_counts > 1
                     if np.any(valid_complexity_rows):
+                        near_heights = surround_heights[:, 0::2].astype(np.float32, copy=False)
+                        valid_heights = np.where(near_valid, near_heights, 0.0)
+                        valid_counts_f = np.maximum(complexity_valid_counts.astype(np.float32), 1.0)
+                        mean_heights = np.sum(valid_heights, axis=1) / valid_counts_f
+                        centered = np.where(near_valid, near_heights - mean_heights[:, None], 0.0)
                         terrain_complexity[valid_complexity_rows] = (
-                            np.nanstd(complexity_heights[valid_complexity_rows], axis=1) / 20.0
+                            np.sqrt(np.sum(centered[valid_complexity_rows] * centered[valid_complexity_rows], axis=1)
+                                    / valid_counts_f[valid_complexity_rows]) / 20.0
                         ).astype(np.float32)
                     terrain_info[:, 30] = terrain_complexity
 
@@ -4555,8 +4560,18 @@ class Scenario(BaseScenario):
                     rel_positions = self._obs_centers[None, :, :] - positions[:, None, :]
                     dists_to_center = np.linalg.norm(rel_positions, axis=2)
                     dists_to_surface = np.maximum(0.0, dists_to_center - self._obs_radii[None, :])
-                    sorted_indices = np.argsort(dists_to_surface, axis=1)
-                    top_k = min(3, sorted_indices.shape[1])
+                    obstacle_count = dists_to_surface.shape[1]
+                    top_k = min(3, obstacle_count)
+                    if obstacle_count > top_k:
+                        nearest_indices = np.argpartition(dists_to_surface, kth=top_k - 1, axis=1)[:, :top_k]
+                        nearest_dists = np.take_along_axis(dists_to_surface, nearest_indices, axis=1)
+                        sorted_indices = np.take_along_axis(
+                            nearest_indices,
+                            np.argsort(nearest_dists, axis=1),
+                            axis=1,
+                        )
+                    else:
+                        sorted_indices = np.argsort(dists_to_surface, axis=1)
                     row_idx = np.arange(num_agents)
                     for k in range(top_k):
                         idx = sorted_indices[:, k]

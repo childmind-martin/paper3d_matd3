@@ -199,7 +199,7 @@ export PF_JIT=${PF_JIT:-1}                      # 势场热内核 JIT，当前�
 #   - 长时间运行（500+回合）后可能出现 CUDA_ERROR_ILLEGAL_ADDRESS
 #   - 已通过频繁的GPU缓存清理（每10回合）来缓解此问题
 export XLA_GLOBAL=${XLA_GLOBAL:-1}               # 默认启用（1），XLA Global + 异步执行
-export CPU_THREADS=${CPU_THREADS:-12}              # 默认12线程（Zen4 7945HX 实测更稳）
+export CPU_THREADS=${CPU_THREADS:-32}              # 默认12线程（Zen4 7945HX 实测更稳）
 export TQDM_MININTERVAL=${TQDM_MININTERVAL:-0.3}  # 进度条刷新间隔（秒）
 export TQDM_NCOLS=${TQDM_NCOLS:-100}              # 进度条列宽
 export GPU_ID=${GPU_ID:-0}
@@ -295,6 +295,8 @@ export ACTION_RANGE_X=${ACTION_RANGE_X:-2.5}      # 好效果：2.5
 export ACTION_RANGE_Y=${ACTION_RANGE_Y:-2.5}      # 好效果：2.5
 export ACTION_RANGE_Z=${ACTION_RANGE_Z:-2.2}      # 好效果：2.2
 export AGENT_ACCEL=${AGENT_ACCEL:-4.6}            # 好效果：4.6
+export AGENT_MAX_SPEED=${AGENT_MAX_SPEED:-42.5}   # 好效果：42.5
+export SIMULATION_DT=${SIMULATION_DT:-0.08}        # 训练/评估统一仿真步长
 ## 已弃用：垂直力抑制参数移除
 export REWARD_POS_SCALE=${REWARD_POS_SCALE:-1.0}   # 🔧 修复奖励累积：降低到1.0（2.0→1.0），避免过度放大奖励
                                                       # 原因：2.0的缩放会将所有正奖励放大2倍，导致奖励值虚高
@@ -1162,7 +1164,7 @@ ARGS=(
     --batch-size "$BATCH_SIZE"    # 批大小：提升到1024以充分利用GPU
     --exp-name "$EXP_NAME_WITH_TIMESTAMP"              # 实验名称：用于日志与模型目录（带时间戳）
     --save-model                          # 开启周期保存模型
-    --save-interval 800                # 保存间隔（回合）：↑ IO频率↑
+    --save-interval "${SAVE_INTERVAL:-800}"                # 保存间隔（回合）：↑ IO频率↑
     --episode-length 2800               # 🔧 回滚到2200：步数翻倍会导致奖励尺度翻倍，Critic Loss反而更高
     --update-rate "$UPDATE_RATE"       # 更新频率（步）：可通过环境变量覆盖
     --learning-rate-actor "$LEARNING_RATE_ACTOR"   # Actor学习率（初始值）
@@ -1210,6 +1212,10 @@ ARGS=(
     --control-accel-gain "$CONTROL_ACCEL_GAIN" # 控制增益
     # --ground-friction 已弃用
     --damping "$DAMPING"                 # 速度阻尼系数
+    --simulation-dt "$SIMULATION_DT"      # 仿真步长
+    --z-action-bias "$Z_ACTION_BIAS"      # Z轴动作偏置
+    --quadrotor-attitude-response-time "$QUADROTOR_ATTITUDE_RESPONSE_TIME" # 四旋翼姿态响应时间
+    --quadrotor-psi-cmd "$QUADROTOR_PSI_CMD" # 四旋翼偏航指令
     --action-range-x "$ACTION_RANGE_X"  # X轴动作范围
     --action-range-y "$ACTION_RANGE_Y"  # Y轴动作范围
     --action-range-z "$ACTION_RANGE_Z"  # Z轴动作范围
@@ -1269,7 +1275,7 @@ ARGS=(
     --weight-scaling-factor "$WEIGHT_SCALING_FACTOR"
     
     --agent-accel "${AGENT_ACCEL:-5.2}"          # 智能体加速度系数（与 ACTION_RANGE/CONTROL_ACCEL_GAIN 共同决定机动能力）
-    --agent-max-speed "42.5"              # 智能体最大速度
+    --agent-max-speed "$AGENT_MAX_SPEED"              # 智能体最大速度
     
     # 动态障碍物切换参数（基于连续成功和奖励停滞）- 🚀 修改：从解锁随机地形改为解锁随机障碍物
     # 🚨 注意：如果不想启用课程学习，请将这两个参数都设置为0
@@ -1302,6 +1308,7 @@ ARGS=(
     --collapse-patience "3"
     --collapse-loss-threshold "1000"
     --collapse-z-threshold "-50.0"
+    --terrain-contact-eps "$TERRAIN_CONTACT_EPS"
     --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
     --map-size "$MAP_SIZE"
 )
@@ -1315,6 +1322,8 @@ if [ "$ALGORITHM" = "matd3" ]; then
         --matd3-use-separated-gradient "${MATD3_USE_SEPARATED_GRADIENT:-true}"
         --matd3-use-hybrid-actor-objective "${MATD3_USE_HYBRID_ACTOR_OBJECTIVE:-false}"
         --matd3-hybrid-actor-alpha "${MATD3_HYBRID_ACTOR_ALPHA:-0.80}"
+        --matd3-action-semantics-mode "${MATD3_ACTION_SEMANTICS_MODE:-dual}"
+        --matd3-reconstruct-corrected-target "${MATD3_RECONSTRUCT_CORRECTED_TARGET:-true}"
     )
 fi
 if [ "$ALGORITHM" = "maddpg" ]; then
@@ -1904,7 +1913,7 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
         
         if [ -n "$RESULTS_JSON_PATH" ] && [ -f "$RESULTS_JSON_PATH" ]; then
             # 使用Python读取results.json中的action_force_ratio
-            TRAINING_FR=$(python3 <<PYTHON_EOF
+            TRAINING_FR=$("$PYTHON_BIN" <<PYTHON_EOF
 import json
 import sys
 try:
@@ -1934,7 +1943,7 @@ PYTHON_EOF
         # 如果训练时FR<1.0（action_apf_fusion），评估时使用多个FR值进行测试
         if [ -n "$TRAINING_FR" ]; then
             # 使用Python进行浮点数比较（更可靠）
-            IS_APF_LEARNABLE=$(python3 <<PYTHON_EOF
+            IS_APF_LEARNABLE=$("$PYTHON_BIN" <<PYTHON_EOF
 try:
     fr = float("$TRAINING_FR")
     if fr >= 0.99:
@@ -2050,8 +2059,8 @@ PYTHON_EOF
                 echo ""
                 echo "📊 评估摘要:"
                 # 尝试提取关键指标（如果JSON格式允许）
-                if command -v python3 >/dev/null 2>&1; then
-                    python3 <<PYTHON_EOF
+                if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+                    "$PYTHON_BIN" <<PYTHON_EOF
 import json
 import sys
 try:
@@ -2089,6 +2098,11 @@ PYTHON_EOF
 else
     echo "ℹ️  自动评估已禁用（设置 AUTO_EVAL=1 启用）"
     echo ""
+fi
+
+if _truthy "${AUTO_EVAL:-0}" && [ "${AUTO_EVAL_MODE,,}" = "official_spec" ] && [ "${EVAL_STATUS:-0}" -ne 0 ]; then
+    echo "❌ 官方自动评估失败，训练 job 以失败状态退出: ${EVAL_STATUS}" >&2
+    exit "${EVAL_STATUS}"
 fi
 
 echo "评估命令示例:"

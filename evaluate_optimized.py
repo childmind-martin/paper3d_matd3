@@ -16,6 +16,7 @@ import json
 import time
 import math
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 
 # 设置环境变量抑制多智能体环境警告
 os.environ['SUPPRESS_MA_PROMPT'] = '1'
@@ -104,6 +105,43 @@ def _env_float(name, default):
         return float(os.getenv(name, str(default)))
     except Exception:
         return float(default)
+
+
+def _apply_fast_artifact_env_defaults():
+    if not _env_flag("FAST_ARTIFACTS", False):
+        return
+    defaults = {
+        "SAVE_INTERACTIVE_TRAJ": "0",
+        "SAVE_EVAL_ALL_EPISODES": "0",
+        "SAVE_BEST_TRAJ": "0",
+        "SAVE_TEAM_SUCCESS_HTML": "0",
+        "SAVE_EVAL_TRAJECTORY_JSON": "0",
+        "SAVE_EVAL_TRAJECTORY_PNG": "0",
+        "SAVE_EVAL_ACTOR_SEQUENCE": "0",
+        "SAVE_EVAL_CONTROL_DIAGNOSTICS": "0",
+        "DISABLE_TRAJECTORY_RECORDING": "1",
+        "EVAL_LIGHT_ACTION_PATH": "1",
+        "EVAL_LIGHT_INFO": "1",
+        "EVAL_ACTOR_ONLY": "1",
+        "EVAL_VERIFY_WEIGHT_COVERAGE": "0",
+        "TIMING_DETAIL": "0",
+        "TIMING_LEVEL": "1",
+        "DEBUG_EPISODE_SUMMARY": "0",
+        "DEBUG_COLLISION_SUMMARY": "0",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+
+def _artifact_filename(filename):
+    tag = str(os.getenv("EVAL_ARTIFACT_FILENAME_TAG", "") or "").strip()
+    if not tag:
+        return filename
+    clean = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in tag)
+    if not clean:
+        return filename
+    stem, ext = os.path.splitext(filename)
+    return f"{stem}_{clean}{ext}"
 
 
 def _episode_positions_filename(episode_idx, terrain_seed=None, terrain_variant_seed=None):
@@ -217,6 +255,16 @@ def _load_training_alignment_snapshot(model_path):
         training_args = results.get('args') if isinstance(results.get('args'), dict) else results
         if not isinstance(training_args, dict):
             continue
+        training_environment = results.get('training_environment', {}) if isinstance(results, dict) else {}
+        if not isinstance(training_environment, dict):
+            training_environment = {}
+
+        def _metadata_value(key):
+            if key in training_args and training_args.get(key) is not None:
+                return training_args.get(key)
+            if key in training_environment and training_environment.get(key) is not None:
+                return training_environment.get(key)
+            return results.get(key)
 
         scenario_name = (
             training_args.get('scenario_name')
@@ -251,6 +299,7 @@ def _load_training_alignment_snapshot(model_path):
             'peak_height_jitter_ratio_max': _coerce_optional_float(training_args.get('peak_height_jitter_ratio_max', results.get('peak_height_jitter_ratio_max'))),
             'peak_height_max_scale': _coerce_optional_float(training_args.get('peak_height_max_scale', results.get('peak_height_max_scale'))),
             'terrain_variant_noise_ratio': _coerce_optional_float(training_args.get('terrain_variant_noise_ratio', results.get('terrain_variant_noise_ratio'))),
+            'terrain_contact_eps': _coerce_optional_float(_metadata_value('terrain_contact_eps')),
             'terrain_complexity_level': _coerce_optional_int(training_args.get('terrain_complexity_level', results.get('terrain_complexity_level'))),
             'map_size': _coerce_optional_float(training_args.get('map_size', results.get('map_size'))),
             'mountain_min_distance': _coerce_optional_float(training_args.get('mountain_min_distance', results.get('mountain_min_distance'))),
@@ -288,6 +337,7 @@ def _apply_training_alignment_to_args(args, snapshot, quiet=False):
     _apply('peak_height_jitter_ratio_max', snapshot.get('peak_height_jitter_ratio_max'))
     _apply('peak_height_max_scale', snapshot.get('peak_height_max_scale'))
     _apply('terrain_variant_noise_ratio', snapshot.get('terrain_variant_noise_ratio'))
+    _apply('terrain_contact_eps', snapshot.get('terrain_contact_eps'))
     _apply('terrain_complexity_level', snapshot.get('terrain_complexity_level'))
     _apply('map_size', snapshot.get('map_size'))
     _apply('mountain_min_distance', snapshot.get('mountain_min_distance'))
@@ -361,6 +411,7 @@ def _apply_runtime_env_overrides_from_args(args):
         ("peak_height_jitter_ratio_max", "PEAK_HEIGHT_JITTER_RATIO_MAX"),
         ("peak_height_max_scale", "PEAK_HEIGHT_MAX_SCALE"),
         ("terrain_variant_noise_ratio", "TERRAIN_VARIANT_NOISE_RATIO"),
+        ("terrain_contact_eps", "TERRAIN_CONTACT_EPS"),
     )
     for attr_name, env_name in terrain_numeric_env_pairs:
         try:
@@ -409,6 +460,8 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
         ('peak_height_jitter_ratio_max', float, 'peak_height_jitter_ratio_max'),
         ('peak_height_max_scale', float, 'peak_height_max_scale'),
         ('terrain_variant_noise_ratio', float, 'terrain_variant_noise_ratio'),
+        ('terrain_contact_eps', float, '_terrain_contact_eps'),
+        ('terrain_contact_eps', float, 'terrain_contact_eps'),
         ('terrain_complexity_level', int, 'terrain_complexity_level'),
         ('map_size', float, 'map_size'),
     )
@@ -1570,6 +1623,295 @@ class ModelEvaluator:
                 ctx['obstacles'] = []
 
         return ctx
+
+    def _capture_episode_vis_context_for_context(self, eval_ctx, episode_idx):
+        """在不永久切换 live evaluator 状态的前提下捕获某个 batch 子环境的可视化上下文。"""
+        old_scenario = getattr(self, 'scenario', None)
+        old_world = getattr(self, 'world', None)
+        old_env = getattr(self, 'env', None)
+        try:
+            self.scenario = eval_ctx.scenario
+            self.world = eval_ctx.world
+            self.env = eval_ctx.env
+            return self._capture_episode_vis_context(episode_idx)
+        finally:
+            self.scenario = old_scenario
+            self.world = old_world
+            self.env = old_env
+
+    def _load_episode_positions_into_scenario(self, scenario, episode_idx, terrain_seed=None, terrain_variant_seed=None):
+        """为给定 scenario 加载 official episode 位置文件，避免 batch 子环境共享 self.scenario。"""
+        episode_positions_dir = os.getenv('EPISODE_POSITIONS_DIR', None)
+        if not episode_positions_dir:
+            return
+        require_episode_positions = os.getenv('EVAL_REQUIRE_EPISODE_POSITIONS', '0').lower() in ('1', 'true', 'yes', 'on')
+
+        try:
+            from pathlib import Path
+
+            positions_dir = Path(episode_positions_dir)
+            candidates = []
+            if terrain_seed is not None and terrain_variant_seed is not None:
+                candidates.append(
+                    positions_dir / _episode_positions_filename(
+                        episode_idx,
+                        terrain_seed=terrain_seed,
+                        terrain_variant_seed=terrain_variant_seed,
+                    )
+                )
+            if terrain_seed is not None:
+                candidates.append(positions_dir / _episode_positions_filename(episode_idx, terrain_seed=terrain_seed))
+            candidates.append(positions_dir / f"episode_{episode_idx:03d}.json")
+
+            positions_file = None
+            for candidate in candidates:
+                if candidate.exists():
+                    positions_file = candidate
+                    break
+
+            if positions_file is None:
+                if require_episode_positions:
+                    raise FileNotFoundError(
+                        f"Episode {episode_idx + 1} 共享位置文件不存在: "
+                        f"{positions_dir / _episode_positions_filename(episode_idx, terrain_seed=terrain_seed, terrain_variant_seed=terrain_variant_seed) if terrain_seed is not None else positions_dir}"
+                    )
+                scenario.fixed_positions = None
+                scenario.use_fixed_positions = False
+                scenario.positions_initialized = False
+                print(f"⚠️  Episode {episode_idx + 1} 位置文件不存在，将使用动态生成")
+                return
+
+            with open(positions_file, 'r', encoding='utf-8') as f:
+                positions_data = json.load(f)
+
+            if 'agents' in positions_data and 'goal' in positions_data:
+                scenario.fixed_positions = {
+                    'agents': positions_data['agents'],
+                    'goal': positions_data['goal']
+                }
+                scenario.use_fixed_positions = True
+                scenario.positions_initialized = True
+                if hasattr(scenario, 'validate_and_adjust_fixed_positions'):
+                    scenario.validate_and_adjust_fixed_positions()
+            else:
+                scenario.fixed_positions = None
+                scenario.use_fixed_positions = False
+                scenario.positions_initialized = False
+                print(f"⚠️  Episode {episode_idx + 1}位置文件格式错误，将使用动态生成")
+        except Exception as e:
+            if require_episode_positions:
+                raise
+            scenario.fixed_positions = None
+            scenario.use_fixed_positions = False
+            scenario.positions_initialized = False
+            print(f"⚠️  加载Episode {episode_idx + 1}位置文件失败: {e}，将使用动态生成")
+
+    def _apply_eval_context_runtime_params(self, scenario, world, env=None):
+        """把评估运行时参数应用到 batch 子环境，保持与单环境评估一致。"""
+        _apply_terrain_runtime_params_to_scenario(scenario, world, self.args)
+
+        try:
+            if hasattr(world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
+                world.gravity = float(self.args.gravity)
+            if hasattr(world, 'control_accel_gain') and getattr(self.args, 'control_accel_gain', None) is not None:
+                world.control_accel_gain = float(self.args.control_accel_gain)
+            if hasattr(world, 'reward_pos_scale') and getattr(self.args, 'reward_pos_scale', None) is not None:
+                world.reward_pos_scale = float(self.args.reward_pos_scale)
+            if hasattr(world, 'reward_neg_scale') and getattr(self.args, 'reward_neg_scale', None) is not None:
+                world.reward_neg_scale = float(self.args.reward_neg_scale)
+            if hasattr(world, 'damping') and getattr(self.args, 'damping', None) is not None:
+                world.damping = float(self.args.damping)
+        except Exception:
+            pass
+
+        try:
+            quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
+        except Exception:
+            quiet_output = True
+        try:
+            _apply_hidden_runtime_params_to_world(world, self.args, quiet_output=quiet_output)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self.args, 'agent_max_speed', None) is not None or getattr(self.args, 'agent_accel', None) is not None:
+                for ag in getattr(world, 'agents', []):
+                    if getattr(self.args, 'agent_max_speed', None) is not None and hasattr(ag, 'max_speed'):
+                        ag.max_speed = float(self.args.agent_max_speed)
+                    if getattr(self.args, 'agent_accel', None) is not None and hasattr(ag, 'accel'):
+                        ag.accel = float(self.args.agent_accel)
+        except Exception:
+            pass
+
+        try:
+            try_apply_scenario_params(scenario, world, self.args, tqdm_file=None)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.args, 'collision_distance_threshold') and self.args.collision_distance_threshold is not None:
+                if hasattr(scenario, 'collision_distance_threshold'):
+                    scenario.collision_distance_threshold = float(self.args.collision_distance_threshold)
+            if hasattr(self.args, 'collision_penalty_value') and self.args.collision_penalty_value is not None:
+                if hasattr(scenario, 'collision_penalty_value'):
+                    scenario.collision_penalty_value = float(self.args.collision_penalty_value)
+        except Exception:
+            pass
+
+        try:
+            ax = getattr(self.args, 'action_range_x', None)
+            ay = getattr(self.args, 'action_range_y', None)
+            az = getattr(self.args, 'action_range_z', None)
+            if any(v is not None for v in (ax, ay, az)):
+                current = getattr(world, 'action_range', None)
+                if isinstance(current, (list, tuple)) and len(current) >= 3:
+                    new_range = [float(current[0]), float(current[1]), float(current[2])]
+                else:
+                    new_range = [1.0, 1.0, 1.0]
+                if ax is not None:
+                    new_range[0] = float(ax)
+                if ay is not None:
+                    new_range[1] = float(ay)
+                if az is not None:
+                    new_range[2] = float(az)
+                world.action_range = new_range
+        except Exception:
+            pass
+
+        try:
+            world.episode_length = int(getattr(self.args, 'episode_length', 2200) or 2200)
+            world.current_step = 0
+            world.scenario = scenario
+        except Exception:
+            pass
+        if env is not None:
+            try:
+                env.scenario = scenario
+            except Exception:
+                pass
+
+    def _build_episode_eval_context(
+        self,
+        episode_idx,
+        terrain_level,
+        terrain_seed_sequence=None,
+        terrain_variant_seed_sequence=None,
+        obstacle_seed_sequence=None,
+    ):
+        """为 batch episode 创建独立 scenario/world/env，不污染 self.scenario。"""
+        scenario = load_scenario_module(self.args.scenario_name, self.args)
+        if scenario is None:
+            raise RuntimeError(f"无法加载场景: {self.args.scenario_name}")
+        _apply_runtime_env_overrides_from_args(self.args)
+        _apply_terrain_runtime_params_to_scenario(scenario, None, self.args)
+        try:
+            scenario.terrain_complexity_level = terrain_level
+        except Exception:
+            pass
+
+        use_random_terrain = (
+            bool(getattr(self.args, 'random_terrain', False))
+            or _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed_sequence)
+        )
+        obstacle_seed = None
+        if obstacle_seed_sequence and episode_idx < len(obstacle_seed_sequence):
+            obstacle_seed = int(obstacle_seed_sequence[episode_idx])
+
+        terrain_seed = getattr(scenario, 'current_terrain_seed', getattr(scenario, 'seed', None))
+        terrain_variant_seed = getattr(
+            scenario,
+            'current_terrain_variant_seed',
+            getattr(scenario, 'terrain_variant_seed', None),
+        )
+
+        if use_random_terrain:
+            if terrain_seed_sequence and episode_idx < len(terrain_seed_sequence):
+                terrain_seed = int(terrain_seed_sequence[episode_idx])
+            else:
+                terrain_seed = int(np.random.randint(0, 1000000))
+
+            terrain_variant_seed = None
+            if terrain_variant_seed_sequence and episode_idx < len(terrain_variant_seed_sequence):
+                terrain_variant_seed = int(terrain_variant_seed_sequence[episode_idx])
+
+            if hasattr(scenario, 'regenerate_terrain'):
+                if terrain_variant_seed is not None:
+                    scenario.regenerate_terrain(new_seed=terrain_seed, variant_seed=terrain_variant_seed)
+                else:
+                    scenario.regenerate_terrain(new_seed=terrain_seed)
+            else:
+                try:
+                    scenario.seed = terrain_seed
+                    if hasattr(scenario, 'rng'):
+                        scenario.rng = np.random.RandomState(terrain_seed)
+                except Exception:
+                    pass
+        else:
+            try:
+                scenario.random_terrain = False
+            except Exception:
+                pass
+
+        world = scenario.make_world()
+        env = MultiAgentEnv(
+            world,
+            reset_callback=scenario.reset_world,
+            reward_callback=scenario.reward,
+            observation_callback=scenario.observation,
+            done_callback=getattr(scenario, 'is_done', None),
+            info_callback=None,
+            shared_viewer=False
+        )
+        self._apply_eval_context_runtime_params(scenario, world, env)
+
+        if use_random_terrain:
+            self._load_episode_positions_into_scenario(
+                scenario,
+                episode_idx,
+                terrain_seed=terrain_seed,
+                terrain_variant_seed=terrain_variant_seed,
+            )
+
+        try:
+            scenario.current_episode_index = int(episode_idx)
+            scenario.current_episode_env_id = 0
+            scenario.current_episode_obstacle_seed_override = (
+                int(obstacle_seed) if obstacle_seed is not None else None
+            )
+            env.scenario.current_episode_index = int(episode_idx)
+            env.scenario.current_episode_env_id = 0
+            env.scenario.current_episode_obstacle_seed_override = (
+                int(obstacle_seed) if obstacle_seed is not None else None
+            )
+        except Exception:
+            pass
+
+        if use_random_terrain:
+            try:
+                scenario.random_terrain = False
+                env.scenario.random_terrain = False
+            except Exception:
+                pass
+        else:
+            try:
+                world._episode_index_counter = int(episode_idx)
+                world.episode_index = int(episode_idx)
+            except Exception:
+                pass
+
+        terrain_info = {
+            'terrain_seed': getattr(scenario, 'current_terrain_seed', terrain_seed),
+            'terrain_variant_seed': getattr(scenario, 'current_terrain_variant_seed', terrain_variant_seed),
+            'obstacle_seed': int(obstacle_seed) if obstacle_seed is not None else None,
+        }
+        return argparse.Namespace(
+            episode_idx=int(episode_idx),
+            terrain_level=terrain_level,
+            terrain_info=terrain_info,
+            scenario=scenario,
+            world=world,
+            env=env,
+        )
     
     def select_actions_eval(self, processed_obs, use_fr=False, use_pf=False):
         """
@@ -1645,17 +1987,28 @@ class ModelEvaluator:
           供 Actor 单独切片使用
         """
         processed_obs = np.asarray(processed_obs, dtype=np.float32)
-        if processed_obs.ndim != 2:
+        if processed_obs.ndim not in (2, 3):
             return processed_obs
 
         base_obs_dim = self._get_base_obs_dim()
-        base_obs = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
+        had_batch_dim = processed_obs.ndim == 3
+        if had_batch_dim:
+            base_obs = (
+                processed_obs[:, :, :base_obs_dim]
+                if processed_obs.shape[2] > base_obs_dim
+                else processed_obs
+            )
+        else:
+            base_obs = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
 
         if not use_pf:
             return base_obs
 
         pf_feature_dim = self._get_pf_feature_dim()
-        pf_features = np.zeros((base_obs.shape[0], pf_feature_dim), dtype=np.float32)
+        if had_batch_dim:
+            pf_features = np.zeros((base_obs.shape[0], base_obs.shape[1], pf_feature_dim), dtype=np.float32)
+        else:
+            pf_features = np.zeros((base_obs.shape[0], pf_feature_dim), dtype=np.float32)
 
         if use_tf_potential_field and action_force_ratio > 0.0:
             try:
@@ -1664,29 +2017,131 @@ class ModelEvaluator:
                 # 与训练主线 batch_select_actions_vectorized 保持一致：
                 # pf_input 应来自当前状态的 base PF 特征，而不是临时拼接出的其他语义。
                 if hasattr(self.maddpg, 'compute_base_pf_forces_batch_numpy'):
+                    pf_input_batch = base_obs if had_batch_dim else np.expand_dims(base_obs, axis=0)
                     pf_force_batch = self.maddpg.compute_base_pf_forces_batch_numpy(
-                        np.expand_dims(base_obs, axis=0),
+                        pf_input_batch,
                         float(action_force_ratio),
                     )
-                    if isinstance(pf_force_batch, np.ndarray) and pf_force_batch.ndim == 3 and pf_force_batch.shape[0] == 1:
-                        pf_forces = np.asarray(pf_force_batch[0], dtype=np.float32)
+                    if isinstance(pf_force_batch, np.ndarray) and pf_force_batch.ndim == 3:
+                        pf_forces = np.asarray(pf_force_batch if had_batch_dim else pf_force_batch[0], dtype=np.float32)
 
                 # 兼容旧模型/旧实现：若缺少统一 helper，则回退到 dummy_action 路径。
                 if pf_forces is None:
-                    dummy_actions_tf = tf.zeros((base_obs.shape[0], 7), dtype=tf.float32)
-                    base_obs_tf = tf.convert_to_tensor(base_obs, dtype=tf.float32)
+                    flat_base_obs = base_obs.reshape((-1, base_obs.shape[-1])) if had_batch_dim else base_obs
+                    dummy_actions_tf = tf.zeros((flat_base_obs.shape[0], 7), dtype=tf.float32)
+                    base_obs_tf = tf.convert_to_tensor(flat_base_obs, dtype=tf.float32)
                     _, pf_forces_tf = self.maddpg._apply_potential_field_correction(
                         dummy_actions_tf, base_obs_tf, action_force_ratio
                     )
                     pf_forces = np.asarray(pf_forces_tf.numpy(), dtype=np.float32)
+                    if had_batch_dim:
+                        pf_forces = pf_forces.reshape((base_obs.shape[0], base_obs.shape[1], -1))
 
-                if pf_forces.ndim == 2 and pf_forces.shape[0] == base_obs.shape[0]:
-                    copy_dim = min(pf_feature_dim, pf_forces.shape[1])
-                    pf_features[:, :copy_dim] = pf_forces[:, :copy_dim]
+                if had_batch_dim:
+                    if pf_forces.ndim == 3 and pf_forces.shape[:2] == base_obs.shape[:2]:
+                        copy_dim = min(pf_feature_dim, pf_forces.shape[2])
+                        pf_features[:, :, :copy_dim] = pf_forces[:, :, :copy_dim]
+                else:
+                    if pf_forces.ndim == 2 and pf_forces.shape[0] == base_obs.shape[0]:
+                        copy_dim = min(pf_feature_dim, pf_forces.shape[1])
+                        pf_features[:, :copy_dim] = pf_forces[:, :copy_dim]
             except Exception:
                 pass
 
-        return np.concatenate([base_obs, pf_features], axis=1)
+        return np.concatenate([base_obs, pf_features], axis=2 if had_batch_dim else 1)
+
+    def _build_eval_actor_obs_tf_with_context(self, processed_obs, use_pf, use_tf_potential_field, action_force_ratio):
+        """
+        TensorFlow 版评估 Actor 输入构造。
+        返回 (policy_obs_tf, base_obs_tf, pf_shared_context)，其中 pf_shared_context 可被
+        后续 PF correction 复用，避免同一步重复解析 observation geometry。
+        """
+        processed_np = np.asarray(processed_obs, dtype=np.float32)
+        if processed_np.ndim != 3:
+            policy_obs_np = self._build_eval_actor_obs(
+                processed_np,
+                use_pf=use_pf,
+                use_tf_potential_field=use_tf_potential_field,
+                action_force_ratio=action_force_ratio,
+            )
+            base_obs_dim = self._get_base_obs_dim()
+            base_obs_np = processed_np[:, :base_obs_dim] if processed_np.ndim == 2 and processed_np.shape[1] > base_obs_dim else processed_np
+            return tf.convert_to_tensor(policy_obs_np, dtype=tf.float32), tf.convert_to_tensor(base_obs_np, dtype=tf.float32), None
+
+        base_obs_dim = self._get_base_obs_dim()
+        base_obs_np = processed_np[:, :, :base_obs_dim] if processed_np.shape[2] > base_obs_dim else processed_np
+        base_obs_tf = tf.convert_to_tensor(base_obs_np, dtype=tf.float32)
+        if not use_pf:
+            return base_obs_tf, base_obs_tf, None
+
+        pf_feature_dim = self._get_pf_feature_dim()
+        pf_features_tf = tf.zeros(
+            [tf.shape(base_obs_tf)[0], tf.shape(base_obs_tf)[1], pf_feature_dim],
+            dtype=tf.float32,
+        )
+        pf_shared_context = None
+
+        if use_tf_potential_field and action_force_ratio > 0.0:
+            try:
+                obs_shapes = [int(v) for v in getattr(self, 'obs_shapes', []) if v is not None]
+                action_dims = [int(v) for v in getattr(self, 'action_dims', []) if v is not None]
+                uniform_obs_dims = bool(obs_shapes) and len(set(obs_shapes)) <= 1
+                uniform_action_dims = bool(action_dims) and len(set(action_dims)) <= 1
+                has_shared_helpers = all(
+                    hasattr(self.maddpg, name)
+                    for name in (
+                        '_extract_pf_obs_context_compiled_tf',
+                        '_extract_pf_geometry_context_compiled_tf',
+                        '_compute_base_pf_forces_from_shared_context_tf',
+                    )
+                )
+                if uniform_obs_dims and uniform_action_dims and has_shared_helpers:
+                    correct_obs_dim = obs_shapes[0]
+                    act_dim = action_dims[0]
+                    flat_base_obs = tf.ensure_shape(
+                        tf.reshape(base_obs_tf[:, :, :correct_obs_dim], [-1, correct_obs_dim]),
+                        [None, correct_obs_dim],
+                    )
+                    obs_ctx = self.maddpg._extract_pf_obs_context_compiled_tf(flat_base_obs)
+                    geometry_ctx = self.maddpg._extract_pf_geometry_context_compiled_tf(
+                        obs_ctx[1],
+                        obs_ctx[2],
+                        obs_ctx[4],
+                        obs_ctx[5],
+                        obs_ctx[6],
+                    )
+                    pf_tensor = self.maddpg._compute_base_pf_forces_from_shared_context_tf(
+                        obs_ctx[3],
+                        geometry_ctx,
+                        float(action_force_ratio),
+                        tf.shape(base_obs_tf)[0],
+                        act_dim,
+                    )
+                    copy_dim = min(int(pf_feature_dim), 3)
+                    if copy_dim > 0:
+                        pf_features_tf = tf.concat(
+                            [
+                                pf_tensor[:, :, :copy_dim],
+                                tf.zeros(
+                                    [tf.shape(base_obs_tf)[0], tf.shape(base_obs_tf)[1], pf_feature_dim - copy_dim],
+                                    dtype=tf.float32,
+                                ),
+                            ],
+                            axis=2,
+                        ) if copy_dim < pf_feature_dim else pf_tensor[:, :, :pf_feature_dim]
+                    pf_shared_context = (obs_ctx[3], geometry_ctx)
+                else:
+                    raise RuntimeError("shared PF helpers unavailable for current shapes")
+            except Exception:
+                policy_obs_np = self._build_eval_actor_obs(
+                    processed_np,
+                    use_pf=use_pf,
+                    use_tf_potential_field=use_tf_potential_field,
+                    action_force_ratio=action_force_ratio,
+                )
+                return tf.convert_to_tensor(policy_obs_np, dtype=tf.float32), base_obs_tf, None
+
+        return tf.concat([base_obs_tf, pf_features_tf], axis=2), base_obs_tf, pf_shared_context
 
     @tf.function(reduce_retracing=True)
     def _select_actions_eval_tf(self, processed_obs, use_fr, use_pf):
@@ -1982,8 +2437,7 @@ class ModelEvaluator:
                             val = results['args']['quadrotor_psi_cmd']
                             training_quadrotor_psi_cmd = float(val) if val is not None else None
                         if 'use_quadrotor_dynamics' in results['args']:
-                            val = results['args']['use_quadrotor_dynamics']
-                            training_use_quadrotor_dynamics = bool(val) if val is not None else None
+                            training_use_quadrotor_dynamics = _coerce_optional_bool(results['args']['use_quadrotor_dynamics'])
                     else:
                         # 从顶层读取（向后兼容）
                         if 'use_fr_feature' in results:
@@ -2047,8 +2501,7 @@ class ModelEvaluator:
                             val = results['quadrotor_psi_cmd']
                             training_quadrotor_psi_cmd = float(val) if val is not None else None
                         if 'use_quadrotor_dynamics' in results:
-                            val = results['use_quadrotor_dynamics']
-                            training_use_quadrotor_dynamics = bool(val) if val is not None else None
+                            training_use_quadrotor_dynamics = _coerce_optional_bool(results['use_quadrotor_dynamics'])
                     
                     if training_use_fr is not None and training_use_pf is not None:
                         print(f"✅ 从训练配置读取特征标志: use_fr_feature={training_use_fr}, use_pf_feature={training_use_pf}")
@@ -2251,18 +2704,17 @@ class ModelEvaluator:
             print(f"✅ 使用训练时的{label}: {value}")
         if training_use_quadrotor_dynamics is not None:
             training_use_quadrotor_dynamics = bool(training_use_quadrotor_dynamics)
+            self.args.use_quadrotor_dynamics = training_use_quadrotor_dynamics
             if (
                 runtime_use_quadrotor_dynamics is not None
                 and runtime_use_quadrotor_dynamics != training_use_quadrotor_dynamics
             ):
-                self.args.use_quadrotor_dynamics = bool(runtime_use_quadrotor_dynamics)
                 print(
                     "⚠️ USE_QUADROTOR_DYNAMICS 与训练配置记录不一致，"
-                    f"保留当前运行时值: {self.args.use_quadrotor_dynamics} "
-                    f"(训练记录为 {training_use_quadrotor_dynamics})"
+                    f"严格评估模式下已覆盖运行时值 {runtime_use_quadrotor_dynamics} "
+                    f"-> 训练记录值 {training_use_quadrotor_dynamics}"
                 )
             else:
-                self.args.use_quadrotor_dynamics = training_use_quadrotor_dynamics
                 print(f"✅ 使用训练时的USE_QUADROTOR_DYNAMICS: {self.args.use_quadrotor_dynamics}")
         if self.training_alignment:
             _apply_training_alignment_to_args(self.args, self.training_alignment, quiet=True)
@@ -2326,6 +2778,7 @@ class ModelEvaluator:
             # 🔧 关键修复：使用训练时的action_force_ratio（如果是apf_learnable，FR=1.0）
             action_force_ratio=eval_action_force_ratio,
             use_tf_potential_field=getattr(self.args, 'use_tf_potential_field', True),
+            eval_actor_only=_env_flag('EVAL_ACTOR_ONLY', True),
             goal_attraction=getattr(self.args, 'goal_attraction', 1.0),
             lambda_1_base=getattr(self.args, 'lambda_1_base', 5.0),
             terrain_repulsion=getattr(self.args, 'terrain_repulsion', 80.0),
@@ -2371,6 +2824,9 @@ class ModelEvaluator:
         # 🔧 修复：移除env参数，因为训练脚本中已经移除了env参数支持
         # Oracle模式通过其他方式实现（在_calculate_terrain_forces_sphere_tf中直接访问scenario）
         algorithm = getattr(self.args, 'algorithm', 'matd3').lower()
+        eval_actor_only = bool(getattr(maddpg_args, 'eval_actor_only', False)) and algorithm in ('matd3', 'maddpg')
+        if eval_actor_only:
+            print("⚡ EVAL_ACTOR_ONLY=1：评估仅构建/加载Actor，跳过Critic、Target网络和优化器。")
         if algorithm == 'matd3':
             self.maddpg = OptimizedMATD3(self.n_agents, self.obs_shapes, self.action_dims, maddpg_args)
         elif algorithm == 'mappo':
@@ -2415,6 +2871,8 @@ class ModelEvaluator:
                     ap = os.path.join(dir_path, f"actor_{i}.weights.h5")
                     if not os.path.isfile(ap) or os.path.getsize(ap) <= 0:
                         return False
+                    if eval_actor_only:
+                        continue
                     # 🚨 标准MATD3：检查两个独立的Critic网络文件
                     if algorithm == 'matd3':
                         cp1 = os.path.join(dir_path, f"critic1_{i}.weights.h5")
@@ -2487,7 +2945,7 @@ class ModelEvaluator:
             else:
                 raise FileNotFoundError(f"找不到可用的权重文件，请检查目录: {self.args.load_model_path}")
 
-        # 先以虚拟输入构建网络，确保变量已创建（为每个智能体的 actor/critic 都建图）
+        # 先以虚拟输入构建网络，确保变量已创建。评估轻量模式只构建 Actor。
         try:
             critic_state_dim = sum(self.obs_shapes)
             use_fr = getattr(maddpg_args, 'use_fr_feature', False)
@@ -2513,6 +2971,9 @@ class ModelEvaluator:
                 else:
                     _ = self.maddpg.agents[i]['actor'](actor_inputs, training=False)
                 
+                if eval_actor_only:
+                    continue
+
                 # 🚨 标准MATD3：构建两个独立的Critic网络（Twin Critic）
                 # Critic需要PF特征作为单独输入（与Actor不同）
                 dummy_state = tf.zeros((1, critic_state_dim), dtype=tf.float32)
@@ -2617,6 +3078,9 @@ class ModelEvaluator:
         ok = True
         total_loaded_vars = 0
         total_vars = 0
+        verify_weight_coverage = _env_flag('EVAL_VERIFY_WEIGHT_COVERAGE', False)
+        if not verify_weight_coverage:
+            print("⚡ EVAL_VERIFY_WEIGHT_COVERAGE=0：跳过加载前后权重全量拷贝检查，降低并发内存峰值。")
 
         if algorithm == 'mappo':
             try:
@@ -2646,17 +3110,27 @@ class ModelEvaluator:
                 return changed, total
 
             # actor
-            a_before = _snapshot_vars(self.maddpg.agents[i]['actor'])
-            ok = _safe_load(self.maddpg.agents[i]['actor'], a_path, f"actor[{i}]") and ok
-            a_after = _snapshot_vars(self.maddpg.agents[i]['actor'])
-            chg, tot = _count_changed(a_before, a_after)
-            total_loaded_vars += chg
-            total_vars += tot
-            if tot > 0:
-                ratio = (chg / tot) * 100.0
-                print(f"actor[{i}] 覆盖变量: {chg}/{tot} ({ratio:.1f}%)")
-                if ratio < 60.0:
-                    print(f"⚠️  actor[{i}] 覆盖比例偏低，可能与训练结构不一致")
+            if verify_weight_coverage:
+                a_before = _snapshot_vars(self.maddpg.agents[i]['actor'])
+                ok = _safe_load(self.maddpg.agents[i]['actor'], a_path, f"actor[{i}]") and ok
+                a_after = _snapshot_vars(self.maddpg.agents[i]['actor'])
+                chg, tot = _count_changed(a_before, a_after)
+                total_loaded_vars += chg
+                total_vars += tot
+                if tot > 0:
+                    ratio = (chg / tot) * 100.0
+                    print(f"actor[{i}] 覆盖变量: {chg}/{tot} ({ratio:.1f}%)")
+                    if ratio < 60.0:
+                        print(f"⚠️  actor[{i}] 覆盖比例偏低，可能与训练结构不一致")
+            else:
+                ok = _safe_load(self.maddpg.agents[i]['actor'], a_path, f"actor[{i}]") and ok
+                tot = len(getattr(self.maddpg.agents[i]['actor'], 'trainable_variables', []) or [])
+                total_loaded_vars += tot
+                total_vars += tot
+                print(f"actor[{i}] 已加载: {os.path.basename(a_path)} ({tot} trainable vars)")
+
+            if eval_actor_only:
+                continue
 
             # 🚨 标准MATD3：加载两个独立的Critic网络
             algorithm = getattr(self.args, 'algorithm', 'matd3').lower()
@@ -2745,6 +3219,607 @@ class ModelEvaluator:
             raise RuntimeError("无法成功加载全部模型权重，请检查权重文件是否完整匹配。")
 
         print("✅ 模型加载完成!")
+
+    def _init_batched_episode_state(self, eval_ctx):
+        """初始化一个 batch 子回合的统计状态。"""
+        episode_idx = int(eval_ctx.episode_idx)
+        env = eval_ctx.env
+        world = eval_ctx.world
+        scenario = eval_ctx.scenario
+
+        reset_result = env.reset()
+        if isinstance(reset_result, tuple):
+            obs_n, _ = reset_result
+        else:
+            obs_n = reset_result
+
+        initial_positions = _capture_agent_positions(world.agents)
+        agent_goal_positions = _extract_agent_goal_positions(world, scenario)
+        direct_goal_distances = [
+            _distance_3d(pos, goal) for pos, goal in zip(initial_positions, agent_goal_positions)
+        ]
+        agent_min_goal_distances = [
+            float(dist) if dist is not None else None for dist in direct_goal_distances
+        ]
+        try:
+            success_threshold = float(getattr(self.args, 'success_distance_threshold', 4.0))
+        except Exception:
+            success_threshold = 4.0
+        try:
+            simulation_dt = float(getattr(world, 'dt', os.getenv('SIMULATION_DT', '0.08')))
+        except Exception:
+            simulation_dt = 0.08
+
+        agent_first_reach_steps = []
+        for pos, goal in zip(initial_positions, agent_goal_positions):
+            dist_to_goal = _distance_3d(pos, goal)
+            agent_first_reach_steps.append(0 if dist_to_goal is not None and dist_to_goal <= success_threshold else None)
+        team_first_reach_step = (
+            0 if agent_first_reach_steps and all(step == 0 for step in agent_first_reach_steps) else None
+        )
+
+        save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
+        save_interactive_traj = _env_flag("SAVE_INTERACTIVE_TRAJ", True)
+        save_all_episode_visualizations = _env_flag("SAVE_EVAL_ALL_EPISODES", False)
+        save_best_traj = _env_flag("SAVE_BEST_TRAJ", True)
+        save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", False)
+        save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
+        save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", False)
+        trajectory_sample_interval = _env_int("EVAL_TRAJECTORY_SAMPLE_INTERVAL", 1)
+        need_trajectory_artifacts = (
+            not getattr(self.args, 'disable_visualization', False)
+            and (
+                save_all_episode_visualizations
+                or save_best_traj
+                or save_trajectory_png
+                or save_interactive_traj
+                or save_team_success_html
+                or (not getattr(self.args, 'disable_gif', False))
+            )
+        )
+        record_trajectory = bool(need_trajectory_artifacts)
+        record_actions = save_actor_sequence or save_control_diagnostics
+        try:
+            env._disable_trajectory_recording = not bool(need_trajectory_artifacts)
+        except Exception:
+            pass
+
+        return {
+            'ctx': eval_ctx,
+            'episode': episode_idx,
+            'processed_obs': self._process_observations_for_eval(obs_n),
+            'done': False,
+            'failed': False,
+            'error': None,
+            'wall_start': time.perf_counter(),
+            'start_time': time.time(),
+            'episode_reward': 0.0,
+            'step_count': 0,
+            'prev_positions': [pos.copy() if pos is not None else None for pos in initial_positions],
+            'agent_path_lengths': [0.0 for _ in initial_positions],
+            'direct_goal_distances': direct_goal_distances,
+            'agent_goal_positions': agent_goal_positions,
+            'agent_min_goal_distances': agent_min_goal_distances,
+            'success_threshold': success_threshold,
+            'simulation_dt': simulation_dt,
+            'agent_first_reach_steps': agent_first_reach_steps,
+            'team_first_reach_step': team_first_reach_step,
+            'episode_trajectory': [],
+            'episode_actions_history': [],
+            'episode_executed_actions_history': [],
+            'episode_velocity_history': [],
+            'episode_goal_distance_history': [],
+            'record_trajectory': record_trajectory,
+            'record_actions': record_actions,
+            'save_control_diagnostics': save_control_diagnostics,
+            'trajectory_sample_interval': trajectory_sample_interval,
+            'episode_inter_agent_collision_counts': [0] * len(getattr(env, 'agents', []) or []),
+            'episode_inter_agent_collision_pair_count': 0,
+            'episode_min_inter_agent_clearance': None,
+        }
+
+    def _prepare_batched_episode_step(self, state, actions, raw_actions, step):
+        """记录 step 前的可选轨迹/动作 artifact。"""
+        env = state['ctx'].env
+        if state.get('record_actions') and raw_actions is not None:
+            try:
+                state['episode_actions_history'].append([action.copy() for action in raw_actions])
+            except Exception:
+                pass
+        if state.get('record_trajectory') and (step % int(state.get('trajectory_sample_interval', 1)) == 0):
+            try:
+                positions = [
+                    agent.state.p_pos.copy() if hasattr(agent.state, 'p_pos') else [0, 0, 0]
+                    for agent in env.agents
+                ]
+                state['episode_trajectory'].append(positions)
+            except Exception:
+                pass
+        try:
+            if state.get('record_actions') and state.get('save_control_diagnostics'):
+                state['episode_executed_actions_history'].append([action.copy() for action in actions])
+        except Exception:
+            pass
+
+    def _step_batched_episode_env(self, state, actions):
+        """只执行单个 batch 子回合的 env.step，便于在线程池中并行。"""
+        env = state['ctx'].env
+        step_result = env.step(actions)
+        if len(step_result) == 4:
+            next_obs_n, rew_n, done_n, info_n = step_result
+        elif len(step_result) == 5:
+            next_obs_n, rew_n, terminated, truncated, info_n = step_result
+            done_n = [t or tr for t, tr in zip(terminated, truncated)]
+        else:
+            raise ValueError(f"意外的环境step返回值: {len(step_result)}")
+        return next_obs_n, rew_n, done_n, info_n
+
+    def _complete_batched_episode_step(self, state, next_obs_n, rew_n, done_n, info_n):
+        """合并单个 batch 子回合的 step 后统计，保持原有结果语义。"""
+        env = state['ctx'].env
+        try:
+            rew_arr = np.asarray(rew_n, dtype=np.float32)
+            if rew_arr.size > 0:
+                if not np.all(np.isfinite(rew_arr)):
+                    rew_arr = np.where(np.isfinite(rew_arr), rew_arr, -1000.0)
+                step_increment = float(np.mean(rew_arr))
+            else:
+                step_increment = 0.0
+        except Exception:
+            try:
+                step_increment = float(np.mean(rew_n))
+            except Exception:
+                step_increment = float(sum(rew_n)) if rew_n is not None else 0.0
+        state['episode_reward'] += step_increment
+        state['step_count'] += 1
+
+        current_positions = _capture_agent_positions(env.agents)
+        if state.get('save_control_diagnostics'):
+            current_velocities = []
+            for agent in env.agents:
+                try:
+                    vel = _normalize_vec3(getattr(getattr(agent, 'state', None), 'p_vel', None))
+                except Exception:
+                    vel = None
+                current_velocities.append(vel)
+            if current_velocities:
+                state['episode_velocity_history'].append(
+                    [vel.copy() if vel is not None else None for vel in current_velocities]
+                )
+
+        agent_goal_positions = state['agent_goal_positions']
+        if state.get('save_control_diagnostics') and current_positions and agent_goal_positions:
+            state['episode_goal_distance_history'].append(
+                [_distance_3d(pos, goal) for pos, goal in zip(current_positions, agent_goal_positions)]
+            )
+
+        for agent_idx in range(min(len(state['agent_path_lengths']), len(current_positions))):
+            prev_pos = state['prev_positions'][agent_idx]
+            curr_pos = current_positions[agent_idx]
+            if prev_pos is None or curr_pos is None:
+                continue
+            step_distance = float(np.linalg.norm(curr_pos - prev_pos))
+            if np.isfinite(step_distance):
+                state['agent_path_lengths'][agent_idx] += step_distance
+        state['prev_positions'] = [pos.copy() if pos is not None else None for pos in current_positions]
+
+        try:
+            pair_count_step, per_agent_step_counts, min_clearance_step = _compute_inter_agent_collision_snapshot(
+                getattr(env, 'agents', [])
+            )
+            state['episode_inter_agent_collision_pair_count'] += int(pair_count_step)
+            if min_clearance_step is not None:
+                cur_min = state['episode_min_inter_agent_clearance']
+                if cur_min is None or min_clearance_step < cur_min:
+                    state['episode_min_inter_agent_clearance'] = float(min_clearance_step)
+            counts = state['episode_inter_agent_collision_counts']
+            if len(counts) < len(per_agent_step_counts):
+                counts.extend([0] * (len(per_agent_step_counts) - len(counts)))
+            for idx, per_agent_count in enumerate(per_agent_step_counts):
+                counts[idx] += int(per_agent_count)
+        except Exception:
+            pass
+
+        if agent_goal_positions and current_positions:
+            team_reached_now = True
+            valid_reach_checks = 0
+            for agent_idx in range(min(len(current_positions), len(agent_goal_positions))):
+                curr_pos = current_positions[agent_idx]
+                goal_pos = agent_goal_positions[agent_idx]
+                dist_to_goal = _distance_3d(curr_pos, goal_pos)
+                if dist_to_goal is None:
+                    team_reached_now = False
+                    continue
+                valid_reach_checks += 1
+                prev_min_goal_dist = state['agent_min_goal_distances'][agent_idx]
+                if prev_min_goal_dist is None or dist_to_goal < prev_min_goal_dist:
+                    state['agent_min_goal_distances'][agent_idx] = float(dist_to_goal)
+                reached = dist_to_goal <= state['success_threshold']
+                if reached and state['agent_first_reach_steps'][agent_idx] is None:
+                    state['agent_first_reach_steps'][agent_idx] = state['step_count']
+                if not reached:
+                    team_reached_now = False
+            if valid_reach_checks == 0:
+                team_reached_now = False
+            if team_reached_now and state['team_first_reach_step'] is None:
+                state['team_first_reach_step'] = state['step_count']
+
+        state['processed_obs'] = self._process_observations_for_eval(next_obs_n)
+        if all(done_n) and (not getattr(self.args, 'disable_early_termination', False)):
+            state['done'] = True
+        return info_n
+
+    def _advance_batched_episode_state(self, state, actions, raw_actions, step):
+        """推进 batch 子回合一步，并更新轻量统计。"""
+        self._prepare_batched_episode_step(state, actions, raw_actions, step)
+        next_obs_n, rew_n, done_n, info_n = self._step_batched_episode_env(state, actions)
+        return self._complete_batched_episode_step(state, next_obs_n, rew_n, done_n, info_n)
+
+    def _finalize_batched_episode_state(self, state):
+        """将 batch 子回合状态转换为 evaluation_results.json 兼容的 episode_data。"""
+        eval_ctx = state['ctx']
+        env = eval_ctx.env
+        episode_idx = int(state['episode'])
+        episode_duration = time.time() - state['start_time']
+
+        episode_collision_counts = []
+        episode_min_distances = []
+        episode_terrain_total = 0
+        episode_obstacle_total = 0
+        try:
+            for agent in getattr(getattr(env, 'world', None), 'agents', []):
+                if not hasattr(agent, 'debug_info') or not isinstance(agent.debug_info, dict):
+                    agent.debug_info = {}
+                penetration_count = agent.debug_info.get(
+                    'total_penetration_count',
+                    getattr(agent, 'current_episode_collision_count', 0),
+                )
+                try:
+                    penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
+                except Exception:
+                    penetration_count = 0
+                episode_collision_counts.append(penetration_count)
+
+                try:
+                    terrain_collision_count = agent.debug_info.get('terrain_penetration_count', 0)
+                    obstacle_collision_count = agent.debug_info.get('obstacle_collision_count', 0)
+                    terrain_collision_count = int(terrain_collision_count) if np.isfinite(terrain_collision_count) else 0
+                    obstacle_collision_count = int(obstacle_collision_count) if np.isfinite(obstacle_collision_count) else 0
+                except Exception:
+                    terrain_collision_count = 0
+                    obstacle_collision_count = 0
+                episode_terrain_total += terrain_collision_count
+                episode_obstacle_total += obstacle_collision_count
+
+                min_dist = agent.debug_info.get('d_min_current', None)
+                if min_dist is None and hasattr(agent, 'last_min_distance'):
+                    min_dist = agent.last_min_distance
+                try:
+                    if isinstance(min_dist, np.ndarray):
+                        min_dist = float(min_dist[-1] if min_dist.size > 0 and min_dist.ndim > 0 else min_dist.item())
+                    elif min_dist is not None:
+                        min_dist = float(min_dist)
+                except Exception:
+                    min_dist = None
+                if min_dist is not None and np.isfinite(min_dist):
+                    episode_min_distances.append(min_dist)
+        except Exception:
+            pass
+
+        agent_success_flags = []
+        team_success_flag = 1
+        try:
+            thr_success = float(getattr(self.args, 'success_distance_threshold', 4.0))
+            scn = getattr(env, 'scenario', None)
+            goal_pos = getattr(scn, 'goal_pos', None) if scn is not None else None
+            if goal_pos is None and scn is not None and hasattr(scn, 'get_goal_pos'):
+                try:
+                    goal_pos = scn.get_goal_pos()
+                except Exception:
+                    goal_pos = None
+            for agent_idx, agent in enumerate(getattr(getattr(env, 'world', None), 'agents', [])):
+                pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
+                if pos is None or len(pos) < 3:
+                    agent_success_flags.append(0)
+                    team_success_flag = 0
+                    continue
+                ag_goal = None
+                if hasattr(agent, 'goal_a') and hasattr(agent.goal_a, 'state') and getattr(agent.goal_a.state, 'p_pos', None) is not None:
+                    ag_goal = agent.goal_a.state.p_pos
+                if ag_goal is None:
+                    ag_goal = goal_pos
+                if ag_goal is None:
+                    agent_success_flags.append(0)
+                    team_success_flag = 0
+                    continue
+                dx = pos[0] - ag_goal[0]
+                dy = pos[1] - ag_goal[1]
+                dz = pos[2] - ag_goal[2]
+                reach_i = ((dx * dx + dy * dy + dz * dz) ** 0.5) <= thr_success
+                safe_i = True
+                for attr in ('_episode_has_collision', '_had_obstacle_collision', '_had_terrain_contact_or_penetration'):
+                    try:
+                        if getattr(agent, attr, False):
+                            safe_i = False
+                    except Exception:
+                        pass
+                pen_count = episode_collision_counts[agent_idx] if agent_idx < len(episode_collision_counts) else None
+                if pen_count is None and hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
+                    pen_count = agent.debug_info.get('total_penetration_count', 0)
+                try:
+                    pen_count = int(pen_count) if np.isfinite(pen_count) else 0
+                except Exception:
+                    pen_count = None
+                if pen_count is None or pen_count > 0:
+                    safe_i = False
+                succ_i = 1 if (reach_i and safe_i) else 0
+                agent_success_flags.append(succ_i)
+                if succ_i == 0:
+                    team_success_flag = 0
+        except Exception:
+            agent_success_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
+            team_success_flag = 0
+
+        total_collisions = sum(episode_collision_counts) if episode_collision_counts else 0
+        try:
+            total_collisions = int(total_collisions) if np.isfinite(total_collisions) else 0
+        except Exception:
+            total_collisions = 0
+        min_distance_stat = None
+        if episode_min_distances:
+            try:
+                min_distance_stat = {
+                    'mean': float(np.mean(episode_min_distances)),
+                    'min': float(np.min(episode_min_distances)),
+                }
+            except Exception:
+                min_distance_stat = None
+
+        direct_goal_distances = state['direct_goal_distances']
+        agent_path_lengths = state['agent_path_lengths']
+        agent_path_efficiencies = []
+        for direct_dist, path_len in zip(direct_goal_distances, agent_path_lengths):
+            if direct_dist is None or path_len is None or path_len <= 1e-9:
+                agent_path_efficiencies.append(None)
+            else:
+                agent_path_efficiencies.append(float(np.clip(direct_dist / max(path_len, 1e-9), 0.0, 1.0)))
+        valid_direct_dists = [dist for dist in direct_goal_distances if dist is not None]
+        team_direct_distance = float(np.sum(valid_direct_dists)) if valid_direct_dists else None
+        team_total_path_length = float(np.sum(agent_path_lengths)) if agent_path_lengths else 0.0
+        path_efficiency = None
+        if team_direct_distance is not None and team_total_path_length > 1e-9:
+            path_efficiency = float(np.clip(team_direct_distance / team_total_path_length, 0.0, 1.0))
+
+        final_positions_for_stats = _capture_agent_positions(env.agents)
+        agent_goal_positions = state['agent_goal_positions']
+        agent_final_goal_distances = [
+            _distance_3d(pos, goal) for pos, goal in zip(final_positions_for_stats, agent_goal_positions)
+        ]
+        valid_final_goal_distances = [dist for dist in agent_final_goal_distances if dist is not None]
+        final_goal_distance = float(np.sum(valid_final_goal_distances)) if valid_final_goal_distances else None
+        valid_min_goal_distances = [dist for dist in state['agent_min_goal_distances'] if dist is not None]
+        min_goal_distance = float(np.sum(valid_min_goal_distances)) if valid_min_goal_distances else None
+
+        first_reach_step = state['team_first_reach_step']
+        first_reach_time = float(first_reach_step * state['simulation_dt']) if first_reach_step is not None else None
+        success_flag = 1 if team_success_flag == 1 else 0
+        arrival_step = first_reach_step if success_flag == 1 else None
+        arrival_time = first_reach_time if success_flag == 1 else None
+
+        penetration_depths = []
+        penetration_count_episodes = 0
+        for min_dist in episode_min_distances:
+            if min_dist is not None and np.isfinite(min_dist) and min_dist < 0:
+                penetration_depths.append(abs(min_dist))
+                penetration_count_episodes += 1
+        penetration_stat = None
+        if penetration_depths:
+            penetration_stat = {
+                'count': penetration_count_episodes,
+                'max_depth': float(np.max(penetration_depths)),
+                'mean_depth': float(np.mean(penetration_depths)),
+                'min_depth': float(np.min(penetration_depths)),
+            }
+
+        if state.get('record_trajectory'):
+            try:
+                final_positions = [
+                    agent.state.p_pos.copy() if hasattr(agent.state, 'p_pos') else [0, 0, 0]
+                    for agent in env.agents
+                ]
+                state['episode_trajectory'].append(final_positions)
+            except Exception:
+                pass
+
+        return {
+            'episode': episode_idx,
+            'reward': state['episode_reward'],
+            'steps': state['step_count'],
+            'trajectory': state['episode_trajectory'] if state.get('record_trajectory') else [],
+            'actions_history': state['episode_actions_history'] if state.get('record_actions') else [],
+            'executed_actions_history': state['episode_executed_actions_history'] if state.get('save_control_diagnostics') else [],
+            'velocity_history': state['episode_velocity_history'] if state.get('save_control_diagnostics') else [],
+            'goal_distance_history': state['episode_goal_distance_history'] if state.get('save_control_diagnostics') else [],
+            'duration': episode_duration,
+            'wall_time_seconds': float(time.perf_counter() - state['wall_start']),
+            'collision_count': total_collisions,
+            'terrain_collision_count': int(episode_terrain_total),
+            'obstacle_collision_count': int(episode_obstacle_total),
+            'agent_collision_counts': episode_collision_counts,
+            'inter_agent_collision_count': int(state['episode_inter_agent_collision_pair_count']),
+            'agent_inter_agent_collision_counts': [int(v) for v in state['episode_inter_agent_collision_counts']],
+            'min_inter_agent_clearance': (
+                float(state['episode_min_inter_agent_clearance']) if state['episode_min_inter_agent_clearance'] is not None else None
+            ),
+            'min_distance': min_distance_stat,
+            'success': success_flag,
+            'agent_success_flags': agent_success_flags,
+            'team_success': team_success_flag,
+            'arrival_step': arrival_step,
+            'arrival_time': arrival_time,
+            'first_reach_step': first_reach_step,
+            'first_reach_time': first_reach_time,
+            'path_length': team_total_path_length,
+            'agent_path_lengths': [float(v) for v in agent_path_lengths],
+            'direct_distance': team_direct_distance,
+            'agent_direct_distances': [float(v) if v is not None else None for v in direct_goal_distances],
+            'final_goal_distance': final_goal_distance,
+            'agent_final_goal_distances': [float(v) if v is not None else None for v in agent_final_goal_distances],
+            'min_goal_distance': min_goal_distance,
+            'agent_min_goal_distances': [float(v) if v is not None else None for v in state['agent_min_goal_distances']],
+            'agent_first_reach_steps': [int(v) if v is not None else None for v in state['agent_first_reach_steps']],
+            'path_efficiency': path_efficiency,
+            'agent_path_efficiencies': agent_path_efficiencies,
+            'penetration_stat': penetration_stat,
+            'vis_context': self._capture_episode_vis_context_for_context(eval_ctx, episode_idx),
+            'terrain_complexity_level': eval_ctx.terrain_level,
+            'terrain_seed': eval_ctx.terrain_info.get('terrain_seed'),
+            'terrain_variant_seed': eval_ctx.terrain_info.get('terrain_variant_seed'),
+            'obstacle_seed': eval_ctx.terrain_info.get('obstacle_seed'),
+        }
+
+    def _evaluate_episode_batch(self, episode_contexts):
+        """方案A：单进程内多 episode 上下文，batch actor/PF 推理，可选并行 env.step。"""
+        states = [self._init_batched_episode_state(eval_ctx) for eval_ctx in episode_contexts]
+        try:
+            episode_length = int(getattr(self.args, 'episode_length', 2200) or 2200)
+        except Exception:
+            episode_length = 2200
+        episode_length = max(1, episode_length)
+
+        use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
+        action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
+        use_fr = getattr(self.maddpg.args, 'use_fr_feature', False)
+        use_pf = getattr(self.maddpg.args, 'use_pf_feature', False)
+        base_obs_dim = self._get_base_obs_dim()
+        try:
+            eval_env_step_threads = int(
+                getattr(self, '_eval_env_step_threads', getattr(self.args, 'eval_env_step_threads', 1)) or 1
+            )
+        except Exception:
+            eval_env_step_threads = 1
+        eval_env_step_threads = max(1, min(eval_env_step_threads, len(states)))
+        step_executor = (
+            ThreadPoolExecutor(max_workers=eval_env_step_threads, thread_name_prefix="eval-env-step")
+            if eval_env_step_threads > 1
+            else None
+        )
+
+        try:
+            for step in range(episode_length):
+                active_states = [state for state in states if not state.get('done') and not state.get('failed')]
+                if not active_states:
+                    break
+                try:
+                    processed_batch = np.stack([state['processed_obs'] for state in active_states], axis=0).astype(np.float32)
+                    policy_obs, base_obs_for_correction_tf, pf_shared_context = self._build_eval_actor_obs_tf_with_context(
+                        processed_batch,
+                        use_pf=use_pf,
+                        use_tf_potential_field=use_tf_potential_field,
+                        action_force_ratio=action_force_ratio,
+                    )
+                    raw_actions_tf = self.select_actions_eval(policy_obs, use_fr=use_fr, use_pf=use_pf)
+                    if isinstance(raw_actions_tf, tf.Tensor):
+                        raw_actions_tensor = raw_actions_tf
+                    else:
+                        raw_actions_tensor = tf.convert_to_tensor(raw_actions_tf, dtype=tf.float32)
+                    try:
+                        action_dim = int(raw_actions_tensor.shape[-1])
+                    except Exception:
+                        action_dim = int(tf.shape(raw_actions_tensor)[-1].numpy())
+                    need_raw_actions = any(bool(state.get('record_actions')) for state in active_states)
+                    raw_actions = raw_actions_tensor.numpy() if need_raw_actions else None
+
+                    if use_tf_potential_field and action_force_ratio > 0.0:
+                        flat_actions_tf = tf.reshape(raw_actions_tensor, [-1, action_dim])
+                        if (
+                            pf_shared_context is not None
+                            and hasattr(self.maddpg, '_apply_potential_field_correction_from_geometry_context_tf')
+                        ):
+                            corrected_head_tf, _ = self.maddpg._apply_potential_field_correction_from_geometry_context_tf(
+                                flat_actions_tf,
+                                float(action_force_ratio),
+                                pf_shared_context[0],
+                                pf_shared_context[1],
+                            )
+                        else:
+                            try:
+                                correction_obs_dim = int(base_obs_for_correction_tf.shape[-1])
+                            except Exception:
+                                correction_obs_dim = base_obs_dim
+                            flat_obs_tf = tf.reshape(base_obs_for_correction_tf, [-1, correction_obs_dim])
+                            corrected_head_tf, _ = self.maddpg._apply_potential_field_correction(
+                                flat_actions_tf,
+                                flat_obs_tf,
+                                action_force_ratio,
+                            )
+                        if action_dim > 3:
+                            corrected_actions_tf = tf.concat([corrected_head_tf, flat_actions_tf[:, 3:]], axis=1)
+                        else:
+                            corrected_actions_tf = corrected_head_tf
+                        actions_batch = corrected_actions_tf.numpy().reshape(
+                            (len(active_states), self.n_agents, action_dim)
+                        )
+                    else:
+                        actions_batch = raw_actions_tensor.numpy()
+                except Exception as action_e:
+                    for state in active_states:
+                        state['failed'] = True
+                        state['error'] = action_e
+                    continue
+
+                step_items = [
+                    (
+                        state,
+                        np.asarray(actions_batch[idx], dtype=np.float32),
+                        None if raw_actions is None else np.asarray(raw_actions[idx], dtype=np.float32),
+                    )
+                    for idx, state in enumerate(active_states)
+                ]
+
+                if step_executor is not None and len(step_items) > 1:
+                    runnable_items = []
+                    for state, actions_np, raw_actions_np in step_items:
+                        try:
+                            self._prepare_batched_episode_step(state, actions_np, raw_actions_np, step)
+                            runnable_items.append((state, actions_np))
+                        except Exception as step_e:
+                            state['failed'] = True
+                            state['error'] = step_e
+                    futures = [
+                        (state, step_executor.submit(self._step_batched_episode_env, state, actions_np))
+                        for state, actions_np in runnable_items
+                    ]
+                    for state, future in futures:
+                        try:
+                            next_obs_n, rew_n, done_n, info_n = future.result()
+                            self._complete_batched_episode_step(state, next_obs_n, rew_n, done_n, info_n)
+                        except Exception as step_e:
+                            state['failed'] = True
+                            state['error'] = step_e
+                else:
+                    for state, actions_np, raw_actions_np in step_items:
+                        try:
+                            self._advance_batched_episode_state(
+                                state,
+                                actions=actions_np,
+                                raw_actions=raw_actions_np,
+                                step=step,
+                            )
+                        except Exception as step_e:
+                            state['failed'] = True
+                            state['error'] = step_e
+        finally:
+            if step_executor is not None:
+                step_executor.shutdown(wait=True)
+
+        episode_data = []
+        for state in states:
+            if state.get('failed'):
+                print(f"❌ 回合 {state['episode'] + 1} batch评估失败: {state.get('error')}")
+                continue
+            episode_data.append(self._finalize_batched_episode_state(state))
+        return sorted(episode_data, key=lambda item: int(item.get('episode', 0)))
         
     def evaluate_single_episode(self, episode_idx):
         """评估单个回合，仿照1.0版本的逻辑"""
@@ -3999,6 +5074,7 @@ class ModelEvaluator:
         persist_episode_trajectories = _env_flag('SAVE_EVAL_TRAJECTORY_JSON', True)
         save_actor_sequence = _env_flag('SAVE_EVAL_ACTOR_SEQUENCE', False)
         save_control_diagnostics = _env_flag('SAVE_EVAL_CONTROL_DIAGNOSTICS', False)
+        log_episode_timing = _env_flag("EVAL_LOG_EPISODE_TIMING", True)
 
         def _normalize_generated_files(generated_files):
             if not isinstance(generated_files, dict):
@@ -4120,6 +5196,7 @@ class ModelEvaluator:
             'peak_height_jitter_ratio_max': _env_float('PEAK_HEIGHT_JITTER_RATIO_MAX', 0.40),
             'peak_height_max_scale': _env_float('PEAK_HEIGHT_MAX_SCALE', 1.30),
             'terrain_variant_noise_ratio': _env_float('TERRAIN_VARIANT_NOISE_RATIO', 0.15),
+            'terrain_contact_eps': _env_float('TERRAIN_CONTACT_EPS', _finite_float_or_none(getattr(self.args, 'terrain_contact_eps', None)) or 0.2),
             'position_family': position_family_override or os.getenv('HELDOUT_POSITION_MODE', 'train_match'),
             'reference_positions_file': os.getenv('HELDOUT_REFERENCE_POSITIONS_FILE', ''),
             'start_center_jitter': _env_float('HELDOUT_START_CENTER_JITTER', 12.0),
@@ -4165,8 +5242,168 @@ class ModelEvaluator:
                 getattr(self, '_forced_eval_action_force_ratio', None)
             ),
         }
-        
-        for episode in range(self.args.eval_episodes):
+
+        def _log_episode_timing(episode_idx, episode_data, wall_seconds, failed=False):
+            if not log_episode_timing:
+                return
+            episode_data = episode_data or {}
+            steps = _safe_int(episode_data.get('steps'))
+            rollout_seconds = _finite_float_or_none(episode_data.get('duration'))
+            reward = _finite_float_or_none(episode_data.get('reward'))
+            team_success = episode_data.get('team_success', episode_data.get('success', None))
+            step_rate = None
+            if steps and wall_seconds is not None and wall_seconds > 0:
+                step_rate = float(steps) / float(wall_seconds)
+            parts = [
+                f"[EvalTiming] episode={episode_idx + 1}/{self.args.eval_episodes}",
+                f"wall_s={wall_seconds:.2f}",
+            ]
+            if rollout_seconds is not None:
+                parts.append(f"rollout_s={rollout_seconds:.2f}")
+            if steps is not None:
+                parts.append(f"steps={steps}")
+            if step_rate is not None:
+                parts.append(f"steps_per_s={step_rate:.2f}")
+            if reward is not None:
+                parts.append(f"reward={reward:.2f}")
+            if team_success is not None:
+                parts.append(f"team_success={team_success}")
+            if failed:
+                parts.append("status=failed")
+            print(" | ".join(parts))
+
+        eval_episode_parallelism = max(
+            1,
+            int(
+                getattr(
+                    self.args,
+                    'eval_episode_parallelism',
+                    _env_int('EVAL_EPISODE_PARALLELISM', 1),
+                )
+                or 1
+            ),
+        )
+        eval_episode_parallelism = min(eval_episode_parallelism, max(1, int(self.args.eval_episodes)))
+        use_batched_episode_eval = eval_episode_parallelism > 1
+        if use_batched_episode_eval and str(getattr(self.args, 'terrain_sensing_mode', 'local')).startswith('oracle'):
+            print("⚠️  EVAL_EPISODE_PARALLELISM>1 但 terrain_sensing_mode=oracle*，为避免 scenario_ref 污染，回退串行评估。")
+            use_batched_episode_eval = False
+        try:
+            eval_env_step_threads = int(
+                getattr(
+                    self.args,
+                    'eval_env_step_threads',
+                    _env_int('EVAL_ENV_STEP_THREADS', 1),
+                )
+                or 1
+            )
+        except Exception:
+            eval_env_step_threads = 1
+        eval_env_step_threads = max(1, eval_env_step_threads)
+        if use_batched_episode_eval:
+            eval_env_step_threads = min(eval_env_step_threads, eval_episode_parallelism)
+        else:
+            eval_env_step_threads = 1
+        self._eval_env_step_threads = int(eval_env_step_threads)
+        evaluation_setup['eval_episode_parallelism'] = int(eval_episode_parallelism if use_batched_episode_eval else 1)
+        evaluation_setup['eval_episode_parallelism_mode'] = 'inprocess_batch' if use_batched_episode_eval else 'serial'
+        evaluation_setup['eval_env_step_threads'] = int(self._eval_env_step_threads)
+
+        serial_episode_range = range(self.args.eval_episodes)
+        if use_batched_episode_eval:
+            print(
+                f"[EvalBatch] 启用方案A: episode_parallelism={eval_episode_parallelism}, "
+                f"env_step_threads={self._eval_env_step_threads}，模型单次加载，batch actor/PF"
+            )
+            for batch_start in range(0, int(self.args.eval_episodes), eval_episode_parallelism):
+                batch_end = min(int(self.args.eval_episodes), batch_start + eval_episode_parallelism)
+                episode_contexts = []
+                for episode in range(batch_start, batch_end):
+                    if self.args.terrain_complexity_level is None:
+                        terrain_level = np.random.randint(1, 5)
+                    else:
+                        terrain_level = self.args.terrain_complexity_level
+                    episode_contexts.append(
+                        self._build_episode_eval_context(
+                            episode,
+                            terrain_level,
+                            terrain_seed_sequence,
+                            terrain_variant_seed_sequence,
+                            obstacle_seed_sequence,
+                        )
+                    )
+
+                try:
+                    batch_episode_data = self._evaluate_episode_batch(episode_contexts)
+                except Exception as batch_e:
+                    print(f"❌ batch评估失败，批次 {batch_start + 1}-{batch_end}: {batch_e}")
+                    traceback.print_exc()
+                    batch_episode_data = []
+
+                for episode_data in batch_episode_data:
+                    if episode_data is None:
+                        print("⚠️  batch评估返回空episode数据，跳过")
+                        continue
+                    episode = int(episode_data.get('episode', 0))
+                    if 'reward' not in episode_data or 'trajectory' not in episode_data:
+                        _log_episode_timing(episode, episode_data, episode_data.get('wall_time_seconds', 0.0), failed=True)
+                        print(f"⚠️  回合 {episode + 1} batch评估数据不完整，跳过")
+                        print(f"    episode_data keys: {list(episode_data.keys())}")
+                        continue
+
+                    episode_wall_seconds = float(episode_data.get('wall_time_seconds', episode_data.get('duration', 0.0)) or 0.0)
+                    all_rewards.append(episode_data['reward'])
+                    _log_episode_timing(episode, episode_data, episode_wall_seconds)
+
+                    if episode_data['reward'] > best_reward:
+                        best_reward = episode_data['reward']
+                        best_episode = episode
+                        best_episode_data = episode_data.copy()
+                        best_trajectory = episode_data.get('trajectory', [])
+                        best_actor_outputs_history = episode_data.get('actions_history', None)
+                        print(f"✅ 更新最佳回合: Episode {episode + 1}, Reward = {best_reward:.2f}")
+
+                    if episode_data.get('team_success', 0) == 1 and episode_data['reward'] > best_success_reward:
+                        best_success_reward = episode_data['reward']
+                        best_success_episode = episode
+                        best_success_episode_data = episode_data.copy()
+                        best_success_trajectory = episode_data.get('trajectory', [])
+                        best_success_actor_outputs_history = episode_data.get('actions_history', None)
+                        print(f"✅ 更新最佳成功回合: Episode {episode + 1}, Reward = {best_success_reward:.2f}")
+
+                    stored_episode_data = dict(episode_data)
+                    if not persist_episode_trajectories:
+                        stored_episode_data['trajectory'] = []
+                    if not save_actor_sequence:
+                        stored_episode_data['actions_history'] = []
+                    if not save_control_diagnostics:
+                        stored_episode_data['executed_actions_history'] = []
+                        stored_episode_data['velocity_history'] = []
+                        stored_episode_data['goal_distance_history'] = []
+                    stored_episode_data['vis_context'] = None
+                    all_episodes_data.append(stored_episode_data)
+
+                    if save_all_episode_visualizations and not self.args.disable_visualization:
+                        try:
+                            generated_episode_files = self.generate_visualization(episode_data, is_best=False) or {}
+                            normalized_files = _normalize_generated_files(generated_episode_files)
+                            if normalized_files:
+                                episode_data['visualization_files'] = normalized_files
+                                episode_visualizations.append(
+                                    {
+                                        'episode': episode_data.get('episode'),
+                                        'reward': float(episode_data.get('reward', 0.0)),
+                                        'team_success': int(episode_data.get('team_success', episode_data.get('success', 0))),
+                                        'files': normalized_files,
+                                    }
+                                )
+                        except Exception as viz_e:
+                            print(f"⚠️  回合 {episode + 1} 可视化生成失败: {viz_e}")
+                            traceback.print_exc()
+            serial_episode_range = range(0)
+
+        for episode in serial_episode_range:
+            episode_wall_start = time.perf_counter()
             if not quiet_output:
                 print(f"\n🚀 开始评估回合 {episode + 1}/{self.args.eval_episodes}")
             
@@ -4202,20 +5439,25 @@ class ModelEvaluator:
             try:
                 episode_data = self.evaluate_single_episode(episode)
                 if episode_data is None:
+                    _log_episode_timing(episode, {}, time.perf_counter() - episode_wall_start, failed=True)
                     print(f"⚠️  回合 {episode + 1} 评估返回空数据，跳过")
                     continue
                 
                 # 验证episode_data是否包含必要字段
                 if 'reward' not in episode_data or 'trajectory' not in episode_data:
+                    _log_episode_timing(episode, episode_data, time.perf_counter() - episode_wall_start, failed=True)
                     print(f"⚠️  回合 {episode + 1} 评估数据不完整，跳过")
                     print(f"    episode_data keys: {list(episode_data.keys())}")
                     continue
                 
+                episode_wall_seconds = time.perf_counter() - episode_wall_start
+                episode_data['wall_time_seconds'] = float(episode_wall_seconds)
                 episode_data['terrain_complexity_level'] = terrain_level
                 episode_data['terrain_seed'] = terrain_seed
                 episode_data['terrain_variant_seed'] = terrain_variant_seed
                 episode_data['obstacle_seed'] = obstacle_seed
                 all_rewards.append(episode_data['reward'])
+                _log_episode_timing(episode, episode_data, episode_wall_seconds)
                 
                 # 🔧 修改：跟踪最佳回合（与训练脚本逻辑一致）
                 if episode_data['reward'] > best_reward:
@@ -4265,6 +5507,7 @@ class ModelEvaluator:
                         print(f"⚠️  回合 {episode + 1} 可视化生成失败: {viz_e}")
                         traceback.print_exc()
             except Exception as ep_e:
+                _log_episode_timing(episode, {}, time.perf_counter() - episode_wall_start, failed=True)
                 print(f"❌ 回合 {episode + 1} 评估失败: {ep_e}")
                 traceback.print_exc()
                 # 继续下一个回合，不中断整个评估流程
@@ -4347,7 +5590,8 @@ class ModelEvaluator:
             print(f"平均队间碰撞次数: {summary['avg_inter_agent_collision_count']:.2f}")
         if summary.get('avg_min_inter_agent_clearance') is not None:
             print(f"平均最小队间净空: {summary['avg_min_inter_agent_clearance']:.2f}")
-        print(f"统计图: {os.path.join(self.args.save_viz_path, 'evaluation_summary.png')}")
+        summary_plot_file = os.path.join(self.args.save_viz_path, _artifact_filename('evaluation_summary.png'))
+        print(f"统计图: {summary_plot_file}")
 
         visualization_artifacts = {
             'episode_visualizations': episode_visualizations,
@@ -4357,7 +5601,7 @@ class ModelEvaluator:
             summary_plot_path = _generate_evaluation_summary_plot(
                 all_episodes_data,
                 summary,
-                os.path.join(self.args.save_viz_path, 'evaluation_summary.png'),
+                summary_plot_file,
             )
         except Exception as summary_plot_err:
             print(f"⚠️  评估统计图生成失败: {summary_plot_err}")
@@ -4402,10 +5646,10 @@ class ModelEvaluator:
                 traceback.print_exc()
                 best_generated_files = {}
 
-        best_html_alias = _copy_alias(best_generated_files.get('html_path'), 'best_reward_interactive.html')
-        best_png_alias = _copy_alias(best_generated_files.get('image_path'), 'best_reward.png')
-        best_actor_sequence_alias = _copy_alias(best_generated_files.get('actor_sequence_path'), 'best_reward_actor_sequence.png')
-        best_control_diag_alias = _copy_alias(best_generated_files.get('control_diagnostics_path'), 'best_reward_control_diagnostics.png')
+        best_html_alias = _copy_alias(best_generated_files.get('html_path'), _artifact_filename('best_reward_interactive.html'))
+        best_png_alias = _copy_alias(best_generated_files.get('image_path'), _artifact_filename('best_reward.png'))
+        best_actor_sequence_alias = _copy_alias(best_generated_files.get('actor_sequence_path'), _artifact_filename('best_reward_actor_sequence.png'))
+        best_control_diag_alias = _copy_alias(best_generated_files.get('control_diagnostics_path'), _artifact_filename('best_reward_control_diagnostics.png'))
         if best_html_alias:
             visualization_artifacts['best_reward_html'] = best_html_alias
         if best_png_alias:
@@ -4469,19 +5713,19 @@ class ModelEvaluator:
                 success_actor_sequence_path = generated_success_files.get('actor_sequence_path')
                 success_control_diag_path = generated_success_files.get('control_diagnostics_path')
                 if success_html_path and os.path.exists(success_html_path):
-                    success_html_alias = os.path.join(self.args.save_viz_path, 'team_success_best_interactive.html')
+                    success_html_alias = os.path.join(self.args.save_viz_path, _artifact_filename('team_success_best_interactive.html'))
                     shutil.copyfile(success_html_path, success_html_alias)
                     visualization_artifacts['team_success_best_html'] = success_html_alias
                 if success_png_path and os.path.exists(success_png_path):
-                    success_png_alias = os.path.join(self.args.save_viz_path, 'team_success_best.png')
+                    success_png_alias = os.path.join(self.args.save_viz_path, _artifact_filename('team_success_best.png'))
                     shutil.copyfile(success_png_path, success_png_alias)
                     visualization_artifacts['team_success_best_png'] = success_png_alias
                 if success_actor_sequence_path and os.path.exists(success_actor_sequence_path):
-                    success_actor_alias = os.path.join(self.args.save_viz_path, 'team_success_best_actor_sequence.png')
+                    success_actor_alias = os.path.join(self.args.save_viz_path, _artifact_filename('team_success_best_actor_sequence.png'))
                     shutil.copyfile(success_actor_sequence_path, success_actor_alias)
                     visualization_artifacts['team_success_best_actor_sequence'] = success_actor_alias
                 if success_control_diag_path and os.path.exists(success_control_diag_path):
-                    success_control_alias = os.path.join(self.args.save_viz_path, 'team_success_best_control_diagnostics.png')
+                    success_control_alias = os.path.join(self.args.save_viz_path, _artifact_filename('team_success_best_control_diagnostics.png'))
                     shutil.copyfile(success_control_diag_path, success_control_alias)
                     visualization_artifacts['team_success_best_control_diagnostics'] = success_control_alias
             except Exception as success_viz_e:
@@ -4514,6 +5758,7 @@ class ModelEvaluator:
                     'terrain_seed': ep.get('terrain_seed', None),
                     'terrain_variant_seed': ep.get('terrain_variant_seed', None),
                     'duration': ep['duration'],
+                    'wall_time_seconds': ep.get('wall_time_seconds', None),
                     'trajectory': ep.get('trajectory', []) if persist_episode_trajectories else [],
                     # 🔧 新增：保存碰撞和成功指标（与训练脚本一致）
                     'collision_count': ep.get('collision_count', 0),
@@ -4881,6 +6126,12 @@ HTML交互式轨迹图功能:
                        help="每回合最大步数（默认2200，与训练脚本一致）")
     parser.add_argument("--eval-episodes", type=int, default=3, 
                        help="评估回合数（将随机生成不同复杂度的地图）")
+    parser.add_argument("--eval-episode-parallelism", type=int, default=_env_int('EVAL_EPISODE_PARALLELISM', 1),
+                       help="方案A：单进程内同时推进的评估回合数；1为旧串行路径")
+    parser.add_argument("--eval-env-step-threads", type=int, default=_env_int('EVAL_ENV_STEP_THREADS', 1),
+                       help="方案A：batch内并行env.step的线程数；1为串行env.step")
+    parser.add_argument("--terrain-contact-eps", type=float, default=float(os.getenv('TERRAIN_CONTACT_EPS', '0.2')),
+                       help="地形接触/碰撞高度容差，默认从TERRAIN_CONTACT_EPS读取")
     parser.add_argument("--terrain-complexity-level", type=int, default=None, 
                        help="地形复杂度等级 (1-4)，None表示随机选择")
     parser.add_argument("--random-terrain", action="store_true", default=False,
@@ -5032,6 +6283,7 @@ HTML交互式轨迹图功能:
 
 def main():
     """主函数"""
+    _apply_fast_artifact_env_defaults()
     args = parse_args()
     disable_viz_env = _env_flag("EVAL_DISABLE_VISUALIZATION", False)
     light_mode_env = _env_flag("EVAL_LIGHT_MODE", False)
