@@ -62,6 +62,13 @@ class MultiAgentEnv(gym.Env):
         # if true, every agent has the same reward
         self.shared_reward = world.collaborative if hasattr(world, 'collaborative') else False
         self.time = 0
+        terminal_order_fix = os.getenv('REWARD_TERMINAL_ORDER_FIX', os.getenv('reward_terminal_order_fix', None))
+        if terminal_order_fix is None:
+            self._reward_terminal_order_fix_enabled = True
+        else:
+            self._reward_terminal_order_fix_enabled = str(terminal_order_fix).strip().lower() in (
+                '1', 'true', 'yes', 'on'
+            )
 
         # 添加这一行来保存render_callback属性
         self.render_callback = None
@@ -203,7 +210,11 @@ class MultiAgentEnv(gym.Env):
         w = self.world
         agents = list(self.agents) if self.agents is not None else []
         scn = getattr(self, 'scenario', None)
-        thr = float(getattr(scn, 'success_distance_threshold', 2.0)) if scn is not None else 2.0
+        thr_raw = getattr(scn, 'success_distance_threshold', 2.0) if scn is not None else 2.0
+        try:
+            thr = float(thr_raw) if thr_raw is not None else 2.0
+        except (TypeError, ValueError):
+            thr = 2.0
         reach = []
         safe = []
         succ = []
@@ -232,6 +243,13 @@ class MultiAgentEnv(gym.Env):
         w._episode_all_reached = bool(reach and all(v == 1 for v in reach))
         w._episode_success = bool(team == 1)
         w._episode_success_thr_snapshot = thr
+        w._episode_terminal = bool(w._episode_all_reached or w._episode_success)
+        if w._episode_success:
+            w._episode_done_reason = 'team_success'
+        elif w._episode_all_reached:
+            w._episode_done_reason = 'all_reached_without_safe_team_success'
+        else:
+            w._episode_done_reason = None
 
     def step(self, action_n):
         # 修改签名以符合gym标准
@@ -366,6 +384,12 @@ class MultiAgentEnv(gym.Env):
                     #    # print(f"DEBUG: 步骤轨迹 - 智能体{i}位置: {position_copy}, 轨迹点数: {len(agent._trajectory)}, 轨迹ID: {trajectory_id}, 位置对象ID: {position_id}")
         if timing_detail_enabled:
             step_timing['env_traj'] += _perf_counter() - _t_env_seg
+
+        # Reward is computed before the done/all-reached block below, so publish the
+        # authoritative success snapshot here. The reward calculator reads this
+        # snapshot to settle terminal success/failure rewards on the same step.
+        if self._reward_terminal_order_fix_enabled:
+            self._sync_world_team_success_snapshot()
         
         # 记录最新的观察、奖励、是否完成和信息
         # 使用异常处理确保即使某个智能体的回调失败，也能返回完整数据
@@ -846,6 +870,8 @@ class MultiAgentEnv(gym.Env):
             self.world._episode_agent_safe_flags = []
             self.world._episode_agent_success_flags = []
             self.world._episode_team_success_flag = 0
+            self.world._episode_terminal = False
+            self.world._episode_done_reason = None
             if hasattr(self.world, '_episode_success_thr_snapshot'):
                 delattr(self.world, '_episode_success_thr_snapshot')
         except Exception:

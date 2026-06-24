@@ -80,7 +80,8 @@ def _normalize_candidates(raw_value: str) -> List[str]:
     ]
     ordered: List[str] = []
     for token in tokens:
-        if not token or token not in allowed or token in ordered:
+        is_explicit_ep = token.startswith("ep") and token[2:].isdigit()
+        if not token or (token not in allowed and not is_explicit_ep) or token in ordered:
             continue
         ordered.append(token)
     if not ordered:
@@ -271,19 +272,121 @@ def _matched_validation_root(output_dir: Path) -> Path:
     return output_dir.parent / f"{output_dir.name}_matched_validation"
 
 
-def _build_validation_spec(official_spec: Dict[str, Any], args) -> Dict[str, Any]:
+def _build_validation_spec(
+    official_spec: Dict[str, Any],
+    args,
+    *,
+    validation_seed: Optional[int] = None,
+    validation_seed_index: int = 0,
+) -> Dict[str, Any]:
     spec = dict(official_spec)
     spec["episodes"] = max(1, int(args.validation_episodes))
-    spec["seed"] = _derive_validation_seed(official_spec, args.validation_seed)
+    spec["seed"] = (
+        int(validation_seed)
+        if validation_seed is not None
+        else _derive_validation_seed(official_spec, args.validation_seed)
+    )
     spec.update(_build_post_eval_sequence_fields(spec))
     spec["artifact_policy"] = _validation_artifact_policy()
     spec["validation_role"] = "checkpoint_selection"
+    spec["validation_seed_index"] = int(validation_seed_index)
     spec["force_regenerate_testset"] = True
     validation_testset_root = _matched_validation_root(Path(args.output_dir)) / "testset"
     spec["episode_positions_dir"] = str(
         validation_testset_root / _generate_post_eval_testset_tag(spec) / "episode_positions"
     )
     return _ensure_episode_positions(spec, force_regenerate=True)
+
+
+def _validation_seeds_from_args(official_spec: Dict[str, Any], args) -> List[int]:
+    raw_seeds = getattr(args, "validation_seeds", None) or []
+    seeds: List[int] = []
+    for seed in raw_seeds:
+        try:
+            value = int(seed)
+        except Exception:
+            continue
+        if value not in seeds:
+            seeds.append(value)
+    if seeds:
+        return seeds
+    return [_derive_validation_seed(official_spec, args.validation_seed)]
+
+
+def _aggregate_summaries(summaries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    valid_summaries = [summary for summary in summaries if isinstance(summary, dict)]
+    if not valid_summaries:
+        return {}
+    if len(valid_summaries) == 1:
+        return dict(valid_summaries[0])
+
+    weights: List[float] = []
+    for summary in valid_summaries:
+        try:
+            weight = float(summary.get("episodes", 0) or 0)
+        except Exception:
+            weight = 0.0
+        weights.append(weight if weight > 0.0 else 1.0)
+    total_weight = float(sum(weights)) if weights else 1.0
+
+    aggregate: Dict[str, Any] = {
+        "episodes": int(sum(int(summary.get("episodes", 0) or 0) for summary in valid_summaries)),
+        "validation_seed_count": int(len(valid_summaries)),
+    }
+    sum_keys = {
+        "success_episode_count",
+        "collision_free_episode_count",
+        "total_collision_count",
+        "total_terrain_collision_count",
+        "total_obstacle_collision_count",
+        "total_inter_agent_collision_count",
+    }
+    keys = set().union(*(summary.keys() for summary in valid_summaries))
+    for key in sorted(keys):
+        if key in aggregate or key == "episodes":
+            continue
+        if key == "agent_success_rates":
+            max_len = 0
+            for summary in valid_summaries:
+                value = summary.get(key)
+                if isinstance(value, list):
+                    max_len = max(max_len, len(value))
+            if max_len > 0:
+                agent_rates: List[float] = []
+                for idx in range(max_len):
+                    numeric_values: List[Tuple[float, float]] = []
+                    for summary, weight in zip(valid_summaries, weights):
+                        value = summary.get(key)
+                        if not isinstance(value, list) or idx >= len(value):
+                            continue
+                        numeric = _safe_float(value[idx])
+                        if numeric is not None:
+                            numeric_values.append((float(numeric), float(weight)))
+                    if numeric_values:
+                        denom = float(sum(weight for _, weight in numeric_values)) or total_weight or 1.0
+                        agent_rates.append(float(sum(value * weight for value, weight in numeric_values) / denom))
+                    else:
+                        agent_rates.append(0.0)
+                aggregate[key] = agent_rates
+            continue
+        if key in sum_keys:
+            values = []
+            for summary in valid_summaries:
+                value = _safe_float(summary.get(key))
+                if value is not None:
+                    values.append(value)
+            if values:
+                aggregate[key] = float(sum(values))
+            continue
+        numeric_values: List[Tuple[float, float]] = []
+        for summary, weight in zip(valid_summaries, weights):
+            value = _safe_float(summary.get(key))
+            if value is not None:
+                numeric_values.append((float(value), float(weight)))
+        if numeric_values:
+            denom = float(sum(weight for _, weight in numeric_values)) or total_weight or 1.0
+            aggregate[key] = float(sum(value * weight for value, weight in numeric_values) / denom)
+    return aggregate
 
 
 def _is_valid_model_dir(dir_path: Path) -> bool:
@@ -359,7 +462,25 @@ def _compute_model_signature(model_dir: Path) -> Optional[str]:
         return None
 
 
-def _score_summary(summary: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
+def _partial_success_scores(summary: Dict[str, Any]) -> Tuple[float, float, float]:
+    rates = summary.get("agent_success_rates")
+    if not isinstance(rates, list):
+        return 0.0, 0.0, 0.0
+    values: List[float] = []
+    for value in rates:
+        numeric = _safe_float(value)
+        if numeric is not None:
+            values.append(max(0.0, min(1.0, float(numeric))))
+    if not values:
+        return 0.0, 0.0, 0.0
+    return (
+        float(sum(values) / len(values)),
+        float(max(values)),
+        float(min(values)),
+    )
+
+
+def _score_summary(summary: Dict[str, Any]) -> Tuple[float, float, float, float, float, float, float, float]:
     def _metric(key: str, *, fallback: float, invert: bool = False) -> float:
         value = _safe_float(summary.get(key))
         if value is None:
@@ -367,10 +488,14 @@ def _score_summary(summary: Dict[str, Any]) -> Tuple[float, float, float, float,
         value = float(value)
         return -value if invert else value
 
+    partial_mean, partial_max, partial_min = _partial_success_scores(summary)
     return (
         _metric("team_success_rate", fallback=-1.0),
-        _metric("collision_free_rate", fallback=-1.0),
+        partial_mean,
+        partial_max,
+        partial_min,
         _metric("avg_team_final_goal_distance", fallback=-1e12, invert=True),
+        _metric("collision_free_rate", fallback=-1.0),
         _metric("avg_collision_count", fallback=-1e12, invert=True),
         _metric("avg_team_total_path_length", fallback=-1e12, invert=True),
     )
@@ -381,8 +506,16 @@ def _build_eval_env(base_env: Dict[str, str], spec: Dict[str, Any], *, quiet_out
     artifact_policy = spec.get("artifact_policy", {}) if isinstance(spec.get("artifact_policy"), dict) else {}
     env["EVAL_PYTHON_BIN"] = python_bin
     env["MODEL_VARIANT"] = "auto"
+    if _to_bool(env.get("OFFICIAL_EVAL_LOAD_CRITIC", "0")):
+        env["EVAL_ACTOR_ONLY"] = "0"
+    else:
+        env["EVAL_ACTOR_ONLY"] = "1"
     env["STRICT_EVAL_MATCH"] = "1"
     env["USE_SCENARIO_SEED"] = "1"
+    agent_size = spec.get("agent_size", None)
+    if agent_size is None:
+        agent_size = env.get("AGENT_SIZE", "0.5")
+    env["AGENT_SIZE"] = str(agent_size)
     env["SCENARIO_SEED"] = str(spec.get("terrain_seed", spec.get("scenario_seed", 88)))
     env["TERRAIN_COMPLEXITY_LEVEL"] = str(spec.get("terrain_complexity", 3))
     env["MAP_SIZE"] = str(spec.get("map_size", 200))
@@ -520,16 +653,31 @@ def _execute_eval_run(
     print(f"{banner_prefix}模型路径: {model_path}")
     print(f"{banner_prefix}输出目录: {eval_dir}")
     print(f"{banner_prefix}测试回合数: {spec.get('episodes')}")
-    _run_command_with_live_output(
-        cmd,
-        env=env,
-        cwd=Path(__file__).resolve().parent,
-        log_path=log_path,
-        prefix=f"{banner_prefix}",
-    )
+    command_error = None
+    try:
+        _run_command_with_live_output(
+            cmd,
+            env=env,
+            cwd=Path(__file__).resolve().parent,
+            log_path=log_path,
+            prefix=f"{banner_prefix}",
+        )
+    except RuntimeError as exc:
+        command_error = exc
+        if not results_path.exists():
+            raise
+        print(
+            f"{banner_prefix}评估命令非零退出，但结果文件已生成，继续读取结果: "
+            f"{results_path} | {exc}"
+        )
     if not results_path.exists():
         raise RuntimeError(f"{banner_prefix}缺少 evaluation_results.json: {results_path}")
-    results = _load_json(results_path)
+    try:
+        results = _load_json(results_path)
+    except Exception as exc:
+        if command_error is not None:
+            raise command_error from exc
+        raise
     summary = results.get("summary", {}) if isinstance(results.get("summary"), dict) else {}
     return {
         "results_path": str(results_path),
@@ -544,6 +692,31 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
     requested_variant = str(args.model_variant or DEFAULT_MODEL_VARIANT).strip().lower()
     protocol = str(args.selection_protocol or DEFAULT_SELECTION_PROTOCOL).strip().lower()
     output_dir = Path(args.output_dir).resolve()
+    preselected_model_path = str(getattr(args, "preselected_model_path", "") or "").strip()
+    if preselected_model_path:
+        selected_path = Path(preselected_model_path).resolve()
+        if not _is_valid_model_dir(selected_path):
+            raise RuntimeError(f"预选 checkpoint 无效或缺少 actor 权重: {selected_path}")
+        summary_path = str(getattr(args, "preselected_selection_summary", "") or "").strip()
+        candidate_alias = "preselected"
+        resolved_variant = selected_path.name
+        if summary_path and Path(summary_path).exists():
+            try:
+                selection_summary = _load_json(Path(summary_path))
+                selected = selection_summary.get("selected", {})
+                if isinstance(selected, dict):
+                    candidate_alias = str(selected.get("candidate_alias") or candidate_alias)
+                    resolved_variant = str(selected.get("resolved_variant") or resolved_variant)
+            except Exception:
+                pass
+        return {
+            "selection_protocol": "shared_matched_validation",
+            "candidate_alias": candidate_alias,
+            "resolved_variant": resolved_variant,
+            "model_path": selected_path,
+            "validation_selection_summary_path": summary_path,
+        }
+
     if protocol != "matched_validation":
         selected_path, resolved_variant = _resolve_model_variant_dir(experiment_root, requested_variant)
         if selected_path is None or resolved_variant is None:
@@ -556,7 +729,16 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
             "validation_selection_summary_path": "",
         }
 
-    validation_spec = _build_validation_spec(official_spec, args)
+    validation_seeds = _validation_seeds_from_args(official_spec, args)
+    validation_specs = [
+        _build_validation_spec(
+            official_spec,
+            args,
+            validation_seed=seed,
+            validation_seed_index=idx,
+        )
+        for idx, seed in enumerate(validation_seeds)
+    ]
     validation_root = _matched_validation_root(output_dir)
     validation_root.mkdir(parents=True, exist_ok=True)
 
@@ -607,30 +789,44 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
                     "order": order_idx,
                     "summary": dict(cached["summary"]),
                     "score": list(cached["score"]),
-                    "eval_dir": cached["eval_dir"],
-                    "results_path": cached["results_path"],
-                    "log_path": cached["log_path"],
+                    "validation_runs": list(cached["validation_runs"]),
                     "model_signature": signature,
                     "reused_validation_from_candidate": cached["candidate_alias"],
                 }
             )
             continue
 
-        candidate_spec = dict(validation_spec)
-        candidate_spec["requested_model_variant"] = str(candidate["resolved_variant"])
-        candidate_spec["candidate_alias"] = str(candidate["candidate_alias"])
-        candidate_spec["selection_protocol"] = "matched_validation_candidate"
-        candidate_eval_dir = validation_root / str(candidate["candidate_alias"])
         try:
-            eval_record = _execute_eval_run(
-                model_path=Path(candidate["model_path"]),
-                spec=candidate_spec,
-                eval_dir=candidate_eval_dir,
-                quiet_output=quiet_output,
-                python_bin=python_bin,
-                banner_prefix=f"[验证选模 {candidate['candidate_alias']}] ",
-                force_rerun=args.force_rerun,
-            )
+            validation_runs: List[Dict[str, Any]] = []
+            candidate_summaries: List[Dict[str, Any]] = []
+            candidate_eval_dir = validation_root / "unknown" / str(candidate["candidate_alias"])
+            for validation_spec in validation_specs:
+                candidate_spec = dict(validation_spec)
+                candidate_spec["requested_model_variant"] = str(candidate["resolved_variant"])
+                candidate_spec["candidate_alias"] = str(candidate["candidate_alias"])
+                candidate_spec["selection_protocol"] = "matched_validation_candidate"
+                seed_tag = f"seed_{int(candidate_spec['seed'])}"
+                candidate_eval_dir = validation_root / seed_tag / str(candidate["candidate_alias"])
+                eval_record = _execute_eval_run(
+                    model_path=Path(candidate["model_path"]),
+                    spec=candidate_spec,
+                    eval_dir=candidate_eval_dir,
+                    quiet_output=quiet_output,
+                    python_bin=python_bin,
+                    banner_prefix=f"[验证选模 {candidate['candidate_alias']} {seed_tag}] ",
+                    force_rerun=args.force_rerun,
+                )
+                candidate_summaries.append(eval_record["summary"])
+                validation_runs.append(
+                    {
+                        "validation_seed": int(candidate_spec["seed"]),
+                        "episodes": int(candidate_spec["episodes"]),
+                        "eval_dir": str(candidate_eval_dir),
+                        "results_path": eval_record["results_path"],
+                        "log_path": eval_record["log_path"],
+                        "summary": eval_record["summary"],
+                    }
+                )
         except Exception as exc:
             failed_candidates.append(
                 {
@@ -643,26 +839,23 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
             )
             continue
 
-        score = _score_summary(eval_record["summary"])
+        aggregate_summary = _aggregate_summaries(candidate_summaries)
+        score = _score_summary(aggregate_summary)
         scored_entry = {
             **candidate,
             "order": order_idx,
-            "summary": eval_record["summary"],
+            "summary": aggregate_summary,
             "score": list(score),
-            "eval_dir": str(candidate_eval_dir),
-            "results_path": eval_record["results_path"],
-            "log_path": eval_record["log_path"],
+            "validation_runs": validation_runs,
             "model_signature": signature,
         }
         scored_candidates.append(scored_entry)
         if signature:
             cached_by_signature[signature] = {
                 "candidate_alias": candidate["candidate_alias"],
-                "summary": eval_record["summary"],
+                "summary": aggregate_summary,
                 "score": list(score),
-                "eval_dir": str(candidate_eval_dir),
-                "results_path": eval_record["results_path"],
-                "log_path": eval_record["log_path"],
+                "validation_runs": validation_runs,
             }
 
     if not scored_candidates:
@@ -673,8 +866,9 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
     selection_summary = {
         "selection_protocol": "matched_validation",
         "requested_model_variant": requested_variant,
-        "validation_episodes": int(validation_spec["episodes"]),
-        "validation_seed": int(validation_spec["seed"]),
+        "validation_episodes": int(args.validation_episodes),
+        "validation_seeds": [int(seed) for seed in validation_seeds],
+        "validation_total_episodes": int(args.validation_episodes) * int(len(validation_seeds)),
         "validation_candidates": list(candidate_aliases),
         "candidates": scored_candidates,
         "failed_candidates": failed_candidates,
@@ -685,9 +879,7 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
             "model_signature": best_candidate.get("model_signature"),
             "score": best_candidate["score"],
             "summary": best_candidate["summary"],
-            "eval_dir": best_candidate["eval_dir"],
-            "results_path": best_candidate["results_path"],
-            "log_path": best_candidate["log_path"],
+            "validation_runs": best_candidate.get("validation_runs", []),
             "reused_validation_from_candidate": best_candidate.get("reused_validation_from_candidate"),
         },
     }
@@ -704,8 +896,31 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
 
 def _inject_selection_metadata(results_path: Path, payload: Dict[str, Any]) -> None:
     data = _load_json(results_path)
+    setup = data.get("evaluation_setup", {})
+    if not isinstance(setup, dict):
+        setup = {}
+    reward_version = str(os.getenv("REWARD_VERSION", os.getenv("reward_version", "v1")) or "v1").strip()
+    terminal_order_raw = os.getenv("REWARD_TERMINAL_ORDER_FIX", os.getenv("reward_terminal_order_fix", ""))
+    setup["reward_version"] = reward_version
+    if str(terminal_order_raw).strip() == "":
+        setup["reward_terminal_order_fix"] = True
+    else:
+        setup["reward_terminal_order_fix"] = _to_bool(terminal_order_raw)
+    data["evaluation_setup"] = setup
     data["model_selection"] = payload
     _save_json(results_path, data)
+
+
+def _selection_metadata(selection: Dict[str, Any], requested_variant: str, selected_model_path: Path) -> Dict[str, Any]:
+    return {
+        "selection_protocol": str(selection["selection_protocol"]),
+        "requested_model_variant": str(requested_variant),
+        "selected_model_candidate": str(selection["candidate_alias"]),
+        "selected_model_variant": str(selection["resolved_variant"]),
+        "selected_model_path": str(selected_model_path),
+        "selected_model_signature": _compute_model_signature(selected_model_path) or "",
+        "validation_selection_summary_path": str(selection.get("validation_selection_summary_path", "")),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -723,10 +938,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-episodes", type=int, default=DEFAULT_VALIDATION_EPISODES)
     parser.add_argument("--validation-seed", type=int, default=None)
     parser.add_argument(
+        "--validation-seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Fixed held-out validation seeds. When provided, checkpoint scores are aggregated over this seed set.",
+    )
+    parser.add_argument(
         "--validation-candidates",
         default=",".join(DEFAULT_VALIDATION_CANDIDATES),
         help="Comma-separated checkpoint candidates",
     )
+    parser.add_argument("--selection-only", action="store_true", help="Run checkpoint selection and write selection_result.json without final official eval")
+    parser.add_argument("--preselected-model-path", default="", help="Use one preselected checkpoint path for the final official eval")
+    parser.add_argument("--preselected-selection-summary", default="", help="Selection summary JSON that produced --preselected-model-path")
     parser.add_argument("--python-bin", default=os.getenv("EVAL_PYTHON_BIN") or os.getenv("TRAIN_PYTHON_BIN") or sys.executable)
     parser.add_argument("--quiet-output", default=os.getenv("OFFICIAL_EVAL_QUIET", "1"))
     parser.add_argument("--force-rerun", action="store_true", help="Delete old eval dirs before rerunning")
@@ -767,6 +992,7 @@ def main() -> int:
         python_bin=str(args.python_bin),
     )
     selected_model_path = Path(selection["model_path"]).resolve()
+    selection_metadata = _selection_metadata(selection, requested_variant, selected_model_path)
 
     final_spec = dict(official_spec)
     final_spec["requested_model_variant"] = requested_variant
@@ -787,6 +1013,21 @@ def main() -> int:
         print(f"  - 选模摘要: {selection['validation_selection_summary_path']}")
     print("")
 
+    if args.selection_only:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        selection_result = {
+            "selection_only": True,
+            "experiment_root": str(experiment_root),
+            "official_spec": str(official_spec_path),
+            "model_selection": selection_metadata,
+        }
+        _save_json(output_dir / "selection_result.json", selection_result)
+        print("======================================")
+        print("✅ checkpoint 选模完成")
+        print(f"  - 结果文件: {output_dir / 'selection_result.json'}")
+        print("======================================")
+        return 0
+
     final_record = _execute_eval_run(
         model_path=selected_model_path,
         spec=final_spec,
@@ -797,14 +1038,6 @@ def main() -> int:
         force_rerun=args.force_rerun,
     )
 
-    selection_metadata = {
-        "selection_protocol": str(selection["selection_protocol"]),
-        "requested_model_variant": requested_variant,
-        "selected_model_candidate": str(selection["candidate_alias"]),
-        "selected_model_variant": str(selection["resolved_variant"]),
-        "selected_model_path": str(selected_model_path),
-        "validation_selection_summary_path": str(selection.get("validation_selection_summary_path", "")),
-    }
     _inject_selection_metadata(Path(final_record["results_path"]), selection_metadata)
     print("")
     print("======================================")

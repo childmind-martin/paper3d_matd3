@@ -243,7 +243,7 @@ class TrajectoryVisualizer:
                 self._plot_goal(ax, scenario, goal_positions=goal_positions)
             
             # 绘制智能体轨迹
-            self._plot_trajectories(ax, trajectories)
+            self._plot_trajectories(ax, trajectories, scenario=scenario, env_instance=env_instance, env_idx=env_idx)
             
             # 计算总步数和有效步数
             total_steps = len(trajectories) if trajectories else 0
@@ -900,7 +900,7 @@ class TrajectoryVisualizer:
             import traceback
             traceback.print_exc()
     
-    def _plot_trajectories(self, ax, trajectories):
+    def _plot_trajectories(self, ax, trajectories, scenario=None, env_instance=None, env_idx=0):
         """绘制智能体轨迹
         
         参数:
@@ -913,6 +913,8 @@ class TrajectoryVisualizer:
         processed_trajectories = self._process_trajectory_data(trajectories)
         # 裁剪每条轨迹的有效步并去重
         processed_trajectories = [self._trim_effective_traj(t) for t in processed_trajectories]
+        agent_radius = self._get_agent_visual_radius(scenario=scenario, env_instance=env_instance, env_idx=env_idx)
+        marker_size = max(80.0, min(450.0, 120.0 + agent_radius * 260.0))
         
         for i, traj in enumerate(processed_trajectories):
             if i >= 3 or not traj:  # 只显示前3个智能体
@@ -930,12 +932,14 @@ class TrajectoryVisualizer:
                 ax.plot(xs, ys, zs, color=color, linewidth=3, alpha=0.8, label=f'Agent {i}')
                 
                 # 标记起点和终点
-                ax.scatter(xs[0], ys[0], zs[0], color=color, marker='o', s=150,
+                self._plot_agent_sphere(ax, (xs[0], ys[0], zs[0]), agent_radius, color, alpha=0.42)
+                ax.scatter(xs[0], ys[0], zs[0], color=color, marker='o', s=marker_size,
                           edgecolors='black', linewidth=2)
                 ax.text(xs[0], ys[0], zs[0]+3, f"Start{i}", color='black', fontsize=10,
                        fontweight='bold')
                 
-                ax.scatter(xs[-1], ys[-1], zs[-1], color=color, marker='o', s=150,
+                self._plot_agent_sphere(ax, (xs[-1], ys[-1], zs[-1]), agent_radius, color, alpha=0.42)
+                ax.scatter(xs[-1], ys[-1], zs[-1], color=color, marker='o', s=marker_size,
                           edgecolors='black', linewidth=2)
                 ax.text(xs[-1], ys[-1], zs[-1]+3, f"End{i}", color='black', fontsize=10,
                        fontweight='bold')
@@ -982,6 +986,96 @@ class TrajectoryVisualizer:
             return np.clip(out, 0.0, 1.0)
         except Exception:
             return rgb
+
+    def _positive_float_or_none(self, value):
+        try:
+            value = float(value)
+            if np.isfinite(value) and value > 0.0:
+                return value
+        except Exception:
+            pass
+        return None
+
+    def _get_agent_visual_radius(self, scenario=None, env_instance=None, env_idx=0):
+        """Return the scene-unit radius used to draw the UAV body/envelope."""
+        candidates = []
+
+        def collect_from_world(world):
+            try:
+                agents = getattr(world, 'agents', None)
+                if agents:
+                    candidates.append(getattr(agents[0], 'size', None))
+            except Exception:
+                pass
+
+        try:
+            collect_from_world(getattr(env_instance, 'world', None))
+            if hasattr(env_instance, 'envs'):
+                envs = getattr(env_instance, 'envs', [])
+                if envs:
+                    idx = int(env_idx) if env_idx is not None else 0
+                    idx = max(0, min(idx, len(envs) - 1))
+                    collect_from_world(getattr(envs[idx], 'world', None))
+                    collect_from_world(envs[idx])
+            collect_from_world(env_instance)
+        except Exception:
+            pass
+
+        try:
+            collect_from_world(getattr(scenario, 'world', None))
+            candidates.append(getattr(scenario, 'agent_size', None))
+        except Exception:
+            pass
+
+        candidates.append(os.getenv('AGENT_SIZE'))
+        for candidate in candidates:
+            value = self._positive_float_or_none(candidate)
+            if value is not None:
+                return value
+        return 0.5
+
+    def _plot_agent_sphere(self, ax, center, radius, color, alpha=0.45):
+        radius = self._positive_float_or_none(radius)
+        if radius is None:
+            return
+        try:
+            center = np.asarray(center, dtype=np.float32)
+            u = np.linspace(0, 2 * np.pi, 12)
+            v = np.linspace(0, np.pi, 8)
+            uu, vv = np.meshgrid(u, v)
+            x = center[0] + radius * np.cos(uu) * np.sin(vv)
+            y = center[1] + radius * np.sin(uu) * np.sin(vv)
+            z = center[2] + radius * np.cos(vv)
+            ax.plot_surface(x, y, z, color=color, alpha=alpha, linewidth=0, shade=True)
+        except Exception:
+            pass
+
+    def _add_plotly_agent_sphere(self, fig, go, center, radius, color, name, opacity=0.42):
+        radius = self._positive_float_or_none(radius)
+        if radius is None:
+            return
+        try:
+            center = np.asarray(center, dtype=np.float32)
+            theta = np.linspace(0, 2 * np.pi, 18)
+            phi = np.linspace(0, np.pi, 10)
+            th, ph = np.meshgrid(theta, phi)
+            x = center[0] + radius * np.cos(th) * np.sin(ph)
+            y = center[1] + radius * np.sin(th) * np.sin(ph)
+            z = center[2] + radius * np.cos(ph)
+            fig.add_trace(go.Surface(
+                x=x,
+                y=y,
+                z=z,
+                surfacecolor=np.zeros_like(x),
+                colorscale=[[0, color], [1, color]],
+                opacity=opacity,
+                showscale=False,
+                name=name,
+                showlegend=False,
+                hoverinfo='skip',
+            ))
+        except Exception:
+            pass
 
     def generate_all_episodes_overlay(self, episodes_trajectories, scenario, save_path,
                                       elev=30, azim=45, max_episodes=None):
@@ -1162,6 +1256,8 @@ class TrajectoryVisualizer:
         
         # 创建3D图表
         fig = go.Figure()
+        agent_radius = self._get_agent_visual_radius(scenario=scenario, env_instance=env_instance, env_idx=env_idx)
+        agent_marker_size = max(6.0, min(16.0, 8.0 + agent_radius * 8.0))
         
         # 安全添加3D散点（带符号规范与回退）
         def _add_marker_safe(x, y, z, size, color, symbol, line_width, line_color, name, text):
@@ -1462,6 +1558,15 @@ class TrajectoryVisualizer:
                     if start_pos[2] < start_terrain_h:
                         # 起点在地形下方，调整到地形上方
                         start_pos[2] = start_terrain_h + 0.5
+                self._add_plotly_agent_sphere(
+                    fig,
+                    go,
+                    start_pos,
+                    agent_radius,
+                    color,
+                    name=f'起点{agent_idx}实际半径',
+                    opacity=0.42,
+                )
                 
                 fig.add_trace(go.Scatter3d(
                     x=[start_pos[0]],
@@ -1469,7 +1574,7 @@ class TrajectoryVisualizer:
                     z=[start_pos[2]],
                     mode='markers+text',
                     marker=dict(
-                        size=8,  # 增大起点标记，更明显
+                        size=agent_marker_size,
                         color=color,
                         symbol='circle',
                         line=dict(color='rgb(0, 0, 0)', width=2)
@@ -1487,13 +1592,23 @@ class TrajectoryVisualizer:
                 ))
                 
                 # 终点标记 - 小球标记
+                end_pos = [agent_traj[-1, 0], agent_traj[-1, 1], agent_traj[-1, 2]]
+                self._add_plotly_agent_sphere(
+                    fig,
+                    go,
+                    end_pos,
+                    agent_radius,
+                    color,
+                    name=f'终点{agent_idx}实际半径',
+                    opacity=0.32,
+                )
                 fig.add_trace(go.Scatter3d(
-                    x=[agent_traj[-1, 0]],
-                    y=[agent_traj[-1, 1]],
-                    z=[agent_traj[-1, 2]],
+                    x=[end_pos[0]],
+                    y=[end_pos[1]],
+                    z=[end_pos[2]],
                     mode='markers',
                     marker=dict(
-                        size=8,  # 从15改为8，更小更精致
+                        size=agent_marker_size,
                         color=color,
                         symbol='circle',
                         line=dict(color='rgb(0, 0, 0)', width=1.5)
@@ -1946,7 +2061,7 @@ class TrajectoryVisualizer:
                 self._plot_goal(ax, scenario, goal_positions=goal_positions)
             
             # 绘制智能体轨迹
-            self._plot_trajectories(ax, trajectories)
+            self._plot_trajectories(ax, trajectories, scenario=scenario, env_instance=env_instance, env_idx=env_idx)
             
             # 设置3D图标签和标题
             self._set_labels_and_title(ax, episode_type, episode_num, reward, None, 

@@ -58,6 +58,138 @@ ALGORITHM_ABLATION_STYLE_BY_LABEL: Dict[str, Dict[str, Any]] = {
         "marker": "D",
         "hatch": "xx",
     },
+    "matd3_full_dual_semantic_cross_agent_ref": {
+        "color": "#2CA02C",  # green
+        "linestyle": "-",
+        "marker": "^",
+        "hatch": "",
+    },
+    "matd3_cross_agent_ref_agent_success": {
+        "color": "#009E73",  # teal green
+        "linestyle": "-",
+        "marker": "^",
+        "hatch": "",
+    },
+    "matd3_cross_agent_ref_agent_quality": {
+        "color": "#56B4E9",  # sky blue
+        "linestyle": (0, (5.0, 1.8)),
+        "marker": "o",
+        "hatch": "..",
+    },
+    "matd3_cross_agent_ref_soft_advantage": {
+        "color": "#CC79A7",  # magenta
+        "linestyle": (0, (6.0, 2.0)),
+        "marker": "v",
+        "hatch": "oo",
+    },
+    "matd3_cross_agent_ref_selector_mix": {
+        "color": "#D55E00",  # vermillion
+        "linestyle": "-",
+        "marker": "*",
+        "hatch": "**",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_tail0": {
+        "color": "#009E73",  # green
+        "linestyle": (0, (1.5, 1.5)),
+        "marker": "P",
+        "hatch": "++",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_tail01": {
+        "color": "#0072B2",  # blue
+        "linestyle": (0, (3.0, 1.6)),
+        "marker": "D",
+        "hatch": "//",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector": {
+        "color": "#6A3D9A",  # deep purple
+        "linestyle": (0, (4.5, 1.6, 1.2, 1.6)),
+        "marker": "h",
+        "hatch": "OO",
+    },
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector": {
+        "color": "#56B4E9",  # sky blue
+        "linestyle": (0, (5.0, 1.4)),
+        "marker": "s",
+        "hatch": "..",
+    },
+    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": {
+        "color": "#E69F00",  # orange
+        "linestyle": (0, (2.0, 1.2)),
+        "marker": "X",
+        "hatch": "xx",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_current": {
+        "color": "#6A3D9A",  # deep purple
+        "linestyle": "-",
+        "marker": "h",
+        "hatch": "",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": {
+        "color": "#9467BD",  # purple
+        "linestyle": (0, (5.0, 1.6)),
+        "marker": "D",
+        "hatch": "//",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045": {
+        "color": "#B279A2",  # muted mauve
+        "linestyle": (0, (2.0, 1.4)),
+        "marker": "P",
+        "hatch": "++",
+    },
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current": {
+        "color": "#0072B2",  # blue
+        "linestyle": "-",
+        "marker": "s",
+        "hatch": "",
+    },
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40": {
+        "color": "#009E73",  # teal green
+        "linestyle": (0, (5.0, 1.6)),
+        "marker": "^",
+        "hatch": "..",
+    },
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045": {
+        "color": "#56B4E9",  # sky blue
+        "linestyle": (0, (2.0, 1.4)),
+        "marker": "v",
+        "hatch": "oo",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_clean_label": {
+        "color": "#9467BD",  # purple
+        "linestyle": (0, (2.0, 1.2)),
+        "marker": "8",
+        "hatch": "\\\\",
+    },
+    "matd3_cross_agent_ref_reward_to_success_selector_tail10": {
+        "color": "#E69F00",  # amber
+        "linestyle": (0, (7.0, 2.0)),
+        "marker": "X",
+        "hatch": "xx",
+    },
+    "matd3_cross_agent_ref_progress_gate": {
+        "color": "#2CA02C",  # legacy green
+        "linestyle": (0, (2.0, 1.6)),
+        "marker": "^",
+        "hatch": "\\\\",
+    },
+    "matd3_cross_agent_ref_agent_success_behavior_label": {
+        "color": "#8C564B",  # brown gray
+        "linestyle": ":",
+        "marker": "X",
+        "hatch": "--",
+    },
+    "matd3_cross_agent_ref_no_quality_gate": {
+        "color": "#FF7F0E",  # orange
+        "linestyle": (0, (4.0, 1.8)),
+        "marker": "P",
+        "hatch": "++",
+    },
+    "matd3_cross_agent_ref_behavior_label": {
+        "color": "#7F7F7F",  # neutral gray
+        "linestyle": ":",
+        "marker": "X",
+        "hatch": "--",
+    },
     "maddpg_separated_gradient": {
         "color": "#9467BD",  # purple
         "linestyle": "-",

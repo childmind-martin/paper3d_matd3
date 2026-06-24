@@ -48,10 +48,75 @@ TEAM_SUCCESS_BONUS_WAS_SET=0
 
 # MADDPG优化版本快速启动脚本
 
+# 直接运行本脚本时也优先使用项目 TensorFlow conda 环境。
+# 外层 wrapper 会显式传 TRAIN_PYTHON_BIN；这里处理手动直接执行 `bash run_optimized.sh ...` 的情况。
+if [ -z "${TRAIN_PYTHON_BIN:-}" ]; then
+    for _MATD3_CANDIDATE_PYTHON in \
+        "$SCRIPT_DIR/.venv/bin/python3" \
+        "/home/tang/miniconda3/envs/maddpg_env/bin/python3" \
+        "${HOME:-}/miniconda3/envs/maddpg_env/bin/python3" \
+        "${HOME:-}/anaconda3/envs/maddpg_env/bin/python3"
+    do
+        if [ -x "$_MATD3_CANDIDATE_PYTHON" ]; then
+            export TRAIN_PYTHON_BIN="$_MATD3_CANDIDATE_PYTHON"
+            break
+        fi
+    done
+    unset _MATD3_CANDIDATE_PYTHON
+fi
+
 # 🔧 关键修复：清理可能干扰训练的环境变量残留（避免之前运行的shell变量影响）
+_MATD3_PRESET_CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING-}"
+_MATD3_PRESET_TF_SYNC_ON_FINISH="${TF_SYNC_ON_FINISH-}"
 unset TF_GPU_ALLOCATOR
 unset CUDA_LAUNCH_BLOCKING  
 unset TF_SYNC_ON_FINISH
+case "${MATD3_ALLOW_RUNTIME_DEBUG_OVERRIDES:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+        if [ -n "${_MATD3_PRESET_CUDA_LAUNCH_BLOCKING}" ]; then
+            export CUDA_LAUNCH_BLOCKING="${_MATD3_PRESET_CUDA_LAUNCH_BLOCKING}"
+        fi
+        if [ -n "${_MATD3_PRESET_TF_SYNC_ON_FINISH}" ]; then
+            export TF_SYNC_ON_FINISH="${_MATD3_PRESET_TF_SYNC_ON_FINISH}"
+        fi
+        ;;
+esac
+unset _MATD3_PRESET_CUDA_LAUNCH_BLOCKING _MATD3_PRESET_TF_SYNC_ON_FINISH
+
+# TensorFlow 2.12 使用 conda 环境内的 CUDA 11/cuDNN 8 动态库。
+# 如果 ROS 或系统环境覆盖了 LD_LIBRARY_PATH，nvidia-smi 仍可见 GPU，
+# 但 TensorFlow 会报 "Cannot dlopen some GPU libraries" 并退回 CPU。
+# 这里必须在启动 Python / import TensorFlow 之前把 WSL libcuda 和当前训练解释器所属环境的 lib 放到最前。
+_MATD3_WSL_CUDA_LIB_DIR="/usr/lib/wsl/lib"
+if [ -d "${_MATD3_WSL_CUDA_LIB_DIR}" ]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":${_MATD3_WSL_CUDA_LIB_DIR}:"*) ;;
+        *) export LD_LIBRARY_PATH="${_MATD3_WSL_CUDA_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+    esac
+fi
+_MATD3_TRAIN_PYTHON_FOR_LIB="${TRAIN_PYTHON_BIN:-python3}"
+_MATD3_CONDA_CUDA_LIB_DIR=""
+if [ -n "${CONDA_PREFIX:-}" ] && [ -d "${CONDA_PREFIX}/lib" ]; then
+    _MATD3_CONDA_CUDA_LIB_DIR="${CONDA_PREFIX}/lib"
+elif command -v "${_MATD3_TRAIN_PYTHON_FOR_LIB}" >/dev/null 2>&1; then
+    _MATD3_PYTHON_PATH="$(command -v "${_MATD3_TRAIN_PYTHON_FOR_LIB}")"
+    if command -v readlink >/dev/null 2>&1; then
+        _MATD3_PYTHON_PATH="$(readlink -f "${_MATD3_PYTHON_PATH}" 2>/dev/null || printf '%s' "${_MATD3_PYTHON_PATH}")"
+    fi
+    _MATD3_PYTHON_ENV_DIR="$(cd "$(dirname "${_MATD3_PYTHON_PATH}")/.." 2>/dev/null && pwd -P || true)"
+    if [ -n "${_MATD3_PYTHON_ENV_DIR}" ] && [ -d "${_MATD3_PYTHON_ENV_DIR}/lib" ]; then
+        _MATD3_CONDA_CUDA_LIB_DIR="${_MATD3_PYTHON_ENV_DIR}/lib"
+    fi
+fi
+if [ -n "${_MATD3_CONDA_CUDA_LIB_DIR}" ] \
+   && { [ -e "${_MATD3_CONDA_CUDA_LIB_DIR}/libcudart.so" ] || [ -e "${_MATD3_CONDA_CUDA_LIB_DIR}/libcudnn.so.8" ]; }; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":${_MATD3_CONDA_CUDA_LIB_DIR}:"*) ;;
+        *) export LD_LIBRARY_PATH="${_MATD3_CONDA_CUDA_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+    esac
+fi
+export MATD3_CONDA_CUDA_LIB_DIR="${_MATD3_CONDA_CUDA_LIB_DIR}"
+unset _MATD3_TRAIN_PYTHON_FOR_LIB _MATD3_PYTHON_PATH _MATD3_PYTHON_ENV_DIR _MATD3_CONDA_CUDA_LIB_DIR _MATD3_WSL_CUDA_LIB_DIR
 
 # 🔧 关键修复：在脚本开头设置 TF_XLA_FLAGS，禁用 Auto JIT
 # 必须在所有其他设置之前，确保在 Python 导入 TensorFlow 之前生效
@@ -110,6 +175,8 @@ fi
 # 生成时间戳，确保每次训练都有唯一的目录
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 EXP_NAME_WITH_TIMESTAMP="${EXP_NAME}_${TIMESTAMP}"
+LOG_ROOT="logs/$EXP_NAME_WITH_TIMESTAMP"
+MODEL_ROOT="models/$EXP_NAME_WITH_TIMESTAMP"
 
 # 🔧 随机种子初始化（在显示参数前生成，确保SEED已设置）
 if [ -z "${SEED:-}" ]; then
@@ -130,6 +197,9 @@ echo "  - 使用分项加权奖励: $USE_WEIGHTED_REWARD"
 echo "  - 训练算法: $ALGORITHM"
 echo "  - 训练障碍序列: ${TRAIN_OBSTACLE_SEQUENCE_MODE:-legacy_linear} (namespace=${TRAIN_OBSTACLE_SEQUENCE_NAMESPACE:-train_obstacle})"
 echo "  - 随机角色(Role Shuffle): ${ENABLE_ROLE_SHUFFLE:-1}"
+echo "  - 跨agent参考学习: ${CROSS_AGENT_REFERENCE_ENABLED:-0} (coef=${CROSS_AGENT_REFERENCE_COEF:-0.03}, gate=${CROSS_AGENT_REFERENCE_QUALITY_GATE:-1}, mode=${CROSS_AGENT_REFERENCE_GATE_MODE:-progress}, clean_label=${CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL:-1})"
+echo "  - 跨agent selector: ${CROSS_AGENT_REFERENCE_SELECTOR_ENABLED:-0} (mode=${CROSS_AGENT_REFERENCE_SELECTOR_MODE:-hard}, alpha=${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}, tau=${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}, lr=${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}, ref_interval=${CROSS_AGENT_REFERENCE_UPDATE_INTERVAL:-1}, pairs_per_agent=${CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT:-0})"
+echo "  - selector奖励→成功阶段: reward_tau=${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU:-500.0}, tie=${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK:-0.05}, stable_window=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW:-100}, stable_delta=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA:-0.02}, min_sr=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE:-0.05}, min_ep=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES:-200}, ramp=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES:-50}"
 echo "  - 随机种子: $SEED ($SEED_SOURCE)"
 if [ -n "$RESUME_MODEL" ]; then
     echo "  - 🔧 持续训练: 从模型恢复 - $RESUME_MODEL"
@@ -142,8 +212,8 @@ echo ""
 
 # 创建必要的目录（仅在真正训练时创建；消融的 resolve-only 模式不产生普通训练目录）
 if ! { [ "${ABLATION_RESOLVE_ONLY}" = "1" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "true" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "yes" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "on" ]; }; then
-    mkdir -p logs/$EXP_NAME_WITH_TIMESTAMP
-    mkdir -p models/$EXP_NAME_WITH_TIMESTAMP
+    mkdir -p "$LOG_ROOT"
+    mkdir -p "$MODEL_ROOT"
 fi
 
 # 检查GPU
@@ -184,21 +254,17 @@ export CRITIC_HIDDEN=${CRITIC_HIDDEN:-"256,256,256"}   # 🚨 修复训练波动
 export MAX_WEIGHT_THRESHOLD=${MAX_WEIGHT_THRESHOLD:-0.999}   # 从0.15放宽到0.8，给予网络更大学习空间
 export WEIGHT_SCALING_FACTOR=${WEIGHT_SCALING_FACTOR:-0.999}  # 从0.6提高到0.9，更温和的缩放
 
-# === 🚀 加速配置（默认：仅保留 PF_JIT，禁用通用 JIT_COMPILE）===
+# === 🚀 加速配置（默认：性能优先，显式设置为0可关闭）===
 export AMP_MODE=${AMP_MODE:-off}
-export JIT_COMPILE=${JIT_COMPILE:-1}            # 当前 MATD3 separated-gradient 热路径下不稳定，默认关闭
-export FORCE_OUTER_JIT_COMPILE=${FORCE_OUTER_JIT_COMPILE:-1}  # 默认启用 outer JIT；若不稳可手动设为0
+export JIT_COMPILE=${JIT_COMPILE:-1}            # 默认启用 train_step JIT；调试时可设为0
+export FORCE_OUTER_JIT_COMPILE=${FORCE_OUTER_JIT_COMPILE:-0}  # separated-gradient 默认不强制 outer JIT；PF_JIT/XLA_GLOBAL 仍可保留
 export PF_JIT=${PF_JIT:-1}                      # 势场热内核 JIT，当前已验证有效
 
-# === 🔧 XLA Global 配置（默认启用，异步执行模式）===
+# === 🔧 XLA Global 配置（默认启用，显式设置 XLA_GLOBAL=0 可关闭）===
 # 配置说明：
-#   - XLA Global：启用全局XLA编译，显著提升性能
-#   - 异步执行：使用异步CUDA执行，最大化GPU利用率
-#   - 缓存清理：已优化到每10回合清理一次，防止长时间运行后内存累积
-# 注意事项：
-#   - 长时间运行（500+回合）后可能出现 CUDA_ERROR_ILLEGAL_ADDRESS
-#   - 已通过频繁的GPU缓存清理（每10回合）来缓解此问题
-export XLA_GLOBAL=${XLA_GLOBAL:-1}               # 默认启用（1），XLA Global + 异步执行
+#   - XLA Global：启用全局XLA编译，提升GPU吞吐
+#   - 异步执行：默认性能优先；若需要定位CUDA异步错误，可显式关闭XLA/JIT并开启同步
+export XLA_GLOBAL=${XLA_GLOBAL:-1}
 export CPU_THREADS=${CPU_THREADS:-32}              # 默认12线程（Zen4 7945HX 实测更稳）
 export TQDM_MININTERVAL=${TQDM_MININTERVAL:-0.3}  # 进度条刷新间隔（秒）
 export TQDM_NCOLS=${TQDM_NCOLS:-100}              # 进度条列宽
@@ -256,8 +322,13 @@ export STEP_WARN_S=${STEP_WARN_S:-5}              # 单步耗时告警阈值
 export STACK_DUMP_TIMEOUT=${STACK_DUMP_TIMEOUT:-0} # 超时打印堆栈（默认禁用）
 export STACK_WATCHDOG_ENABLE=${STACK_WATCHDOG_ENABLE:-0} # 显式看门狗开关（默认禁用）
 export QUIET_OUTPUT=${QUIET_OUTPUT:-1}            # 安静输出（1=安静, 0=详细）；默认走性能模式
-export DEBUG_EPISODE_SUMMARY=${DEBUG_EPISODE_SUMMARY:-1}   # 回合级成功/失败诊断摘要，默认保留
-export DEBUG_COLLISION_SUMMARY=${DEBUG_COLLISION_SUMMARY:-1} # 回合级碰撞统计，默认保留
+if [ "${QUIET_OUTPUT,,}" = "1" ] || [ "${QUIET_OUTPUT,,}" = "true" ] || [ "${QUIET_OUTPUT,,}" = "yes" ] || [ "${QUIET_OUTPUT,,}" = "on" ]; then
+    export DEBUG_EPISODE_SUMMARY=${DEBUG_EPISODE_SUMMARY:-0}   # 安静模式默认关闭逐回合详细诊断
+    export DEBUG_COLLISION_SUMMARY=${DEBUG_COLLISION_SUMMARY:-0}
+else
+    export DEBUG_EPISODE_SUMMARY=${DEBUG_EPISODE_SUMMARY:-1}
+    export DEBUG_COLLISION_SUMMARY=${DEBUG_COLLISION_SUMMARY:-1}
+fi
 export DEBUG_SETUP_INFO=${DEBUG_SETUP_INFO:-0}     # 固定位置/地形/初始化关键信息，默认保留
 export DEBUG_REWARD_EVENTS=${DEBUG_REWARD_EVENTS:-0} # 高频奖励事件打印（部分到达/成功奖励细节），默认关闭
 export DEBUG_EFF_SAMPLES=${DEBUG_EFF_SAMPLES:-0}   # 打印每批有效样本计数/批大小（调试数值稳定性）
@@ -294,6 +365,7 @@ export QUADROTOR_ATTITUDE_RESPONSE_TIME=${QUADROTOR_ATTITUDE_RESPONSE_TIME:-0.05
 export ACTION_RANGE_X=${ACTION_RANGE_X:-2.5}      # 好效果：2.5
 export ACTION_RANGE_Y=${ACTION_RANGE_Y:-2.5}      # 好效果：2.5
 export ACTION_RANGE_Z=${ACTION_RANGE_Z:-2.2}      # 好效果：2.2
+export AGENT_SIZE=${AGENT_SIZE:-0.5}              # 智能体物理半径/可视化半径（m）；旧点质量设置为0.05
 export AGENT_ACCEL=${AGENT_ACCEL:-4.6}            # 好效果：4.6
 export AGENT_MAX_SPEED=${AGENT_MAX_SPEED:-42.5}   # 好效果：42.5
 export SIMULATION_DT=${SIMULATION_DT:-0.08}        # 训练/评估统一仿真步长
@@ -311,14 +383,18 @@ export NOISE_SCALE=${NOISE_SCALE:-0.30}           # 降低初始噪声，减少�
 export NOISE_DECAY=${NOISE_DECAY:-0.9995}         # 略放慢衰减，保留前期探索但不靠高方差硬撞
 export NOISE_MIN=${NOISE_MIN:-0.003}              # 进一步降低末段噪声下限，利于精确收敛到目标
 
-# === 🔧 自适应调整参数（修复奖励下降问题）===
-export ADAPTIVE_PATIENCE=${ADAPTIVE_PATIENCE:-25}              # 🔧 修复：降低耐心（20→15），更早触发探索增强
-export ADAPTIVE_LR_DECAY=${ADAPTIVE_LR_DECAY:-0.98}            # 🚨 修复学习率过低：降低衰减力度（0.9→0.95），每次降低5%而非10%
-                                                                 # 问题：当前Actor LR已降到0.000063，接近最小值0.00002，导致无法跳出局部最优
-                                                                 # 解决：降低衰减力度，让学习率下降更慢，保持足够的学习能力
-export ADAPTIVE_MIN_LR=${ADAPTIVE_MIN_LR:-8e-5}                # 🚨 修复学习率过低：提高最小学习率（2e-5→5e-5），保持学习能力
-                                                                 # 问题：最小学习率2e-5过低，导致网络无法有效学习
-                                                                 # 解决：提高到5e-5，确保网络始终有足够的学习能力
+# === 🔧 自适应调整参数（Level-3 稳定性优化）===
+export ADAPTIVE_PATIENCE=${ADAPTIVE_PATIENCE:-60}              # Level-3奖励方差大，避免25回合未刷新best就过早调整
+export ADAPTIVE_LR_DECAY=${ADAPTIVE_LR_DECAY:-0.98}            # 兼容旧路径；新路径使用actor/critic分离衰减
+export ADAPTIVE_ACTOR_LR_DECAY=${ADAPTIVE_ACTOR_LR_DECAY:-0.98}
+export ADAPTIVE_CRITIC_LR_DECAY=${ADAPTIVE_CRITIC_LR_DECAY:-1.0}  # critic保持跟踪Q面，不随actor一起衰减
+export ADAPTIVE_MIN_LR=${ADAPTIVE_MIN_LR:-8e-5}                # 兼容旧路径；新路径使用actor/critic分离下限
+export ADAPTIVE_MIN_ACTOR_LR=${ADAPTIVE_MIN_ACTOR_LR:-8e-5}
+export ADAPTIVE_MIN_CRITIC_LR=${ADAPTIVE_MIN_CRITIC_LR:-2e-4}
+export ADAPTIVE_PLATEAU_ENABLED=${ADAPTIVE_PLATEAU_ENABLED:-1}
+export ADAPTIVE_PLATEAU_WINDOW=${ADAPTIVE_PLATEAU_WINDOW:-50}
+export ADAPTIVE_PLATEAU_REL_DELTA=${ADAPTIVE_PLATEAU_REL_DELTA:-0.03}
+export ADAPTIVE_PLATEAU_SLOPE_EPS=${ADAPTIVE_PLATEAU_SLOPE_EPS:-0.002}
 export ADAPTIVE_NOISE_MAX=${ADAPTIVE_NOISE_MAX:-0.12}           # 0.2→0.16：后期自适应/重启时噪声上限更低，避免动作波动、保证稳定
                                                                # 说明：动作范围2.0，0.16约8%，配合更低NOISE_MIN实现“后期减探索”
 export ADAPTIVE_NOISE_SMOOTH=${ADAPTIVE_NOISE_SMOOTH:-0.4}     # 噪声平滑更新系数（0-1）
@@ -558,6 +634,7 @@ export REWARD_CLIP_VALUE=${REWARD_CLIP_VALUE:--1500.0} # TD目标奖励裁剪下
                                                         # 作用：防止极端负奖励淹没正常奖励信号，同时保留有效的穿透惩罚
                                                         # 注意：单步奖励范围扩大到-150到-200，需要更大的裁剪阈值
                                                         # 建议范围：-300到-500（根据实际奖励分布调整）
+export REWARD_SCALE=${REWARD_SCALE:-0.002}              # Critic TD目标奖励缩放，默认1/500；增大可放大TD误差和Q动态范围
 
 # === 新增分项参数 ===
 export SUCCESS_REWARD_VALUE=${SUCCESS_REWARD_VALUE:-2200.0}   # 成功奖励基础值：400（配合safe 1.5x/unsafe 0.4x倍率和clip范围[-1500,1500]）
@@ -821,7 +898,7 @@ export DELTA_RADIUS=${DELTA_RADIUS:-80.0}                                       
 
 # 🔧 势场力归一化说明（自动归一化到与网络动作同一量级）
 # 工作原理：
-#   1. 限制势场力最大幅度到max_force_magnitude（8.0）
+#   1. 限制势场力最大幅度到max_force_magnitude（80.0）
 #   2. 归一化到单位向量（保留方向，去除幅值）→ 范围[-1, +1]
 #   3. 与网络动作混合：corrected_action = action + force_direction * force_ratio
 # 网络动作范围是[-1, +1]，势场单位向量范围也是[-1, +1]，自然同一量级
@@ -866,7 +943,7 @@ fi
 # 3. 降低“安全但不完成”相关 dense shaping 的相对吸引力，把奖励重心拉回团队到达。
 if _truthy "${SEMI_RANDOM_TERRAIN:-0}"; then
     if [ "$BUFFER_SIZE_WAS_SET" -eq 0 ]; then
-        export BUFFER_SIZE=250000
+        export BUFFER_SIZE=300000
     fi
     if [ "$ACTION_FORCE_RATIO_SCHEDULE_PCT_WAS_SET" -eq 0 ]; then
         export ACTION_FORCE_RATIO_SCHEDULE_PCT="0%:0.50,25%:0.50,50%:0.48,70%:0.45,85%:0.42,100%:0.40"
@@ -903,7 +980,7 @@ export SUCCESS_COUNT_MODE=${SUCCESS_COUNT_MODE:-all}                  # 并行�
 # FR条件化与Q安全参数
 export USE_FR_FEATURE=${USE_FR_FEATURE:-1}            # ✅ 启用FR特征（作为独立条件输入传递给网络）
 export USE_PF_FEATURE=${USE_PF_FEATURE:-1}            # ✅ 启用势场矢量特征（训练脚本会在保存经验时追加到obs）
-export ENABLE_ACTOR_OUTPUT_COLLECTION=${ENABLE_ACTOR_OUTPUT_COLLECTION:-1}  # 训练期Actor原始7维输出采样（默认开启；可手动关闭以做纯性能对比）
+export ENABLE_ACTOR_OUTPUT_COLLECTION=${ENABLE_ACTOR_OUTPUT_COLLECTION:-0}  # 训练期Actor原始7维输出采样仅用于诊断，默认关闭以避免训练热路径同步
 export Q_CLIP_VALUE=${Q_CLIP_VALUE:-2000.0}         # 🔧 修复：大幅提高Q裁剪值（500→2000），确保正确传递梯队和Reward
                                                       # 原因：Q值过大会导致Bellman更新时出现数值溢出，引发NaN
 export CRITIC_Q_REG=${CRITIC_Q_REG:-0.005}           # 🔧 进一步降低Q正则（0.01→0.005），稍微放开critic的学习能力
@@ -927,6 +1004,7 @@ export NEG_Z_REG_COEF=${NEG_Z_REG_COEF:-0.0}           # 🔧 默认关闭负向
 #    - 目标吸引力：使用sigmoid函数实现可微分段，实现NumPy版本的分段效果
 #    - 所有斥力都基于实际的环境信息，不再使用随机方向
 export USE_TF_POTENTIAL_FIELD=${USE_TF_POTENTIAL_FIELD:-1}           # 势场修正版本（统一使用TF版本）
+export APF_BACKEND=${APF_BACKEND:-python_original}                   # APF后端: python_original|gazebo_apf
 # 🔧 注意：TERRAIN_SENSING_MODE 仅用于评估，训练时强制使用local模式
 # Oracle模式仅在评估时通过 evaluate_optimized.py 传递，训练时不需要此参数
                                                                      # 
@@ -1251,6 +1329,7 @@ ARGS=(
     --q-clip-value "$Q_CLIP_VALUE"                                         # 目标Q裁剪阈值
     --critic-q-reg "$CRITIC_Q_REG"                                         # Critic Q正则权重
     --reward-clip-value "$REWARD_CLIP_VALUE"                               # TD目标计算的奖励裁剪值
+    --reward-scale "$REWARD_SCALE"                                         # TD目标奖励缩放
     
     # 势场修正版本选择
     --use-tf-potential-field "$USE_TF_POTENTIAL_FIELD"                      # 是否使用TensorFlow版本的势场修正
@@ -1324,10 +1403,43 @@ if [ "$ALGORITHM" = "matd3" ]; then
         --matd3-hybrid-actor-alpha "${MATD3_HYBRID_ACTOR_ALPHA:-0.80}"
         --matd3-action-semantics-mode "${MATD3_ACTION_SEMANTICS_MODE:-dual}"
         --matd3-reconstruct-corrected-target "${MATD3_RECONSTRUCT_CORRECTED_TARGET:-true}"
+        --cross-agent-reference-enabled "${CROSS_AGENT_REFERENCE_ENABLED:-false}"
+        --cross-agent-reference-coef "${CROSS_AGENT_REFERENCE_COEF:-0.03}"
+        --cross-agent-reference-start-episode "${CROSS_AGENT_REFERENCE_START_EPISODE:-50}"
+        --cross-agent-reference-progress-threshold "${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}"
+        --cross-agent-reference-margin "${CROSS_AGENT_REFERENCE_MARGIN:-0.0}"
+        --cross-agent-reference-head-weight "${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}"
+        --cross-agent-reference-tail-weight "${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}"
+        --cross-agent-reference-use-clean-label "${CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL:-true}"
+        --cross-agent-reference-exclude-random "${CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM:-true}"
+        --cross-agent-reference-quality-gate "${CROSS_AGENT_REFERENCE_QUALITY_GATE:-true}"
+        --cross-agent-reference-gate-mode "${CROSS_AGENT_REFERENCE_GATE_MODE:-progress}"
+        --cross-agent-reference-update-interval "${CROSS_AGENT_REFERENCE_UPDATE_INTERVAL:-1}"
+        --cross-agent-reference-pairs-per-agent "${CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT:-0}"
+        --cross-agent-reference-selector-enabled "${CROSS_AGENT_REFERENCE_SELECTOR_ENABLED:-false}"
+        --cross-agent-reference-selector-mode "${CROSS_AGENT_REFERENCE_SELECTOR_MODE:-hard}"
+        --cross-agent-reference-selector-alpha "${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}"
+        --cross-agent-reference-selector-q-tau "${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}"
+        --cross-agent-reference-selector-lr "${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}"
+        --cross-agent-reference-selector-hidden "${CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN:-128,64}"
+        --cross-agent-reference-selector-init-logit "${CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT:--2.0}"
+        --cross-agent-reference-selector-adv-clip "${CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP:-5.0}"
+        --cross-agent-reference-selector-reward-tau "${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU:-500.0}"
+        --cross-agent-reference-selector-reward-tiebreak "${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK:-0.05}"
+        --cross-agent-reference-selector-success-stable-window "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW:-100}"
+        --cross-agent-reference-selector-success-stable-delta "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA:-0.02}"
+        --cross-agent-reference-selector-success-stable-min-rate "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE:-0.05}"
+        --cross-agent-reference-selector-success-stable-min-episodes "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES:-200}"
+        --cross-agent-reference-selector-success-ramp-episodes "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES:-50}"
     )
 fi
 if [ "$ALGORITHM" = "maddpg" ]; then
     ARGS+=(--maddpg-use-dual-q "${MADDPG_USE_DUAL_Q:-false}" --maddpg-use-separated-gradient "${MADDPG_USE_SEPARATED_GRADIENT:-true}")
+fi
+if [ "$ALGORITHM" != "mappo" ]; then
+    ARGS+=(
+        --algorithm-name "${ALGORITHM_NAME:-}"
+    )
 fi
 if [ "$ALGORITHM" = "mappo" ]; then
     ARGS+=(
@@ -1620,8 +1732,26 @@ PY
     exit 0
 fi
 
-"$PYTHON_BIN" "$PYTHON_SCRIPT" "${ARGS[@]}"
-STATUS=$?
+if ! { [ "${ABLATION_RESOLVE_ONLY}" = "1" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "true" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "yes" ] || [ "${ABLATION_RESOLVE_ONLY,,}" = "on" ]; }; then
+    mkdir -p "$LOG_ROOT"
+    TRAIN_STDOUT_LOG="$LOG_ROOT/run_optimized_stdout.log"
+    export PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
+    export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
+    {
+        echo "[run_optimized] $(date '+%Y-%m-%d %H:%M:%S') launching training"
+        echo "[run_optimized] python=$PYTHON_BIN"
+        echo "[run_optimized] script=$PYTHON_SCRIPT"
+        echo "[run_optimized] exp=$EXP_NAME_WITH_TIMESTAMP"
+        echo "[run_optimized] seed=$SEED"
+        echo "[run_optimized] cuda_visible=${CUDA_VISIBLE_DEVICES:-unset}"
+        echo "[run_optimized] xla_global=${XLA_GLOBAL:-0} jit_compile=${JIT_COMPILE:-0} force_outer_jit=${FORCE_OUTER_JIT_COMPILE:-0}"
+    } | tee -a "$TRAIN_STDOUT_LOG"
+    "$PYTHON_BIN" -u "$PYTHON_SCRIPT" "${ARGS[@]}" 2>&1 | tee -a "$TRAIN_STDOUT_LOG"
+    STATUS=${PIPESTATUS[0]}
+else
+    "$PYTHON_BIN" "$PYTHON_SCRIPT" "${ARGS[@]}"
+    STATUS=$?
+fi
 
 if [ $STATUS -ne 0 ]; then
     echo "❌ 训练失败: Python进程退出码 $STATUS" >&2
@@ -1786,6 +1916,7 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
         echo "  - 地形复杂度: ${TERRAIN_COMPLEXITY_LEVEL:-3}"
         echo "  - 场景种子: ${SCENARIO_SEED:-88}"
         echo "  - 势场修正: ${USE_TF_POTENTIAL_FIELD:-1} [1=启用TF版本，0=禁用]"
+        echo "  - APF后端: ${APF_BACKEND:-python_original}"
         echo "  - FR值测试序列: 0.55, 0.65, 0.75, 0.85, 0.95 (每个回合使用不同值)"
         echo ""
         
@@ -1820,6 +1951,9 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
         if [ -n "${MAP_SIZE}" ]; then
             EVAL_ENV+=("MAP_SIZE=${MAP_SIZE}")
         fi
+        if [ -n "${AGENT_SIZE}" ]; then
+            EVAL_ENV+=("AGENT_SIZE=${AGENT_SIZE}")
+        fi
         if [ -n "${MOUNTAIN_MIN_DISTANCE}" ]; then
             EVAL_ENV+=("MOUNTAIN_MIN_DISTANCE=${MOUNTAIN_MIN_DISTANCE}")
         fi
@@ -1832,6 +1966,7 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
             # 如果未设置，默认启用TF版本势场修正
             EVAL_ENV+=("USE_TF_POTENTIAL_FIELD=1")
         fi
+        EVAL_ENV+=("APF_BACKEND=${APF_BACKEND:-python_original}")
         
         # 🔧 关键修复：传递训练时的DELTA参数（确保传统APF评估时DELTA_*=0.0）
         # 传统APF训练时DELTA_*=0.0，评估时必须保持一致，否则势场参数范围会变化
@@ -1860,6 +1995,9 @@ if [ "${AUTO_EVAL}" = "1" ] || [ "${AUTO_EVAL,,}" = "true" ] || [ "${AUTO_EVAL,,
         fi
         if [ -n "${AGENT_INFLUENCE_RANGE}" ]; then
             EVAL_ENV+=("AGENT_INFLUENCE_RANGE=${AGENT_INFLUENCE_RANGE}")
+        fi
+        if [ -n "${MAX_FORCE_MAGNITUDE}" ]; then
+            EVAL_ENV+=("MAX_FORCE_MAGNITUDE=${MAX_FORCE_MAGNITUDE}")
         fi
         
         # 🔧 关键修复：传递训练时的特征标志（确保与训练时一致）
@@ -2018,10 +2156,16 @@ PYTHON_EOF
             echo "📋 当前评估配置:"
             echo "  ACTION_FORCE_RATIO=${CURRENT_FR}"
             echo "  USE_TF_POTENTIAL_FIELD=${USE_TF_POTENTIAL_FIELD:-1}"
+            echo "  APF_BACKEND=${APF_BACKEND:-python_original}"
+            echo "  GOAL_ATTRACTION=${GOAL_ATTRACTION:-未设置}"
+            echo "  LAMBDA_1_BASE=${LAMBDA_1_BASE:-未设置}"
+            echo "  TERRAIN_REPULSION=${TERRAIN_REPULSION:-未设置}"
+            echo "  AGENT_INFLUENCE_RANGE=${AGENT_INFLUENCE_RANGE:-未设置}"
             echo "  DELTA_K_ATT=${DELTA_K_ATT:-未设置}"
             echo "  DELTA_LAMBDA_1=${DELTA_LAMBDA_1:-未设置}"
             echo "  DELTA_K_REP=${DELTA_K_REP:-未设置}"
             echo "  DELTA_RADIUS=${DELTA_RADIUS:-未设置}"
+            echo "  MAX_FORCE_MAGNITUDE=${MAX_FORCE_MAGNITUDE:-未设置}"
             echo "  USE_FR_FEATURE=${USE_FR_FEATURE:-未设置}"
             echo "  USE_PF_FEATURE=${USE_PF_FEATURE:-未设置}"
             echo ""

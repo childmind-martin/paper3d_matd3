@@ -11,6 +11,16 @@ import matplotlib.pyplot as plt
 import os
 import traceback  # 添加traceback模块用于错误跟踪
 
+
+def _scenario_quiet_output():
+    try:
+        if os.getenv('SUPPRESS_TERRAIN_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on'):
+            return True
+        return os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        return True
+
+
 class Scenario(BaseScenario):
     """
     自定义3D地形场景
@@ -98,6 +108,13 @@ class Scenario(BaseScenario):
         # 障碍物设置（由复杂度等级控制）
         self.obstacle_size_range = [5, 15]  # 障碍物尺寸范围
         self.obstacle_height_boost = 10  # 障碍物高度提升
+        try:
+            agent_size_kw = kwargs.get('agent_size', None)
+            if agent_size_kw is None:
+                agent_size_kw = os.getenv('AGENT_SIZE', '0.5')
+            self.agent_size = float(agent_size_kw)
+        except Exception:
+            self.agent_size = 0.5
 
         # 观察构建的静态模板与缓存
         self._obs_centers = np.zeros((0, 3), dtype=np.float32)
@@ -828,7 +845,7 @@ class Scenario(BaseScenario):
         width_range = tuple(self.mountain_width_range)
         noise_scale = float(self.noise_amplitude)
 
-        min_distance = int(os.getenv('MOUNTAIN_MIN_DISTANCE', '45'))
+        min_distance = int(os.getenv('MOUNTAIN_MIN_DISTANCE', '55'))
         margin = int(os.getenv('MOUNTAIN_MARGIN', '20'))
         
         # 🔧 确保起点区域与山峰保持足够距离
@@ -1487,7 +1504,8 @@ class Scenario(BaseScenario):
                 self.fixed_positions['goal'] = goal_pos.tolist()
 
             self._fixed_positions_validation_signature = self._build_fixed_positions_validation_signature()
-            print(f"固定位置已验证并调整: {len(self.fixed_positions['agents'])}个智能体")
+            if not _scenario_quiet_output():
+                print(f"固定位置已验证并调整: {len(self.fixed_positions['agents'])}个智能体")
         except Exception as e:
             print(f"验证和调整固定位置时出错: {e}")
             import traceback
@@ -1610,7 +1628,7 @@ class Scenario(BaseScenario):
         # 记录已生成的山峰位置，确保它们之间有足够的距离
         mountain_centers = []
         # 山峰之间的最小距离（可通过环境变量 MOUNTAIN_MIN_DISTANCE 调整）
-        min_mountain_distance = float(os.getenv('MOUNTAIN_MIN_DISTANCE', '40'))
+        min_mountain_distance = float(os.getenv('MOUNTAIN_MIN_DISTANCE', '55'))
         max_attempts = 100  # 最大尝试次数，避免无限循环
         
         # 🔧 确保起点区域与山峰保持足够距离
@@ -1973,7 +1991,7 @@ class Scenario(BaseScenario):
             agent.name = f'agent_{i}'
             agent.collide = True
             agent.silent = True
-            agent.size = 0.05
+            agent.size = float(getattr(self, 'agent_size', 0.5))
             # 确保地形文件生成之后再进行属性设置
             if hasattr(agent, 'max_speed'):
                 agent.max_speed = 25  # 原始值是1.0，调整到1.2
@@ -2216,7 +2234,7 @@ class Scenario(BaseScenario):
         # 重新生成地形（如果设置了随机地形）
         if hasattr(self, 'random_terrain') and self.random_terrain:
             try:
-                if getattr(world, 'is_main_env', True):
+                if getattr(world, 'is_main_env', True) and not _scenario_quiet_output():
                     print("启用随机地形，重新生成")
             except Exception:
                 pass
@@ -2423,13 +2441,16 @@ class Scenario(BaseScenario):
                 if initial_use_fixed:
                     # 只有在启用固定位置时才检查fixed_positions
                     if self.fixed_positions is not None and 'agents' in self.fixed_positions and 'goal' in self.fixed_positions:
-                        print(f"已保存动态生成的位置: {len(self.fixed_positions['agents'])}个智能体, 目标位置: {self.fixed_positions['goal']}")
+                        if not _scenario_quiet_output():
+                            print(f"已保存动态生成的位置: {len(self.fixed_positions['agents'])}个智能体, 目标位置: {self.fixed_positions['goal']}")
                     else:
-                        print(f"⚠️  动态位置生成失败或未创建fixed_positions")
+                        if not _scenario_quiet_output():
+                            print(f"⚠️  动态位置生成失败或未创建fixed_positions")
                 else:
                     # 如果未启用固定位置，fixed_positions为None是正常的
                     if self.goal_pos is not None:
-                        print(f"动态位置生成完成: {len(world.agents)}个智能体, 目标位置: {self.goal_pos}")
+                        if not _scenario_quiet_output():
+                            print(f"动态位置生成完成: {len(world.agents)}个智能体, 目标位置: {self.goal_pos}")
                     else:
                         print(f"⚠️  动态位置生成完成，但目标位置未设置")
                 return
@@ -2513,7 +2534,7 @@ class Scenario(BaseScenario):
         elif debug_mode == 2:  # 仅错误时输出
             should_output = False
         
-        if should_output:
+        if should_output and not _scenario_quiet_output():
             # 输出各智能体的初始位置坐标信息
             print(f"[智能体位置] 智能体初始位置坐标:")
             for i, agent in enumerate(world.agents):
@@ -3139,7 +3160,8 @@ class Scenario(BaseScenario):
         
         if len(start_areas) < 3:
             # 如果最好的象限也没有足够的区域，从所有区域中选择
-            print(f"[智能体放置] 象限{best_quadrant}仅有{len(start_areas)}个区域，从全局选择")
+            if not _scenario_quiet_output():
+                print(f"[智能体放置] 象限{best_quadrant}仅有{len(start_areas)}个区域，从全局选择")
             start_areas = flat_areas[:20]  # 取前20个最平坦的区域
         
         # 3) 在起始区域内集中放置3个智能体
@@ -3186,7 +3208,8 @@ class Scenario(BaseScenario):
         agents_center_z = np.mean([pos[2] for pos in selected_positions])
         agents_center = np.array([agents_center_x, agents_center_y, agents_center_z])
         
-        print(f"[智能体放置] 在象限{best_quadrant}集中放置{num_agents}个智能体，区域中心: ({agents_center_x:.1f}, {agents_center_y:.1f}, {agents_center_z:.1f})")
+        if not _scenario_quiet_output():
+            print(f"[智能体放置] 在象限{best_quadrant}集中放置{num_agents}个智能体，区域中心: ({agents_center_x:.1f}, {agents_center_y:.1f}, {agents_center_z:.1f})")
         
         # 4) 找到距离智能体区域最远且最高的山峰
         all_peaks = self.find_peak_positions(neighborhood_size=8, max_peaks=100)
@@ -3216,7 +3239,8 @@ class Scenario(BaseScenario):
             if len(high_peaks) < 5:
                 high_peaks = all_peaks[:min(20, len(all_peaks))]  # 至少选前20个
             
-            print(f"[目标选择] 总山峰数={len(all_peaks)}, 筛选高峰={len(high_peaks)}, 高度阈值={height_threshold:.1f}m")
+            if not _scenario_quiet_output():
+                print(f"[目标选择] 总山峰数={len(all_peaks)}, 筛选高峰={len(high_peaks)}, 高度阈值={height_threshold:.1f}m")
             
             # 🔧 修复：从高峰中选择距离智能体中心最远的（确保距离足够远）
             # 🚨 新增：计算所有高峰到智能体中心的距离，只选择距离足够远的（>80m）
@@ -3237,9 +3261,11 @@ class Scenario(BaseScenario):
             # 如果还是没有，直接使用所有高峰
             if len(far_peaks) == 0:
                 far_peaks = high_peaks
-                print(f"[目标选择] ⚠️  没有找到距离>{min_distance_to_start}m的高峰，使用所有高峰")
+                if not _scenario_quiet_output():
+                    print(f"[目标选择] ⚠️  没有找到距离>{min_distance_to_start}m的高峰，使用所有高峰")
             else:
-                print(f"[目标选择] 找到{len(far_peaks)}个距离>{min_distance_to_start}m的高峰")
+                if not _scenario_quiet_output():
+                    print(f"[目标选择] 找到{len(far_peaks)}个距离>{min_distance_to_start}m的高峰")
             
             # 从远距离高峰中选择最远的
             farthest_peak = max(far_peaks, key=lambda p: np.linalg.norm(
@@ -3249,7 +3275,8 @@ class Scenario(BaseScenario):
             
             # 打印最终选择的山峰距离
             final_distance = np.linalg.norm(np.array([peak_x, peak_y]) - agents_center[:2])
-            print(f"[目标选择] 选择的遮挡山峰距离智能体: {final_distance:.1f}m")
+            if not _scenario_quiet_output():
+                print(f"[目标选择] 选择的遮挡山峰距离智能体: {final_distance:.1f}m")
             
             # 计算到智能体的距离和方向
             direction_to_peak = np.array([peak_x - agents_center_x, peak_y - agents_center_y])
@@ -3292,10 +3319,11 @@ class Scenario(BaseScenario):
             dist_agents_to_goal = np.linalg.norm(goal.state.p_pos - agents_center)
             dist_peak_to_goal = np.linalg.norm(goal.state.p_pos - np.array([peak_x, peak_y, peak_z]))
             
-            print(f"[目标设置] 遮挡山峰: ({peak_x:.1f}, {peak_y:.1f}, {peak_z:.1f})")
-            print(f"[目标设置] 目标位置: ({goal_x:.1f}, {goal_y:.1f}, {goal_z:.1f})")
-            print(f"[目标设置] 距离统计: 智能体→山峰={dist_agents_to_peak:.1f}m, 智能体→目标={dist_agents_to_goal:.1f}m, 山峰→目标={dist_peak_to_goal:.1f}m")
-            print(f"[目标设置] ✓ 目标放置在山峰后方，距离增加{(dist_agents_to_goal/dist_agents_to_peak - 1)*100:.1f}%")
+            if not _scenario_quiet_output():
+                print(f"[目标设置] 遮挡山峰: ({peak_x:.1f}, {peak_y:.1f}, {peak_z:.1f})")
+                print(f"[目标设置] 目标位置: ({goal_x:.1f}, {goal_y:.1f}, {goal_z:.1f})")
+                print(f"[目标设置] 距离统计: 智能体→山峰={dist_agents_to_peak:.1f}m, 智能体→目标={dist_agents_to_goal:.1f}m, 山峰→目标={dist_peak_to_goal:.1f}m")
+                print(f"[目标设置] ✓ 目标放置在山峰后方，距离增加{(dist_agents_to_goal/dist_agents_to_peak - 1)*100:.1f}%")
         
         if hasattr(world, 'goal_pos'):
             world.goal_pos = self.goal_pos.copy()
@@ -3319,7 +3347,8 @@ class Scenario(BaseScenario):
             final_terrain_h = self.get_terrain_height(agent.state.p_pos[0], agent.state.p_pos[1])
             if agent.state.p_pos[2] < final_terrain_h + min_air_gap:
                 agent.state.p_pos[2] = final_terrain_h + min_air_gap
-                print(f"[智能体放置] 警告：智能体{i}位置在地形下方，已调整到地形高度+{min_air_gap:.1f}m")
+                if not _scenario_quiet_output():
+                    print(f"[智能体放置] 警告：智能体{i}位置在地形下方，已调整到地形高度+{min_air_gap:.1f}m")
             
             agent.state.p_vel = np.zeros(3)
             if hasattr(agent, 'action') and hasattr(agent.action, 'u'):
@@ -3338,16 +3367,18 @@ class Scenario(BaseScenario):
         )
         
         # 输出各智能体的初始位置坐标信息
-        print(f"[智能体位置] 智能体初始位置坐标:")
-        for i, agent in enumerate(world.agents):
-            pos = agent.state.p_pos
-            terrain_h = self.get_terrain_height(pos[0], pos[1])
-            height_above_terrain = pos[2] - terrain_h
-            print(f"  Agent{i+1}: pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) | terrain_h={terrain_h:.2f} | 离地高度={height_above_terrain:.2f}m")
+        if not _scenario_quiet_output():
+            print(f"[智能体位置] 智能体初始位置坐标:")
+            for i, agent in enumerate(world.agents):
+                pos = agent.state.p_pos
+                terrain_h = self.get_terrain_height(pos[0], pos[1])
+                height_above_terrain = pos[2] - terrain_h
+                print(f"  Agent{i+1}: pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) | terrain_h={terrain_h:.2f} | 离地高度={height_above_terrain:.2f}m")
     
     def _place_agents_fallback(self, world):
         """备用智能体放置方案（当找不到平坦区域时）"""
-        print("[智能体放置] 使用备用方案：在低海拔安全位置放置")
+        if not _scenario_quiet_output():
+            print("[智能体放置] 使用备用方案：在低海拔安全位置放置")
         
         # 🔧 修复：获取离地高度配置（使用统一方法）
         altitude_offset = self._get_start_altitude_offset()
@@ -3930,16 +3961,19 @@ class Scenario(BaseScenario):
                 agent.debug_info['deviation_penalty_soft'] = float(dev_penalty)
                 agent.debug_info['distance_ratio'] = float(distance_ratio)
             
+            agent_radius = float(max(0.0, getattr(agent, 'size', getattr(self, 'agent_size', 0.0))))
+
             # 计算当前位置和对应的地形高度，用于记录
             terrain_height = 0.0
             height_diff = 0.0
             if hasattr(self, 'get_terrain_height'):
                 current_pos = agent.state.p_pos
                 terrain_height = self.get_terrain_height(current_pos[0], current_pos[1])
-                height_diff = current_pos[2] - terrain_height
+                body_bottom_z = current_pos[2] - agent_radius
+                height_diff = body_bottom_z - terrain_height
                 
                 # === 地形穿透惩罚（软化） ===
-                depth = max(0.0, terrain_height - current_pos[2])
+                depth = max(0.0, terrain_height - body_bottom_z)
                 k_pen = 500.0  # 🚨 修复穿透问题：从100.0提高到500.0，大幅增强穿透惩罚
                 k_deep = 1500.0  # 🚨 修复穿透问题：从300.0提高到1500.0，严惩深度穿透
                 pen_main = k_pen * _softplus(depth, beta=6.0)
@@ -3956,7 +3990,7 @@ class Scenario(BaseScenario):
                 diff = self._obs_centers - current_pos
                 d = np.sqrt(np.sum(diff * diff, axis=1))
                 r = self._obs_radii
-                gap = d - r
+                gap = d - (r + agent_radius)
                 k_near = 50.0   # 🚨 修复穿透问题：从20.0提高到50.0，进一步增强接近障碍物的惩罚
                 k_coll = 1500.0 # 🚨 修复穿透问题：从600.0提高到1500.0，更严厉惩罚穿透障碍物
                 near_term = k_near * np.sum(_softplus(-(gap - 1.0), beta=5.0))
@@ -3973,7 +4007,7 @@ class Scenario(BaseScenario):
             if hasattr(self, 'get_terrain_height'):
                 current_pos = agent.state.p_pos
                 terrain_height = self.get_terrain_height(current_pos[0], current_pos[1])
-                terrain_clearance = current_pos[2] - terrain_height  # 正值=在地形上方，负值=穿透地形
+                terrain_clearance = current_pos[2] - agent_radius - terrain_height  # 正值=机体底部在地形上方，负值=穿透地形
                 clearance_distances.append(terrain_clearance)
             
             # 2. 计算障碍物净空（允许负值表示穿透）
@@ -3981,7 +4015,7 @@ class Scenario(BaseScenario):
                 current_pos_obs = agent.state.p_pos.astype(np.float32)
                 diff = self._obs_centers - current_pos_obs
                 d = np.sqrt(np.sum(diff * diff, axis=1))
-                obstacle_clearances = d - self._obs_radii  # 正值=在障碍物外，负值=穿透障碍物
+                obstacle_clearances = d - (self._obs_radii + agent_radius)  # 正值=机体在障碍物外，负值=穿透障碍物
                 clearance_distances.extend(obstacle_clearances.tolist())
             
             # 3. 取最小净空值（最负值表示最大穿透深度）
@@ -4093,13 +4127,13 @@ class Scenario(BaseScenario):
                     agent.debug_info['clearance_weight'] = self.clearance_weight
                 # 🔧 新增：记录地形和障碍物的净空值，便于调试
                 if hasattr(self, 'get_terrain_height'):
-                    terrain_clearance = current_pos[2] - self.get_terrain_height(current_pos[0], current_pos[1])
+                    terrain_clearance = current_pos[2] - agent_radius - self.get_terrain_height(current_pos[0], current_pos[1])
                     agent.debug_info['terrain_clearance'] = float(terrain_clearance)
                 if getattr(self, '_obs_centers', None) is not None and self._obs_centers.shape[0] > 0:
                     current_pos_obs = agent.state.p_pos.astype(np.float32)
                     diff = self._obs_centers - current_pos_obs
                     d = np.sqrt(np.sum(diff * diff, axis=1))
-                    obstacle_clearances = d - self._obs_radii
+                    obstacle_clearances = d - (self._obs_radii + agent_radius)
                     agent.debug_info['obstacle_clearances'] = obstacle_clearances.tolist()
             rew += clearance_reward
             agent.last_min_distance = d_min_current
@@ -4362,6 +4396,8 @@ class Scenario(BaseScenario):
             return 0.0  # 出错时返回零奖励
     
     def is_collision(self, agent, entity):
+        if (not getattr(agent, 'collide', True)) or (not getattr(entity, 'collide', True)):
+            return False
         delta_pos = agent.state.p_pos - entity.state.p_pos
         dist = np.linalg.norm(delta_pos)
         dist_min = agent.size + entity.size
@@ -5032,6 +5068,8 @@ class Scenario(BaseScenario):
             pos = agent.state.p_pos
             x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
             terrain_h = self.get_terrain_height(x, y)
+            agent_radius = float(max(0.0, getattr(agent, 'size', getattr(self, 'agent_size', 0.0))))
+            body_bottom_z = z - agent_radius
             # 目标距离
             if hasattr(self, 'goal_pos') and self.goal_pos is not None:
                 gx, gy, gz = float(self.goal_pos[0]), float(self.goal_pos[1]), float(self.goal_pos[2])
@@ -5049,8 +5087,7 @@ class Scenario(BaseScenario):
             # 🚨 修复侧面穿透：改进为3D碰撞检测，而非只检查Z轴触底
             # 旧逻辑：只检查 z <= terrain_h（只能检测从上往下的穿透）
             # 新逻辑：检查 z < terrain_h（真正在地形下方）
-            if z < terrain_h - eps:  # 🚨 从 <= 改为 <，且减去eps而非加上，严格检测穿透
-                # 智能体Z坐标低于地形高度 → 真正的穿透
+            if body_bottom_z < terrain_h - eps:  # 机体底部低于地形高度 → 真正穿透
                 # 只在首次判定时打印
                 if not self._agent_done_logged.get(agent_key, False):
                     self._agent_done_logged[agent_key] = True
@@ -5062,8 +5099,8 @@ class Scenario(BaseScenario):
                     try:
                         step_idx = int(getattr(world, 'current_step', -1))
                         ep_len = int(getattr(world, 'episode_length', -1))
-                        depth = terrain_h - z
-                        print(f"[终止] 地形穿透 | step={step_idx}/{ep_len} | agent={getattr(agent,'name','?')} | pos=({x:.2f},{y:.2f},{z:.2f}) | terrain_h={terrain_h:.2f} | 穿透深度={depth:.2f}m")
+                        depth = terrain_h - body_bottom_z
+                        print(f"[终止] 地形穿透 | step={step_idx}/{ep_len} | agent={getattr(agent,'name','?')} | pos=({x:.2f},{y:.2f},{z:.2f}) | body_bottom_z={body_bottom_z:.2f} | terrain_h={terrain_h:.2f} | 穿透深度={depth:.2f}m")
                     except Exception:
                         pass
                 return True
@@ -5072,6 +5109,8 @@ class Scenario(BaseScenario):
                 dmin = None
                 if hasattr(world, 'landmarks'):
                     for landmark in world.landmarks:
+                        if not getattr(landmark, 'collide', False):
+                            continue
                         lp = getattr(getattr(landmark, 'state', None), 'p_pos', None)
                         if lp is None:
                             continue
@@ -5572,8 +5611,13 @@ class Scenario(BaseScenario):
         try:
             pos = agent.state.p_pos
             terrain_h = self.get_terrain_height(pos[0], pos[1])
-            eps = 0.03
-            if pos[2] <= terrain_h + eps:
+            agent_radius = float(max(0.0, getattr(agent, 'size', getattr(self, 'agent_size', 0.0))))
+            body_bottom_z = float(pos[2]) - agent_radius
+            try:
+                eps = float(os.getenv('TERRAIN_COLLISION_EPS', '0.3'))
+            except Exception:
+                eps = 0.3
+            if body_bottom_z <= terrain_h + eps:
                 base = float(getattr(self, 'collision_penalty_value', 50.0))
                 ep_len = int(getattr(world, 'episode_length', 1000))
                 cur_step = int(getattr(world, 'current_step', ep_len))
@@ -5584,6 +5628,8 @@ class Scenario(BaseScenario):
             dmin = None
             if hasattr(world, 'landmarks'):
                 for landmark in world.landmarks:
+                    if not getattr(landmark, 'collide', False):
+                        continue
                     lp = getattr(getattr(landmark, 'state', None), 'p_pos', None)
                     if lp is None:
                         continue

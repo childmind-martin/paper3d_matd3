@@ -13,6 +13,9 @@ EVAL_SEEDS=(${EVAL_SEEDS:-30088 30188 30288 30388 30488 30588 30688 30788 30888 
 LABELS=(${LABELS_OVERRIDE:-matd3_full_dual_semantic matd3_collapsed_replay matd3_no_corrected_target_reconstruction})
 MODEL_VARIANT="${MODEL_VARIANT:-best_by_team_sr}"
 SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-fixed}"
+SELECTION_VALIDATION_SEEDS=(${SELECTION_VALIDATION_SEEDS:-41088 41188 41288})
+SELECTION_VALIDATION_EPISODES="${SELECTION_VALIDATION_EPISODES:-10}"
+SELECTION_VALIDATION_CANDIDATES="${SELECTION_VALIDATION_CANDIDATES:-best_by_team_sr,best,checkpoint,final,latest_ep}"
 STRICT_SUMMARY="${STRICT_SUMMARY:-1}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
@@ -22,11 +25,64 @@ SUMMARY_FILENAME_TAG="${SUMMARY_FILENAME_TAG:-model_fr}"
 PYTHON_BIN="${PYTHON_BIN:-${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-/home/tang/miniconda3/envs/maddpg_env/bin/python3}}}"
 CONDA_SH="${CONDA_SH:-/home/tang/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-maddpg_env}"
+REWARD_VERSION="${REWARD_VERSION:-v1}"
+REWARD_TERMINAL_ORDER_FIX="${REWARD_TERMINAL_ORDER_FIX:-1}"
+AGENT_SIZE="${AGENT_SIZE:-0.5}"
 
 BASE_SPEC="${BASE_SPEC:-}"
 SPEC_ROOT="${SPEC_ROOT:-/home/tang/matd3/ablation_experiments/${RUN_TAG}_specs}"
 RUN_LOG_ROOT="${RUN_LOG_ROOT:-/home/tang/matd3/parallel_logs/${RUN_TAG}_$(date +%Y%m%d_%H%M%S)}"
+SHARED_SELECTION_ROOT="${SHARED_SELECTION_ROOT:-/home/tang/matd3/logs/${RUN_TAG}_shared_checkpoint_selection}"
 mkdir -p "$RUN_LOG_ROOT" "$SPEC_ROOT"
+
+prepend_path_once() {
+  local path="$1"
+  [ -n "$path" ] && [ -d "$path" ] || return 0
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":${path}:"*) ;;
+    *) export LD_LIBRARY_PATH="${path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+  esac
+}
+
+configure_eval_gpu_env() {
+  local python_for_lib="${1:-$PYTHON_BIN}"
+  local python_path=""
+  local env_dir=""
+
+  if [ -n "${CONDA_PREFIX:-}" ] && [ -d "${CONDA_PREFIX}/lib" ]; then
+    env_dir="$CONDA_PREFIX"
+  elif [ -x "$python_for_lib" ]; then
+    python_path="$python_for_lib"
+  elif command -v "$python_for_lib" >/dev/null 2>&1; then
+    python_path="$(command -v "$python_for_lib")"
+  fi
+
+  if [ -z "$env_dir" ] && [ -n "$python_path" ]; then
+    if command -v readlink >/dev/null 2>&1; then
+      python_path="$(readlink -f "$python_path" 2>/dev/null || printf '%s' "$python_path")"
+    fi
+    env_dir="$(cd "$(dirname "$python_path")/.." 2>/dev/null && pwd -P || true)"
+  fi
+
+  if [ -n "$env_dir" ] && [ -d "$env_dir/lib" ]; then
+    prepend_path_once "$env_dir/lib"
+    if [ -z "${CONDA_PREFIX:-}" ] && [ -d "$env_dir/conda-meta" ]; then
+      export CONDA_PREFIX="$env_dir"
+    fi
+    export MATD3_EVAL_CONDA_LIB_DIR="$env_dir/lib"
+  fi
+  prepend_path_once "/usr/lib/wsl/lib"
+
+  if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
+    export CUDA_VISIBLE_DEVICES="${GPU_ID:-0}"
+  fi
+  export TF_FORCE_GPU_ALLOW_GROWTH="${TF_FORCE_GPU_ALLOW_GROWTH:-true}"
+}
+
+configure_eval_gpu_env "$PYTHON_BIN"
+
+declare -A SHARED_SELECTED_MODEL_PATHS=()
+declare -A SHARED_SELECTION_SUMMARIES=()
 
 truthy() {
   case "${1:-0}" in
@@ -35,8 +91,25 @@ truthy() {
   esac
 }
 
+use_shared_selection() {
+  case "${SELECTION_PROTOCOL,,}" in
+    shared|shared_validation|shared_matched_validation) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_positive_int() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]
+}
+
+active_job_count() {
+  local count=0
+  local _job
+  while IFS= read -r _job; do
+    [ -n "$_job" ] || continue
+    count=$((count + 1))
+  done < <(jobs -pr || true)
+  printf '%s\n' "$count"
 }
 
 model_dirs_newest_first() {
@@ -104,7 +177,8 @@ model_has_variant() {
 eval_completed() {
   local eval_dir="$1"
   local model_dir="$2"
-  "$PYTHON_BIN" - "$eval_dir/evaluation_results.json" "$EVAL_EPISODES" "$EVAL_FR_MODE" "$model_dir" <<'PY'
+  "$PYTHON_BIN" - "$eval_dir/evaluation_results.json" "$EVAL_EPISODES" "$EVAL_FR_MODE" "$model_dir" "$MODEL_VARIANT" "$SELECTION_PROTOCOL" "$REWARD_VERSION" "$REWARD_TERMINAL_ORDER_FIX" "$AGENT_SIZE" <<'PY'
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -113,6 +187,11 @@ path = Path(sys.argv[1])
 target = int(sys.argv[2])
 fr_mode = str(sys.argv[3]).lower()
 model_dir = Path(sys.argv[4])
+model_variant = str(sys.argv[5]).strip() or "best_by_team_sr"
+selection_protocol = str(sys.argv[6]).strip().lower() or "fixed"
+expected_reward_version = str(sys.argv[7]).strip() or "v1"
+expected_terminal_order_raw = str(sys.argv[8]).strip()
+expected_agent_size_raw = str(sys.argv[9]).strip()
 if not path.exists():
     raise SystemExit(1)
 try:
@@ -121,17 +200,80 @@ except Exception:
     raise SystemExit(1)
 summary = data.get("summary", {}) if isinstance(data, dict) else {}
 setup = data.get("evaluation_setup", {}) if isinstance(data, dict) else {}
+selection = data.get("model_selection", {}) if isinstance(data.get("model_selection"), dict) else {}
 if not isinstance(setup, dict):
     setup = {}
 try:
     episodes = int(summary.get("episodes", data.get("episodes")) or 0)
 except Exception:
     raise SystemExit(1)
-has_selection = isinstance(data.get("model_selection"), dict)
+has_selection = bool(selection)
 fr_source = str(setup.get("action_force_ratio_source", "") or "").strip()
 fr_source_ok = bool(fr_source)
 if fr_mode in {"checkpoint", "checkpoint_fr", "model", "model_fr", "corresponding", "corresponding_fr"}:
     fr_source_ok = fr_source_ok and fr_source != "forced_override"
+
+def model_signature(model_path: Path):
+    try:
+        weight_files = sorted(model_path.glob("actor_*.weights.h5"))
+        if not weight_files:
+            return None
+        hasher = hashlib.sha1()
+        for weight_path in weight_files:
+            hasher.update(weight_path.name.encode("utf-8", errors="ignore"))
+            with open(weight_path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return None
+
+selected_path_raw = str(selection.get("selected_model_path", "") or "")
+if not selected_path_raw:
+    raise SystemExit(1)
+try:
+    selected_path = Path(selected_path_raw).resolve()
+    model_root = model_dir.resolve()
+except Exception:
+    raise SystemExit(1)
+
+selection_ok = True
+if selection_protocol == "fixed":
+    expected_path = (model_root / model_variant).resolve()
+    selection_ok = selected_path == expected_path
+else:
+    try:
+        selection_ok = selected_path == model_root or selected_path.is_relative_to(model_root)
+    except Exception:
+        selection_ok = str(selected_path).startswith(str(model_root) + "/")
+
+recorded_signature = str(selection.get("selected_model_signature", "") or "").strip()
+current_signature = model_signature(selected_path)
+signature_ok = bool(recorded_signature) and bool(current_signature) and recorded_signature == current_signature
+
+recorded_reward_version = str(setup.get("reward_version", "") or "").strip()
+if expected_terminal_order_raw:
+    expected_terminal_order_fix = expected_terminal_order_raw.lower() in {"1", "true", "yes", "on"}
+else:
+    expected_terminal_order_fix = True
+recorded_terminal_order_fix = setup.get("reward_terminal_order_fix", None)
+if isinstance(recorded_terminal_order_fix, bool):
+    terminal_order_ok = recorded_terminal_order_fix == expected_terminal_order_fix
+else:
+    terminal_order_ok = str(recorded_terminal_order_fix).strip().lower() in {"1", "true", "yes", "on"} if recorded_terminal_order_fix is not None else False
+    terminal_order_ok = terminal_order_ok == expected_terminal_order_fix
+reward_setup_ok = recorded_reward_version == expected_reward_version and terminal_order_ok
+agent_size_ok = True
+if expected_agent_size_raw:
+    try:
+        expected_agent_size = float(expected_agent_size_raw)
+        actual_agent_size = float(setup.get("agent_size"))
+        agent_size_ok = abs(actual_agent_size - expected_agent_size) <= 1e-6
+    except Exception:
+        agent_size_ok = False
 
 def to_bool(value):
     if value is None:
@@ -205,7 +347,18 @@ if expected_quad is not None and actual_quad != expected_quad:
 if not training_args or expected_quad is None:
     physics_ok = False
 
-raise SystemExit(0 if episodes == target and has_selection and fr_source_ok and physics_ok else 1)
+raise SystemExit(
+    0
+    if episodes == target
+    and has_selection
+    and selection_ok
+    and signature_ok
+    and reward_setup_ok
+    and agent_size_ok
+    and fr_source_ok
+    and physics_ok
+    else 1
+)
 PY
 }
 
@@ -214,6 +367,12 @@ eval_dir_for() {
   local train_seed="$2"
   local eval_seed="$3"
   printf '%s/logs/%s_%s_trainseed%s_testseed%s/evaluation_official\n' "$ROOT_DIR" "$RUN_TAG" "$label" "$train_seed" "$eval_seed"
+}
+
+selection_dir_for() {
+  local label="$1"
+  local train_seed="$2"
+  printf '%s/%s_trainseed%s\n' "$SHARED_SELECTION_ROOT" "$label" "$train_seed"
 }
 
 resolve_base_spec() {
@@ -250,6 +409,109 @@ prepare_specs() {
     --eval-seeds "${EVAL_SEEDS[@]}"
 }
 
+load_selection_result() {
+  local result_path="$1"
+  "$PYTHON_BIN" - "$result_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+data = json.loads(path.read_text(encoding="utf-8"))
+selection = data.get("model_selection", {})
+model_path = str(selection.get("selected_model_path", "") or "").strip()
+summary_path = str(selection.get("validation_selection_summary_path", "") or "").strip()
+if not model_path or not Path(model_path).exists():
+    raise SystemExit(1)
+print(model_path)
+print(summary_path)
+PY
+}
+
+select_shared_checkpoint() {
+  local label="$1"
+  local train_seed="$2"
+  local model_dir="$3"
+  local selection_dir
+  local selection_result
+  local selection_log
+  local selection_base_spec
+  local force_args=()
+  local selected_model_path
+  local selection_summary_path
+  local key="${label}|${train_seed}"
+
+  selection_dir="$(selection_dir_for "$label" "$train_seed")"
+  selection_result="$selection_dir/selection_result.json"
+  selection_log="$RUN_LOG_ROOT/${label}_trainseed${train_seed}_shared_selection.log"
+  mkdir -p "$selection_dir"
+
+  if ! truthy "$FORCE_RERUN" && load_selection_result "$selection_result" >/tmp/level3_shared_selection_result.$$ 2>/dev/null; then
+    selected_model_path="$(sed -n '1p' /tmp/level3_shared_selection_result.$$)"
+    selection_summary_path="$(sed -n '2p' /tmp/level3_shared_selection_result.$$)"
+    rm -f /tmp/level3_shared_selection_result.$$
+    SHARED_SELECTED_MODEL_PATHS["$key"]="$selected_model_path"
+    SHARED_SELECTION_SUMMARIES["$key"]="$selection_summary_path"
+    echo "[shared-selection] reuse $label trainseed${train_seed}: $selected_model_path"
+    return 0
+  fi
+  rm -f /tmp/level3_shared_selection_result.$$ 2>/dev/null || true
+
+  if truthy "$FORCE_RERUN"; then
+    force_args+=(--force-rerun)
+  fi
+  selection_base_spec="$(resolve_base_spec)"
+  echo "[shared-selection] selecting checkpoint for $label trainseed${train_seed}"
+  echo "[shared-selection] validation seeds: ${SELECTION_VALIDATION_SEEDS[*]} | episodes/seed=$SELECTION_VALIDATION_EPISODES"
+  (
+    REWARD_VERSION="$REWARD_VERSION" \
+    REWARD_TERMINAL_ORDER_FIX="$REWARD_TERMINAL_ORDER_FIX" \
+    AGENT_SIZE="$AGENT_SIZE" \
+    OFFICIAL_EVAL_QUIET=1 \
+    QUIET_OUTPUT=1 \
+    TQDM_DISABLE=1 \
+    EVAL_ARTIFACT_FILENAME_TAG="$SUMMARY_FILENAME_TAG" \
+    "$PYTHON_BIN" "$ROOT_DIR/official_eval_with_matched_validation.py" \
+      --experiment-root "$model_dir" \
+      --official-spec "$selection_base_spec" \
+      --output-dir "$selection_dir" \
+      --model-variant "$MODEL_VARIANT" \
+      --selection-protocol matched_validation \
+      --validation-episodes "$SELECTION_VALIDATION_EPISODES" \
+      --validation-seeds "${SELECTION_VALIDATION_SEEDS[@]}" \
+      --validation-candidates "$SELECTION_VALIDATION_CANDIDATES" \
+      --selection-only \
+      --quiet-output 1 \
+      --python-bin "$PYTHON_BIN" \
+      "${force_args[@]}"
+  ) 2>&1 | sed -u "s/^/[shared-selection ${label} trainseed${train_seed}] /" | tee "$selection_log"
+
+  mapfile -t _selection_lines < <(load_selection_result "$selection_result")
+  selected_model_path="${_selection_lines[0]:-}"
+  selection_summary_path="${_selection_lines[1]:-}"
+  if [ -z "$selected_model_path" ]; then
+    echo "[shared-selection-error] selected checkpoint missing for $label trainseed${train_seed}" >&2
+    return 1
+  fi
+  SHARED_SELECTED_MODEL_PATHS["$key"]="$selected_model_path"
+  SHARED_SELECTION_SUMMARIES["$key"]="$selection_summary_path"
+  echo "[shared-selection] selected $label trainseed${train_seed}: $selected_model_path"
+}
+
+run_shared_selection_all() {
+  local label
+  local train_seed
+  local model_dir
+  for label in "${LABELS[@]}"; do
+    for train_seed in "${TRAIN_SEEDS[@]}"; do
+      model_dir="$(latest_completed_model_dir "$label" "$train_seed")"
+      select_shared_checkpoint "$label" "$train_seed" "$model_dir"
+    done
+  done
+}
+
 run_eval_job() {
   local label="$1"
   local train_seed="$2"
@@ -259,6 +521,9 @@ run_eval_job() {
   local eval_dir
   local log_file
   local force_args=()
+  local preselected_args=()
+  local helper_selection_protocol="$SELECTION_PROTOCOL"
+  local key="${label}|${train_seed}"
   local eval_env_cmd=(env)
   eval_dir="$(eval_dir_for "$label" "$train_seed" "$eval_seed")"
   log_file="$RUN_LOG_ROOT/${label}_trainseed${train_seed}_testseed${eval_seed}.log"
@@ -268,6 +533,24 @@ run_eval_job() {
   elif eval_completed "$eval_dir" "$model_dir"; then
     echo "[skip-eval] $label trainseed${train_seed} testseed${eval_seed}: complete"
     return 0
+  elif [ -f "$eval_dir/evaluation_results.json" ]; then
+    force_args+=(--force-rerun)
+  fi
+
+  if use_shared_selection; then
+    if [ -z "${SHARED_SELECTED_MODEL_PATHS[$key]:-}" ]; then
+      echo "[eval-error] missing shared selected checkpoint for $label trainseed${train_seed}" >&2
+      return 2
+    fi
+    helper_selection_protocol="fixed"
+    preselected_args+=(
+      --preselected-model-path "${SHARED_SELECTED_MODEL_PATHS[$key]}"
+    )
+    if [ -n "${SHARED_SELECTION_SUMMARIES[$key]:-}" ]; then
+      preselected_args+=(
+        --preselected-selection-summary "${SHARED_SELECTION_SUMMARIES[$key]}"
+      )
+    fi
   fi
 
   (
@@ -276,9 +559,9 @@ run_eval_job() {
       source "$CONDA_SH"
       conda activate "$CONDA_ENV_NAME"
       PYTHON_BIN="$(command -v python3)"
-      export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
+      configure_eval_gpu_env "$PYTHON_BIN"
     fi
-    export TF_FORCE_GPU_ALLOW_GROWTH="${TF_FORCE_GPU_ALLOW_GROWTH:-true}"
+    configure_eval_gpu_env "$PYTHON_BIN"
     case "${EVAL_FR_MODE,,}" in
       checkpoint|checkpoint_fr|model|model_fr|corresponding|corresponding_fr)
         eval_env_cmd+=( -u FORCE_EVAL_ACTION_FORCE_RATIO -u ACTION_FORCE_RATIO )
@@ -292,6 +575,9 @@ run_eval_job() {
         ;;
     esac
     "${eval_env_cmd[@]}" \
+      REWARD_VERSION="$REWARD_VERSION" \
+      REWARD_TERMINAL_ORDER_FIX="$REWARD_TERMINAL_ORDER_FIX" \
+      AGENT_SIZE="$AGENT_SIZE" \
       OFFICIAL_EVAL_QUIET=1 \
       QUIET_OUTPUT=1 \
       TQDM_DISABLE=1 \
@@ -301,9 +587,10 @@ run_eval_job() {
         --official-spec "$spec" \
         --output-dir "$eval_dir" \
         --model-variant "$MODEL_VARIANT" \
-        --selection-protocol "$SELECTION_PROTOCOL" \
+        --selection-protocol "$helper_selection_protocol" \
         --quiet-output 1 \
         --python-bin "$PYTHON_BIN" \
+        "${preselected_args[@]}" \
         "${force_args[@]}"
   ) 2>&1 | sed -u "s/^/[${label} trainseed${train_seed} testseed${eval_seed}] /" | tee "$log_file" &
 
@@ -321,10 +608,18 @@ preflight_checks() {
   is_positive_int "$TRAIN_EPISODES" || { echo "[preflight-error] TRAIN_EPISODES must be positive: $TRAIN_EPISODES" >&2; errors=$((errors + 1)); }
   is_positive_int "$EVAL_EPISODES" || { echo "[preflight-error] EVAL_EPISODES must be positive: $EVAL_EPISODES" >&2; errors=$((errors + 1)); }
   is_positive_int "$MAX_PARALLEL" || { echo "[preflight-error] MAX_PARALLEL must be positive: $MAX_PARALLEL" >&2; errors=$((errors + 1)); }
+  if use_shared_selection; then
+    is_positive_int "$SELECTION_VALIDATION_EPISODES" || { echo "[preflight-error] SELECTION_VALIDATION_EPISODES must be positive: $SELECTION_VALIDATION_EPISODES" >&2; errors=$((errors + 1)); }
+    if [ "${#SELECTION_VALIDATION_SEEDS[@]}" -eq 0 ]; then
+      echo "[preflight-error] SELECTION_VALIDATION_SEEDS must not be empty for shared selection" >&2
+      errors=$((errors + 1))
+    fi
+  fi
   [ -f "$ROOT_DIR/official_eval_with_matched_validation.py" ] || { echo "[preflight-error] official_eval_with_matched_validation.py missing" >&2; errors=$((errors + 1)); }
   [ -f "$ROOT_DIR/prepare_level2_eval_seed_specs.py" ] || { echo "[preflight-error] prepare_level2_eval_seed_specs.py missing" >&2; errors=$((errors + 1)); }
   [ -f "$ROOT_DIR/summarize_level2_dual_semantics_eval_sweep.py" ] || { echo "[preflight-error] summarize_level2_dual_semantics_eval_sweep.py missing" >&2; errors=$((errors + 1)); }
   [ -x "$PYTHON_BIN" ] || { echo "[preflight-error] PYTHON_BIN not executable: $PYTHON_BIN" >&2; errors=$((errors + 1)); }
+  echo "[preflight] reward version: $REWARD_VERSION | terminal_order_fix=$REWARD_TERMINAL_ORDER_FIX"
   case "${EVAL_FR_MODE,,}" in
     checkpoint|checkpoint_fr|model|model_fr|corresponding|corresponding_fr|forced|fixed|fixed_fr) ;;
     *) echo "[preflight-error] unknown EVAL_FR_MODE=$EVAL_FR_MODE (expected checkpoint or forced)" >&2; errors=$((errors + 1)); ;;
@@ -343,7 +638,7 @@ preflight_checks() {
         errors=$((errors + 1))
         continue
       fi
-      if ! model_has_variant "$model_dir" "$MODEL_VARIANT"; then
+      if ! use_shared_selection && ! model_has_variant "$model_dir" "$MODEL_VARIANT"; then
         echo "[preflight-error] model variant missing: $MODEL_VARIANT | $model_dir" >&2
         errors=$((errors + 1))
       fi
@@ -354,8 +649,12 @@ preflight_checks() {
     echo "[preflight] failed with $errors error(s)." >&2
     return 1
   fi
-  echo "[preflight] ok: Level3 specs and completed $MODEL_VARIANT models are available."
+  echo "[preflight] ok: Level3 specs and completed models are available."
   echo "[preflight] FR mode: $EVAL_FR_MODE"
+  echo "[preflight] selection protocol: $SELECTION_PROTOCOL | model variant: $MODEL_VARIANT"
+  if use_shared_selection; then
+    echo "[preflight] shared validation seeds: ${SELECTION_VALIDATION_SEEDS[*]} | episodes/seed=$SELECTION_VALIDATION_EPISODES | candidates=$SELECTION_VALIDATION_CANDIDATES"
+  fi
 }
 
 prepare_specs
@@ -365,11 +664,15 @@ if truthy "$PREFLIGHT_ONLY"; then
   exit 0
 fi
 
+if use_shared_selection; then
+  run_shared_selection_all
+fi
+
 for label in "${LABELS[@]}"; do
   for train_seed in "${TRAIN_SEEDS[@]}"; do
     model_dir="$(latest_completed_model_dir "$label" "$train_seed")"
     for eval_seed in "${EVAL_SEEDS[@]}"; do
-      while [ "$(jobs -pr | wc -l)" -ge "$MAX_PARALLEL" ]; do
+      while [ "$(active_job_count)" -ge "$MAX_PARALLEL" ]; do
         wait -n
       done
       run_eval_job "$label" "$train_seed" "$eval_seed" "$model_dir"
@@ -384,6 +687,11 @@ SUMMARY_FLAGS=()
 if truthy "$STRICT_SUMMARY"; then
   SUMMARY_FLAGS+=(--strict)
 fi
+case "${EVAL_FR_MODE,,}" in
+  forced|fixed|fixed_fr)
+    SUMMARY_FLAGS+=(--allow-forced-fr)
+    ;;
+esac
 
 MPLCONFIGDIR=/tmp/mplconfig "$PYTHON_BIN" "$ROOT_DIR/summarize_level2_dual_semantics_eval_sweep.py" \
   --run-tag "$RUN_TAG" \

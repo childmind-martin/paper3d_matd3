@@ -29,6 +29,7 @@
 """
 
 import argparse
+import copy
 import contextlib
 import hashlib
 import importlib
@@ -118,6 +119,28 @@ STRICT_CORE_EXPERIMENT_LABELS = [
 
 DUAL_SEMANTICS_EXPERIMENT_LABELS = [
     "matd3_full_dual_semantic",
+    "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_agent_quality",
+    "matd3_cross_agent_ref_soft_advantage",
+    "matd3_cross_agent_ref_selector_mix",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail0",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail01",
+    "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_current",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045",
+    "matd3_cross_agent_ref_reward_to_success_selector_clean_label",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail10",
+    "matd3_cross_agent_ref_progress_gate",
+    "matd3_cross_agent_ref_agent_success_behavior_label",
+    "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_no_quality_gate",
+    "matd3_cross_agent_ref_behavior_label",
     "matd3_collapsed_replay",
     "matd3_no_corrected_target_reconstruction",
 ]
@@ -161,6 +184,28 @@ AUDIT_REFERENCE_LABEL_BY_EXPERIMENT = {
     "matd3_full_dual_semantic": "matd3_full_dual_semantic",
     "matd3_collapsed_replay": "matd3_full_dual_semantic",
     "matd3_no_corrected_target_reconstruction": "matd3_full_dual_semantic",
+    "matd3_cross_agent_ref_agent_success": "matd3_full_dual_semantic",
+    "matd3_cross_agent_ref_agent_quality": "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_soft_advantage": "matd3_cross_agent_ref_agent_quality",
+    "matd3_cross_agent_ref_selector_mix": "matd3_cross_agent_ref_soft_advantage",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail0": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail01": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector": "matd3_cross_agent_ref_selector_mix",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_current": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_clean_label": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail10": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_progress_gate": "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_agent_success_behavior_label": "matd3_cross_agent_ref_agent_success",
+    "matd3_full_dual_semantic_cross_agent_ref": "matd3_full_dual_semantic",
+    "matd3_cross_agent_ref_no_quality_gate": "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_behavior_label": "matd3_full_dual_semantic_cross_agent_ref",
     "maddpg_separated_gradient": "maddpg_separated_gradient",
     "maddpg_dual_q": "maddpg_separated_gradient",
     "maddpg_baseline": "maddpg_separated_gradient",
@@ -208,6 +253,28 @@ EXPERIMENT_ABBR_BY_LABEL = {
     "matd3_full_dual_semantic": "Full-DS",
     "matd3_collapsed_replay": "Coll-RB",
     "matd3_no_corrected_target_reconstruction": "No-Tgt",
+    "matd3_cross_agent_ref_agent_success": "XRef-Succ",
+    "matd3_cross_agent_ref_agent_quality": "XRef-Qual",
+    "matd3_cross_agent_ref_soft_advantage": "XRef-SoftAdv",
+    "matd3_cross_agent_ref_selector_mix": "XRef-Sel",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail0": "XRef-R2S-T0",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail01": "XRef-R2S-T01",
+    "matd3_cross_agent_ref_reward_to_success_selector": "XRef-R2S",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector": "XRef-R2S-HT",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": "XRef-R2S-HT-SplitT",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_current": "R2S-CurFR",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": "R2S-FR40",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045": "R2S-FR45",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current": "R2S-HT-CurFR",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40": "R2S-HT-FR40",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045": "R2S-HT-FR45",
+    "matd3_cross_agent_ref_reward_to_success_selector_clean_label": "XRef-R2S-Clean",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail10": "XRef-R2S-T10",
+    "matd3_cross_agent_ref_progress_gate": "XRef-Prog",
+    "matd3_cross_agent_ref_agent_success_behavior_label": "XRef-Beh",
+    "matd3_full_dual_semantic_cross_agent_ref": "CrossRef",
+    "matd3_cross_agent_ref_no_quality_gate": "NoGate",
+    "matd3_cross_agent_ref_behavior_label": "BehLbl",
     "maddpg_separated_gradient": "DPG-Sep",
     "maddpg_dual_q": "DPG-Uni",
     "maddpg_baseline": "DPG-Base",
@@ -286,6 +353,106 @@ ALLOWED_MANIFEST_ARG_DIFF_KEYS = {
     "--maddpg-use-dual-q",
     "--maddpg-use-separated-gradient",
     "--mappo-use-separated-gradient",
+}
+
+CROSS_AGENT_REFERENCE_ENV_KEYS = {
+    "CROSS_AGENT_REFERENCE_ENABLED",
+    "CROSS_AGENT_REFERENCE_COEF",
+    "CROSS_AGENT_REFERENCE_START_EPISODE",
+    "CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE",
+    "CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES",
+    "CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS",
+    "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD",
+    "CROSS_AGENT_REFERENCE_MARGIN",
+    "CROSS_AGENT_REFERENCE_HEAD_WEIGHT",
+    "CROSS_AGENT_REFERENCE_TAIL_WEIGHT",
+    "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL",
+    "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS",
+    "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM",
+    "CROSS_AGENT_REFERENCE_QUALITY_GATE",
+    "CROSS_AGENT_REFERENCE_GATE_MODE",
+    "CROSS_AGENT_REFERENCE_UPDATE_INTERVAL",
+    "CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT",
+    "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED",
+    "CROSS_AGENT_REFERENCE_SELECTOR_MODE",
+    "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA",
+    "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU",
+    "CROSS_AGENT_REFERENCE_SELECTOR_LR",
+    "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN",
+    "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT",
+    "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP",
+    "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU",
+    "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK",
+    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW",
+    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA",
+    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE",
+    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES",
+    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES",
+}
+
+CROSS_AGENT_REFERENCE_ARG_KEYS = {
+    "--cross-agent-reference-enabled",
+    "--cross-agent-reference-coef",
+    "--cross-agent-reference-start-episode",
+    "--cross-agent-reference-actor-start-episode",
+    "--cross-agent-reference-actor-ramp-episodes",
+    "--cross-agent-reference-actor-require-success",
+    "--cross-agent-reference-progress-threshold",
+    "--cross-agent-reference-margin",
+    "--cross-agent-reference-head-weight",
+    "--cross-agent-reference-tail-weight",
+    "--cross-agent-reference-use-clean-label",
+    "--cross-agent-reference-target-semantics",
+    "--cross-agent-reference-exclude-random",
+    "--cross-agent-reference-quality-gate",
+    "--cross-agent-reference-gate-mode",
+    "--cross-agent-reference-update-interval",
+    "--cross-agent-reference-pairs-per-agent",
+    "--cross-agent-reference-selector-enabled",
+    "--cross-agent-reference-selector-mode",
+    "--cross-agent-reference-selector-alpha",
+    "--cross-agent-reference-selector-q-tau",
+    "--cross-agent-reference-selector-lr",
+    "--cross-agent-reference-selector-hidden",
+    "--cross-agent-reference-selector-init-logit",
+    "--cross-agent-reference-selector-adv-clip",
+    "--cross-agent-reference-selector-reward-tau",
+    "--cross-agent-reference-selector-reward-tiebreak",
+    "--cross-agent-reference-selector-success-stable-window",
+    "--cross-agent-reference-selector-success-stable-delta",
+    "--cross-agent-reference-selector-success-stable-min-rate",
+    "--cross-agent-reference-selector-success-stable-min-episodes",
+    "--cross-agent-reference-selector-success-ramp-episodes",
+    "--cross-agent-reference-team-goal-relaxed-near-mult",
+    "--cross-agent-reference-team-goal-single-cap",
+    "--cross-agent-reference-team-goal-two-near-score",
+    "--cross-agent-reference-team-goal-all-near-score",
+    "--cross-agent-reference-team-goal-close-weight",
+}
+
+CROSS_AGENT_REFERENCE_LABELS = {
+    "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_agent_quality",
+    "matd3_cross_agent_ref_soft_advantage",
+    "matd3_cross_agent_ref_selector_mix",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail0",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail01",
+    "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_current",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40",
+    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045",
+    "matd3_cross_agent_ref_reward_to_success_selector_clean_label",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail10",
+    "matd3_cross_agent_ref_progress_gate",
+    "matd3_cross_agent_ref_agent_success_behavior_label",
+    "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_no_quality_gate",
+    "matd3_cross_agent_ref_behavior_label",
 }
 
 
@@ -434,10 +601,16 @@ def _list_label_run_dirs(project_logs_root: Path, label: str) -> List[Path]:
 
 
 def _find_latest_log_dir_by_exp_name_base(project_logs_root: Path, exp_name_base: str) -> Optional[str]:
+    candidates = _candidate_log_dirs_by_exp_name_base(project_logs_root, exp_name_base)
+    return str(candidates[0]) if candidates else None
+
+
+def _candidate_log_dirs_by_exp_name_base(project_logs_root: Path, exp_name_base: str) -> List[Path]:
     matching_roots: List[Path] = []
+    candidates: List[Path] = []
     try:
         if not project_logs_root.exists():
-            return None
+            return candidates
         prefix = f"{exp_name_base}_"
         for item in project_logs_root.iterdir():
             if not item.is_dir():
@@ -451,16 +624,17 @@ def _find_latest_log_dir_by_exp_name_base(project_logs_root: Path, exp_name_base
         for root in matching_roots:
             resolved = _resolve_run_log_dir(project_logs_root, root.name)
             if resolved:
-                return resolved
+                candidates.append(Path(resolved))
+                continue
             metric_file = (
                 resolve_metric_file(str(root), "episode_rewards.json")
                 or resolve_metric_file(str(root), "results.json")
             )
             if metric_file is not None:
-                return str(metric_file.parent)
-        return None
+                candidates.append(metric_file.parent)
+        return candidates
     except Exception:
-        return None
+        return candidates
 
 
 def _resolve_current_run_log_dir(project_logs_root: Path, label: str, before_names: set) -> Optional[str]:
@@ -1208,7 +1382,9 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "--terrain-base-seed",
         "--training-env-sequence-seed",
     }
+    allowed_argv_only_in_ref = set()
     allowed_argv_changed = set()
+    allowed_env_only_in_ref = set()
     allowed_env_only_in_cur = {
         "DETERMINISTIC_TRAIN_ENV_SEQUENCE",
         "ENABLE_RANDOM_TERRAIN_COMPLEXITY_PROGRESSION",
@@ -1251,14 +1427,35 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
     if cur_label == "matd3_no_corrected_target_reconstruction" and ref_label == "matd3_full_dual_semantic":
         allowed_argv_changed.add("--matd3-reconstruct-corrected-target")
         allowed_env_changed.add("MATD3_RECONSTRUCT_CORRECTED_TARGET")
+    if cur_label in CROSS_AGENT_REFERENCE_LABELS:
+        allowed_argv_changed.update(CROSS_AGENT_REFERENCE_ARG_KEYS)
+        allowed_argv_only_in_cur.update(CROSS_AGENT_REFERENCE_ARG_KEYS)
+        allowed_env_changed.update(CROSS_AGENT_REFERENCE_ENV_KEYS)
+        allowed_env_only_in_cur.update(CROSS_AGENT_REFERENCE_ENV_KEYS)
+    if "_fr_" in cur_label:
+        fr_schedule_arg_keys = {
+            "--action-force-ratio",
+            "--action-force-ratio-schedule-pct",
+        }
+        fr_schedule_env_keys = {
+            "ACTION_FORCE_RATIO",
+            "ACTION_FORCE_RATIO_SCHEDULE_PCT",
+            "FR_SCHEDULE_VARIANT_LOCK",
+        }
+        allowed_argv_changed.update(fr_schedule_arg_keys)
+        allowed_argv_only_in_cur.update(fr_schedule_arg_keys)
+        allowed_argv_only_in_ref.update(fr_schedule_arg_keys)
+        allowed_env_changed.update(fr_schedule_env_keys)
+        allowed_env_only_in_cur.update(fr_schedule_env_keys)
+        allowed_env_only_in_ref.update(fr_schedule_env_keys)
     if cur_label == "mappo_fusion_only" and ref_label == "mappo_baseline":
         allowed_argv_changed.add("--use-pf-feature")
         allowed_env_changed.add("USE_PF_FEATURE")
 
-    unexpected_argv_only_in_ref = list(argv_only_in_ref)
+    unexpected_argv_only_in_ref = sorted(key for key in argv_only_in_ref if key not in allowed_argv_only_in_ref)
     unexpected_argv_only_in_cur = sorted(key for key in argv_only_in_cur if key not in allowed_argv_only_in_cur)
     unexpected_argv_changed = sorted(key for key in argv_changed if key not in allowed_argv_changed)
-    unexpected_env_only_in_ref = list(env_only_in_ref)
+    unexpected_env_only_in_ref = sorted(key for key in env_only_in_ref if key not in allowed_env_only_in_ref)
     unexpected_env_only_in_cur = sorted(key for key in env_only_in_cur if key not in allowed_env_only_in_cur)
     unexpected_env_changed = sorted(key for key in env_changed if key not in allowed_env_changed)
 
@@ -1287,8 +1484,10 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "env_only_in_ref": env_only_in_ref,
         "env_only_in_cur": env_only_in_cur,
         "env_changed": {key: {"ref": env_ref.get(key), "cur": env_cur.get(key)} for key in env_changed},
+        "allowed_argv_only_in_ref": sorted(allowed_argv_only_in_ref),
         "allowed_argv_only_in_cur": sorted(allowed_argv_only_in_cur),
         "allowed_argv_changed": sorted(allowed_argv_changed),
+        "allowed_env_only_in_ref": sorted(allowed_env_only_in_ref),
         "allowed_env_only_in_cur": sorted(allowed_env_only_in_cur),
         "allowed_env_changed": sorted(allowed_env_changed),
         "unexpected_argv_only_in_ref": unexpected_argv_only_in_ref,
@@ -1547,7 +1746,8 @@ def _resolve_post_eval_validation_candidates(args) -> List[str]:
     allowed = {"auto", "final", "best", "best_by_team_sr", "latest_ep", "checkpoint"}
     ordered: List[str] = []
     for token in tokens:
-        if not token or token not in allowed or token in ordered:
+        is_explicit_ep = token.startswith("ep") and token[2:].isdigit()
+        if not token or (token not in allowed and not is_explicit_ep) or token in ordered:
             continue
         ordered.append(token)
     if not ordered:
@@ -4413,6 +4613,23 @@ def _sort_experiment_configs(configs: List[Dict[str, Any]]) -> List[Dict[str, An
     order_map = {label: idx for idx, label in enumerate(EXPERIMENT_DISPLAY_ORDER)}
     return sorted(configs, key=lambda cfg: order_map.get(cfg["label"], len(order_map)))
 
+
+def _select_experiment_configs_preserve_label_order(labels: Sequence[str]) -> List[Dict[str, Any]]:
+    requested = [str(label).strip() for label in labels if str(label).strip()]
+    config_by_label = {str(cfg["label"]): cfg for cfg in EXPERIMENT_CONFIGS}
+    missing = [label for label in requested if label not in config_by_label]
+    if missing:
+        raise RuntimeError(f"以下实验标签未注册: {missing}")
+
+    configs: List[Dict[str, Any]] = []
+    seen = set()
+    for label in requested:
+        if label in seen:
+            continue
+        seen.add(label)
+        configs.append(config_by_label[label])
+    return configs
+
 def plot_comparison_rewards_dualq(series, title, output_path, smooth_window=10, fit_method="moving_average"):
     """绘制奖励对比图（6种不同颜色）"""
     import matplotlib
@@ -6753,6 +6970,419 @@ EXPERIMENT_CONFIGS = [
             "MATD3_ACTION_SEMANTICS_MODE": "dual",
             "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
             "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "0",
+        }
+    },
+    {
+        "label": "matd3_full_dual_semantic_cross_agent_ref",
+        "name": "MATD3 Full Dual-Semantic + Cross-Agent Reference",
+        "name_en": "Full DS + Cross-Agent Reference",
+        "description": "Proposed optimization: keeps full dual semantic replay/target semantics and adds quality-gated cross-agent reference imitation on Actor updates.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "progress",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_agent_success",
+        "name": "MATD3 Cross-Agent Reference - Agent Success Gate",
+        "name_en": "Cross-Agent Ref - Agent Success Gate",
+        "description": "Optimized mechanism: cross-agent reference imitation uses clean Actor labels only from the referenced UAV's successful trajectory samples.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_success",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_agent_quality",
+        "name": "MATD3 Cross-Agent Reference - Agent Quality Gate",
+        "name_en": "Cross-Agent Ref - Agent Quality Gate",
+        "description": "Mechanism ablation: clean cross-agent reference uses per-UAV safe high-quality trajectory samples, allowing safe reach/progress/near-goal segments.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_soft_advantage",
+        "name": "MATD3 Cross-Agent Reference - Soft Advantage",
+        "name_en": "Cross-Agent Ref - Soft Advantage",
+        "description": "Mechanism ablation: cross-agent reference uses hindsight labels mixed with source-critic advantage as a soft imitation weight, without a trainable selector.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "soft_advantage",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_selector_mix",
+        "name": "MATD3 Cross-Agent Reference - Selector Mix",
+        "name_en": "Cross-Agent Ref - Selector Mix",
+        "description": "Proposed mechanism: trains a selector network from hindsight labels mixed with source-critic advantage, then uses its score to weight cross-agent imitation.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "selector_mix",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_reward_to_success_selector",
+        "name": "MATD3 Cross-Agent Reference - Reward-to-Success Selector",
+        "name_en": "Cross-Agent Ref - Reward-to-Success Selector",
+        "description": "Mechanism ablation: trains the selector with reward-first targets early, then switches through local per-UAV success toward team-success-priority targets; actor imitation uses replay behavior actions.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "reward_to_success_priority",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW": "100",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA": "0.02",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES": "200",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES": "50",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+        "name": "MATD3 Cross-Agent Reference - R2S Head/Tail Selector",
+        "name_en": "Cross-Agent Ref - R2S Head/Tail Selector",
+        "description": "Mechanism ablation: keeps the reward-to-success behavior-action selector but uses a two-output selector to control actor head and APF/tail imitation separately.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "reward_to_success_head_tail",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW": "100",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA": "0.02",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES": "200",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES": "50",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
+        "name": "MATD3 Cross-Agent Reference - R2S Head/Tail Split Teacher Selector",
+        "name_en": "Cross-Agent Ref - R2S Head/Tail Split Teacher Selector",
+        "description": "Mechanism ablation: keeps the two-output R2S head/tail selector, but classifies the teacher action so head imitates replay raw behavior while tail imitates corrected/executed behavior.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS": "split_raw_head_corrected_tail",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "reward_to_success_head_tail",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW": "100",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA": "0.02",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES": "200",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES": "50",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_reward_to_success_selector_clean_label",
+        "name": "MATD3 Cross-Agent Reference - Reward-to-Success Selector Clean Label",
+        "name_en": "Cross-Agent Ref - R2S Selector Clean Label",
+        "description": "Causal check for R2S: keeps the current reward-to-success selector but imitates clean actor outputs instead of replay behavior actions.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "reward_to_success_priority",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW": "100",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA": "0.02",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES": "200",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES": "50",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_progress_gate",
+        "name": "MATD3 Cross-Agent Reference - Progress Gate",
+        "name_en": "Cross-Agent Ref - Progress Gate",
+        "description": "Mechanism ablation: keeps the old single-step target-distance progress gate for direct comparison with trajectory-label gates.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "progress",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_agent_success_behavior_label",
+        "name": "MATD3 Cross-Agent Reference - Agent Success Behavior Label",
+        "name_en": "Cross-Agent Ref - Agent Success Behavior Label",
+        "description": "Mechanism ablation: per-UAV successful trajectory gate is kept, but the imitation target uses replay behavior actions instead of clean Actor labels.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_success",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_no_quality_gate",
+        "name": "MATD3 Cross-Agent Reference - No Quality Gate",
+        "name_en": "Cross-Agent Ref - No Quality Gate",
+        "description": "Mechanism ablation: cross-agent reference imitation is enabled but target-distance progress/near-goal quality filtering is removed.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "1",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "0",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "progress",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_behavior_label",
+        "name": "MATD3 Cross-Agent Reference - Behavior Label",
+        "name_en": "Cross-Agent Ref - Behavior Label",
+        "description": "Mechanism ablation: quality-gated cross-agent reference imitation uses replay behavior actions instead of clean Actor labels.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "progress",
         }
     },
     {
@@ -6768,6 +7398,7 @@ EXPERIMENT_CONFIGS = [
             "MATD3_ACTION_SEMANTICS_MODE": "collapsed_replay",
             "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
             "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "0",
         }
     },
     {
@@ -6783,6 +7414,7 @@ EXPERIMENT_CONFIGS = [
             "MATD3_ACTION_SEMANTICS_MODE": "dual",
             "MATD3_RECONSTRUCT_CORRECTED_TARGET": "0",
             "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "0",
         }
     },
     {
@@ -6858,6 +7490,140 @@ EXPERIMENT_CONFIGS = [
         }
     }
 ]
+
+
+def _insert_r2s_tail_weight_ablation_configs() -> None:
+    """Add R2S tail-weight variants cloned from the canonical R2S config."""
+    base_label = "matd3_cross_agent_ref_reward_to_success_selector"
+    existing_labels = {str(cfg.get("label")) for cfg in EXPERIMENT_CONFIGS}
+    try:
+        base_index, base_config = next(
+            (idx, cfg)
+            for idx, cfg in enumerate(EXPERIMENT_CONFIGS)
+            if str(cfg.get("label")) == base_label
+        )
+    except StopIteration as exc:
+        raise RuntimeError(f"base R2S experiment config missing: {base_label}") from exc
+
+    variants = [
+        (
+            "matd3_cross_agent_ref_reward_to_success_selector_tail0",
+            "0.0",
+            "MATD3 Cross-Agent Reference - Reward-to-Success Selector (Tail 0.0)",
+            "Cross-Agent Ref - R2S Selector Tail 0.0",
+            "Tail-weight ablation: same reward-to-success selector as the canonical R2S run, but cross-agent reference imitation is applied only to the actor head.",
+        ),
+        (
+            "matd3_cross_agent_ref_reward_to_success_selector_tail01",
+            "0.1",
+            "MATD3 Cross-Agent Reference - Reward-to-Success Selector (Tail 0.1)",
+            "Cross-Agent Ref - R2S Selector Tail 0.1",
+            "Tail-weight ablation: same reward-to-success selector as the canonical R2S run, with weak APF/tail imitation weight 0.1.",
+        ),
+        (
+            "matd3_cross_agent_ref_reward_to_success_selector_tail10",
+            "1.0",
+            "MATD3 Cross-Agent Reference - Reward-to-Success Selector (Tail 1.0)",
+            "Cross-Agent Ref - R2S Selector Tail 1.0",
+            "Tail-weight ablation: same reward-to-success selector as the canonical R2S run, with full-strength APF/tail imitation weight 1.0.",
+        ),
+    ]
+
+    insert_at = base_index + 1
+    for label, tail_weight, name, name_en, description in variants:
+        if label in existing_labels:
+            continue
+        cfg = copy.deepcopy(base_config)
+        cfg["label"] = label
+        cfg["name"] = name
+        cfg["name_en"] = name_en
+        cfg["description"] = description
+        cfg.setdefault("env", {})["CROSS_AGENT_REFERENCE_TAIL_WEIGHT"] = tail_weight
+        EXPERIMENT_CONFIGS.insert(insert_at, cfg)
+        insert_at += 1
+        existing_labels.add(label)
+
+
+_insert_r2s_tail_weight_ablation_configs()
+
+
+def _insert_r2s_fr_schedule_ablation_configs() -> None:
+    """Add paired R2S FR-schedule variants for unified vs head/tail borrowing."""
+    base_specs = [
+        (
+            "matd3_cross_agent_ref_reward_to_success_selector",
+            "MATD3 Cross-Agent Reference - R2S Unified",
+            "Cross-Agent Ref - R2S Unified",
+            "reward-to-success selector with one shared selector score for head and tail imitation",
+            "matd3_cross_agent_ref_reward_to_success_selector",
+        ),
+        (
+            "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+            "MATD3 Cross-Agent Reference - R2S Head/Tail",
+            "Cross-Agent Ref - R2S Head/Tail",
+            "reward-to-success selector with separate selector scores for actor head and APF/tail imitation",
+            "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+        ),
+    ]
+    schedule_specs = [
+        (
+            "fr_current",
+            "Current FR Schedule",
+            "current FR",
+            "0.50",
+            DEFAULT_UNIFIED_ACTION_FORCE_RATIO_SCHEDULE_PCT,
+        ),
+        (
+            "fr_floor40",
+            "FR Schedule Floor 0.40",
+            "FR floor 0.40",
+            "0.50",
+            "0%:0.50,25%:0.48,50%:0.45,70%:0.43,85%:0.40,100%:0.40",
+        ),
+        (
+            "fr_fixed045",
+            "Fixed FR 0.45",
+            "fixed FR 0.45",
+            "0.45",
+            "DISABLED",
+        ),
+    ]
+
+    existing_labels = {str(cfg.get("label")) for cfg in EXPERIMENT_CONFIGS}
+    config_by_label = {str(cfg.get("label")): (idx, cfg) for idx, cfg in enumerate(EXPERIMENT_CONFIGS)}
+
+    insert_at = max(
+        idx
+        for idx, cfg in enumerate(EXPERIMENT_CONFIGS)
+        if str(cfg.get("label")) in {base_label for base_label, *_ in base_specs}
+    ) + 1
+
+    for base_label, name_prefix, name_en_prefix, description_prefix, label_prefix in base_specs:
+        if base_label not in config_by_label:
+            raise RuntimeError(f"base R2S experiment config missing: {base_label}")
+        _, base_config = config_by_label[base_label]
+        for suffix, schedule_name, schedule_short, action_force_ratio, schedule_pct in schedule_specs:
+            label = f"{label_prefix}_{suffix}"
+            if label in existing_labels:
+                continue
+            cfg = copy.deepcopy(base_config)
+            cfg["label"] = label
+            cfg["name"] = f"{name_prefix} ({schedule_name})"
+            cfg["name_en"] = f"{name_en_prefix} ({schedule_name})"
+            cfg["description"] = (
+                f"FR-schedule ablation: {description_prefix}; uses {schedule_short} "
+                "under the same seed101 training and official 10x30 evaluation environment."
+            )
+            env = cfg.setdefault("env", {})
+            env["ACTION_FORCE_RATIO"] = action_force_ratio
+            env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = schedule_pct
+            env["FR_SCHEDULE_VARIANT_LOCK"] = "1"
+            EXPERIMENT_CONFIGS.insert(insert_at, cfg)
+            insert_at += 1
+            existing_labels.add(label)
+
+
+_insert_r2s_fr_schedule_ablation_configs()
 
 
 def parse_args():
@@ -7366,8 +8132,7 @@ def _apply_experiment_group_overrides(args) -> Tuple[str, str]:
 
 def _select_experiment_configs(args) -> List[Dict[str, Any]]:
     if args.experiments:
-        configs_to_run = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in args.experiments]
-        configs_to_run = _sort_experiment_configs(configs_to_run)
+        configs_to_run = _select_experiment_configs_preserve_label_order(args.experiments)
         if not configs_to_run:
             raise RuntimeError(f"未找到指定实验: {args.experiments}")
         reference_selected = sorted(
@@ -7385,14 +8150,10 @@ def _select_experiment_configs(args) -> List[Dict[str, Any]]:
 
 
 def _select_experiment_configs_by_labels(labels: Sequence[str]) -> List[Dict[str, Any]]:
-    requested = [str(label) for label in labels if str(label).strip()]
-    configs = [cfg for cfg in EXPERIMENT_CONFIGS if cfg["label"] in requested]
-    configs = _sort_experiment_configs(configs)
+    requested = [str(label).strip() for label in labels if str(label).strip()]
+    configs = _select_experiment_configs_preserve_label_order(requested)
     if requested and not configs:
         raise RuntimeError(f"未找到指定实验: {requested}")
-    missing = sorted(set(requested) - {cfg["label"] for cfg in configs})
-    if missing:
-        raise RuntimeError(f"以下实验标签未注册: {missing}")
     return configs
 
 
@@ -7882,6 +8643,19 @@ def setup_base_env_vars(
     else:
         raise ValueError(f"未知配置模式: {config_mode}")
 
+    if _to_bool(os.environ.get("RESTORE_FULL_BASELINE_LEGACY", "0")):
+        env["RESTORE_FULL_BASELINE_LEGACY"] = "1"
+        env["BUFFER_SIZE"] = "250000"
+        env["ACTION_REG_MIN_COEF"] = "0.01"
+        env["ADAPTIVE_PATIENCE"] = "25"
+        env["ADAPTIVE_LR_DECAY"] = "0.98"
+        env["ADAPTIVE_ACTOR_LR_DECAY"] = "0.98"
+        env["ADAPTIVE_CRITIC_LR_DECAY"] = "0.98"
+        env["ADAPTIVE_MIN_LR"] = "8e-5"
+        env["ADAPTIVE_MIN_ACTOR_LR"] = "8e-5"
+        env["ADAPTIVE_MIN_CRITIC_LR"] = "8e-5"
+        env["ADAPTIVE_PLATEAU_ENABLED"] = "0"
+
     return env
 
 
@@ -7920,18 +8694,45 @@ def _apply_runtime_env_overrides(env: Dict[str, str], args) -> Dict[str, str]:
         env["XLA_COMPILE_PARALLELISM"] = str(max(1, int(args.xla_compile_parallelism)))
     else:
         env.pop("XLA_COMPILE_PARALLELISM", None)
-    if getattr(args, "action_force_ratio", None) is not None:
-        env["ACTION_FORCE_RATIO"] = str(float(args.action_force_ratio))
-    else:
-        env.pop("ACTION_FORCE_RATIO", None)
-    if getattr(args, "action_force_ratio_schedule_pct", None) is not None:
-        env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = str(getattr(args, "action_force_ratio_schedule_pct", "") or "")
-    else:
-        env.pop("ACTION_FORCE_RATIO_SCHEDULE_PCT", None)
+    if (
+        getattr(args, "cuda_launch_blocking", None) is not None
+        or getattr(args, "tf_sync_on_finish", None) is not None
+    ):
+        env["MATD3_ALLOW_RUNTIME_DEBUG_OVERRIDES"] = "1"
+    fr_schedule_variant_locked = _to_bool(env.get("FR_SCHEDULE_VARIANT_LOCK", "0"))
+    if not fr_schedule_variant_locked:
+        if getattr(args, "action_force_ratio", None) is not None:
+            env["ACTION_FORCE_RATIO"] = str(float(args.action_force_ratio))
+        else:
+            env.pop("ACTION_FORCE_RATIO", None)
+        if getattr(args, "action_force_ratio_schedule_pct", None) is not None:
+            env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = str(getattr(args, "action_force_ratio_schedule_pct", "") or "")
+        else:
+            env.pop("ACTION_FORCE_RATIO_SCHEDULE_PCT", None)
     if getattr(args, "force_eval_action_force_ratio", None) is not None:
         env["FORCE_EVAL_ACTION_FORCE_RATIO"] = str(float(args.force_eval_action_force_ratio))
     else:
         env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
+    if os.environ.get("CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"):
+        env["CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"] = str(
+            max(1, int(os.environ["CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"]))
+        )
+    if os.environ.get("CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"):
+        env["CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"] = str(
+            max(0, int(os.environ["CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"]))
+        )
+    if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"):
+        env["CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"] = str(
+            max(0, int(os.environ["CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"]))
+        )
+    if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"):
+        env["CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"] = str(
+            max(0, int(os.environ["CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"]))
+        )
+    if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"):
+        env["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"] = "1" if _to_bool(
+            os.environ["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"]
+        ) else "0"
     return env
 
 
@@ -8071,9 +8872,44 @@ def _resolve_experiment_manifest(
         "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES",
         "USE_DYNAMIC_OBSTACLES",
         "TERRAIN_CONTACT_EPS",
+        "ACTION_FORCE_RATIO",
+        "ACTION_FORCE_RATIO_SCHEDULE_PCT",
+        "FR_SCHEDULE_VARIANT_LOCK",
         "SCENARIO_SEED",
         "POSITIONS_FILE",
         "USE_FIXED_POSITIONS",
+        "CROSS_AGENT_REFERENCE_ENABLED",
+        "CROSS_AGENT_REFERENCE_COEF",
+        "CROSS_AGENT_REFERENCE_START_EPISODE",
+        "CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE",
+        "CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES",
+        "CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS",
+        "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD",
+        "CROSS_AGENT_REFERENCE_MARGIN",
+        "CROSS_AGENT_REFERENCE_HEAD_WEIGHT",
+        "CROSS_AGENT_REFERENCE_TAIL_WEIGHT",
+        "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL",
+        "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS",
+        "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM",
+        "CROSS_AGENT_REFERENCE_QUALITY_GATE",
+        "CROSS_AGENT_REFERENCE_GATE_MODE",
+        "CROSS_AGENT_REFERENCE_UPDATE_INTERVAL",
+        "CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT",
+        "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED",
+        "CROSS_AGENT_REFERENCE_SELECTOR_MODE",
+        "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA",
+        "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU",
+        "CROSS_AGENT_REFERENCE_SELECTOR_LR",
+        "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN",
+        "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT",
+        "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP",
+        "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU",
+        "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK",
+        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW",
+        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA",
+        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE",
+        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES",
+        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES",
     )
     for key in training_env_exec_keys:
         if key in env:
@@ -8233,27 +9069,45 @@ def run_experiment(
                 except Exception:
                     reuse_require_explicit_training_environment = False
             seeded_exp_name_base = _build_seeded_exp_name_base(label, args)
+            reuse_candidates: List[Path] = []
             if seeded_exp_name_base and seeded_exp_name_base != label:
-                log_dir = _find_latest_log_dir_by_exp_name_base(reuse_logs_root, seeded_exp_name_base)
-            if not log_dir:
-                log_dir = find_latest_log_dir(label, str(reuse_logs_root))
-            metrics = load_metrics(log_dir)
-            validation_errors = _validate_loaded_result(
-                cfg=cfg,
-                log_dir=log_dir,
-                metrics=metrics,
-                expected_episodes=int(args.episodes),
-                positions_file=Path(positions_file),
-                expected_terrain_seed=int(args.resolved_scenario_seed),
-                expected_training_setup=_effective_training_environment_setup(args),
-                batch_seed=getattr(args, 'batch_seed', None),
-                manifest_path=Path(reuse_manifest_path) if reuse_manifest_path is not None else None,
-                require_explicit_training_environment=reuse_require_explicit_training_environment,
-            )
-            if validation_errors:
-                raise RuntimeError(
-                    "[复用-{}] 历史结果有效性校验失败: {}".format(label, " | ".join(validation_errors))
+                reuse_candidates.extend(_candidate_log_dirs_by_exp_name_base(reuse_logs_root, seeded_exp_name_base))
+            reuse_candidates.extend(_candidate_log_dirs_by_exp_name_base(reuse_logs_root, label))
+            try:
+                latest_fallback = find_latest_log_dir(label, str(reuse_logs_root))
+                if latest_fallback:
+                    reuse_candidates.append(Path(latest_fallback))
+            except Exception:
+                pass
+            seen_candidates = set()
+            validation_failures: List[str] = []
+            metrics: Dict[str, Any] = {}
+            for candidate_log_dir in reuse_candidates:
+                candidate_key = str(candidate_log_dir)
+                if candidate_key in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_key)
+                candidate_metrics = load_metrics(candidate_key)
+                validation_errors = _validate_loaded_result(
+                    cfg=cfg,
+                    log_dir=candidate_key,
+                    metrics=candidate_metrics,
+                    expected_episodes=int(args.episodes),
+                    positions_file=Path(positions_file),
+                    expected_terrain_seed=int(args.resolved_scenario_seed),
+                    expected_training_setup=_effective_training_environment_setup(args),
+                    batch_seed=getattr(args, 'batch_seed', None),
+                    manifest_path=Path(reuse_manifest_path) if reuse_manifest_path is not None else None,
+                    require_explicit_training_environment=reuse_require_explicit_training_environment,
                 )
+                if not validation_errors:
+                    log_dir = candidate_key
+                    metrics = candidate_metrics
+                    break
+                validation_failures.append(f"{candidate_key}: {' | '.join(validation_errors)}")
+            if not log_dir:
+                detail = " ; ".join(validation_failures[:5]) if validation_failures else "未找到候选日志目录"
+                raise RuntimeError(f"[复用-{label}] 未找到通过校验的历史结果: {detail}")
             reused = {
                 "label": label,
                 "name": cfg.get("name", label),

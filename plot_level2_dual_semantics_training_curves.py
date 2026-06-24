@@ -20,6 +20,16 @@ import numpy as np
 
 LABELS = [
     "matd3_full_dual_semantic",
+    "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_agent_quality",
+    "matd3_cross_agent_ref_soft_advantage",
+    "matd3_cross_agent_ref_selector_mix",
+    "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_progress_gate",
+    "matd3_cross_agent_ref_agent_success_behavior_label",
+    "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_no_quality_gate",
+    "matd3_cross_agent_ref_behavior_label",
     "matd3_collapsed_replay",
     "matd3_no_corrected_target_reconstruction",
 ]
@@ -28,12 +38,32 @@ DISPLAY_NAMES = {
     "matd3_full_dual_semantic": "Full Dual-Semantic",
     "matd3_collapsed_replay": "Collapsed Replay",
     "matd3_no_corrected_target_reconstruction": "No Corrected Target Recon",
+    "matd3_cross_agent_ref_agent_success": "CrossRef Agent Success",
+    "matd3_cross_agent_ref_agent_quality": "CrossRef Agent Quality",
+    "matd3_cross_agent_ref_soft_advantage": "CrossRef Soft Advantage",
+    "matd3_cross_agent_ref_selector_mix": "CrossRef Selector Mix",
+    "matd3_cross_agent_ref_reward_to_success_selector": "CrossRef Reward-to-Success Selector",
+    "matd3_cross_agent_ref_progress_gate": "CrossRef Progress Gate",
+    "matd3_cross_agent_ref_agent_success_behavior_label": "CrossRef Success Behavior Label",
+    "matd3_full_dual_semantic_cross_agent_ref": "Full DS + CrossRef",
+    "matd3_cross_agent_ref_no_quality_gate": "CrossRef No Gate",
+    "matd3_cross_agent_ref_behavior_label": "CrossRef Behavior Label",
 }
 
 COLORS = {
     "matd3_full_dual_semantic": "#1F77B4",
     "matd3_collapsed_replay": "#B07AA1",
     "matd3_no_corrected_target_reconstruction": "#E45756",
+    "matd3_cross_agent_ref_agent_success": "#009E73",
+    "matd3_cross_agent_ref_agent_quality": "#56B4E9",
+    "matd3_cross_agent_ref_soft_advantage": "#CC79A7",
+    "matd3_cross_agent_ref_selector_mix": "#D55E00",
+    "matd3_cross_agent_ref_reward_to_success_selector": "#6A3D9A",
+    "matd3_cross_agent_ref_progress_gate": "#2CA02C",
+    "matd3_cross_agent_ref_agent_success_behavior_label": "#8C564B",
+    "matd3_full_dual_semantic_cross_agent_ref": "#2CA02C",
+    "matd3_cross_agent_ref_no_quality_gate": "#FF7F0E",
+    "matd3_cross_agent_ref_behavior_label": "#7F7F7F",
 }
 
 

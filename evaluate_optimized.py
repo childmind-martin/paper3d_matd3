@@ -16,6 +16,15 @@ import json
 import time
 import math
 import shutil
+import csv
+import re
+import copy
+import shlex
+import signal
+import subprocess
+from collections import deque
+from contextlib import contextmanager
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 # 设置环境变量抑制多智能体环境警告
@@ -85,6 +94,868 @@ def _safe_int(value):
         return None
 
 
+_REWARD_DECOMPOSITION_FIELDS = [
+    'reward_progress',
+    'reward_clearance',
+    'reward_height',
+    'reward_stagnation',
+    'reward_sync',
+    'reward_dense_success',
+    'reward_energy',
+    'reward_safety_penalty',
+    'reward_collision_penalty',
+    'reward_terrain_penalty',
+    'reward_obstacle_penalty',
+    'reward_inter_agent_penalty',
+    'reward_boundary_penalty',
+    'reward_terminal_success',
+    'reward_terminal_failure',
+    'reward_terminal_quality',
+    'reward_apf_or_action_cost_if_any',
+]
+
+
+def _new_eval_diagnostics_accumulator():
+    return {
+        'reward_components': {name: 0.0 for name in _REWARD_DECOMPOSITION_FIELDS},
+        'reward_diag_step_count': 0,
+        'reward_diag_missing_steps': 0,
+        'raw_action_norm_sum': 0.0,
+        'corr_action_norm_sum': 0.0,
+        'action_delta_norm_sum': 0.0,
+        'pf_force_norm_sum': 0.0,
+        'force_ratio_sum': 0.0,
+        'action_diag_step_count': 0,
+        'speed_sum': 0.0,
+        'speed_step_count': 0,
+        'semantic_gap_sum': 0.0,
+        'semantic_gap_max': 0.0,
+        'semantic_gap_step_count': 0,
+        'reward_total_before_clip_sum': 0.0,
+        'reward_clip_delta_sum': 0.0,
+    }
+
+
+def _mean_head_norm(values):
+    try:
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            return None
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        head_dim = min(3, int(arr.shape[-1]))
+        if head_dim <= 0:
+            return None
+        norms = np.linalg.norm(arr[..., :head_dim], axis=-1)
+        finite = norms[np.isfinite(norms)]
+        if finite.size == 0:
+            return None
+        return float(np.mean(finite))
+    except Exception:
+        return None
+
+
+def _add_optional_mean(acc, key, value):
+    try:
+        if value is None:
+            return
+        value = float(value)
+        if not np.isfinite(value):
+            return
+        acc[key] += value
+    except Exception:
+        pass
+
+
+def _get_vectorized_reward_diagnostics(env):
+    try:
+        scenario = getattr(env, 'scenario', None)
+        for attr in ('vectorized_calculator', 'vectorized_reward_calculator', 'reward_calculator'):
+            calc = getattr(scenario, attr, None) if scenario is not None else None
+            diag = getattr(calc, 'last_reward_diagnostics', None) if calc is not None else None
+            if isinstance(diag, dict):
+                return diag
+    except Exception:
+        return None
+    return None
+
+
+def _get_world_success_snapshot(env, expected_count=None):
+    try:
+        world = getattr(env, 'world', None)
+        if world is None:
+            return None
+        reach = list(getattr(world, '_episode_agent_reach_flags', []))
+        safe = list(getattr(world, '_episode_agent_safe_flags', []))
+        succ = list(getattr(world, '_episode_agent_success_flags', []))
+        if expected_count is not None:
+            expected_count = int(expected_count)
+            if expected_count > 0 and (
+                len(reach) != expected_count or len(safe) != expected_count or len(succ) != expected_count
+            ):
+                return None
+        if not succ:
+            return None
+        team = int(getattr(world, '_episode_team_success_flag', 1 if all(int(v) == 1 for v in succ) else 0))
+        return {
+            'reach_flags': [int(v) for v in reach],
+            'safe_flags': [int(v) for v in safe],
+            'success_flags': [int(v) for v in succ],
+            'team_success': 1 if team == 1 else 0,
+            'all_reached': 1 if bool(getattr(world, '_episode_all_reached', False)) else 0,
+            'done_reason': getattr(world, '_episode_done_reason', None),
+        }
+    except Exception:
+        return None
+
+
+_MISSING_GAZEBO_LIVE_STATE = object()
+
+
+def _copy_gazebo_live_state_value(value):
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
+def _snapshot_attr(obj, attr):
+    if obj is None or not hasattr(obj, attr):
+        return _MISSING_GAZEBO_LIVE_STATE
+    return _copy_gazebo_live_state_value(getattr(obj, attr))
+
+
+def _restore_attr(obj, attr, value):
+    if obj is None:
+        return
+    if value is _MISSING_GAZEBO_LIVE_STATE:
+        try:
+            if hasattr(obj, attr):
+                delattr(obj, attr)
+        except Exception:
+            pass
+        return
+    try:
+        setattr(obj, attr, _copy_gazebo_live_state_value(value))
+    except Exception:
+        pass
+
+
+def _snapshot_gazebo_live_reward_state(env):
+    """Capture mutable reward/done bookkeeping before Python env.step prediction."""
+    world = getattr(env, 'world', None)
+    agents = list(getattr(env, 'agents', []) or getattr(world, 'policy_agents', []) or [])
+    env_attrs = (
+        '_agent_done_flags',
+        '_agent_done_steps',
+        '_termination_reasons',
+    )
+    world_attrs = (
+        '_global_reward_given',
+        '_global_reward_step_cache',
+        '_team_sync_step_cache',
+        '_team_sync_state',
+        '_episode_success',
+        '_episode_all_reached',
+        '_episode_agent_reach_flags',
+        '_episode_agent_safe_flags',
+        '_episode_agent_success_flags',
+        '_episode_team_success_flag',
+        '_episode_success_thr_snapshot',
+        '_episode_terminal',
+        '_episode_done_reason',
+        '_termination_reasons',
+        '_all_agents_reached_logged',
+    )
+    agent_attrs = (
+        'last_position',
+        'last_velocity',
+        'last_goal_dist',
+        'stationary_count',
+        'visited_cells',
+        'debug_info',
+        '_success_state',
+        '_episode_has_collision',
+        '_had_obstacle_collision',
+        '_had_terrain_contact_or_penetration',
+        '_had_penetration_or_collision',
+        '_ever_reached_goal',
+        'current_episode_collision_count',
+        'previous_episode_collision_count',
+        'collision_reduction_reward_given',
+        'last_min_distance',
+        'out_of_bounds_info',
+        '_rc_th',
+    )
+    return {
+        'env': {attr: _snapshot_attr(env, attr) for attr in env_attrs},
+        'world': {attr: _snapshot_attr(world, attr) for attr in world_attrs},
+        'agents': [
+            {attr: _snapshot_attr(agent, attr) for attr in agent_attrs}
+            for agent in agents
+        ],
+    }
+
+
+def _restore_gazebo_live_reward_state(env, snapshot):
+    if not isinstance(snapshot, dict):
+        return
+    world = getattr(env, 'world', None)
+    for attr, value in snapshot.get('env', {}).items():
+        _restore_attr(env, attr, value)
+    for attr, value in snapshot.get('world', {}).items():
+        _restore_attr(world, attr, value)
+    agents = list(getattr(env, 'agents', []) or getattr(world, 'policy_agents', []) or [])
+    for agent, agent_state in zip(agents, snapshot.get('agents', [])):
+        if isinstance(agent_state, dict):
+            for attr, value in agent_state.items():
+                _restore_attr(agent, attr, value)
+
+
+def _clear_eval_observation_cache(env):
+    try:
+        callback_owner = getattr(env.observation_callback, "__self__", None)
+        if callback_owner is not None:
+            callback_owner._obs_step_cache_key = None
+            callback_owner._obs_step_cache = {}
+    except Exception:
+        pass
+
+
+def _mean_step_reward_increment(rew_n):
+    try:
+        rew_arr = np.asarray(rew_n, dtype=np.float32)
+        if rew_arr.size > 0:
+            if not np.all(np.isfinite(rew_arr)):
+                rew_arr = np.where(np.isfinite(rew_arr), rew_arr, -1000.0)
+            return float(np.mean(rew_arr))
+        return 0.0
+    except Exception:
+        try:
+            return float(np.mean(rew_n))
+        except Exception:
+            return float(sum(rew_n)) if rew_n is not None else 0.0
+
+
+def _recompute_step_outputs_from_current_state(env, fallback_info_n=None):
+    """Recompute obs/reward/done after Gazebo state feedback becomes authoritative."""
+    world = getattr(env, 'world', None)
+    agents = list(getattr(env, 'agents', []) or getattr(world, 'policy_agents', []) or [])
+    agent_count = len(agents)
+    _clear_eval_observation_cache(env)
+
+    try:
+        obs_n = env._get_obs_batch(agents)
+    except Exception:
+        default_obs_dim = env._get_default_obs_dim()
+        obs_n = [np.zeros(default_obs_dim, dtype=np.float32) for _ in range(agent_count)]
+
+    reward_pos_scale = float(getattr(world, 'reward_pos_scale', 1.0))
+    reward_neg_scale = float(getattr(world, 'reward_neg_scale', 1.0))
+    reward_values = None
+    reward_owner = getattr(env.reward_callback, '__self__', None) if getattr(env, 'reward_callback', None) is not None else None
+    if reward_owner is not None and hasattr(reward_owner, '_compute_batch_rewards'):
+        try:
+            if hasattr(reward_owner, '_ensure_world_reward_initialized'):
+                reward_owner._ensure_world_reward_initialized(world)
+            reward_batch = reward_owner._compute_batch_rewards([agents], [world], cache_key=None)
+            if (
+                isinstance(reward_batch, np.ndarray)
+                and reward_batch.ndim == 2
+                and reward_batch.shape[0] >= 1
+                and reward_batch.shape[1] >= agent_count
+            ):
+                reward_values = np.asarray(reward_batch[0], dtype=np.float32)
+        except Exception:
+            reward_values = None
+
+    rew_n = []
+    for i, agent in enumerate(agents):
+        try:
+            if reward_values is not None and i < reward_values.shape[0]:
+                r = float(reward_values[i])
+            else:
+                r = float(env._get_reward(agent))
+            rew_n.append(r * reward_pos_scale if r >= 0 else r * reward_neg_scale)
+        except Exception:
+            rew_n.append(0.0)
+
+    done_n = []
+    for i, agent in enumerate(agents):
+        try:
+            agent_key = getattr(agent, 'name', f'agent_{i}')
+            if getattr(env, '_agent_done_flags', {}).get(agent_key, False):
+                done_n.append(True)
+            else:
+                d = bool(env._get_done(agent))
+                if d:
+                    env._agent_done_flags[agent_key] = True
+                    env._agent_done_steps[agent_key] = int(getattr(env, '_current_step', 0))
+                done_n.append(d)
+        except Exception:
+            done_n.append(False)
+
+    try:
+        env._sync_world_team_success_snapshot()
+        if bool(getattr(world, '_episode_all_reached', False)):
+            done_n = [True] * agent_count
+            for i, agent in enumerate(agents):
+                agent_key = getattr(agent, 'name', f'agent_{i}')
+                env._agent_done_flags[agent_key] = True
+                env._agent_done_steps[agent_key] = int(getattr(world, 'current_step', getattr(env, '_current_step', 0)))
+    except Exception:
+        pass
+
+    info_list = []
+    fallback_list = []
+    if isinstance(fallback_info_n, dict):
+        fallback_list = fallback_info_n.get('n', []) or []
+    for i, agent in enumerate(agents):
+        try:
+            if getattr(env, '_eval_light_info', False):
+                info = {}
+            else:
+                info = env._get_info(agent)
+                if not isinstance(info, dict):
+                    info = {}
+        except Exception:
+            info = fallback_list[i] if i < len(fallback_list) and isinstance(fallback_list[i], dict) else {}
+        info_list.append(info)
+
+    return obs_n, rew_n, done_n, {'n': info_list}
+
+
+def _terminate_process_group(proc, timeout=5.0):
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        pass
+
+
+def _export_and_launch_gazebo_live_world(scenario, world, args, episode_idx, quiet_output=True):
+    if not (_env_flag("GAZEBO_LIVE_SYNC", False) and _env_flag("GAZEBO_LIVE_AUTOLAUNCH", False)):
+        return None
+
+    output_root_raw = os.getenv("GAZEBO_LIVE_EXPORT_DIR", "").strip()
+    if output_root_raw:
+        output_dir = Path(output_root_raw).expanduser().resolve()
+        if int(episode_idx) != 0:
+            output_dir = output_dir / f"episode_{int(episode_idx) + 1:03d}"
+    else:
+        output_dir = Path(getattr(args, "save_viz_path", "evaluation_results")).expanduser().resolve() / f"gazebo_live_ep{int(episode_idx) + 1:03d}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dense_default = int(round(float(getattr(scenario, "map_size", 200.0) or 200.0)))
+    dense_resolution = max(2, _env_int("GAZEBO_LIVE_DENSE_RESOLUTION", dense_default))
+    visual_resolution_env = _env_int("GAZEBO_LIVE_VISUAL_RESOLUTION", 0)
+    visual_resolution = visual_resolution_env if visual_resolution_env >= 2 else None
+    coarse_resolution = max(2, _env_int("GAZEBO_LIVE_COARSE_COLLISION_RESOLUTION", 80))
+    use_coarse_collision = _env_flag("GAZEBO_LIVE_USE_COARSE_COLLISION", False)
+    reuse_cache = _env_flag("GAZEBO_LIVE_EXPORT_CACHE", False)
+    collision_mode = _gazebo_live_collision_mode()
+    physical_collision_enabled = collision_mode != "nonblocking"
+
+    from scenario_exporter import export_scenario_snapshot
+    from gazebo_terrain_exporter import export_gazebo_scene
+    from gazebo_dynamic_replay_exporter import export_gazebo_live_world
+
+    scenario_snapshot = export_scenario_snapshot(
+        scenario=scenario,
+        world=world,
+        output_dir=output_dir,
+        scenario_name=getattr(args, "scenario_name", "paper3d_terrain_vectorized"),
+        dense_resolution=dense_resolution,
+        generate_html=_env_flag("GAZEBO_LIVE_EXPORT_HTML", False),
+    )
+    scenario_json = Path(scenario_snapshot["export_paths"]["scenario_json"]).resolve()
+    gazebo_scene = export_gazebo_scene(
+        scenario_json=scenario_json,
+        output_dir=output_dir,
+        visual_resolution=visual_resolution,
+        coarse_collision_resolution=coarse_resolution,
+        use_coarse_collision=use_coarse_collision,
+        terrain_collision=physical_collision_enabled,
+        obstacle_collision=physical_collision_enabled,
+        reuse_cache=reuse_cache,
+    )
+    gazebo_live = export_gazebo_live_world(
+        scenario_json=scenario_json,
+        output_dir=output_dir,
+        base_world_sdf=Path(gazebo_scene["world_sdf"]),
+        collision_mode=collision_mode,
+        reuse_cache=reuse_cache,
+    )
+    gazebo_live["collision_mode"] = collision_mode
+    gazebo_live["physical_collision_enabled"] = bool(physical_collision_enabled)
+
+    model_parent_dir = Path(gazebo_live["model_parent_dir"]).resolve()
+    current_resource_path = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
+    resource_parts = [str(model_parent_dir)]
+    if current_resource_path:
+        resource_parts.append(current_resource_path)
+    os.environ["GZ_SIM_RESOURCE_PATH"] = ":".join(resource_parts)
+    os.environ["GAZEBO_LIVE_WORLD"] = str(gazebo_live["world_name"])
+    if gazebo_live.get("agent_prefix"):
+        os.environ["GAZEBO_LIVE_AGENT_PREFIX"] = str(gazebo_live["agent_prefix"])
+    os.environ["GAZEBO_LIVE_STATE_FILE"] = str(output_dir / "gazebo_live_state.json")
+    os.environ["GAZEBO_LIVE_CONTACT_FLAG_FILE"] = str(output_dir / "gazebo_live_contact.flag")
+
+    if not _env_flag("GAZEBO_LIVE_AUTOLAUNCH_START", True):
+        gazebo_live.update(
+            {
+                "autolaunch_started": False,
+                "output_dir": str(output_dir),
+                "scenario_json": str(scenario_json),
+            }
+        )
+        return gazebo_live
+
+    home_dir = os.getenv("GAZEBO_LIVE_HOME", "/tmp/matd3_gz_home")
+    stdout_path = output_dir / "gz_server.stdout.log"
+    stderr_path = output_dir / "gz_server.stderr.log"
+    launch_gui = _env_flag("GAZEBO_LIVE_AUTOLAUNCH_GUI", False)
+    launch_run = _env_flag("GAZEBO_LIVE_AUTOLAUNCH_RUN", False)
+    gz_command = " ".join(
+        part for part in (
+            "gz",
+            "sim",
+            "-s",
+            "-r" if launch_run else "",
+            shlex.quote(str(gazebo_live["world_live_sdf"])),
+        )
+        if part
+    )
+    gazebo_shell_prefix = (
+        # Keep Gazebo out of the active conda runtime; otherwise gz transport / Qt
+        # may load conda's libstdc++ and crash when opening the GUI.
+        "unset LD_LIBRARY_PATH; "
+        "unset PYTHONPATH; "
+        "unset CONDA_PREFIX; "
+        "unset CONDA_DEFAULT_ENV; "
+        "unset QT_PLUGIN_PATH; "
+        "unset QT_QPA_PLATFORM_PLUGIN_PATH; "
+        "unset QT_QPA_PLATFORM; "
+        "unset OPENCV_QT_PLUGIN_PATH; "
+        "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
+        "export XDG_RUNTIME_DIR=/tmp/runtime-$USER; "
+        "mkdir -p \"$XDG_RUNTIME_DIR\"; "
+        "chmod 700 \"$XDG_RUNTIME_DIR\"; "
+        "export GZ_IP=${GZ_IP:-127.0.0.1}; "
+        "export IGN_IP=${IGN_IP:-127.0.0.1}; "
+        "source /opt/ros/jazzy/setup.bash; "
+        f"export HOME={shlex.quote(home_dir)}; "
+        f"export GZ_SIM_RESOURCE_PATH={shlex.quote(str(model_parent_dir))}:$GZ_SIM_RESOURCE_PATH; "
+    )
+    shell_cmd = gazebo_shell_prefix + f"exec {gz_command}"
+    stdout_f = stdout_path.open("w", encoding="utf-8")
+    stderr_f = stderr_path.open("w", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-lc", shell_cmd],
+            stdout=stdout_f,
+            stderr=stderr_f,
+            text=True,
+            start_new_session=True,
+        )
+    finally:
+        stdout_f.close()
+        stderr_f.close()
+
+    wait_seconds = max(0.0, _env_float("GAZEBO_LIVE_AUTOLAUNCH_WAIT", 2.0))
+    if wait_seconds > 0.0:
+        time.sleep(wait_seconds)
+    if proc.poll() is not None:
+        err_tail = ""
+        try:
+            err_tail = stderr_path.read_text(encoding="utf-8", errors="ignore")[-2000:]
+        except Exception:
+            pass
+        launch_error = f"Gazebo live autolaunch exited early with code {proc.returncode}: {err_tail}"
+        gazebo_live.update(
+            {
+                "autolaunch_started": False,
+                "autolaunch_error": launch_error,
+                "output_dir": str(output_dir),
+                "scenario_json": str(scenario_json),
+                "stdout_log": str(stdout_path),
+                "stderr_log": str(stderr_path),
+                "process_returncode": int(proc.returncode) if proc.returncode is not None else None,
+                "_process": None,
+                "_gui_process": None,
+            }
+        )
+        if _env_flag("GAZEBO_LIVE_REQUIRED", False) or _env_flag("GAZEBO_LIVE_AUTOLAUNCH_REQUIRED", False):
+            raise RuntimeError(launch_error)
+        return gazebo_live
+
+    gui_proc = None
+    gui_error = None
+    gui_stdout_path = output_dir / "gz_gui.stdout.log"
+    gui_stderr_path = output_dir / "gz_gui.stderr.log"
+    if launch_gui:
+        gui_command = f"gz sim -g {shlex.quote(str(gazebo_live['world_live_sdf']))}"
+        gui_shell_cmd = gazebo_shell_prefix + f"exec {gui_command}"
+        gui_stdout_f = gui_stdout_path.open("w", encoding="utf-8")
+        gui_stderr_f = gui_stderr_path.open("w", encoding="utf-8")
+        try:
+            gui_proc = subprocess.Popen(
+                ["bash", "-lc", gui_shell_cmd],
+                stdout=gui_stdout_f,
+                stderr=gui_stderr_f,
+                text=True,
+                start_new_session=True,
+            )
+        finally:
+            gui_stdout_f.close()
+            gui_stderr_f.close()
+        gui_wait_seconds = max(0.0, _env_float("GAZEBO_LIVE_GUI_WAIT", 2.0))
+        if gui_wait_seconds > 0.0:
+            time.sleep(gui_wait_seconds)
+        if gui_proc.poll() is not None:
+            try:
+                gui_error = gui_stderr_path.read_text(encoding="utf-8", errors="ignore")[-2000:]
+            except Exception:
+                gui_error = f"Gazebo GUI exited early with code {gui_proc.returncode}"
+            if _env_flag("GAZEBO_LIVE_GUI_REQUIRED", False):
+                _terminate_process_group(proc)
+                raise RuntimeError(f"Gazebo live GUI exited early with code {gui_proc.returncode}: {gui_error}")
+
+    gazebo_live.update(
+        {
+            "autolaunch_started": True,
+            "autolaunch_gui": bool(launch_gui),
+            "autolaunch_run": bool(launch_run),
+            "gui_error": gui_error,
+            "output_dir": str(output_dir),
+            "scenario_json": str(scenario_json),
+            "stdout_log": str(stdout_path),
+            "stderr_log": str(stderr_path),
+            "gui_stdout_log": str(gui_stdout_path) if launch_gui else None,
+            "gui_stderr_log": str(gui_stderr_path) if launch_gui else None,
+            "process_pid": int(proc.pid),
+            "gui_process_pid": int(gui_proc.pid) if gui_proc is not None else None,
+            "_process": proc,
+            "_gui_process": gui_proc,
+        }
+    )
+    if not quiet_output:
+        print(f"✅ Gazebo live world 已同源导出并启动: {gazebo_live['world_live_sdf']}")
+    return gazebo_live
+
+
+def _reward_diag_component_mean(weighted_components, reward_names, selected_names, negative_only=False):
+    try:
+        name_to_idx = {str(name): idx for idx, name in enumerate(reward_names)}
+        indices = [name_to_idx[name] for name in selected_names if name in name_to_idx]
+        if not indices:
+            return 0.0
+        arr = np.asarray(weighted_components, dtype=np.float32)
+        if arr.ndim == 2:
+            selected = arr[:, indices]
+        elif arr.ndim == 3:
+            selected = arr[:, :, indices]
+        else:
+            return 0.0
+        per_agent = np.sum(selected, axis=-1)
+        if negative_only:
+            per_agent = np.minimum(per_agent, 0.0)
+        finite = per_agent[np.isfinite(per_agent)]
+        if finite.size == 0:
+            return 0.0
+        return float(np.mean(finite))
+    except Exception:
+        return 0.0
+
+
+def _reward_diag_array_mean(diag, key):
+    try:
+        arr = np.asarray(diag.get(key), dtype=np.float32)
+        if arr.size == 0:
+            return 0.0
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return 0.0
+        return float(np.mean(finite))
+    except Exception:
+        return 0.0
+
+
+def _accumulate_reward_decomposition(acc, env):
+    diag = _get_vectorized_reward_diagnostics(env)
+    if not diag:
+        acc['reward_diag_missing_steps'] += 1
+        return
+    weighted_components = diag.get('weighted_components')
+    reward_names = diag.get('reward_names', [])
+    if weighted_components is None or not reward_names:
+        acc['reward_diag_missing_steps'] += 1
+        return
+
+    components = acc['reward_components']
+    components['reward_progress'] += _reward_diag_component_mean(
+        weighted_components, reward_names, ('distance', 'approach', 'exploration', 'shaping')
+    )
+    components['reward_clearance'] += _reward_diag_component_mean(weighted_components, reward_names, ('clearance',))
+    components['reward_height'] += _reward_diag_component_mean(weighted_components, reward_names, ('height',))
+    components['reward_stagnation'] += _reward_diag_component_mean(weighted_components, reward_names, ('stationary',))
+    components['reward_sync'] += _reward_diag_component_mean(weighted_components, reward_names, ('global',))
+    components['reward_dense_success'] += _reward_diag_component_mean(weighted_components, reward_names, ('success',))
+    components['reward_energy'] += _reward_diag_component_mean(weighted_components, reward_names, ('energy',))
+    components['reward_collision_penalty'] += _reward_diag_component_mean(weighted_components, reward_names, ('collision',))
+    components['reward_safety_penalty'] += _reward_diag_component_mean(
+        weighted_components, reward_names, ('clearance', 'height', 'lateral'), negative_only=True
+    )
+    components['reward_terminal_success'] += _reward_diag_array_mean(diag, 'terminal_success')
+    components['reward_terminal_failure'] += (
+        _reward_diag_array_mean(diag, 'terminal_failure')
+        + _reward_diag_array_mean(diag, 'terminal_unsafe_arrival')
+    )
+    components['reward_terminal_quality'] += _reward_diag_array_mean(diag, 'terminal_quality')
+    acc['reward_total_before_clip_sum'] += _reward_diag_array_mean(diag, 'total_before_clip')
+    acc['reward_clip_delta_sum'] += _reward_diag_array_mean(diag, 'clip_delta')
+    acc['reward_diag_step_count'] += 1
+
+
+def _accumulate_eval_step_diagnostics(acc, env, actions=None, raw_actions=None, pf_forces=None, action_force_ratio=None):
+    _accumulate_reward_decomposition(acc, env)
+    raw_norm = _mean_head_norm(raw_actions)
+    corr_norm = _mean_head_norm(actions)
+    pf_norm = _mean_head_norm(pf_forces)
+    delta_norm = None
+    try:
+        if actions is not None and raw_actions is not None:
+            arr_corr = np.asarray(actions, dtype=np.float32)
+            arr_raw = np.asarray(raw_actions, dtype=np.float32)
+            if arr_corr.shape == arr_raw.shape and arr_corr.size > 0:
+                delta_norm = _mean_head_norm(arr_corr - arr_raw)
+    except Exception:
+        delta_norm = None
+
+    if any(v is not None for v in (raw_norm, corr_norm, delta_norm, pf_norm)) or action_force_ratio is not None:
+        _add_optional_mean(acc, 'raw_action_norm_sum', raw_norm)
+        _add_optional_mean(acc, 'corr_action_norm_sum', corr_norm)
+        _add_optional_mean(acc, 'action_delta_norm_sum', delta_norm)
+        _add_optional_mean(acc, 'pf_force_norm_sum', pf_norm)
+        _add_optional_mean(acc, 'force_ratio_sum', action_force_ratio)
+        acc['action_diag_step_count'] += 1
+
+    try:
+        speeds = []
+        for agent in getattr(env, 'agents', []):
+            vel = _normalize_vec3(getattr(getattr(agent, 'state', None), 'p_vel', None))
+            if vel is not None:
+                speed = float(np.linalg.norm(vel))
+                if np.isfinite(speed):
+                    speeds.append(speed)
+        if speeds:
+            acc['speed_sum'] += float(np.mean(speeds))
+            acc['speed_step_count'] += 1
+    except Exception:
+        pass
+
+
+def _finalize_eval_diagnostics(acc):
+    action_count = max(int(acc.get('action_diag_step_count', 0)), 1)
+    speed_count = max(int(acc.get('speed_step_count', 0)), 1)
+    semantic_count = max(int(acc.get('semantic_gap_step_count', 0)), 1)
+    return {
+        'reward_components': {
+            key: float(value) for key, value in acc.get('reward_components', {}).items()
+        },
+        'diagnostic_metrics': {
+            'mean_semantic_gap': float(acc.get('semantic_gap_sum', 0.0) / semantic_count),
+            'max_semantic_gap': float(acc.get('semantic_gap_max', 0.0)),
+            'mean_force_ratio': float(acc.get('force_ratio_sum', 0.0) / action_count),
+            'avg_speed': float(acc.get('speed_sum', 0.0) / speed_count),
+            'avg_action_norm': float(acc.get('raw_action_norm_sum', 0.0) / action_count),
+            'avg_corr_action_norm': float(acc.get('corr_action_norm_sum', 0.0) / action_count),
+            'avg_action_delta_norm': float(acc.get('action_delta_norm_sum', 0.0) / action_count),
+            'mean_pf_force_norm': float(acc.get('pf_force_norm_sum', 0.0) / action_count),
+            'reward_diag_step_count': int(acc.get('reward_diag_step_count', 0)),
+            'reward_diag_missing_steps': int(acc.get('reward_diag_missing_steps', 0)),
+            'reward_total_before_clip_sum': float(acc.get('reward_total_before_clip_sum', 0.0)),
+            'reward_clip_delta_sum': float(acc.get('reward_clip_delta_sum', 0.0)),
+        },
+    }
+
+
+def _infer_eval_method_name(args):
+    text = f"{getattr(args, 'save_viz_path', '')} {getattr(args, 'load_model_path', '')}"
+    known = [
+        ('ds_matd3_fixed_bucket', 'DS Fixed Bucket'),
+        ('ds_matd3_recent', 'DS Recent'),
+        ('ds_matd3_uniform', 'DS Uniform'),
+        ('ds_matd3_legacy_per', 'DS Legacy PER'),
+        ('ds_matd3_original', 'DS Original'),
+    ]
+    for needle, label in known:
+        if needle in text:
+            return label
+    model_path = str(getattr(args, 'load_model_path', '') or '')
+    leaf = os.path.basename(os.path.dirname(model_path)) if model_path.endswith(os.sep) else os.path.basename(model_path)
+    return leaf or 'unknown'
+
+
+def _parse_eval_int_from_paths(args, patterns):
+    text = f"{getattr(args, 'save_viz_path', '')} {getattr(args, 'load_model_path', '')}"
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def _agent_flags_any_two(agent_flags):
+    flags = []
+    try:
+        flags = [int(v) for v in (agent_flags or [])]
+    except Exception:
+        flags = []
+    return int(any(flags)), int(sum(flags) >= 2)
+
+
+def _infer_episode_done_reason(success_flag, first_reach_step, step_count, episode_length, total_collisions):
+    try:
+        if int(success_flag) == 1:
+            return 'team_success'
+        if first_reach_step is not None:
+            return 'all_reached_without_safe_team_success'
+        if int(step_count) >= int(episode_length):
+            return 'time_limit'
+        if int(total_collisions or 0) > 0:
+            return 'collision_or_safety_early_done'
+    except Exception:
+        pass
+    return 'early_done'
+
+
+def _write_reward_decomposition_eval_csv(output_dir, episodes, args):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, 'reward_decomposition_eval.csv')
+    method = _infer_eval_method_name(args)
+    train_seed = _parse_eval_int_from_paths(args, (r'trainseed(\d+)', r'__seed(\d+)', r'seed(\d+)'))
+    eval_seed = _parse_eval_int_from_paths(args, (r'testseed(\d+)', r'eval[_-]?seed(\d+)'))
+    fieldnames = [
+        'method', 'train_seed', 'eval_seed', 'episode_id',
+        'success', 'any_arrival', 'two_arrival', 'collision_free',
+        'final_goal_distance', 'episode_length', 'total_collisions',
+        'reward_total',
+        *_REWARD_DECOMPOSITION_FIELDS,
+        'n_terrain_collisions', 'n_obstacle_collisions',
+        'n_inter_agent_collisions', 'n_boundary_violations',
+        'mean_semantic_gap', 'max_semantic_gap', 'mean_force_ratio',
+        'path_length', 'avg_speed', 'avg_action_norm', 'avg_corr_action_norm',
+        'avg_action_delta_norm', 'mean_pf_force_norm',
+        'reward_diag_step_count', 'reward_diag_missing_steps',
+        'reward_total_before_clip_sum', 'reward_clip_delta_sum',
+    ]
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for ep in episodes:
+            any_arrival, two_arrival = _agent_flags_any_two(ep.get('agent_success_flags', []))
+            total_collisions = int(ep.get('collision_count', 0) or 0)
+            inter_collisions = int(ep.get('inter_agent_collision_count', 0) or 0)
+            comps = dict(ep.get('reward_decomposition') or {})
+            metrics = dict(ep.get('diagnostic_metrics') or {})
+            row = {
+                'method': method,
+                'train_seed': train_seed,
+                'eval_seed': eval_seed,
+                'episode_id': ep.get('episode'),
+                'success': int(ep.get('team_success', ep.get('success', 0)) or 0),
+                'any_arrival': any_arrival,
+                'two_arrival': two_arrival,
+                'collision_free': int(total_collisions == 0 and inter_collisions == 0),
+                'final_goal_distance': ep.get('final_goal_distance'),
+                'episode_length': ep.get('steps'),
+                'total_collisions': total_collisions,
+                'reward_total': ep.get('reward'),
+                'n_terrain_collisions': int(ep.get('terrain_collision_count', 0) or 0),
+                'n_obstacle_collisions': int(ep.get('obstacle_collision_count', 0) or 0),
+                'n_inter_agent_collisions': inter_collisions,
+                'n_boundary_violations': int(ep.get('boundary_violation_count', 0) or 0),
+                'mean_semantic_gap': metrics.get('mean_semantic_gap', 0.0),
+                'max_semantic_gap': metrics.get('max_semantic_gap', 0.0),
+                'mean_force_ratio': metrics.get('mean_force_ratio', 0.0),
+                'path_length': ep.get('path_length'),
+                'avg_speed': metrics.get('avg_speed', 0.0),
+                'avg_action_norm': metrics.get('avg_action_norm', 0.0),
+                'avg_corr_action_norm': metrics.get('avg_corr_action_norm', 0.0),
+                'avg_action_delta_norm': metrics.get('avg_action_delta_norm', 0.0),
+                'mean_pf_force_norm': metrics.get('mean_pf_force_norm', 0.0),
+                'reward_diag_step_count': metrics.get('reward_diag_step_count', 0),
+                'reward_diag_missing_steps': metrics.get('reward_diag_missing_steps', 0),
+                'reward_total_before_clip_sum': metrics.get('reward_total_before_clip_sum', 0.0),
+                'reward_clip_delta_sum': metrics.get('reward_clip_delta_sum', 0.0),
+            }
+            for field in _REWARD_DECOMPOSITION_FIELDS:
+                row[field] = comps.get(field, 0.0)
+            writer.writerow(row)
+    return path
+
+
+def _write_success_reward_consistency_report(output_dir, episodes, args):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, 'success_reward_consistency_report.txt')
+    method = _infer_eval_method_name(args)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(f"method={method}\n")
+        f.write("team_success_reward is true when reward_terminal_success is non-zero in the eval reward diagnostics.\n")
+        f.write(
+            "episode_id\tteam_success_eval\tteam_success_reward\t"
+            "terminal_success_bonus_applied\tsafe_flags\tfinal_distances\t"
+            "collisions\tepisode_done_reason\treward_total\n"
+        )
+        for ep in episodes:
+            comps = ep.get('reward_decomposition') or {}
+            terminal_success = float(comps.get('reward_terminal_success', 0.0) or 0.0)
+            applied = bool(abs(terminal_success) > 1e-8)
+            f.write(
+                f"{ep.get('episode')}\t"
+                f"{int(ep.get('team_success', ep.get('success', 0)) or 0)}\t"
+                f"{int(applied)}\t"
+                f"{int(applied)}\t"
+                f"{ep.get('agent_safe_flags', [])}\t"
+                f"{ep.get('agent_final_goal_distances', [])}\t"
+                f"{ep.get('agent_collision_counts', [])}\t"
+                f"{ep.get('episode_done_reason', 'unknown')}\t"
+                f"{ep.get('reward')}\n"
+            )
+    return path
+
+
 def _env_flag(name, default=False):
     try:
         return os.getenv(name, "1" if default else "0").lower() in ("1", "true", "yes", "on")
@@ -107,6 +978,39 @@ def _env_float(name, default):
         return float(default)
 
 
+def _gazebo_live_collision_mode():
+    raw = os.getenv("GAZEBO_LIVE_COLLISION_MODE", "hard").strip().lower()
+    if raw in (
+        "nonblocking",
+        "non_blocking",
+        "visual_only",
+        "visual-only",
+        "soft",
+        "python_soft",
+        "python-soft",
+        "transfer_equivalence",
+        "none",
+        "disabled",
+        "off",
+        "0",
+        "false",
+        "no",
+    ):
+        return "nonblocking"
+    return "hard"
+
+
+def _env_optional_float(name):
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return value if np.isfinite(value) else None
+
+
 def _apply_fast_artifact_env_defaults():
     if not _env_flag("FAST_ARTIFACTS", False):
         return
@@ -116,6 +1020,12 @@ def _apply_fast_artifact_env_defaults():
         "SAVE_BEST_TRAJ": "0",
         "SAVE_TEAM_SUCCESS_HTML": "0",
         "SAVE_EVAL_TRAJECTORY_JSON": "0",
+        "SAVE_TRAJECTORY_SNAPSHOT": "0",
+        "SAVE_GAZEBO_REPLAY": "0",
+        "SAVE_GAZEBO_DYNAMIC_REPLAY": "0",
+        "SAVE_GAZEBO_FAST_REPLAY": "0",
+        "COMPILE_GAZEBO_FAST_REPLAY": "0",
+        "GAZEBO_LIVE_SYNC": "0",
         "SAVE_EVAL_TRAJECTORY_PNG": "0",
         "SAVE_EVAL_ACTOR_SEQUENCE": "0",
         "SAVE_EVAL_CONTROL_DIAGNOSTICS": "0",
@@ -204,6 +1114,28 @@ def _is_model_variant_dir_name(name):
     ) or model_leaf.startswith('ep')
 
 
+def _model_path_has_placeholder(model_path):
+    text = str(model_path or '')
+    placeholders = (
+        'YOUR_MODEL_DIR',
+        '<MODEL_DIR>',
+        '<YOUR_MODEL_DIR>',
+        'MODEL_DIR_PLACEHOLDER',
+    )
+    return any(token in text for token in placeholders)
+
+
+def _validate_load_model_path_arg(args):
+    model_path = str(getattr(args, 'load_model_path', '') or '').strip()
+    if not model_path:
+        raise ValueError("--load-model-path 不能为空，请指定包含 actor_*.weights.h5 的模型目录")
+    if _model_path_has_placeholder(model_path):
+        raise ValueError(
+            "--load-model-path 仍然包含示例占位符 YOUR_MODEL_DIR；"
+            "请替换为真实模型目录，例如 /home/tang/matd3/models/<实验目录>/best_by_team_sr"
+        )
+
+
 def _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed_sequence):
     if terrain_variant_seed_sequence:
         return True
@@ -219,17 +1151,41 @@ def _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed
 def _iter_results_json_paths(model_path):
     if not model_path:
         return
+    if _model_path_has_placeholder(model_path):
+        return
     model_leaf = os.path.basename(os.path.normpath(model_path))
     if _is_model_variant_dir_name(model_leaf):
         model_base_dir = os.path.dirname(model_path)
     else:
         model_base_dir = model_path
     exp_name = os.path.basename(model_base_dir)
-    potential_log_dirs = [
-        os.path.join("logs", exp_name),
-        model_base_dir,
-        os.path.dirname(model_base_dir),
-    ]
+    potential_log_dirs = []
+    seen_dirs = set()
+
+    def _add_candidate_dir(path, allow_broad_root=False):
+        if not path:
+            return
+        norm = os.path.normpath(path)
+        if norm in seen_dirs or not os.path.isdir(norm):
+            return
+        leaf = os.path.basename(norm)
+        if not allow_broad_root and leaf in ('models', 'logs'):
+            return
+        seen_dirs.add(norm)
+        potential_log_dirs.append(norm)
+
+    _add_candidate_dir(os.path.join("logs", exp_name))
+    _add_candidate_dir(model_base_dir)
+
+    parent_dir = os.path.dirname(os.path.normpath(model_base_dir))
+    # Some legacy layouts store results.json one level above a checkpoint
+    # container. Never recurse through broad roots like ./models, because that
+    # can bind an invalid model path to an unrelated experiment config.
+    if os.path.isfile(os.path.join(parent_dir, 'results.json')):
+        _add_candidate_dir(parent_dir, allow_broad_root=True)
+    else:
+        _add_candidate_dir(parent_dir)
+
     seen = set()
     for log_dir in potential_log_dirs:
         if not os.path.isdir(log_dir):
@@ -303,6 +1259,15 @@ def _load_training_alignment_snapshot(model_path):
             'terrain_complexity_level': _coerce_optional_int(training_args.get('terrain_complexity_level', results.get('terrain_complexity_level'))),
             'map_size': _coerce_optional_float(training_args.get('map_size', results.get('map_size'))),
             'mountain_min_distance': _coerce_optional_float(training_args.get('mountain_min_distance', results.get('mountain_min_distance'))),
+            'max_reward': _coerce_optional_float(_metadata_value('max_reward')),
+            'min_reward': _coerce_optional_float(_metadata_value('min_reward')),
+            'success_reward_value': _coerce_optional_float(_metadata_value('success_reward_value')),
+            'no_collision_reward_value': _coerce_optional_float(_metadata_value('no_collision_reward_value')),
+            'success_distance_threshold': _coerce_optional_float(_metadata_value('success_distance_threshold')),
+            'collision_penalty_value': _coerce_optional_float(_metadata_value('collision_penalty_value')),
+            'collision_distance_threshold': _coerce_optional_float(_metadata_value('collision_distance_threshold')),
+            'global_reward_mode': _metadata_value('global_reward_mode'),
+            'shaping_gamma': _coerce_optional_float(_metadata_value('shaping_gamma')),
         }
         if snapshot['terrain_base_seed'] is None and snapshot['terrain_seed'] is not None:
             snapshot['terrain_base_seed'] = snapshot['terrain_seed']
@@ -341,6 +1306,15 @@ def _apply_training_alignment_to_args(args, snapshot, quiet=False):
     _apply('terrain_complexity_level', snapshot.get('terrain_complexity_level'))
     _apply('map_size', snapshot.get('map_size'))
     _apply('mountain_min_distance', snapshot.get('mountain_min_distance'))
+    _apply('max_reward', snapshot.get('max_reward'))
+    _apply('min_reward', snapshot.get('min_reward'))
+    _apply('success_reward_value', snapshot.get('success_reward_value'))
+    _apply('no_collision_reward_value', snapshot.get('no_collision_reward_value'))
+    _apply('success_distance_threshold', snapshot.get('success_distance_threshold'))
+    _apply('collision_penalty_value', snapshot.get('collision_penalty_value'))
+    _apply('collision_distance_threshold', snapshot.get('collision_distance_threshold'))
+    _apply('global_reward_mode', snapshot.get('global_reward_mode'))
+    _apply('shaping_gamma', snapshot.get('shaping_gamma'))
 
     if applied and not quiet:
         pretty = ", ".join(f"{k}={applied[k]}" for k in sorted(applied.keys()))
@@ -356,6 +1330,7 @@ def _apply_runtime_env_overrides_from_args(args):
         ("z_action_bias", "Z_ACTION_BIAS"),
         ("quadrotor_attitude_response_time", "QUADROTOR_ATTITUDE_RESPONSE_TIME"),
         ("quadrotor_psi_cmd", "QUADROTOR_PSI_CMD"),
+        ("agent_size", "AGENT_SIZE"),
     )
     for attr_name, env_name in runtime_pairs:
         try:
@@ -581,6 +1556,78 @@ def _normalize_vec3(vec):
     return arr
 
 
+def _normalize_vecn(vec, length, default=None):
+    if vec is None:
+        if default is None:
+            return None
+        return np.asarray(default, dtype=np.float64)[:length]
+    try:
+        arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+    except Exception:
+        if default is None:
+            return None
+        return np.asarray(default, dtype=np.float64)[:length]
+    if arr.size < length:
+        if default is None:
+            return None
+        out = np.asarray(default, dtype=np.float64).reshape(-1)
+        if out.size < length:
+            return None
+        return out[:length]
+    arr = arr[:length]
+    if not np.all(np.isfinite(arr)):
+        if default is None:
+            return None
+        return np.asarray(default, dtype=np.float64)[:length]
+    return arr
+
+
+def _normalize_quat_wxyz(quat):
+    arr = _normalize_vecn(quat, 4, default=[1.0, 0.0, 0.0, 0.0])
+    if arr is None:
+        return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    norm = float(np.linalg.norm(arr))
+    if not np.isfinite(norm) or norm <= 1e-9:
+        return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return arr / norm
+
+
+def _copy_action_frame(actions):
+    if actions is None:
+        return []
+    frame = []
+    try:
+        for action in actions:
+            arr = np.asarray(action, dtype=np.float64).reshape(-1)
+            frame.append(arr.tolist())
+    except Exception:
+        return []
+    return frame
+
+
+def _capture_agent_dynamic_states(agents):
+    frames = []
+    for agent in agents:
+        state = getattr(agent, "state", None)
+        pos = _normalize_vec3(getattr(state, "p_pos", None))
+        vel = _normalize_vec3(getattr(state, "p_vel", None))
+        acc = _normalize_vec3(getattr(state, "p_acc", None))
+        angular_vel = _normalize_vec3(getattr(state, "angular_vel", None))
+        orientation = _normalize_quat_wxyz(getattr(state, "orientation", None))
+        motors = _normalize_vecn(getattr(state, "motor_speeds", None), 4, default=[0.0, 0.0, 0.0, 0.0])
+        frames.append(
+            {
+                "position": (pos.tolist() if pos is not None else [0.0, 0.0, 0.0]),
+                "velocity": (vel.tolist() if vel is not None else [0.0, 0.0, 0.0]),
+                "acceleration": (acc.tolist() if acc is not None else [0.0, 0.0, 0.0]),
+                "orientation": orientation.tolist(),
+                "angular_velocity": (angular_vel.tolist() if angular_vel is not None else [0.0, 0.0, 0.0]),
+                "motor_speeds": (motors.tolist() if motors is not None else [0.0, 0.0, 0.0, 0.0]),
+            }
+        )
+    return frames
+
+
 def _distance_3d(a, b):
     va = _normalize_vec3(a)
     vb = _normalize_vec3(b)
@@ -595,6 +1642,42 @@ def _capture_agent_positions(agents):
         pos = _normalize_vec3(getattr(getattr(agent, "state", None), "p_pos", None))
         positions.append(pos)
     return positions
+
+
+def _capture_agent_velocities(agents):
+    velocities = []
+    for agent in agents:
+        vel = _normalize_vec3(getattr(getattr(agent, "state", None), "p_vel", None))
+        velocities.append(vel)
+    return velocities
+
+
+def _positions_from_gazebo_state_data(data, agent_count):
+    if not isinstance(data, dict):
+        return None
+    entries = data.get("agents", [])
+    if not isinstance(entries, list) or len(entries) < int(agent_count):
+        return None
+    positions = []
+    for agent_idx in range(int(agent_count)):
+        entry = entries[agent_idx]
+        if not isinstance(entry, dict) or not bool(entry.get("seen", False)):
+            return None
+        pos = _normalize_vec3(entry.get("position"))
+        if pos is None:
+            return None
+        positions.append(pos)
+    return positions
+
+
+def _vec_frames_to_lists(values):
+    out = []
+    for value in values or []:
+        if value is None:
+            out.append(None)
+        else:
+            out.append(np.asarray(value, dtype=np.float64).reshape(-1).tolist())
+    return out
 
 
 def _extract_agent_goal_positions(world, scenario):
@@ -1099,16 +2182,22 @@ class ModelEvaluator:
         except Exception as _e:
             print(f"评估环境设置物理/奖励缩放失败: {_e}")
 
-        # 应用智能体速度/加速度（若提供）
+        # 应用智能体尺寸/速度/加速度（若提供）
         try:
-            if getattr(self.args, 'agent_max_speed', None) is not None or getattr(self.args, 'agent_accel', None) is not None:
+            if (
+                getattr(self.args, 'agent_size', None) is not None
+                or getattr(self.args, 'agent_max_speed', None) is not None
+                or getattr(self.args, 'agent_accel', None) is not None
+            ):
                 for ag in getattr(self.world, 'agents', []):
+                    if getattr(self.args, 'agent_size', None) is not None and hasattr(ag, 'size'):
+                        ag.size = float(self.args.agent_size)
                     if getattr(self.args, 'agent_max_speed', None) is not None and hasattr(ag, 'max_speed'):
                         ag.max_speed = float(self.args.agent_max_speed)
                     if getattr(self.args, 'agent_accel', None) is not None and hasattr(ag, 'accel'):
                         ag.accel = float(self.args.agent_accel)
         except Exception as _e:
-            print(f"评估环境应用速度/加速度失败: {_e}")
+            print(f"评估环境应用尺寸/速度/加速度失败: {_e}")
 
         try:
             _apply_hidden_runtime_params_to_world(self.world, self.args, quiet_output=False)
@@ -1295,8 +2384,14 @@ class ModelEvaluator:
             pass
 
         try:
-            if getattr(self.args, 'agent_max_speed', None) is not None or getattr(self.args, 'agent_accel', None) is not None:
+            if (
+                getattr(self.args, 'agent_size', None) is not None
+                or getattr(self.args, 'agent_max_speed', None) is not None
+                or getattr(self.args, 'agent_accel', None) is not None
+            ):
                 for ag in getattr(self.world, 'agents', []):
+                    if getattr(self.args, 'agent_size', None) is not None and hasattr(ag, 'size'):
+                        ag.size = float(self.args.agent_size)
                     if getattr(self.args, 'agent_max_speed', None) is not None and hasattr(ag, 'max_speed'):
                         ag.max_speed = float(self.args.agent_max_speed)
                     if getattr(self.args, 'agent_accel', None) is not None and hasattr(ag, 'accel'):
@@ -1734,8 +2829,14 @@ class ModelEvaluator:
             pass
 
         try:
-            if getattr(self.args, 'agent_max_speed', None) is not None or getattr(self.args, 'agent_accel', None) is not None:
+            if (
+                getattr(self.args, 'agent_size', None) is not None
+                or getattr(self.args, 'agent_max_speed', None) is not None
+                or getattr(self.args, 'agent_accel', None) is not None
+            ):
                 for ag in getattr(world, 'agents', []):
+                    if getattr(self.args, 'agent_size', None) is not None and hasattr(ag, 'size'):
+                        ag.size = float(self.args.agent_size)
                     if getattr(self.args, 'agent_max_speed', None) is not None and hasattr(ag, 'max_speed'):
                         ag.max_speed = float(self.args.agent_max_speed)
                     if getattr(self.args, 'agent_accel', None) is not None and hasattr(ag, 'accel'):
@@ -2510,11 +3611,12 @@ class ModelEvaluator:
                         # 🔧 关键修复：打印动作范围参数
                         if training_action_range_x is not None or training_action_range_y is not None or training_action_range_z is not None:
                             print(f"✅ 从训练配置读取动作范围: X={training_action_range_x}, Y={training_action_range_y}, Z={training_action_range_z}")
-                        break
+                        if selected_force_ratio is not None:
+                            break
                 except Exception as e:
                     continue
             
-            if training_use_fr is not None and training_use_pf is not None:
+            if training_use_fr is not None and training_use_pf is not None and selected_force_ratio is not None:
                 break
         
         # 使用训练时的配置（如果找到），否则使用当前配置
@@ -2779,14 +3881,15 @@ class ModelEvaluator:
             action_force_ratio=eval_action_force_ratio,
             use_tf_potential_field=getattr(self.args, 'use_tf_potential_field', True),
             eval_actor_only=_env_flag('EVAL_ACTOR_ONLY', True),
-            goal_attraction=getattr(self.args, 'goal_attraction', 1.0),
-            lambda_1_base=getattr(self.args, 'lambda_1_base', 5.0),
-            terrain_repulsion=getattr(self.args, 'terrain_repulsion', 80.0),
-            agent_influence_range=getattr(self.args, 'agent_influence_range', 10.0),
-            delta_k_att=getattr(self.args, 'delta_k_att', 0.5),
-            delta_lambda_1=getattr(self.args, 'delta_lambda_1', 2.5),
-            delta_k_rep=getattr(self.args, 'delta_k_rep', 40.0),
-            delta_radius=getattr(self.args, 'delta_radius', 5.0),
+            goal_attraction=getattr(self.args, 'goal_attraction', 26.0),
+            lambda_1_base=getattr(self.args, 'lambda_1_base', 8.5),
+            terrain_repulsion=getattr(self.args, 'terrain_repulsion', 1600.0),
+            agent_influence_range=getattr(self.args, 'agent_influence_range', 150.0),
+            delta_k_att=getattr(self.args, 'delta_k_att', 5.0),
+            delta_lambda_1=getattr(self.args, 'delta_lambda_1', 2.2),
+            delta_k_rep=getattr(self.args, 'delta_k_rep', 600.0),
+            delta_radius=getattr(self.args, 'delta_radius', 80.0),
+            max_force_magnitude=getattr(self.args, 'max_force_magnitude', 80.0),
         )
         
         # 🔧 新增：创建环境对象以支持Oracle模式
@@ -3260,11 +4363,14 @@ class ModelEvaluator:
 
         save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
         save_interactive_traj = _env_flag("SAVE_INTERACTIVE_TRAJ", True)
+        save_gazebo_replay = _env_flag("SAVE_GAZEBO_REPLAY", False)
+        save_gazebo_dynamic_replay = _env_flag("SAVE_GAZEBO_DYNAMIC_REPLAY", False)
+        save_trajectory_snapshot = _env_flag("SAVE_TRAJECTORY_SNAPSHOT", save_gazebo_replay or save_gazebo_dynamic_replay)
         save_all_episode_visualizations = _env_flag("SAVE_EVAL_ALL_EPISODES", False)
         save_best_traj = _env_flag("SAVE_BEST_TRAJ", True)
         save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", False)
         save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
-        save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", False)
+        save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", save_gazebo_dynamic_replay)
         trajectory_sample_interval = _env_int("EVAL_TRAJECTORY_SAMPLE_INTERVAL", 1)
         need_trajectory_artifacts = (
             not getattr(self.args, 'disable_visualization', False)
@@ -3274,11 +4380,14 @@ class ModelEvaluator:
                 or save_trajectory_png
                 or save_interactive_traj
                 or save_team_success_html
+                or save_trajectory_snapshot
+                or save_gazebo_replay
+                or save_gazebo_dynamic_replay
                 or (not getattr(self.args, 'disable_gif', False))
             )
         )
         record_trajectory = bool(need_trajectory_artifacts)
-        record_actions = save_actor_sequence or save_control_diagnostics
+        record_actions = save_actor_sequence or save_control_diagnostics or save_gazebo_dynamic_replay
         try:
             env._disable_trajectory_recording = not bool(need_trajectory_artifacts)
         except Exception:
@@ -3309,13 +4418,24 @@ class ModelEvaluator:
             'episode_executed_actions_history': [],
             'episode_velocity_history': [],
             'episode_goal_distance_history': [],
+            'episode_dynamic_state_history': (
+                [_capture_agent_dynamic_states(env.agents)] if save_gazebo_dynamic_replay else []
+            ),
+            'episode_dynamic_time_history': ([0.0] if save_gazebo_dynamic_replay else []),
+            'episode_dynamic_step_indices': ([0] if save_gazebo_dynamic_replay else []),
+            'episode_dynamic_raw_action_history': [],
+            'episode_dynamic_executed_action_history': [],
+            'episode_dynamic_pf_force_history': [],
             'record_trajectory': record_trajectory,
             'record_actions': record_actions,
             'save_control_diagnostics': save_control_diagnostics,
+            'save_gazebo_dynamic_replay': save_gazebo_dynamic_replay,
             'trajectory_sample_interval': trajectory_sample_interval,
             'episode_inter_agent_collision_counts': [0] * len(getattr(env, 'agents', []) or []),
             'episode_inter_agent_collision_pair_count': 0,
             'episode_min_inter_agent_clearance': None,
+            'episode_length': int(getattr(self.args, 'episode_length', 2200) or 2200),
+            'eval_diagnostics': _new_eval_diagnostics_accumulator(),
         }
 
     def _prepare_batched_episode_step(self, state, actions, raw_actions, step):
@@ -3354,7 +4474,17 @@ class ModelEvaluator:
             raise ValueError(f"意外的环境step返回值: {len(step_result)}")
         return next_obs_n, rew_n, done_n, info_n
 
-    def _complete_batched_episode_step(self, state, next_obs_n, rew_n, done_n, info_n):
+    def _complete_batched_episode_step(
+        self,
+        state,
+        next_obs_n,
+        rew_n,
+        done_n,
+        info_n,
+        actions=None,
+        raw_actions=None,
+        pf_forces=None,
+    ):
         """合并单个 batch 子回合的 step 后统计，保持原有结果语义。"""
         env = state['ctx'].env
         try:
@@ -3372,6 +4502,21 @@ class ModelEvaluator:
                 step_increment = float(sum(rew_n)) if rew_n is not None else 0.0
         state['episode_reward'] += step_increment
         state['step_count'] += 1
+        _accumulate_eval_step_diagnostics(
+            state['eval_diagnostics'],
+            env,
+            actions=actions,
+            raw_actions=raw_actions,
+            pf_forces=pf_forces,
+            action_force_ratio=getattr(self.args, 'action_force_ratio', 0.0),
+        )
+        if state.get('save_gazebo_dynamic_replay'):
+            state['episode_dynamic_state_history'].append(_capture_agent_dynamic_states(env.agents))
+            state['episode_dynamic_time_history'].append(float(state['step_count'] * state.get('simulation_dt', 0.08)))
+            state['episode_dynamic_step_indices'].append(int(state['step_count']))
+            state['episode_dynamic_raw_action_history'].append(_copy_action_frame(raw_actions))
+            state['episode_dynamic_executed_action_history'].append(_copy_action_frame(actions))
+            state['episode_dynamic_pf_force_history'].append(_copy_action_frame(pf_forces))
 
         current_positions = _capture_agent_positions(env.agents)
         if state.get('save_control_diagnostics'):
@@ -3449,11 +4594,20 @@ class ModelEvaluator:
             state['done'] = True
         return info_n
 
-    def _advance_batched_episode_state(self, state, actions, raw_actions, step):
+    def _advance_batched_episode_state(self, state, actions, raw_actions, step, pf_forces=None):
         """推进 batch 子回合一步，并更新轻量统计。"""
         self._prepare_batched_episode_step(state, actions, raw_actions, step)
         next_obs_n, rew_n, done_n, info_n = self._step_batched_episode_env(state, actions)
-        return self._complete_batched_episode_step(state, next_obs_n, rew_n, done_n, info_n)
+        return self._complete_batched_episode_step(
+            state,
+            next_obs_n,
+            rew_n,
+            done_n,
+            info_n,
+            actions=actions,
+            raw_actions=raw_actions,
+            pf_forces=pf_forces,
+        )
 
     def _finalize_batched_episode_state(self, state):
         """将 batch 子回合状态转换为 evaluation_results.json 兼容的 episode_data。"""
@@ -3507,6 +4661,7 @@ class ModelEvaluator:
             pass
 
         agent_success_flags = []
+        agent_safe_flags = []
         team_success_flag = 1
         try:
             thr_success = float(getattr(self.args, 'success_distance_threshold', 4.0))
@@ -3553,12 +4708,20 @@ class ModelEvaluator:
                 if pen_count is None or pen_count > 0:
                     safe_i = False
                 succ_i = 1 if (reach_i and safe_i) else 0
+                agent_safe_flags.append(1 if safe_i else 0)
                 agent_success_flags.append(succ_i)
                 if succ_i == 0:
                     team_success_flag = 0
         except Exception:
             agent_success_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
+            agent_safe_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             team_success_flag = 0
+
+        world_snapshot = _get_world_success_snapshot(env, expected_count=len(episode_collision_counts))
+        if world_snapshot is not None:
+            agent_safe_flags = world_snapshot['safe_flags']
+            agent_success_flags = world_snapshot['success_flags']
+            team_success_flag = world_snapshot['team_success']
 
         total_collisions = sum(episode_collision_counts) if episode_collision_counts else 0
         try:
@@ -3631,6 +4794,22 @@ class ModelEvaluator:
             except Exception:
                 pass
 
+        eval_diag = _finalize_eval_diagnostics(state.get('eval_diagnostics', _new_eval_diagnostics_accumulator()))
+        reward_decomposition = eval_diag['reward_components']
+        diagnostic_metrics = eval_diag['diagnostic_metrics']
+        terminal_success_bonus_applied = bool(
+            abs(float(reward_decomposition.get('reward_terminal_success', 0.0) or 0.0)) > 1e-8
+        )
+        episode_done_reason = _infer_episode_done_reason(
+            success_flag,
+            first_reach_step,
+            state['step_count'],
+            state.get('episode_length', getattr(self.args, 'episode_length', 2200)),
+            total_collisions,
+        )
+        if world_snapshot is not None and world_snapshot.get('done_reason'):
+            episode_done_reason = world_snapshot['done_reason']
+
         return {
             'episode': episode_idx,
             'reward': state['episode_reward'],
@@ -3640,6 +4819,12 @@ class ModelEvaluator:
             'executed_actions_history': state['episode_executed_actions_history'] if state.get('save_control_diagnostics') else [],
             'velocity_history': state['episode_velocity_history'] if state.get('save_control_diagnostics') else [],
             'goal_distance_history': state['episode_goal_distance_history'] if state.get('save_control_diagnostics') else [],
+            'dynamic_state_history': state['episode_dynamic_state_history'] if state.get('save_gazebo_dynamic_replay') else [],
+            'dynamic_time_history': state['episode_dynamic_time_history'] if state.get('save_gazebo_dynamic_replay') else [],
+            'dynamic_step_indices': state['episode_dynamic_step_indices'] if state.get('save_gazebo_dynamic_replay') else [],
+            'dynamic_raw_action_history': state['episode_dynamic_raw_action_history'] if state.get('save_gazebo_dynamic_replay') else [],
+            'dynamic_executed_action_history': state['episode_dynamic_executed_action_history'] if state.get('save_gazebo_dynamic_replay') else [],
+            'dynamic_pf_force_history': state['episode_dynamic_pf_force_history'] if state.get('save_gazebo_dynamic_replay') else [],
             'duration': episode_duration,
             'wall_time_seconds': float(time.perf_counter() - state['wall_start']),
             'collision_count': total_collisions,
@@ -3654,6 +4839,7 @@ class ModelEvaluator:
             'min_distance': min_distance_stat,
             'success': success_flag,
             'agent_success_flags': agent_success_flags,
+            'agent_safe_flags': agent_safe_flags,
             'team_success': team_success_flag,
             'arrival_step': arrival_step,
             'arrival_time': arrival_time,
@@ -3671,6 +4857,10 @@ class ModelEvaluator:
             'path_efficiency': path_efficiency,
             'agent_path_efficiencies': agent_path_efficiencies,
             'penetration_stat': penetration_stat,
+            'reward_decomposition': reward_decomposition,
+            'diagnostic_metrics': diagnostic_metrics,
+            'terminal_success_bonus_applied': terminal_success_bonus_applied,
+            'episode_done_reason': episode_done_reason,
             'vis_context': self._capture_episode_vis_context_for_context(eval_ctx, episode_idx),
             'terrain_complexity_level': eval_ctx.terrain_level,
             'terrain_seed': eval_ctx.terrain_info.get('terrain_seed'),
@@ -3727,8 +4917,8 @@ class ModelEvaluator:
                         action_dim = int(raw_actions_tensor.shape[-1])
                     except Exception:
                         action_dim = int(tf.shape(raw_actions_tensor)[-1].numpy())
-                    need_raw_actions = any(bool(state.get('record_actions')) for state in active_states)
-                    raw_actions = raw_actions_tensor.numpy() if need_raw_actions else None
+                    raw_actions = raw_actions_tensor.numpy()
+                    pf_forces_batch = None
 
                     if use_tf_potential_field and action_force_ratio > 0.0:
                         flat_actions_tf = tf.reshape(raw_actions_tensor, [-1, action_dim])
@@ -3736,7 +4926,7 @@ class ModelEvaluator:
                             pf_shared_context is not None
                             and hasattr(self.maddpg, '_apply_potential_field_correction_from_geometry_context_tf')
                         ):
-                            corrected_head_tf, _ = self.maddpg._apply_potential_field_correction_from_geometry_context_tf(
+                            corrected_head_tf, pf_force_flat_tf = self.maddpg._apply_potential_field_correction_from_geometry_context_tf(
                                 flat_actions_tf,
                                 float(action_force_ratio),
                                 pf_shared_context[0],
@@ -3748,11 +4938,17 @@ class ModelEvaluator:
                             except Exception:
                                 correction_obs_dim = base_obs_dim
                             flat_obs_tf = tf.reshape(base_obs_for_correction_tf, [-1, correction_obs_dim])
-                            corrected_head_tf, _ = self.maddpg._apply_potential_field_correction(
+                            corrected_head_tf, pf_force_flat_tf = self.maddpg._apply_potential_field_correction(
                                 flat_actions_tf,
                                 flat_obs_tf,
                                 action_force_ratio,
                             )
+                        try:
+                            pf_forces_batch = pf_force_flat_tf.numpy().reshape(
+                                (len(active_states), self.n_agents, 3)
+                            )
+                        except Exception:
+                            pf_forces_batch = None
                         if action_dim > 3:
                             corrected_actions_tf = tf.concat([corrected_head_tf, flat_actions_tf[:, 3:]], axis=1)
                         else:
@@ -3773,38 +4969,49 @@ class ModelEvaluator:
                         state,
                         np.asarray(actions_batch[idx], dtype=np.float32),
                         None if raw_actions is None else np.asarray(raw_actions[idx], dtype=np.float32),
+                        None if pf_forces_batch is None else np.asarray(pf_forces_batch[idx], dtype=np.float32),
                     )
                     for idx, state in enumerate(active_states)
                 ]
 
                 if step_executor is not None and len(step_items) > 1:
                     runnable_items = []
-                    for state, actions_np, raw_actions_np in step_items:
+                    for state, actions_np, raw_actions_np, pf_forces_np in step_items:
                         try:
                             self._prepare_batched_episode_step(state, actions_np, raw_actions_np, step)
-                            runnable_items.append((state, actions_np))
+                            runnable_items.append((state, actions_np, raw_actions_np, pf_forces_np))
                         except Exception as step_e:
                             state['failed'] = True
                             state['error'] = step_e
                     futures = [
-                        (state, step_executor.submit(self._step_batched_episode_env, state, actions_np))
-                        for state, actions_np in runnable_items
+                        (state, actions_np, raw_actions_np, pf_forces_np, step_executor.submit(self._step_batched_episode_env, state, actions_np))
+                        for state, actions_np, raw_actions_np, pf_forces_np in runnable_items
                     ]
-                    for state, future in futures:
+                    for state, actions_np, raw_actions_np, pf_forces_np, future in futures:
                         try:
                             next_obs_n, rew_n, done_n, info_n = future.result()
-                            self._complete_batched_episode_step(state, next_obs_n, rew_n, done_n, info_n)
+                            self._complete_batched_episode_step(
+                                state,
+                                next_obs_n,
+                                rew_n,
+                                done_n,
+                                info_n,
+                                actions=actions_np,
+                                raw_actions=raw_actions_np,
+                                pf_forces=pf_forces_np,
+                            )
                         except Exception as step_e:
                             state['failed'] = True
                             state['error'] = step_e
                 else:
-                    for state, actions_np, raw_actions_np in step_items:
+                    for state, actions_np, raw_actions_np, pf_forces_np in step_items:
                         try:
                             self._advance_batched_episode_state(
                                 state,
                                 actions=actions_np,
                                 raw_actions=raw_actions_np,
                                 step=step,
+                                pf_forces=pf_forces_np,
                             )
                         except Exception as step_e:
                             state['failed'] = True
@@ -3845,12 +5052,81 @@ class ModelEvaluator:
                 if episode_idx == 0 and not quiet_output:
                     print(f"⚠️  警告: use_fixed_positions=True但fixed_positions为None，可能未正确加载位置文件")
         
+        validation_active = _env_flag("GAZEBO_LIVE_VALIDATION", False)
+        validation_root = None
+        if validation_active:
+            try:
+                from gazebo_live_validation import validation_root_from_args
+                validation_root = validation_root_from_args(self.args)
+            except Exception:
+                validation_root = Path(os.getenv("GAZEBO_LIVE_VALIDATION_DIR", "results/gazebo_live_validation")).resolve()
+
         # 环境重置
         reset_result = self.env.reset()
         if isinstance(reset_result, tuple):
             obs_n, _ = reset_result
         else:
             obs_n = reset_result
+
+        gazebo_live_launch = None
+        gazebo_live_launch_error = None
+        try:
+            gazebo_live_launch = _export_and_launch_gazebo_live_world(
+                self.scenario,
+                self.world,
+                self.args,
+                episode_idx,
+                quiet_output=quiet_output,
+            )
+        except Exception as launch_err:
+            gazebo_live_launch_error = str(launch_err)
+            if _env_flag("GAZEBO_LIVE_REQUIRED", False):
+                raise
+            if not quiet_output:
+                print(f"⚠️ Gazebo live world 同源导出/启动失败，将继续普通评估: {gazebo_live_launch_error}")
+
+        gazebo_live_scene_check = None
+        if isinstance(gazebo_live_launch, dict) and gazebo_live_launch.get("autolaunch_error"):
+            gazebo_live_launch_error = str(gazebo_live_launch.get("autolaunch_error"))
+        if validation_active and isinstance(gazebo_live_launch, dict):
+            try:
+                from gazebo_live_validation import run_scene_binding_check
+                gazebo_live_scene_check = run_scene_binding_check(
+                    scenario=self.scenario,
+                    world=self.world,
+                    gazebo_live=gazebo_live_launch,
+                    episode_idx=episode_idx,
+                    terrain_info=getattr(self, "_current_episode_terrain_info", {}) or {},
+                    validation_root=validation_root,
+                )
+                if (
+                    not bool(gazebo_live_scene_check.get("ok", False))
+                    and _env_flag("GAZEBO_LIVE_SCENE_CHECK_REQUIRED", True)
+                ):
+                    failed = [
+                        item.get("name")
+                        for item in gazebo_live_scene_check.get("checks", [])
+                        if not item.get("ok")
+                    ]
+                    raise RuntimeError(f"Gazebo live scene binding check failed: {failed}")
+            except Exception as scene_check_err:
+                gazebo_live_launch_error = str(scene_check_err)
+                if _env_flag("GAZEBO_LIVE_REQUIRED", False) or _env_flag("GAZEBO_LIVE_SCENE_CHECK_REQUIRED", validation_active):
+                    raise
+                if not quiet_output:
+                    print(f"⚠️ Gazebo live scene binding check failed: {gazebo_live_launch_error}")
+
+        python_scene_signature_record = None
+        if validation_active:
+            try:
+                from gazebo_live_validation import build_python_scene_signature
+                python_scene_signature_record = build_python_scene_signature(
+                    scenario=self.scenario,
+                    world=self.world,
+                    terrain_info=getattr(self, "_current_episode_terrain_info", {}) or {},
+                )
+            except Exception as python_scene_sig_err:
+                python_scene_signature_record = {"error": str(python_scene_sig_err)}
         
         # 🔧 关键修复：在reset后验证实际起点位置，确保所有评估模式使用相同的起点
         if episode_idx == 0 and not quiet_output:  # 只在第一个回合打印
@@ -3898,36 +5174,52 @@ class ModelEvaluator:
             light_mode = False
         save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
         save_interactive_traj = _env_flag("SAVE_INTERACTIVE_TRAJ", True)
+        save_gazebo_replay = _env_flag("SAVE_GAZEBO_REPLAY", False)
+        save_gazebo_dynamic_replay = _env_flag("SAVE_GAZEBO_DYNAMIC_REPLAY", False)
+        save_trajectory_snapshot = _env_flag("SAVE_TRAJECTORY_SNAPSHOT", save_gazebo_replay or save_gazebo_dynamic_replay)
         save_all_episode_visualizations = _env_flag("SAVE_EVAL_ALL_EPISODES", False)
         save_best_traj = _env_flag("SAVE_BEST_TRAJ", True)
         save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", False)
         save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
-        save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", False)
+        save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", save_gazebo_dynamic_replay)
         trajectory_sample_interval = _env_int("EVAL_TRAJECTORY_SAMPLE_INTERVAL", 1)
         need_trajectory_artifacts = (
-            not getattr(self.args, 'disable_visualization', False)
-            and (
-                save_all_episode_visualizations
-                or save_best_traj
-                or save_trajectory_png
-                or save_interactive_traj
-                or save_team_success_html
-                or (not getattr(self.args, 'disable_gif', False))
+            validation_active
+            or (
+                not getattr(self.args, 'disable_visualization', False)
+                and (
+                    save_all_episode_visualizations
+                    or save_best_traj
+                    or save_trajectory_png
+                    or save_interactive_traj
+                    or save_team_success_html
+                    or save_trajectory_snapshot
+                    or save_gazebo_replay
+                    or save_gazebo_dynamic_replay
+                    or (not getattr(self.args, 'disable_gif', False))
+                )
             )
         )
         # 轻量模式下允许通过稀疏采样保留评估轨迹；若本轮不生成任何轨迹类产物，则完全跳过轨迹缓存。
         record_trajectory = bool(need_trajectory_artifacts)
         # 动作历史只服务于时序图/控制诊断；默认不再在纯HTML评估里额外记录。
-        record_actions = save_actor_sequence or save_control_diagnostics
+        record_actions = save_actor_sequence or save_control_diagnostics or save_gazebo_dynamic_replay or validation_active
         episode_trajectory = []
         episode_actions_history = []  # 🔧 新增：记录动作历史（用于生成动作时序图）
         episode_executed_actions_history = []  # 记录实际送入环境的动作（含PF修正）
         episode_velocity_history = []  # 记录每步速度向量，判断是否“推不起来”
         episode_goal_distance_history = []  # 记录每步到目标距离，判断是否持续推进
+        episode_dynamic_state_history = []
+        episode_dynamic_time_history = []
+        episode_dynamic_step_indices = []
+        episode_dynamic_raw_action_history = []
+        episode_dynamic_executed_action_history = []
+        episode_dynamic_pf_force_history = []
         step_count = 0
         episode_inter_agent_collision_counts = [0] * len(getattr(self.env, 'agents', []) or [])
         episode_inter_agent_collision_pair_count = 0
         episode_min_inter_agent_clearance = None
+        eval_diagnostics = _new_eval_diagnostics_accumulator()
 
         # 与产物需求对齐：若本轮不生成任何轨迹类文件，则连环境内部轨迹也一起关闭。
         try:
@@ -3937,6 +5229,186 @@ class ModelEvaluator:
         
         # 处理观察数据
         processed_obs = self._process_observations_for_eval(obs_n)
+        if save_gazebo_dynamic_replay:
+            episode_dynamic_state_history.append(_capture_agent_dynamic_states(self.env.agents))
+            episode_dynamic_time_history.append(0.0)
+            episode_dynamic_step_indices.append(0)
+
+        gazebo_live_client = None
+        gazebo_live_sync_active = False
+        gazebo_live_sync_error = None
+        gazebo_live_sync_every = max(1, _env_int("GAZEBO_LIVE_SYNC_EVERY", 1))
+        gazebo_live_control_mode = os.getenv("GAZEBO_LIVE_CONTROL_MODE", "pose").strip().lower()
+        if gazebo_live_control_mode in ("cmd_vel", "twist"):
+            gazebo_live_control_mode = "velocity"
+        if gazebo_live_control_mode not in ("pose", "velocity"):
+            gazebo_live_control_mode = "pose"
+        gazebo_live_consistency_mode = os.getenv("GAZEBO_LIVE_CONSISTENCY_MODE", "gazebo_authoritative").strip().lower()
+        if gazebo_live_consistency_mode in ("python", "python_only", "python_authoritative", "mirror", "follow_python"):
+            gazebo_live_consistency_mode = "python_authoritative"
+        else:
+            gazebo_live_consistency_mode = "gazebo_authoritative"
+        gazebo_live_python_authoritative = gazebo_live_consistency_mode == "python_authoritative"
+        gazebo_live_semantic_mode = os.getenv("GAZEBO_LIVE_SEMANTIC_MODE", "transfer_equivalence").strip().lower()
+        gazebo_live_collision_mode = _gazebo_live_collision_mode()
+        gazebo_live_physical_collision_enabled = gazebo_live_collision_mode != "nonblocking"
+        gazebo_live_physical_contact_semantics = gazebo_live_semantic_mode in (
+            "physical",
+            "physical_robustness",
+            "contact_authoritative",
+            "gazebo_contact_authoritative",
+        )
+        gazebo_live_command_sleep = max(0.0, _env_float("GAZEBO_LIVE_COMMAND_SLEEP", 0.0))
+        gazebo_live_step_iterations = max(0, _env_int("GAZEBO_LIVE_STEP_ITERATIONS", 0))
+        gazebo_live_state_feedback = _env_flag("GAZEBO_LIVE_STATE_FEEDBACK", False)
+        gazebo_live_state_feedback_timeout = max(0.0, _env_float("GAZEBO_LIVE_STATE_FEEDBACK_TIMEOUT", 0.2))
+        gazebo_live_authoritative_feedback = (
+            gazebo_live_control_mode == "velocity"
+            and gazebo_live_state_feedback
+            and not gazebo_live_python_authoritative
+            and _env_flag("GAZEBO_LIVE_AUTHORITATIVE_FEEDBACK", True)
+        )
+        gazebo_live_contact_authoritative = _env_flag(
+            "GAZEBO_LIVE_CONTACT_AUTHORITATIVE",
+            gazebo_live_physical_contact_semantics and not gazebo_live_python_authoritative,
+        )
+        gazebo_live_contact_marks_collision = _env_flag(
+            "GAZEBO_LIVE_CONTACT_MARKS_COLLISION",
+            gazebo_live_contact_authoritative,
+        )
+        gazebo_live_contact_terminates = _env_flag("GAZEBO_LIVE_CONTACT_TERMINATES", False)
+        gazebo_live_pose_correction = _env_flag(
+            "GAZEBO_LIVE_POSE_CORRECTION",
+            gazebo_live_python_authoritative,
+        )
+        gazebo_live_state_feedback_updates = 0
+        gazebo_live_state_feedback_misses = 0
+        gazebo_live_authoritative_feedback_updates = 0
+        gazebo_live_authoritative_feedback_errors = 0
+        gazebo_contact_detected = False
+        gazebo_contact_step = None
+        gazebo_contact_count = 0
+        gazebo_contact_agent_indices = []
+        gazebo_contact_pairs = []
+        validation_trace_tail = deque(maxlen=20)
+        gazebo_live_client_stats = {
+            "semantic_mode": gazebo_live_semantic_mode,
+            "feedback_velocity_mode": os.getenv("GAZEBO_LIVE_FEEDBACK_VELOCITY_MODE", "clamp").strip().lower(),
+            "feedback_acceleration_mode": os.getenv("GAZEBO_LIVE_FEEDBACK_ACCELERATION_MODE", "estimate").strip().lower(),
+            "pose_jump_reject_count": 0,
+            "max_pose_jump_observed": 0.0,
+            "max_feedback_speed_observed": 0.0,
+            "max_feedback_accel_observed": 0.0,
+            "cmd_vel_publish_count": 0,
+            "pose_publish_count": 0,
+            "bridge_ack_enabled": _env_flag("GAZEBO_LIVE_WAIT_ACK", False),
+            "bridge_ack_count": 0,
+            "bridge_ack_timeout_count": 0,
+            "bridge_last_ack_state_frame": None,
+            "pre_step_sleep_ms": _env_int("GAZEBO_LIVE_PRE_STEP_SLEEP_MS", 0),
+            "post_step_sleep_ms": _env_int("GAZEBO_LIVE_POST_STEP_SLEEP_MS", 0),
+            "wall_time_step_ms": _env_int("GAZEBO_LIVE_WALL_TIME_STEP_MS", 0),
+            "pause_for_step": _env_flag("GAZEBO_LIVE_PAUSE_FOR_STEP", False),
+            "world_name": None,
+            "agent_prefix": None,
+            "bridge_running": False,
+            "state_file": os.getenv("GAZEBO_LIVE_STATE_FILE", None),
+            "contact_flag_file": os.getenv("GAZEBO_LIVE_CONTACT_FLAG_FILE", None),
+            "contact_feedback_enabled": _env_flag("GAZEBO_LIVE_CONTACT_FEEDBACK", True),
+            "contact_feedback_armed": False,
+            "contact_topics": [],
+        }
+        apf_backend = str(getattr(self.args, "apf_backend", "python_original") or "python_original").strip().lower()
+        if apf_backend not in ("python_original", "gazebo_apf"):
+            apf_backend = "python_original"
+        gazebo_apf_enabled = apf_backend == "gazebo_apf"
+        gazebo_apf_provider = None
+        gazebo_apf_calculator = None
+        gazebo_apf_validator = None
+        gazebo_apf_metrics = None
+        gazebo_apf_error = None
+        if gazebo_apf_enabled:
+            try:
+                from gazebo_apf import GazeboAPFCalculator
+                from gazebo_apf_state_provider import GazeboAPFStateProvider
+                from gazebo_apf_validator import GazeboAPFValidator
+
+                scenario_json = (
+                    gazebo_live_launch.get("scenario_json")
+                    if isinstance(gazebo_live_launch, dict)
+                    else None
+                )
+                gazebo_apf_provider = GazeboAPFStateProvider.from_runtime(
+                    scenario_json=scenario_json,
+                    scenario=self.scenario,
+                    world=self.world,
+                    agent_count=self.n_agents,
+                    state_file=os.getenv("GAZEBO_LIVE_STATE_FILE", None),
+                    contact_flag_file=os.getenv("GAZEBO_LIVE_CONTACT_FLAG_FILE", None),
+                    agent_prefix=os.getenv("GAZEBO_LIVE_AGENT_PREFIX", "dynamic_agent_"),
+                    state_feedback_dt=float(getattr(self.args, "simulation_dt", os.getenv("SIMULATION_DT", "0.08"))),
+                )
+                gazebo_apf_calculator = GazeboAPFCalculator.from_args(self.args, gazebo_apf_provider)
+                gazebo_apf_validator = GazeboAPFValidator(
+                    output_dir=getattr(self.args, "gazebo_apf_output_dir", "results/gazebo_apf_validation"),
+                    mismatch_threshold=float(getattr(self.args, "gazebo_apf_consistency_threshold", 0.05)),
+                    direction_threshold=float(os.getenv("GAZEBO_APF_DIRECTION_THRESHOLD", "0.995")),
+                    max_cases=int(os.getenv("GAZEBO_APF_MAX_MISMATCH_CASES", "50")),
+                )
+                validation_active = True
+                if not quiet_output:
+                    print(
+                        "✅ Gazebo APF backend enabled: "
+                        f"scenario_json={scenario_json}, output={gazebo_apf_validator.output_dir}"
+                    )
+            except Exception as apf_err:
+                gazebo_apf_error = str(apf_err)
+                if _env_flag("GAZEBO_APF_REQUIRED", True):
+                    raise
+                gazebo_apf_enabled = False
+                if not quiet_output:
+                    print(f"⚠️ Gazebo APF backend init failed; fallback to python_original: {gazebo_apf_error}")
+        if _env_flag("GAZEBO_LIVE_SYNC", False):
+            try:
+                from gazebo_live_pose_client import make_live_pose_client_from_env
+
+                gazebo_live_client = make_live_pose_client_from_env(len(getattr(self.env, "agents", []) or []))
+                if gazebo_live_client is not None:
+                    gazebo_live_client.start()
+                    gazebo_live_client.send_agents(self.env.agents)
+                    try:
+                        gazebo_live_client.clear_contact_flag()
+                    except Exception:
+                        pass
+                    gazebo_live_sync_active = True
+                    gazebo_live_client_stats["world_name"] = getattr(gazebo_live_client, "world", None)
+                    gazebo_live_client_stats["agent_prefix"] = getattr(gazebo_live_client, "agent_prefix", None)
+                    gazebo_live_client_stats["bridge_running"] = bool(gazebo_live_client.is_running())
+                    gazebo_live_client_stats["state_file"] = str(getattr(gazebo_live_client, "state_file", "")) or None
+                    gazebo_live_client_stats["contact_flag_file"] = str(getattr(gazebo_live_client, "contact_flag_file", "")) or None
+                    gazebo_live_client_stats["contact_feedback_enabled"] = bool(getattr(gazebo_live_client, "contact_feedback", False))
+                    gazebo_live_client_stats["contact_feedback_armed"] = bool(gazebo_live_client.contact_feedback_armed())
+                    gazebo_live_client_stats["contact_topics"] = gazebo_live_client.expected_contact_topics()
+                    if not quiet_output:
+                        print(
+                            f"✅ Gazebo live sync 已启动: world={gazebo_live_client.world}, "
+                            f"agents={gazebo_live_client.agent_count}, mode={gazebo_live_control_mode}, "
+                            f"every={gazebo_live_sync_every} step, gz_steps={gazebo_live_step_iterations}, "
+                            f"state_feedback={gazebo_live_state_feedback}, "
+                            f"authoritative_feedback={gazebo_live_authoritative_feedback}, "
+                            f"semantic_mode={gazebo_live_semantic_mode}, "
+                            f"contact_marks_collision={gazebo_live_contact_marks_collision}, "
+                            f"agent_prefix={gazebo_live_client.agent_prefix}, "
+                            f"feedback_vel={gazebo_live_client.state_velocity_mode}, "
+                            f"feedback_acc={getattr(gazebo_live_client, 'state_acceleration_mode', None)}"
+                        )
+            except Exception as live_sync_err:
+                gazebo_live_sync_error = str(live_sync_err)
+                if _env_flag("GAZEBO_LIVE_REQUIRED", False):
+                    raise
+                gazebo_live_client = None
+                if not quiet_output:
+                    print(f"⚠️ Gazebo live sync 启动失败，将继续普通评估: {gazebo_live_sync_error}")
         
         # 记录开始时间
         start_time = time.time()
@@ -3966,6 +5438,7 @@ class ModelEvaluator:
             print(f"   - use_fr_feature={use_fr_feature}")
             print(f"   - use_pf_feature={use_pf_feature}")
             print(f"   - action_range: X={action_range_x}, Y={action_range_y}, Z={action_range_z}")
+            print(f"   - apf_backend={apf_backend}")
             if use_tf_potential_field and action_force_ratio > 0.0:
                 print(f"   ✅ 势场修正将生效 (FR={action_force_ratio})")
             else:
@@ -4025,12 +5498,76 @@ class ModelEvaluator:
             # 确保与训练时的网络输入结构完全一致
             use_fr = getattr(self.maddpg.args, 'use_fr_feature', False)
             use_pf = getattr(self.maddpg.args, 'use_pf_feature', False)
-            policy_obs = self._build_eval_actor_obs(
-                processed_obs,
-                use_pf=use_pf,
-                use_tf_potential_field=use_tf_potential_field,
-                action_force_ratio=action_force_ratio,
-            )
+            gazebo_apf_state = None
+            gazebo_apf_base_obs = None
+            gazebo_apf_result = None
+            gazebo_apf_comparison_records = []
+            if gazebo_apf_enabled and gazebo_apf_provider is not None:
+                try:
+                    if gazebo_live_client is not None:
+                        gazebo_apf_state = gazebo_apf_provider.read_live_state(
+                            client=gazebo_live_client,
+                            agents=self.env.agents,
+                            timeout=max(0.0, min(gazebo_live_state_feedback_timeout, 0.05)),
+                            require_seen=True,
+                        )
+                    if gazebo_apf_state is None:
+                        gazebo_apf_state = gazebo_apf_provider.build_state(
+                            agents=self.env.agents,
+                            source="python_fallback_before_gazebo_feedback",
+                        )
+                    if gazebo_apf_state is not None:
+                        gazebo_apf_provider.apply_state_to_agents(gazebo_apf_state, self.env.agents)
+                        try:
+                            _clear_eval_observation_cache(self.env)
+                        except Exception:
+                            pass
+                        gazebo_apf_base_obs = gazebo_apf_provider.build_observations(gazebo_apf_state)
+                        processed_obs = self._process_observations_for_eval(gazebo_apf_base_obs)
+                except Exception as state_err:
+                    gazebo_apf_error = str(state_err)
+                    if _env_flag("GAZEBO_APF_REQUIRED", True):
+                        raise
+                    gazebo_apf_state = None
+                    gazebo_apf_base_obs = None
+
+            if gazebo_apf_enabled and gazebo_apf_calculator is not None and gazebo_apf_state is not None:
+                base_obs_dim = self._get_base_obs_dim()
+                base_obs_for_policy = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
+                if use_pf:
+                    try:
+                        gazebo_pf_features = gazebo_apf_calculator.compute_base_pf_features(
+                            gazebo_apf_state,
+                            action_dim=self.action_dims[0] if self.action_dims else 7,
+                            force_ratio=action_force_ratio,
+                            observations=base_obs_for_policy,
+                        )
+                        pf_feature_dim = self._get_pf_feature_dim()
+                        if gazebo_pf_features.shape[1] < pf_feature_dim:
+                            pad = np.zeros((gazebo_pf_features.shape[0], pf_feature_dim - gazebo_pf_features.shape[1]), dtype=np.float32)
+                            gazebo_pf_features = np.concatenate([gazebo_pf_features, pad], axis=1)
+                        policy_obs = np.concatenate(
+                            [base_obs_for_policy, gazebo_pf_features[:, :pf_feature_dim]],
+                            axis=1,
+                        ).astype(np.float32, copy=False)
+                    except Exception:
+                        if _env_flag("GAZEBO_APF_REQUIRED", True):
+                            raise
+                        policy_obs = self._build_eval_actor_obs(
+                            processed_obs,
+                            use_pf=use_pf,
+                            use_tf_potential_field=use_tf_potential_field,
+                            action_force_ratio=action_force_ratio,
+                        )
+                else:
+                    policy_obs = base_obs_for_policy
+            else:
+                policy_obs = self._build_eval_actor_obs(
+                    processed_obs,
+                    use_pf=use_pf,
+                    use_tf_potential_field=use_tf_potential_field,
+                    action_force_ratio=action_force_ratio,
+                )
             raw_actions_tf = self.select_actions_eval(policy_obs, use_fr=use_fr, use_pf=use_pf)
             # 🔧 性能优化：延迟numpy转换，尽量在tensor空间内操作
             raw_actions = raw_actions_tf.numpy() if isinstance(raw_actions_tf, tf.Tensor) else raw_actions_tf
@@ -4047,6 +5584,7 @@ class ModelEvaluator:
             action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
             
             if use_tf_potential_field and action_force_ratio > 0.0:
+                pf_forces = None
                 # 🔧 性能优化：批量应用势场修正，尽量在tensor空间内操作
                 # 🔧 关键优化：如果raw_actions已经是tensor，避免重复转换
                 if isinstance(raw_actions_tf, tf.Tensor):
@@ -4058,22 +5596,86 @@ class ModelEvaluator:
                 base_obs_dim = self._get_base_obs_dim()
                 base_obs_for_correction = processed_obs[:, :base_obs_dim] if processed_obs.shape[1] > base_obs_dim else processed_obs
                 processed_obs_tf = tf.convert_to_tensor(base_obs_for_correction, dtype=tf.float32)  # (n_agents, obs_dim)
-                    
-                # 🔧 性能优化：使用训练代码的@tf.function装饰的势场修正函数
-                corrected_head_tf, _ = self.maddpg._apply_potential_field_correction(
+
+                # The original APF is still called here for default backend and
+                # for gazebo_apf consistency measurement. It is not modified.
+                corrected_head_tf, pf_forces_tf = self.maddpg._apply_potential_field_correction(
                     raw_actions_tf_for_correction, processed_obs_tf, action_force_ratio
-                    )
-                    
-                # 获取action_dim（从tensor形状推断）
-                action_dim = tf.shape(raw_actions_tf_for_correction)[1]
-                if action_dim > 3:
-                    corrected_actions_tf = tf.concat([corrected_head_tf, raw_actions_tf_for_correction[:, 3:]], axis=1)
+                )
+                try:
+                    original_pf_forces_np = pf_forces_tf.numpy()
+                except Exception:
+                    original_pf_forces_np = None
+
+                if (
+                    gazebo_apf_enabled
+                    and gazebo_apf_calculator is not None
+                    and gazebo_apf_provider is not None
+                    and gazebo_apf_state is not None
+                ):
+                    try:
+                        gazebo_apf_result = gazebo_apf_calculator.correct_actions(
+                            raw_actions,
+                            gazebo_apf_state,
+                            force_ratio=action_force_ratio,
+                            observations=base_obs_for_correction,
+                        )
+                        actions = gazebo_apf_result.corrected_actions
+                        pf_forces = gazebo_apf_result.pf_forces
+
+                        if gazebo_apf_validator is not None and original_pf_forces_np is not None:
+                            original_corrected_head_np = corrected_head_tf.numpy()
+                            if raw_actions.shape[1] > 3:
+                                original_corrected_full_np = np.concatenate(
+                                    [original_corrected_head_np, raw_actions[:, 3:]],
+                                    axis=1,
+                                )
+                            else:
+                                original_corrected_full_np = original_corrected_head_np
+                            comparison = gazebo_apf_validator.compare(
+                                original_corrected_actions=original_corrected_full_np,
+                                original_pf_forces=original_pf_forces_np,
+                                gazebo_result=gazebo_apf_result,
+                                state=gazebo_apf_state,
+                                state_provider=gazebo_apf_provider,
+                                raw_actions=raw_actions,
+                                original_observations=base_obs_for_correction,
+                                gazebo_observations=gazebo_apf_result.observations,
+                                episode=episode_idx,
+                                step=step,
+                                seed=(
+                                    getattr(self.scenario, "current_terrain_seed", None)
+                                    if hasattr(self, "scenario")
+                                    else None
+                                ),
+                                force_ratio=action_force_ratio,
+                            )
+                            gazebo_apf_comparison_records = comparison.get("records", [])
+                    except Exception as apf_step_err:
+                        gazebo_apf_error = str(apf_step_err)
+                        if _env_flag("GAZEBO_APF_REQUIRED", True):
+                            raise
+                        # Fallback preserves existing behavior if the new backend is optional.
+                        pf_forces = original_pf_forces_np
+                        action_dim = int(raw_actions.shape[1]) if hasattr(raw_actions, "shape") and len(raw_actions.shape) > 1 else 0
+                        if action_dim > 3:
+                            corrected_actions_tf = tf.concat([corrected_head_tf, raw_actions_tf_for_correction[:, 3:]], axis=1)
+                        else:
+                            corrected_actions_tf = corrected_head_tf
+                        actions = corrected_actions_tf.numpy()
                 else:
-                    corrected_actions_tf = corrected_head_tf
-                
-                # 🔧 性能优化：延迟numpy转换，只在env.step需要时转换
-                actions = corrected_actions_tf.numpy()  # env.step需要numpy数组
+                    pf_forces = original_pf_forces_np
+                    # 获取action_dim（从tensor形状推断）
+                    action_dim = int(raw_actions.shape[1]) if hasattr(raw_actions, "shape") and len(raw_actions.shape) > 1 else 0
+                    if action_dim > 3:
+                        corrected_actions_tf = tf.concat([corrected_head_tf, raw_actions_tf_for_correction[:, 3:]], axis=1)
+                    else:
+                        corrected_actions_tf = corrected_head_tf
+
+                    # 🔧 性能优化：延迟numpy转换，只在env.step需要时转换
+                    actions = corrected_actions_tf.numpy()  # env.step需要numpy数组
             else:
+                pf_forces = None
                 # 不使用势场修正，直接使用原始动作
                 # 🔧 性能优化：如果raw_actions_tf是tensor，转换为numpy；否则直接使用
                 if isinstance(raw_actions_tf, tf.Tensor):
@@ -4110,7 +5712,14 @@ class ModelEvaluator:
                         file=tqdm_file
                     )
                 
-            # 执行动作
+            authoritative_reward_snapshot = (
+                _snapshot_gazebo_live_reward_state(self.env)
+                if gazebo_live_authoritative_feedback
+                else None
+            )
+
+            # 执行动作；velocity live 模式下这一步提供策略动作到速度命令的同源映射，
+            # 随后的 Gazebo 状态反馈会覆盖 agent state，并重算本步输出。
             step_result = self.env.step(actions)
             if len(step_result) == 4:
                 next_obs_n, rew_n, done_n, info_n = step_result
@@ -4120,25 +5729,223 @@ class ModelEvaluator:
             else:
                 raise ValueError(f"意外的环境step返回值: {len(step_result)}")
 
+            step_count += 1
+            gazebo_state_feedback_applied = False
+            validation_python_pose = _capture_agent_positions(self.env.agents) if validation_active else []
+            validation_cmd_vel = _capture_agent_velocities(self.env.agents) if validation_active else []
+            validation_gazebo_pose = None
+
+            if gazebo_live_client is not None and (step_count % gazebo_live_sync_every == 0):
+                try:
+                    if gazebo_live_control_mode == "velocity":
+                        gazebo_live_client.send_velocity_agents(self.env.agents)
+                    else:
+                        gazebo_live_client.send_agents(self.env.agents)
+                    if gazebo_live_command_sleep > 0.0:
+                        time.sleep(gazebo_live_command_sleep)
+                    if gazebo_live_control_mode == "velocity" and gazebo_live_state_feedback:
+                        if gazebo_live_python_authoritative:
+                            min_frame = getattr(gazebo_live_client, "_pending_state_min_frame", None)
+                            state_data = gazebo_live_client.read_state(
+                                min_frame=min_frame,
+                                timeout=gazebo_live_state_feedback_timeout,
+                            )
+                            gazebo_positions = _positions_from_gazebo_state_data(
+                                state_data,
+                                len(getattr(self.env, "agents", []) or []),
+                            )
+                            if gazebo_positions is not None:
+                                gazebo_live_state_feedback_updates += 1
+                                if validation_active:
+                                    validation_gazebo_pose = gazebo_positions
+                                try:
+                                    frame = int(state_data.get("frame", -1))
+                                    gazebo_live_client._last_state_frame = frame
+                                    gazebo_live_client._last_state_positions = np.asarray(gazebo_positions, dtype=np.float64)
+                                    if getattr(gazebo_live_client, "_pending_state_min_frame", None) is not None and frame >= int(gazebo_live_client._pending_state_min_frame):
+                                        gazebo_live_client._pending_state_min_frame = None
+                                except Exception:
+                                    pass
+                            else:
+                                gazebo_live_state_feedback_misses += 1
+                                if _env_flag("GAZEBO_LIVE_STATE_FEEDBACK_REQUIRED", False):
+                                    raise RuntimeError("Gazebo live state feedback did not arrive")
+                            if gazebo_live_pose_correction:
+                                gazebo_live_client.send_agents(self.env.agents)
+                        else:
+                            state_ok = gazebo_live_client.apply_state_to_agents(
+                                self.env.agents,
+                                timeout=gazebo_live_state_feedback_timeout,
+                            )
+                            if state_ok:
+                                gazebo_state_feedback_applied = True
+                                gazebo_live_state_feedback_updates += 1
+                                if validation_active:
+                                    validation_gazebo_pose = _capture_agent_positions(self.env.agents)
+                                if gazebo_live_authoritative_feedback and authoritative_reward_snapshot is not None:
+                                    _restore_gazebo_live_reward_state(self.env, authoritative_reward_snapshot)
+                                try:
+                                    _clear_eval_observation_cache(self.env)
+                                    next_obs_n = self.env._get_obs_batch(self.env.agents)
+                                except Exception:
+                                    pass
+                            else:
+                                gazebo_live_state_feedback_misses += 1
+                                if _env_flag("GAZEBO_LIVE_STATE_FEEDBACK_REQUIRED", False):
+                                    raise RuntimeError("Gazebo live state feedback did not arrive")
+                except Exception as live_sync_err:
+                    gazebo_live_sync_error = str(live_sync_err)
+                    if _env_flag("GAZEBO_LIVE_REQUIRED", False):
+                        raise
+                    try:
+                        gazebo_live_client.close()
+                    except Exception:
+                        pass
+                    gazebo_live_client = None
+                    gazebo_live_sync_active = False
+                    if not quiet_output:
+                        tqdm.write(
+                            f"⚠️ Gazebo live sync 中断，将继续普通评估: {gazebo_live_sync_error}",
+                            file=tqdm_file,
+                        )
+
+            if gazebo_live_client is not None:
+                try:
+                    if gazebo_live_client.contact_detected():
+                        gazebo_contact_detected = True
+                        gazebo_contact_count += 1
+                        if gazebo_contact_step is None:
+                            gazebo_contact_step = int(step_count)
+                        contact_agents = gazebo_live_client.contact_agent_indices()
+                        try:
+                            contact_pairs = gazebo_live_client.contact_pairs()
+                            if contact_pairs:
+                                gazebo_contact_pairs.extend(contact_pairs)
+                        except Exception:
+                            pass
+                        if not contact_agents:
+                            contact_agents = list(range(len(getattr(self.env, "agents", []) or [])))
+                        gazebo_contact_agent_indices = sorted(set(gazebo_contact_agent_indices).union(contact_agents))
+                        if gazebo_live_contact_marks_collision:
+                            for contact_agent_idx in contact_agents:
+                                try:
+                                    agent = self.env.agents[contact_agent_idx]
+                                except Exception:
+                                    continue
+                                try:
+                                    agent._episode_has_collision = True
+                                    agent._had_obstacle_collision = True
+                                    agent._had_penetration_or_collision = True
+                                except Exception:
+                                    pass
+                                try:
+                                    if not hasattr(agent, "debug_info") or not isinstance(agent.debug_info, dict):
+                                        agent.debug_info = {}
+                                    old_count = int(agent.debug_info.get("gazebo_contact_collision_count", 0) or 0)
+                                    agent.debug_info["gazebo_contact_collision_count"] = old_count + 1
+                                    total_old = int(agent.debug_info.get("total_penetration_count", 0) or 0)
+                                    agent.debug_info["total_penetration_count"] = total_old + 1
+                                    if not hasattr(agent, "current_episode_collision_count"):
+                                        agent.current_episode_collision_count = 0
+                                    agent.current_episode_collision_count = int(agent.current_episode_collision_count) + 1
+                                except Exception:
+                                    pass
+                            if gazebo_live_contact_terminates and len(done_n) > 0:
+                                for done_idx in range(len(done_n)):
+                                    done_n[done_idx] = True
+                        try:
+                            gazebo_live_client.clear_contact_flag()
+                        except Exception:
+                            pass
+                        if not quiet_output:
+                            tqdm.write(
+                                f"⚠️ Gazebo contact detected at step {step_count}: agents={gazebo_contact_agent_indices}",
+                                file=tqdm_file,
+                            )
+                except Exception as contact_err:
+                    gazebo_live_sync_error = str(contact_err)
+                    if _env_flag("GAZEBO_LIVE_REQUIRED", False):
+                        raise
+
+            if gazebo_live_authoritative_feedback and gazebo_state_feedback_applied:
+                try:
+                    next_obs_n, rew_n, done_n, info_n = _recompute_step_outputs_from_current_state(
+                        self.env,
+                        fallback_info_n=info_n,
+                    )
+                    if gazebo_contact_detected and gazebo_live_contact_terminates and len(done_n) > 0:
+                        done_n = [True] * len(done_n)
+                    gazebo_live_authoritative_feedback_updates += 1
+                except Exception as authoritative_err:
+                    gazebo_live_authoritative_feedback_errors += 1
+                    gazebo_live_sync_error = str(authoritative_err)
+                    if _env_flag("GAZEBO_LIVE_REQUIRED", False) or _env_flag("GAZEBO_LIVE_AUTHORITATIVE_FEEDBACK_REQUIRED", False):
+                        raise
+            elif gazebo_live_authoritative_feedback and not gazebo_state_feedback_applied:
+                if _env_flag("GAZEBO_LIVE_AUTHORITATIVE_FEEDBACK_REQUIRED", False):
+                    raise RuntimeError("Gazebo authoritative feedback was requested but no Gazebo state was applied")
+
             # 累计奖励口径与训练保持一致：
             # 训练按“当前步所有智能体奖励的均值”累计，而不是直接对智能体求和。
-            try:
-                rew_arr = np.asarray(rew_n, dtype=np.float32)
-                if rew_arr.size > 0:
-                    if not np.all(np.isfinite(rew_arr)):
-                        rew_arr = np.where(np.isfinite(rew_arr), rew_arr, -1000.0)
-                    step_increment = float(np.mean(rew_arr))
-                else:
-                    step_increment = 0.0
-            except Exception:
-                try:
-                    step_increment = float(np.mean(rew_n))
-                except Exception:
-                    step_increment = float(sum(rew_n)) if rew_n is not None else 0.0
+            step_increment = _mean_step_reward_increment(rew_n)
             episode_reward += step_increment
-            step_count += 1
+            _accumulate_eval_step_diagnostics(
+                eval_diagnostics,
+                self.env,
+                actions=actions,
+                raw_actions=raw_actions,
+                pf_forces=pf_forces,
+                action_force_ratio=action_force_ratio,
+            )
+            if save_gazebo_dynamic_replay:
+                episode_dynamic_state_history.append(_capture_agent_dynamic_states(self.env.agents))
+                episode_dynamic_time_history.append(float(step_count * simulation_dt))
+                episode_dynamic_step_indices.append(int(step_count))
+                episode_dynamic_raw_action_history.append(_copy_action_frame(raw_actions))
+                episode_dynamic_executed_action_history.append(_copy_action_frame(actions))
+                episode_dynamic_pf_force_history.append(_copy_action_frame(pf_forces))
 
             current_positions = _capture_agent_positions(self.env.agents)
+            current_feedback_velocities = _capture_agent_velocities(self.env.agents)
+            if validation_active:
+                try:
+                    from gazebo_live_validation import capture_pose_metrics
+                    validation_metrics = capture_pose_metrics(
+                        scenario=self.scenario,
+                        positions=current_positions,
+                        goals=agent_goal_positions,
+                    )
+                except Exception as validation_metric_err:
+                    validation_metrics = {"error": str(validation_metric_err)}
+                validation_trace_tail.append(
+                    {
+                        "step": int(step_count),
+                        "actions": _copy_action_frame(actions),
+                        "raw_actions": _copy_action_frame(raw_actions),
+                        "cmd_vel": _vec_frames_to_lists(validation_cmd_vel),
+                        "feedback_vel": _vec_frames_to_lists(current_feedback_velocities),
+                        "python_pose": _vec_frames_to_lists(validation_python_pose),
+                        "gazebo_pose": _vec_frames_to_lists(
+                            validation_gazebo_pose if validation_gazebo_pose is not None else current_positions
+                        ),
+                        "metrics": validation_metrics,
+                    }
+                )
+            if gazebo_apf_enabled and gazebo_apf_validator is not None and gazebo_apf_result is not None and gazebo_apf_state is not None:
+                try:
+                    gazebo_apf_validator.record_live_step(
+                        gazebo_result=gazebo_apf_result,
+                        state=gazebo_apf_state,
+                        episode=episode_idx,
+                        step=step_count,
+                        comparison_records=gazebo_apf_comparison_records,
+                        sent_cmd_vel=validation_cmd_vel,
+                        feedback_velocities=current_feedback_velocities,
+                    )
+                except Exception as live_metric_err:
+                    gazebo_apf_error = str(live_metric_err)
+                    if _env_flag("GAZEBO_APF_REQUIRED", True):
+                        raise
             if save_control_diagnostics:
                 current_velocities = []
                 for agent in self.env.agents:
@@ -4239,6 +6046,55 @@ class ModelEvaluator:
                 '状态': '完成'
             })
             pbar.close()
+
+        if gazebo_apf_validator is not None:
+            try:
+                gazebo_apf_metrics = gazebo_apf_validator.finalize()
+            except Exception as apf_finalize_err:
+                gazebo_apf_error = str(apf_finalize_err)
+                if _env_flag("GAZEBO_APF_REQUIRED", True):
+                    raise
+
+        if gazebo_live_client is not None:
+            try:
+                gazebo_live_client_stats = {
+                    "semantic_mode": gazebo_live_semantic_mode,
+                    "feedback_velocity_mode": getattr(gazebo_live_client, "state_velocity_mode", None),
+                    "feedback_acceleration_mode": getattr(gazebo_live_client, "state_acceleration_mode", None),
+                    "pose_jump_reject_count": int(getattr(gazebo_live_client, "pose_jump_reject_count", 0) or 0),
+                    "max_pose_jump_observed": float(getattr(gazebo_live_client, "max_pose_jump_observed", 0.0) or 0.0),
+                    "max_feedback_speed_observed": float(getattr(gazebo_live_client, "max_feedback_speed_observed", 0.0) or 0.0),
+                    "max_feedback_accel_observed": float(getattr(gazebo_live_client, "max_feedback_accel_observed", 0.0) or 0.0),
+                    "cmd_vel_publish_count": int(getattr(gazebo_live_client, "sent_twist_frames", 0) or 0),
+                    "pose_publish_count": int(getattr(gazebo_live_client, "sent_frames", 0) or 0),
+                    "bridge_ack_enabled": bool(getattr(gazebo_live_client, "wait_ack", False)),
+                    "bridge_ack_count": int(getattr(gazebo_live_client, "ack_count", 0) or 0),
+                    "bridge_ack_timeout_count": int(getattr(gazebo_live_client, "ack_timeout_count", 0) or 0),
+                    "bridge_last_ack_state_frame": getattr(gazebo_live_client, "last_ack_state_frame", None),
+                    "pre_step_sleep_ms": int(getattr(gazebo_live_client, "pre_step_sleep_ms", 0) or 0),
+                    "post_step_sleep_ms": int(getattr(gazebo_live_client, "post_step_sleep_ms", 0) or 0),
+                    "wall_time_step_ms": int(getattr(gazebo_live_client, "wall_time_step_ms", 0) or 0),
+                    "pause_for_step": bool(getattr(gazebo_live_client, "pause_for_step", False)),
+                    "world_name": getattr(gazebo_live_client, "world", None),
+                    "agent_prefix": getattr(gazebo_live_client, "agent_prefix", None),
+                    "bridge_running": bool(gazebo_live_client.is_running()),
+                    "state_file": str(getattr(gazebo_live_client, "state_file", "")) or None,
+                    "contact_flag_file": str(getattr(gazebo_live_client, "contact_flag_file", "")) or None,
+                    "contact_feedback_enabled": bool(getattr(gazebo_live_client, "contact_feedback", False)),
+                    "contact_feedback_armed": bool(gazebo_live_client.contact_feedback_armed()),
+                    "contact_topics": gazebo_live_client.expected_contact_topics(),
+                }
+                gazebo_live_client.close()
+            except Exception as live_sync_close_err:
+                gazebo_live_sync_error = str(live_sync_close_err)
+                if _env_flag("GAZEBO_LIVE_REQUIRED", False):
+                    raise
+            finally:
+                gazebo_live_client = None
+        if isinstance(gazebo_live_launch, dict) and gazebo_live_launch.get("_process") is not None:
+            if not _env_flag("GAZEBO_LIVE_KEEP_ALIVE", False):
+                _terminate_process_group(gazebo_live_launch.get("_gui_process"))
+                _terminate_process_group(gazebo_live_launch.get("_process"))
         
         # 计算回合统计
         episode_duration = time.time() - start_time
@@ -4337,6 +6193,7 @@ class ModelEvaluator:
         #       Succ_i := Reach_i ∧ Safe_i
         #       Succ_team := Λ_{i=1}^{M} Succ_i
         agent_success_flags = []
+        agent_safe_flags = []
         team_success_flag = 1
         try:
             thr_success = float(getattr(self.args, 'success_distance_threshold', 4.0))
@@ -4411,6 +6268,7 @@ class ModelEvaluator:
                     
                     # 单智能体成功 = 到达目标 AND 无碰撞
                     succ_i = 1 if (reach_i and safe_i) else 0
+                    agent_safe_flags.append(1 if safe_i else 0)
                     agent_success_flags.append(succ_i)
                     
                     if succ_i == 0:
@@ -4419,7 +6277,14 @@ class ModelEvaluator:
             if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
                 print(f"⚠️  计算成功标志时出错: {e}")
             agent_success_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
+            agent_safe_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             team_success_flag = 0
+
+        world_snapshot = _get_world_success_snapshot(self.env, expected_count=len(episode_collision_counts))
+        if world_snapshot is not None:
+            agent_safe_flags = world_snapshot['safe_flags']
+            agent_success_flags = world_snapshot['success_flags']
+            team_success_flag = world_snapshot['team_success']
         
         # 计算汇总统计
         total_collisions = sum(episode_collision_counts) if episode_collision_counts else 0
@@ -4508,6 +6373,22 @@ class ModelEvaluator:
             except Exception as e:
                 if not quiet_output:
                     print(f"⚠️  追加最终轨迹点失败: {e}")
+
+        eval_diag = _finalize_eval_diagnostics(eval_diagnostics)
+        reward_decomposition = eval_diag['reward_components']
+        diagnostic_metrics = eval_diag['diagnostic_metrics']
+        terminal_success_bonus_applied = bool(
+            abs(float(reward_decomposition.get('reward_terminal_success', 0.0) or 0.0)) > 1e-8
+        )
+        episode_done_reason = _infer_episode_done_reason(
+            success_flag,
+            first_reach_step,
+            step_count,
+            episode_length,
+            total_collisions,
+        )
+        if world_snapshot is not None and world_snapshot.get('done_reason'):
+            episode_done_reason = world_snapshot['done_reason']
         
         if not quiet_output:
             print(f"✅ 回合 {episode_idx + 1} 完成:")
@@ -4547,15 +6428,135 @@ class ModelEvaluator:
 
         vis_context = self._capture_episode_vis_context(episode_idx)
         
-        return {
+        gazebo_live_cmd_vel_publish_count = int(gazebo_live_client_stats.get("cmd_vel_publish_count", 0) or 0)
+        gazebo_live_feedback_update_ratio = float(
+            gazebo_live_authoritative_feedback_updates / max(gazebo_live_cmd_vel_publish_count, 1)
+        )
+        gazebo_live_state_feedback_update_ratio = float(
+            gazebo_live_state_feedback_updates / max(gazebo_live_cmd_vel_publish_count, 1)
+        )
+
+        episode_data = {
             'episode': episode_idx,
             'reward': episode_reward,
             'steps': step_count,
+            'episode_length': int(episode_length),
             'trajectory': episode_trajectory if record_trajectory else [],
             'actions_history': episode_actions_history if record_actions else [],
             'executed_actions_history': episode_executed_actions_history if save_control_diagnostics else [],
             'velocity_history': episode_velocity_history if save_control_diagnostics else [],
             'goal_distance_history': episode_goal_distance_history if save_control_diagnostics else [],
+            'dynamic_state_history': episode_dynamic_state_history if save_gazebo_dynamic_replay else [],
+            'dynamic_time_history': episode_dynamic_time_history if save_gazebo_dynamic_replay else [],
+            'dynamic_step_indices': episode_dynamic_step_indices if save_gazebo_dynamic_replay else [],
+            'dynamic_raw_action_history': episode_dynamic_raw_action_history if save_gazebo_dynamic_replay else [],
+            'dynamic_executed_action_history': episode_dynamic_executed_action_history if save_gazebo_dynamic_replay else [],
+            'dynamic_pf_force_history': episode_dynamic_pf_force_history if save_gazebo_dynamic_replay else [],
+            'gazebo_live_sync_active': bool(gazebo_live_sync_active),
+            'gazebo_live_sync_error': gazebo_live_sync_error,
+            'apf_backend': apf_backend,
+            'gazebo_apf_enabled': bool(gazebo_apf_enabled),
+            'gazebo_apf_error': gazebo_apf_error,
+            'gazebo_apf_metrics': gazebo_apf_metrics,
+            'gazebo_apf_validation_dir': (
+                str(gazebo_apf_validator.output_dir)
+                if gazebo_apf_validator is not None
+                else None
+            ),
+            'gazebo_live_launch_error': gazebo_live_launch_error,
+            'gazebo_live_autolaunched': bool(isinstance(gazebo_live_launch, dict) and gazebo_live_launch.get('autolaunch_started', False)),
+            'gazebo_live_autolaunch_gui': bool(isinstance(gazebo_live_launch, dict) and gazebo_live_launch.get('autolaunch_gui', False)),
+            'gazebo_live_autolaunch_run': bool(isinstance(gazebo_live_launch, dict) and gazebo_live_launch.get('autolaunch_run', False)),
+            'gazebo_live_gui_error': (
+                gazebo_live_launch.get('gui_error') if isinstance(gazebo_live_launch, dict) else None
+            ),
+            'gazebo_live_world_sdf': (
+                gazebo_live_launch.get('world_live_sdf') if isinstance(gazebo_live_launch, dict) else None
+            ),
+            'gazebo_live_scenario_json': (
+                gazebo_live_launch.get('scenario_json') if isinstance(gazebo_live_launch, dict) else None
+            ),
+            'gazebo_live_export_dir': (
+                gazebo_live_launch.get('output_dir') if isinstance(gazebo_live_launch, dict) else None
+            ),
+            'gazebo_live_consistency_mode': gazebo_live_consistency_mode,
+            'gazebo_live_semantic_mode': gazebo_live_client_stats.get("semantic_mode", gazebo_live_semantic_mode),
+            'gazebo_live_collision_mode': (
+                gazebo_live_launch.get('collision_mode')
+                if isinstance(gazebo_live_launch, dict) and gazebo_live_launch.get('collision_mode')
+                else gazebo_live_collision_mode
+            ),
+            'gazebo_live_physical_collision_enabled': bool(
+                gazebo_live_launch.get('physical_collision_enabled')
+                if isinstance(gazebo_live_launch, dict) and 'physical_collision_enabled' in gazebo_live_launch
+                else gazebo_live_physical_collision_enabled
+            ),
+            'gazebo_live_python_authoritative': bool(gazebo_live_python_authoritative),
+            'gazebo_live_contact_authoritative': bool(gazebo_live_contact_authoritative),
+            'gazebo_live_contact_marks_collision': bool(gazebo_live_contact_marks_collision),
+            'gazebo_live_contact_terminates': bool(gazebo_live_contact_terminates),
+            'gazebo_live_pose_correction': bool(gazebo_live_pose_correction),
+            'gazebo_live_control_mode': gazebo_live_control_mode,
+            'gazebo_live_command_sleep': float(gazebo_live_command_sleep),
+            'gazebo_live_step_iterations': int(gazebo_live_step_iterations),
+            'gazebo_live_state_feedback': bool(gazebo_live_state_feedback),
+            'gazebo_live_contact_feedback': bool(gazebo_live_client_stats.get("contact_feedback_enabled", _env_flag("GAZEBO_LIVE_CONTACT_FEEDBACK", True))),
+            'gazebo_live_bridge_running': bool(gazebo_live_client_stats.get("bridge_running", False)),
+            'gazebo_live_contact_feedback_armed': bool(gazebo_live_client_stats.get("contact_feedback_armed", False)),
+            'gazebo_live_contact_topics': gazebo_live_client_stats.get("contact_topics", []),
+            'gazebo_live_state_file': gazebo_live_client_stats.get("state_file"),
+            'gazebo_live_contact_flag_file': gazebo_live_client_stats.get("contact_flag_file"),
+            'gazebo_live_feedback_velocity_mode': gazebo_live_client_stats.get("feedback_velocity_mode"),
+            'gazebo_live_feedback_acceleration_mode': gazebo_live_client_stats.get("feedback_acceleration_mode"),
+            'gazebo_live_world_name': gazebo_live_client_stats.get("world_name") or (
+                gazebo_live_launch.get("world_name") if isinstance(gazebo_live_launch, dict) else None
+            ),
+            'gazebo_live_agent_prefix': gazebo_live_client_stats.get("agent_prefix") or (
+                gazebo_live_launch.get("agent_prefix") if isinstance(gazebo_live_launch, dict) else None
+            ),
+            'gazebo_live_cmd_vel_publish_count': gazebo_live_cmd_vel_publish_count,
+            'gazebo_live_pose_publish_count': int(gazebo_live_client_stats.get("pose_publish_count", 0) or 0),
+            'gazebo_live_bridge_ack_enabled': bool(gazebo_live_client_stats.get("bridge_ack_enabled", False)),
+            'gazebo_live_bridge_ack_count': int(gazebo_live_client_stats.get("bridge_ack_count", 0) or 0),
+            'gazebo_live_bridge_ack_timeout_count': int(gazebo_live_client_stats.get("bridge_ack_timeout_count", 0) or 0),
+            'gazebo_live_bridge_last_ack_state_frame': gazebo_live_client_stats.get("bridge_last_ack_state_frame"),
+            'gazebo_live_pre_step_sleep_ms': int(gazebo_live_client_stats.get("pre_step_sleep_ms", 0) or 0),
+            'gazebo_live_post_step_sleep_ms': int(gazebo_live_client_stats.get("post_step_sleep_ms", 0) or 0),
+            'gazebo_live_wall_time_step_ms': int(gazebo_live_client_stats.get("wall_time_step_ms", 0) or 0),
+            'gazebo_live_pause_for_step': bool(gazebo_live_client_stats.get("pause_for_step", False)),
+            'gazebo_live_pose_jump_reject_count': int(gazebo_live_client_stats.get("pose_jump_reject_count", 0) or 0),
+            'gazebo_live_max_pose_jump_observed': float(gazebo_live_client_stats.get("max_pose_jump_observed", 0.0) or 0.0),
+            'gazebo_live_max_feedback_speed_observed': float(gazebo_live_client_stats.get("max_feedback_speed_observed", 0.0) or 0.0),
+            'gazebo_live_max_feedback_accel_observed': float(gazebo_live_client_stats.get("max_feedback_accel_observed", 0.0) or 0.0),
+            'gazebo_live_state_feedback_updates': int(gazebo_live_state_feedback_updates),
+            'gazebo_live_state_feedback_misses': int(gazebo_live_state_feedback_misses),
+            'gazebo_live_state_feedback_update_ratio': gazebo_live_state_feedback_update_ratio,
+            'gazebo_live_authoritative_feedback': bool(gazebo_live_authoritative_feedback),
+            'gazebo_live_authoritative_feedback_updates': int(gazebo_live_authoritative_feedback_updates),
+            'gazebo_live_authoritative_feedback_errors': int(gazebo_live_authoritative_feedback_errors),
+            'gazebo_live_feedback_update_ratio': gazebo_live_feedback_update_ratio,
+            'gazebo_contact_detected': bool(gazebo_contact_detected),
+            'gazebo_contact_count': int(gazebo_contact_count),
+            'gazebo_contact_step': int(gazebo_contact_step) if gazebo_contact_step is not None else None,
+            'gazebo_contact_agent_indices': [int(v) for v in gazebo_contact_agent_indices],
+            'gazebo_contact_pairs': gazebo_contact_pairs,
+            'gazebo_live_scene_check': gazebo_live_scene_check,
+            'python_scene_signature': (
+                python_scene_signature_record.get('python_scene_signature')
+                if isinstance(python_scene_signature_record, dict)
+                else None
+            ),
+            'python_scene_signature_parts': (
+                python_scene_signature_record.get('python_scene_signature_parts')
+                if isinstance(python_scene_signature_record, dict)
+                else None
+            ),
+            'scene_signature': (
+                gazebo_live_scene_check.get('scene_signature')
+                if isinstance(gazebo_live_scene_check, dict)
+                else None
+            ),
+            'validation_trace_tail': list(validation_trace_tail) if validation_active else [],
             'duration': episode_duration,
             # 🔧 新增：返回碰撞和成功指标（与训练脚本一致）
             'collision_count': total_collisions,
@@ -4570,6 +6571,7 @@ class ModelEvaluator:
             'min_distance': min_distance_stat,
             'success': success_flag,
             'agent_success_flags': agent_success_flags,
+            'agent_safe_flags': agent_safe_flags,
             'team_success': team_success_flag,
             # 🔧 新增：到达时间/步数
             'arrival_step': arrival_step,
@@ -4589,8 +6591,23 @@ class ModelEvaluator:
             'agent_path_efficiencies': agent_path_efficiencies,
             # 🔧 新增：穿透深度统计
             'penetration_stat': penetration_stat,
+            'reward_decomposition': reward_decomposition,
+            'diagnostic_metrics': diagnostic_metrics,
+            'terminal_success_bonus_applied': terminal_success_bonus_applied,
+            'episode_done_reason': episode_done_reason,
             'vis_context': vis_context,
         }
+        if validation_active:
+            try:
+                from gazebo_live_validation import build_sync_health_record
+                episode_data['gazebo_live_sync_health'] = build_sync_health_record(
+                    episode_data=episode_data,
+                    backend=getattr(self.args, 'eval_backend', os.getenv('EVAL_BACKEND', 'python_only')),
+                    validation_root=validation_root,
+                )
+            except Exception as sync_health_err:
+                episode_data['gazebo_live_sync_health_error'] = str(sync_health_err)
+        return episode_data
         
     def generate_visualization(self, episode_data, is_best=False):
         """生成可视化结果，仿照1.0版本
@@ -5007,6 +7024,116 @@ class ModelEvaluator:
                     env_instance=None if goal_positions_snapshot is not None else self.env
                 )
 
+            save_gazebo_replay = _env_flag('SAVE_GAZEBO_REPLAY', False)
+            save_gazebo_dynamic_replay = _env_flag('SAVE_GAZEBO_DYNAMIC_REPLAY', False)
+            save_gazebo_fast_replay = _env_flag('SAVE_GAZEBO_FAST_REPLAY', False)
+            compile_gazebo_fast_replay = _env_flag('COMPILE_GAZEBO_FAST_REPLAY', save_gazebo_fast_replay)
+            save_trajectory_snapshot = _env_flag('SAVE_TRAJECTORY_SNAPSHOT', save_gazebo_replay or save_gazebo_dynamic_replay)
+            if save_trajectory_snapshot:
+                try:
+                    from pathlib import Path
+                    from trajectory_snapshot_exporter import write_dynamic_replay_snapshot, write_trajectory_snapshot
+
+                    replay_dir = (
+                        os.path.join(self.args.save_viz_path, f"gazebo_replay_ep{episode_num:03d}")
+                        if (save_gazebo_replay or save_gazebo_dynamic_replay)
+                        else self.args.save_viz_path
+                    )
+                    snapshot_prefix = f"episode_{episode_num:03d}"
+                    gazebo_replay_cache = _env_flag('GAZEBO_REPLAY_CACHE', True)
+                    gazebo_replay_compact = _env_flag('GAZEBO_REPLAY_COMPACT', save_gazebo_replay)
+                    snapshot_files = write_trajectory_snapshot(
+                        output_dir=Path(replay_dir),
+                        prefix=snapshot_prefix,
+                        episode_data=episode_data,
+                        vis_context=vis_context if isinstance(vis_context, dict) else None,
+                        args=self.args,
+                        generated_files=generated_files,
+                        compact=gazebo_replay_compact,
+                        reuse_cache=gazebo_replay_cache,
+                    )
+                    generated_files.update({k: v for k, v in snapshot_files.items() if v})
+
+                    if save_gazebo_replay or save_gazebo_dynamic_replay:
+                        from gazebo_terrain_exporter import export_gazebo_scene
+                        from gazebo_trajectory_exporter import export_gazebo_trajectory_replay
+
+                        scenario_json_path = snapshot_files.get('scenario_json_path')
+                        trajectory_json_path = snapshot_files.get('trajectory_snapshot_path')
+                        if not scenario_json_path or not trajectory_json_path:
+                            raise RuntimeError("Gazebo replay export requires both scenario_json_path and trajectory_snapshot_path")
+
+                        visual_resolution_raw = os.getenv('GAZEBO_TERRAIN_VISUAL_RESOLUTION', '').strip()
+                        visual_resolution = int(visual_resolution_raw) if visual_resolution_raw else None
+                        coarse_collision_resolution = _env_int('GAZEBO_COARSE_COLLISION_RESOLUTION', 80)
+                        gazebo_scene = export_gazebo_scene(
+                            scenario_json=Path(scenario_json_path),
+                            output_dir=Path(replay_dir),
+                            visual_resolution=visual_resolution,
+                            coarse_collision_resolution=coarse_collision_resolution,
+                            use_coarse_collision=_env_flag('GAZEBO_USE_COARSE_COLLISION', False),
+                            uav_marker_scale=_env_optional_float('GAZEBO_UAV_MARKER_SCALE'),
+                            show_agent_collision_envelope=not _env_flag('GAZEBO_HIDE_AGENT_COLLISION_ENVELOPE', False),
+                            reuse_cache=gazebo_replay_cache,
+                        )
+                        gazebo_replay = export_gazebo_trajectory_replay(
+                            scenario_json=Path(scenario_json_path),
+                            trajectory_json=Path(trajectory_json_path),
+                            output_dir=Path(replay_dir),
+                            base_world_sdf=Path(gazebo_scene['world_sdf']),
+                            path_stride=_env_int('GAZEBO_REPLAY_PATH_STRIDE', 2),
+                            path_radius=_env_float('GAZEBO_REPLAY_PATH_RADIUS', 0.18),
+                            tube_sides=_env_int('GAZEBO_REPLAY_TUBE_SIDES', 10),
+                            ghost_stride=_env_int('GAZEBO_REPLAY_GHOST_STRIDE', 80),
+                            ghost_radius_scale=_env_float('GAZEBO_REPLAY_GHOST_RADIUS_SCALE', 1.0),
+                            reuse_cache=gazebo_replay_cache,
+                        )
+                        generated_files.update({
+                            'gazebo_world_sdf': gazebo_scene.get('world_sdf'),
+                            'gazebo_world_replay_sdf': gazebo_replay.get('world_replay_sdf'),
+                            'gazebo_model_parent_dir': gazebo_replay.get('model_parent_dir'),
+                            'gazebo_resource_path_command': gazebo_replay.get('resource_path_command'),
+                        })
+                        print(f"✅ Gazebo静态轨迹回放已生成: {gazebo_replay.get('world_replay_sdf')}")
+                        if save_gazebo_dynamic_replay:
+                            from gazebo_dynamic_replay_exporter import export_gazebo_dynamic_replay
+
+                            dynamic_snapshot_files = write_dynamic_replay_snapshot(
+                                output_dir=Path(replay_dir),
+                                prefix=snapshot_prefix,
+                                episode_data=episode_data,
+                                args=self.args,
+                                trajectory_snapshot_path=Path(trajectory_json_path),
+                                scenario_json_path=Path(scenario_json_path),
+                                compact=gazebo_replay_compact,
+                                reuse_cache=gazebo_replay_cache,
+                            )
+                            dynamic_replay = export_gazebo_dynamic_replay(
+                                scenario_json=Path(scenario_json_path),
+                                trajectory_json=Path(trajectory_json_path),
+                                dynamic_json=Path(dynamic_snapshot_files['dynamic_replay_json_path']),
+                                output_dir=Path(replay_dir),
+                                base_world_sdf=Path(gazebo_replay['world_replay_sdf']),
+                                uav_marker_scale=_env_optional_float('GAZEBO_UAV_MARKER_SCALE'),
+                                reuse_cache=gazebo_replay_cache,
+                                build_fast_replay=save_gazebo_fast_replay or compile_gazebo_fast_replay,
+                                compile_fast_replay=compile_gazebo_fast_replay,
+                            )
+                            generated_files.update({k: v for k, v in dynamic_snapshot_files.items() if v})
+                            generated_files.update({
+                                'gazebo_dynamic_world_sdf': dynamic_replay.get('world_dynamic_replay_sdf'),
+                                'gazebo_dynamic_player': dynamic_replay.get('player_script'),
+                                'gazebo_dynamic_replay_json': dynamic_replay.get('dynamic_replay_json'),
+                                'gazebo_dynamic_replay_npz': dynamic_replay.get('dynamic_replay_npz'),
+                                'gazebo_fast_replay_meta': dynamic_replay.get('fast_replay', {}).get('meta_path') if isinstance(dynamic_replay.get('fast_replay'), dict) else None,
+                                'gazebo_fast_replay_executable': dynamic_replay.get('fast_replay', {}).get('executable') if isinstance(dynamic_replay.get('fast_replay'), dict) else None,
+                                'gazebo_fast_replay_binary': dynamic_replay.get('fast_replay', {}).get('binary', {}).get('binary_path') if isinstance(dynamic_replay.get('fast_replay'), dict) else None,
+                            })
+                            print(f"✅ Gazebo动态轨迹回放已生成: {dynamic_replay.get('world_dynamic_replay_sdf')}")
+                except Exception as gazebo_replay_err:
+                    print(f"⚠️ Gazebo静态轨迹回放导出失败: {gazebo_replay_err}")
+                    traceback.print_exc()
+
             # GIF仍只在显式允许时生成，默认由shell脚本禁用
             if is_best and len(episode_data['trajectory']) > 10 and not getattr(self.args, 'disable_gif', False):
                 gif_path = os.path.join(
@@ -5061,6 +7188,27 @@ class ModelEvaluator:
         best_success_trajectory = None
         best_success_actor_outputs_history = None
         save_all_episode_visualizations = os.getenv('SAVE_EVAL_ALL_EPISODES', '1').lower() in ('1','true','yes','on')
+        selected_episode_visualizations = set()
+        for raw_value, one_based in (
+            (os.getenv('SAVE_EVAL_EPISODE_INDICES', ''), False),
+            (os.getenv('SAVE_EVAL_EPISODE_NUMBERS', ''), True),
+        ):
+            for token in str(raw_value or '').replace(';', ',').replace(' ', ',').split(','):
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    episode_id = int(token)
+                except Exception:
+                    continue
+                if one_based:
+                    episode_id -= 1
+                if episode_id >= 0:
+                    selected_episode_visualizations.add(int(episode_id))
+
+        def _should_save_episode_visualization(episode_idx):
+            return save_all_episode_visualizations or int(episode_idx) in selected_episode_visualizations
+
         episode_visualizations = []
         try:
             quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
@@ -5074,6 +7222,7 @@ class ModelEvaluator:
         persist_episode_trajectories = _env_flag('SAVE_EVAL_TRAJECTORY_JSON', True)
         save_actor_sequence = _env_flag('SAVE_EVAL_ACTOR_SEQUENCE', False)
         save_control_diagnostics = _env_flag('SAVE_EVAL_CONTROL_DIAGNOSTICS', False)
+        persist_dynamic_replay_json = _env_flag('SAVE_EVAL_DYNAMIC_REPLAY_JSON', False)
         log_episode_timing = _env_flag("EVAL_LOG_EPISODE_TIMING", True)
 
         def _normalize_generated_files(generated_files):
@@ -5114,6 +7263,31 @@ class ModelEvaluator:
             print(f"🏆 最佳回合单独可视化: {'是' if (enable_best_traj and not save_all_episode_visualizations) else '否'}")
             print(f"📊 保存交互式HTML: {'是' if enable_interactive else '否'}")
         
+        terrain_level_sequence = None
+        terrain_level_str = os.getenv('TERRAIN_COMPLEXITY_LEVEL_SEQUENCE', '')
+        if terrain_level_str:
+            try:
+                terrain_level_sequence = [
+                    max(1, min(4, int(s.strip())))
+                    for s in terrain_level_str.split(',')
+                    if s.strip()
+                ]
+                if not quiet_output:
+                    print(
+                        f"🔧 使用预定义地形复杂度序列（共{len(terrain_level_sequence)}个）: "
+                        f"{terrain_level_sequence[:5]}... (前5个)"
+                    )
+            except Exception as e:
+                print(f"⚠️  解析地形复杂度序列失败: {e}，将使用随机复杂度")
+                terrain_level_sequence = None
+
+        def _select_episode_terrain_level(episode_index):
+            if self.args.terrain_complexity_level is not None:
+                return int(self.args.terrain_complexity_level)
+            if terrain_level_sequence:
+                return int(terrain_level_sequence[int(episode_index) % len(terrain_level_sequence)])
+            return int(np.random.randint(1, 5))
+
         # 🔧 关键修复：从环境变量读取地形种子序列，确保所有评估模式使用相同的地图顺序
         terrain_seed_sequence = None
         terrain_seed_str = os.getenv('TERRAIN_SEED_SEQUENCE', '')
@@ -5197,6 +7371,10 @@ class ModelEvaluator:
             'peak_height_max_scale': _env_float('PEAK_HEIGHT_MAX_SCALE', 1.30),
             'terrain_variant_noise_ratio': _env_float('TERRAIN_VARIANT_NOISE_RATIO', 0.15),
             'terrain_contact_eps': _env_float('TERRAIN_CONTACT_EPS', _finite_float_or_none(getattr(self.args, 'terrain_contact_eps', None)) or 0.2),
+            'reward_version': str(os.getenv('REWARD_VERSION', os.getenv('reward_version', 'v1')) or 'v1').strip(),
+            'reward_terminal_order_fix': bool(
+                getattr(getattr(self, 'env', None), '_reward_terminal_order_fix_enabled', True)
+            ),
             'position_family': position_family_override or os.getenv('HELDOUT_POSITION_MODE', 'train_match'),
             'reference_positions_file': os.getenv('HELDOUT_REFERENCE_POSITIONS_FILE', ''),
             'start_center_jitter': _env_float('HELDOUT_START_CENTER_JITTER', 12.0),
@@ -5212,6 +7390,7 @@ class ModelEvaluator:
             'gravity': _finite_float_or_none(getattr(self.args, 'gravity', None)),
             'control_accel_gain': _finite_float_or_none(getattr(self.args, 'control_accel_gain', None)),
             'damping': _finite_float_or_none(getattr(self.args, 'damping', None)),
+            'agent_size': _finite_float_or_none(getattr(self.args, 'agent_size', None)),
             'agent_max_speed': _finite_float_or_none(getattr(self.args, 'agent_max_speed', None)),
             'agent_accel': _finite_float_or_none(getattr(self.args, 'agent_accel', None)),
             'action_range_x': _finite_float_or_none(getattr(self.args, 'action_range_x', None)),
@@ -5227,6 +7406,21 @@ class ModelEvaluator:
                 _env_float('POST_EVAL_EPISODE_LENGTH_MULTIPLIER', 1.0),
             ),
             'action_force_ratio': _finite_float_or_none(getattr(self.args, 'action_force_ratio', None)),
+            'apf_backend': str(getattr(self.args, 'apf_backend', 'python_original')),
+            'gazebo_apf_output_dir': str(getattr(self.args, 'gazebo_apf_output_dir', 'results/gazebo_apf_validation')),
+            'use_tf_potential_field': bool(getattr(self.args, 'use_tf_potential_field', True)),
+            'use_fr_feature': bool(getattr(self.args, 'use_fr_feature', False)),
+            'use_pf_feature': bool(getattr(self.args, 'use_pf_feature', False)),
+            'terrain_sensing_mode': str(getattr(self.args, 'terrain_sensing_mode', 'local')),
+            'goal_attraction': _finite_float_or_none(getattr(self.args, 'goal_attraction', None)),
+            'lambda_1_base': _finite_float_or_none(getattr(self.args, 'lambda_1_base', None)),
+            'terrain_repulsion': _finite_float_or_none(getattr(self.args, 'terrain_repulsion', None)),
+            'agent_influence_range': _finite_float_or_none(getattr(self.args, 'agent_influence_range', None)),
+            'delta_k_att': _finite_float_or_none(getattr(self.args, 'delta_k_att', None)),
+            'delta_lambda_1': _finite_float_or_none(getattr(self.args, 'delta_lambda_1', None)),
+            'delta_k_rep': _finite_float_or_none(getattr(self.args, 'delta_k_rep', None)),
+            'delta_radius': _finite_float_or_none(getattr(self.args, 'delta_radius', None)),
+            'max_force_magnitude': _finite_float_or_none(getattr(self.args, 'max_force_magnitude', None)),
             'action_force_ratio_source': (
                 'forced_override'
                 if getattr(self.args, 'force_action_force_ratio', None) is not None
@@ -5283,8 +7477,14 @@ class ModelEvaluator:
                 or 1
             ),
         )
-        eval_episode_parallelism = min(eval_episode_parallelism, max(1, int(self.args.eval_episodes)))
+        eval_episode_count = max(1, int(self.args.eval_episodes))
+        eval_episode_start_index = max(0, _env_int("EVAL_EPISODE_START_INDEX", 0))
+        eval_episode_stop_index = eval_episode_start_index + eval_episode_count
+        eval_episode_parallelism = min(eval_episode_parallelism, eval_episode_count)
         use_batched_episode_eval = eval_episode_parallelism > 1
+        if use_batched_episode_eval and str(getattr(self.args, 'apf_backend', 'python_original')).strip().lower() == 'gazebo_apf':
+            print("⚠️  apf_backend=gazebo_apf 需要逐步读取Gazebo反馈，已回退串行评估。")
+            use_batched_episode_eval = False
         if use_batched_episode_eval and str(getattr(self.args, 'terrain_sensing_mode', 'local')).startswith('oracle'):
             print("⚠️  EVAL_EPISODE_PARALLELISM>1 但 terrain_sensing_mode=oracle*，为避免 scenario_ref 污染，回退串行评估。")
             use_batched_episode_eval = False
@@ -5309,20 +7509,17 @@ class ModelEvaluator:
         evaluation_setup['eval_episode_parallelism_mode'] = 'inprocess_batch' if use_batched_episode_eval else 'serial'
         evaluation_setup['eval_env_step_threads'] = int(self._eval_env_step_threads)
 
-        serial_episode_range = range(self.args.eval_episodes)
+        serial_episode_range = range(eval_episode_start_index, eval_episode_stop_index)
         if use_batched_episode_eval:
             print(
                 f"[EvalBatch] 启用方案A: episode_parallelism={eval_episode_parallelism}, "
                 f"env_step_threads={self._eval_env_step_threads}，模型单次加载，batch actor/PF"
             )
-            for batch_start in range(0, int(self.args.eval_episodes), eval_episode_parallelism):
-                batch_end = min(int(self.args.eval_episodes), batch_start + eval_episode_parallelism)
+            for batch_start in range(eval_episode_start_index, eval_episode_stop_index, eval_episode_parallelism):
+                batch_end = min(eval_episode_stop_index, batch_start + eval_episode_parallelism)
                 episode_contexts = []
                 for episode in range(batch_start, batch_end):
-                    if self.args.terrain_complexity_level is None:
-                        terrain_level = np.random.randint(1, 5)
-                    else:
-                        terrain_level = self.args.terrain_complexity_level
+                    terrain_level = _select_episode_terrain_level(episode)
                     episode_contexts.append(
                         self._build_episode_eval_context(
                             episode,
@@ -5380,10 +7577,17 @@ class ModelEvaluator:
                         stored_episode_data['executed_actions_history'] = []
                         stored_episode_data['velocity_history'] = []
                         stored_episode_data['goal_distance_history'] = []
+                    if not persist_dynamic_replay_json:
+                        stored_episode_data['dynamic_state_history'] = []
+                        stored_episode_data['dynamic_time_history'] = []
+                        stored_episode_data['dynamic_step_indices'] = []
+                        stored_episode_data['dynamic_raw_action_history'] = []
+                        stored_episode_data['dynamic_executed_action_history'] = []
+                        stored_episode_data['dynamic_pf_force_history'] = []
                     stored_episode_data['vis_context'] = None
                     all_episodes_data.append(stored_episode_data)
 
-                    if save_all_episode_visualizations and not self.args.disable_visualization:
+                    if _should_save_episode_visualization(episode) and not self.args.disable_visualization:
                         try:
                             generated_episode_files = self.generate_visualization(episode_data, is_best=False) or {}
                             normalized_files = _normalize_generated_files(generated_episode_files)
@@ -5409,7 +7613,7 @@ class ModelEvaluator:
             
             # 为每个回合随机选择地形复杂度等级（如果未指定）
             if self.args.terrain_complexity_level is None:
-                terrain_level = np.random.randint(1, 5)  # 1-4
+                terrain_level = _select_episode_terrain_level(episode)
                 if not quiet_output:
                     print(f"🎲 随机选择地形复杂度等级: {terrain_level}")
             else:
@@ -5451,11 +7655,29 @@ class ModelEvaluator:
                     continue
                 
                 episode_wall_seconds = time.perf_counter() - episode_wall_start
+                actual_terrain_seed = terrain_seed
+                if actual_terrain_seed is None:
+                    actual_terrain_seed = getattr(
+                        self.scenario,
+                        'current_terrain_seed',
+                        getattr(self.scenario, 'seed', None),
+                    )
+                actual_terrain_variant_seed = terrain_variant_seed
+                if actual_terrain_variant_seed is None:
+                    actual_terrain_variant_seed = getattr(
+                        self.scenario,
+                        'current_terrain_variant_seed',
+                        getattr(self.scenario, 'terrain_variant_seed', None),
+                    )
+                actual_obstacle_seed = obstacle_seed
+                if actual_obstacle_seed is None:
+                    actual_obstacle_seed = getattr(self.scenario, 'current_episode_obstacle_seed', None)
+
                 episode_data['wall_time_seconds'] = float(episode_wall_seconds)
                 episode_data['terrain_complexity_level'] = terrain_level
-                episode_data['terrain_seed'] = terrain_seed
-                episode_data['terrain_variant_seed'] = terrain_variant_seed
-                episode_data['obstacle_seed'] = obstacle_seed
+                episode_data['terrain_seed'] = actual_terrain_seed
+                episode_data['terrain_variant_seed'] = actual_terrain_variant_seed
+                episode_data['obstacle_seed'] = actual_obstacle_seed
                 all_rewards.append(episode_data['reward'])
                 _log_episode_timing(episode, episode_data, episode_wall_seconds)
                 
@@ -5486,10 +7708,17 @@ class ModelEvaluator:
                     stored_episode_data['executed_actions_history'] = []
                     stored_episode_data['velocity_history'] = []
                     stored_episode_data['goal_distance_history'] = []
+                if not persist_dynamic_replay_json:
+                    stored_episode_data['dynamic_state_history'] = []
+                    stored_episode_data['dynamic_time_history'] = []
+                    stored_episode_data['dynamic_step_indices'] = []
+                    stored_episode_data['dynamic_raw_action_history'] = []
+                    stored_episode_data['dynamic_executed_action_history'] = []
+                    stored_episode_data['dynamic_pf_force_history'] = []
                 stored_episode_data['vis_context'] = None
                 all_episodes_data.append(stored_episode_data)
                 
-                if save_all_episode_visualizations and not self.args.disable_visualization:
+                if _should_save_episode_visualization(episode) and not self.args.disable_visualization:
                     try:
                         generated_episode_files = self.generate_visualization(episode_data, is_best=False) or {}
                         normalized_files = _normalize_generated_files(generated_episode_files)
@@ -5546,6 +7775,7 @@ class ModelEvaluator:
                 'evaluation_setup': evaluation_setup,
                 'episode_details': [],
                 'visualization_artifacts': {},
+                'terrain_complexity_level_sequence': terrain_level_sequence or [],
                 'terrain_seed_sequence': terrain_seed_sequence or [],
                 'terrain_variant_seed_sequence': terrain_variant_seed_sequence or [],
                 'evaluation_time': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -5562,6 +7792,50 @@ class ModelEvaluator:
         std_reward = np.std(all_rewards)
         max_reward = np.max(all_rewards)
         min_reward = np.min(all_rewards)
+        os.makedirs(self.args.save_viz_path, exist_ok=True)
+        evaluation_setup['gazebo_live_sync_enabled'] = _env_flag('GAZEBO_LIVE_SYNC', False)
+        evaluation_setup['eval_backend'] = getattr(self.args, 'eval_backend', None) or os.getenv('EVAL_BACKEND', 'python_only')
+        evaluation_setup['gazebo_live_validation'] = _env_flag('GAZEBO_LIVE_VALIDATION', False)
+        evaluation_setup['gazebo_live_validation_dir'] = os.getenv('GAZEBO_LIVE_VALIDATION_DIR', None)
+        evaluation_setup['gazebo_live_autolaunch'] = _env_flag('GAZEBO_LIVE_AUTOLAUNCH', False)
+        evaluation_setup['gazebo_live_autolaunch_gui'] = _env_flag('GAZEBO_LIVE_AUTOLAUNCH_GUI', False)
+        evaluation_setup['gazebo_live_autolaunch_run'] = _env_flag('GAZEBO_LIVE_AUTOLAUNCH_RUN', False)
+        evaluation_setup['gazebo_live_keep_alive'] = _env_flag('GAZEBO_LIVE_KEEP_ALIVE', False)
+        evaluation_setup['gazebo_live_export_dir'] = os.getenv('GAZEBO_LIVE_EXPORT_DIR', None)
+        evaluation_setup['gazebo_live_world'] = os.getenv('GAZEBO_LIVE_WORLD', 'matd3_static_scene')
+        evaluation_setup['gazebo_live_agent_prefix'] = os.getenv('GAZEBO_LIVE_AGENT_PREFIX', 'dynamic_agent_')
+        evaluation_setup['gazebo_live_consistency_mode'] = os.getenv('GAZEBO_LIVE_CONSISTENCY_MODE', 'gazebo_authoritative')
+        gazebo_live_setup_semantic_mode = os.getenv('GAZEBO_LIVE_SEMANTIC_MODE', 'transfer_equivalence').strip().lower()
+        gazebo_live_setup_physical_contact = gazebo_live_setup_semantic_mode in (
+            'physical',
+            'physical_robustness',
+            'contact_authoritative',
+            'gazebo_contact_authoritative',
+        )
+        evaluation_setup['gazebo_live_semantic_mode'] = gazebo_live_setup_semantic_mode
+        gazebo_live_setup_collision_mode = _gazebo_live_collision_mode()
+        evaluation_setup['gazebo_live_collision_mode'] = gazebo_live_setup_collision_mode
+        evaluation_setup['gazebo_live_physical_collision_enabled'] = gazebo_live_setup_collision_mode != 'nonblocking'
+        evaluation_setup['gazebo_live_contact_authoritative'] = _env_flag('GAZEBO_LIVE_CONTACT_AUTHORITATIVE', gazebo_live_setup_physical_contact)
+        evaluation_setup['gazebo_live_contact_marks_collision'] = _env_flag('GAZEBO_LIVE_CONTACT_MARKS_COLLISION', _env_flag('GAZEBO_LIVE_CONTACT_AUTHORITATIVE', gazebo_live_setup_physical_contact))
+        evaluation_setup['gazebo_live_contact_terminates'] = _env_flag('GAZEBO_LIVE_CONTACT_TERMINATES', False)
+        evaluation_setup['gazebo_live_pose_correction'] = _env_flag('GAZEBO_LIVE_POSE_CORRECTION', False)
+        evaluation_setup['gazebo_live_sync_every'] = _env_int('GAZEBO_LIVE_SYNC_EVERY', 1)
+        evaluation_setup['gazebo_live_control_mode'] = os.getenv('GAZEBO_LIVE_CONTROL_MODE', 'pose')
+        evaluation_setup['gazebo_live_command_sleep'] = _env_float('GAZEBO_LIVE_COMMAND_SLEEP', 0.0)
+        evaluation_setup['gazebo_live_step_iterations'] = _env_int('GAZEBO_LIVE_STEP_ITERATIONS', 0)
+        evaluation_setup['gazebo_live_wait_ack'] = _env_flag('GAZEBO_LIVE_WAIT_ACK', False)
+        evaluation_setup['gazebo_live_ack_timeout'] = _env_float('GAZEBO_LIVE_ACK_TIMEOUT', 2.0)
+        evaluation_setup['gazebo_live_pre_step_sleep_ms'] = _env_int('GAZEBO_LIVE_PRE_STEP_SLEEP_MS', 0)
+        evaluation_setup['gazebo_live_post_step_sleep_ms'] = _env_int('GAZEBO_LIVE_POST_STEP_SLEEP_MS', 0)
+        evaluation_setup['gazebo_live_wall_time_step_ms'] = _env_int('GAZEBO_LIVE_WALL_TIME_STEP_MS', 0)
+        evaluation_setup['gazebo_live_pause_for_step'] = _env_flag('GAZEBO_LIVE_PAUSE_FOR_STEP', False)
+        evaluation_setup['gazebo_live_state_feedback'] = _env_flag('GAZEBO_LIVE_STATE_FEEDBACK', False)
+        evaluation_setup['gazebo_live_feedback_velocity_mode'] = os.getenv('GAZEBO_LIVE_FEEDBACK_VELOCITY_MODE', 'clamp')
+        evaluation_setup['gazebo_live_feedback_acceleration_mode'] = os.getenv('GAZEBO_LIVE_FEEDBACK_ACCELERATION_MODE', 'estimate')
+        evaluation_setup['gazebo_live_max_pose_jump'] = _env_float('GAZEBO_LIVE_MAX_POSE_JUMP', 100.0)
+        evaluation_setup['gazebo_uav_visual_scale_multiplier'] = _env_float('GAZEBO_UAV_VISUAL_SCALE_MULTIPLIER', _env_float('GAZEBO_LIVE_UAV_VISUAL_SCALE_MULTIPLIER', 3.0))
+        evaluation_setup['gazebo_live_authoritative_feedback'] = _env_flag('GAZEBO_LIVE_AUTHORITATIVE_FEEDBACK', True)
         summary = _build_evaluation_summary(
             all_rewards,
             all_episodes_data,
@@ -5734,6 +8008,30 @@ class ModelEvaluator:
         elif save_team_success_html and best_success_episode_data is None:
             print("⏭️  未生成团队成功HTML（本次评估没有团队成功回合）")
 
+        try:
+            reward_decomp_csv_path = _write_reward_decomposition_eval_csv(
+                self.args.save_viz_path,
+                all_episodes_data,
+                self.args,
+            )
+            visualization_artifacts['reward_decomposition_eval_csv'] = reward_decomp_csv_path
+            print(f"✅ Reward decomposition CSV已保存: {reward_decomp_csv_path}")
+        except Exception as reward_diag_e:
+            print(f"⚠️  Reward decomposition CSV生成失败: {reward_diag_e}")
+            traceback.print_exc()
+
+        try:
+            success_consistency_path = _write_success_reward_consistency_report(
+                self.args.save_viz_path,
+                all_episodes_data,
+                self.args,
+            )
+            visualization_artifacts['success_reward_consistency_report'] = success_consistency_path
+            print(f"✅ Success/reward一致性报告已保存: {success_consistency_path}")
+        except Exception as success_diag_e:
+            print(f"⚠️  Success/reward一致性报告生成失败: {success_diag_e}")
+            traceback.print_exc()
+
         # 保存评估结果
         results = {
             'model_path': self.args.load_model_path,
@@ -5747,6 +8045,7 @@ class ModelEvaluator:
             'summary': summary,
             'evaluation_setup': evaluation_setup,
             'visualization_artifacts': visualization_artifacts,
+            'terrain_complexity_level_sequence': terrain_level_sequence or [],
             'terrain_seed_sequence': terrain_seed_sequence or [],
             'terrain_variant_seed_sequence': terrain_variant_seed_sequence or [],
             'episode_details': [
@@ -5754,9 +8053,11 @@ class ModelEvaluator:
                     'episode': ep['episode'],
                     'reward': float(ep['reward']),
                     'steps': ep['steps'],
+                    'episode_length': ep.get('episode_length', getattr(self.args, 'episode_length', None)),
                     'terrain_complexity_level': ep.get('terrain_complexity_level', 'unknown'),
                     'terrain_seed': ep.get('terrain_seed', None),
                     'terrain_variant_seed': ep.get('terrain_variant_seed', None),
+                    'obstacle_seed': ep.get('obstacle_seed', None),
                     'duration': ep['duration'],
                     'wall_time_seconds': ep.get('wall_time_seconds', None),
                     'trajectory': ep.get('trajectory', []) if persist_episode_trajectories else [],
@@ -5790,6 +8091,68 @@ class ModelEvaluator:
                     'agent_path_efficiencies': ep.get('agent_path_efficiencies', []),
                     # 🔧 新增：穿透深度统计
                     'penetration_stat': ep.get('penetration_stat', None),
+                    'agent_safe_flags': ep.get('agent_safe_flags', []),
+                    'reward_decomposition': ep.get('reward_decomposition', {}),
+                    'diagnostic_metrics': ep.get('diagnostic_metrics', {}),
+                    'terminal_success_bonus_applied': ep.get('terminal_success_bonus_applied', False),
+                    'episode_done_reason': ep.get('episode_done_reason', None),
+                    'gazebo_live_sync_active': ep.get('gazebo_live_sync_active', False),
+                    'gazebo_live_sync_error': ep.get('gazebo_live_sync_error', None),
+                    'gazebo_live_launch_error': ep.get('gazebo_live_launch_error', None),
+                    'gazebo_live_autolaunched': ep.get('gazebo_live_autolaunched', False),
+                    'gazebo_live_autolaunch_gui': ep.get('gazebo_live_autolaunch_gui', False),
+                    'gazebo_live_autolaunch_run': ep.get('gazebo_live_autolaunch_run', False),
+                    'gazebo_live_gui_error': ep.get('gazebo_live_gui_error', None),
+                    'gazebo_live_world_sdf': ep.get('gazebo_live_world_sdf', None),
+                    'gazebo_live_scenario_json': ep.get('gazebo_live_scenario_json', None),
+                    'gazebo_live_export_dir': ep.get('gazebo_live_export_dir', None),
+                    'gazebo_live_control_mode': ep.get('gazebo_live_control_mode', None),
+                    'gazebo_live_command_sleep': ep.get('gazebo_live_command_sleep', None),
+                    'gazebo_live_step_iterations': ep.get('gazebo_live_step_iterations', None),
+                    'gazebo_live_state_feedback': ep.get('gazebo_live_state_feedback', False),
+                    'gazebo_live_contact_feedback': ep.get('gazebo_live_contact_feedback', False),
+                    'gazebo_live_contact_authoritative': ep.get('gazebo_live_contact_authoritative', True),
+                    'gazebo_live_contact_marks_collision': ep.get('gazebo_live_contact_marks_collision', True),
+                    'gazebo_live_contact_terminates': ep.get('gazebo_live_contact_terminates', False),
+                    'gazebo_live_bridge_running': ep.get('gazebo_live_bridge_running', False),
+                    'gazebo_live_contact_feedback_armed': ep.get('gazebo_live_contact_feedback_armed', False),
+                    'gazebo_live_contact_topics': ep.get('gazebo_live_contact_topics', []),
+                    'gazebo_live_state_file': ep.get('gazebo_live_state_file', None),
+                    'gazebo_live_contact_flag_file': ep.get('gazebo_live_contact_flag_file', None),
+                    'gazebo_live_feedback_velocity_mode': ep.get('gazebo_live_feedback_velocity_mode', None),
+                    'gazebo_live_world_name': ep.get('gazebo_live_world_name', None),
+                    'gazebo_live_agent_prefix': ep.get('gazebo_live_agent_prefix', None),
+                    'gazebo_live_cmd_vel_publish_count': ep.get('gazebo_live_cmd_vel_publish_count', 0),
+                    'gazebo_live_pose_publish_count': ep.get('gazebo_live_pose_publish_count', 0),
+                    'gazebo_live_bridge_ack_enabled': ep.get('gazebo_live_bridge_ack_enabled', False),
+                    'gazebo_live_bridge_ack_count': ep.get('gazebo_live_bridge_ack_count', 0),
+                    'gazebo_live_bridge_ack_timeout_count': ep.get('gazebo_live_bridge_ack_timeout_count', 0),
+                    'gazebo_live_bridge_last_ack_state_frame': ep.get('gazebo_live_bridge_last_ack_state_frame', None),
+                    'gazebo_live_pre_step_sleep_ms': ep.get('gazebo_live_pre_step_sleep_ms', 0),
+                    'gazebo_live_post_step_sleep_ms': ep.get('gazebo_live_post_step_sleep_ms', 0),
+                    'gazebo_live_wall_time_step_ms': ep.get('gazebo_live_wall_time_step_ms', 0),
+                    'gazebo_live_pause_for_step': ep.get('gazebo_live_pause_for_step', False),
+                    'gazebo_live_pose_jump_reject_count': ep.get('gazebo_live_pose_jump_reject_count', 0),
+                    'gazebo_live_max_pose_jump_observed': ep.get('gazebo_live_max_pose_jump_observed', 0.0),
+                    'gazebo_live_max_feedback_speed_observed': ep.get('gazebo_live_max_feedback_speed_observed', 0.0),
+                    'gazebo_live_state_feedback_updates': ep.get('gazebo_live_state_feedback_updates', 0),
+                    'gazebo_live_state_feedback_misses': ep.get('gazebo_live_state_feedback_misses', 0),
+                    'gazebo_live_state_feedback_update_ratio': ep.get('gazebo_live_state_feedback_update_ratio', 0.0),
+                    'gazebo_live_authoritative_feedback': ep.get('gazebo_live_authoritative_feedback', False),
+                    'gazebo_live_authoritative_feedback_updates': ep.get('gazebo_live_authoritative_feedback_updates', 0),
+                    'gazebo_live_authoritative_feedback_errors': ep.get('gazebo_live_authoritative_feedback_errors', 0),
+                    'gazebo_live_feedback_update_ratio': ep.get('gazebo_live_feedback_update_ratio', 0.0),
+                    'gazebo_contact_detected': ep.get('gazebo_contact_detected', False),
+                    'gazebo_contact_count': ep.get('gazebo_contact_count', 0),
+                    'gazebo_contact_step': ep.get('gazebo_contact_step', None),
+                    'gazebo_contact_agent_indices': ep.get('gazebo_contact_agent_indices', []),
+                    'gazebo_contact_pairs': ep.get('gazebo_contact_pairs', []),
+                    'gazebo_live_scene_check': ep.get('gazebo_live_scene_check', None),
+                    'gazebo_live_sync_health': ep.get('gazebo_live_sync_health', None),
+                    'python_scene_signature': ep.get('python_scene_signature', None),
+                    'python_scene_signature_parts': ep.get('python_scene_signature_parts', None),
+                    'scene_signature': ep.get('scene_signature', None),
+                    'validation_trace_tail': ep.get('validation_trace_tail', []),
                     'visualization_files': ep.get('visualization_files', {}),
                 } for ep in all_episodes_data
             ],
@@ -6130,6 +8493,17 @@ HTML交互式轨迹图功能:
                        help="方案A：单进程内同时推进的评估回合数；1为旧串行路径")
     parser.add_argument("--eval-env-step-threads", type=int, default=_env_int('EVAL_ENV_STEP_THREADS', 1),
                        help="方案A：batch内并行env.step的线程数；1为串行env.step")
+    parser.add_argument("--eval-backend", "--eval_backend", type=str,
+                       default=os.getenv("EVAL_BACKEND", None),
+                       choices=["python_only", "gazebo_live", "both"],
+                       help="显式启用验证评估后端: python_only=原Python评估, gazebo_live=Gazebo live反馈评估, both=同seed成对对照")
+    parser.add_argument("--validation-output-dir", type=str,
+                       default=os.getenv("GAZEBO_LIVE_VALIDATION_DIR", "results/gazebo_live_validation"),
+                       help="Gazebo-live验证结果输出目录")
+    parser.add_argument("--gazebo-live-gui", action="store_true", default=False,
+                       help="Gazebo-live后端启动Gazebo GUI；等价于设置GAZEBO_LIVE_AUTOLAUNCH_GUI=1")
+    parser.add_argument("--gazebo-live-gui-required", action="store_true", default=False,
+                       help="Gazebo GUI启动失败时直接中断；等价于设置GAZEBO_LIVE_GUI_REQUIRED=1")
     parser.add_argument("--terrain-contact-eps", type=float, default=float(os.getenv('TERRAIN_CONTACT_EPS', '0.2')),
                        help="地形接触/碰撞高度容差，默认从TERRAIN_CONTACT_EPS读取")
     parser.add_argument("--terrain-complexity-level", type=int, default=None, 
@@ -6141,6 +8515,7 @@ HTML交互式轨迹图功能:
     parser.add_argument("--control-accel-gain", type=float, default=1.0, help="动作到物理加速度的控制增益，默认1.0")
     parser.add_argument("--reward-pos-scale", type=float, default=1.5, help="正向奖励缩放系数，默认1.5")
     parser.add_argument("--reward-neg-scale", type=float, default=2.5, help="负向奖励缩放系数，默认2.5")
+    parser.add_argument("--agent-size", type=float, default=float(os.getenv('AGENT_SIZE', '0.5')), help="智能体物理半径/可视化半径，默认从AGENT_SIZE读取")
     parser.add_argument("--agent-max-speed", type=float, default=37.5, help="智能体最大速度，默认37.5")
     parser.add_argument("--agent-accel", type=float, default=3.6, help="智能体加速度，默认3.6")
     parser.add_argument("--action-range-x", type=float, default=3.5, help="动作X轴映射范围系数（将网络输出乘以该系数），默认3.5")
@@ -6190,6 +8565,16 @@ HTML交互式轨迹图功能:
     # 势场修正版本选择
     parser.add_argument("--use-tf-potential-field", type=lambda x: (str(x).lower() in ('1','true','yes','on')), default=True,
                        help="是否使用TensorFlow版本的势场修正 (1=TF版本, 0=原版)")
+    parser.add_argument("--apf-backend", "--apf_backend", dest="apf_backend", type=str,
+                       default=os.getenv("APF_BACKEND", "python_original"),
+                       choices=["python_original", "gazebo_apf"],
+                       help="APF backend: python_original keeps the existing path; gazebo_apf uses Gazebo-authoritative state")
+    parser.add_argument("--gazebo-apf-output-dir", type=str,
+                       default=os.getenv("GAZEBO_APF_VALIDATION_DIR", "results/gazebo_apf_validation"),
+                       help="Gazebo APF validation output directory")
+    parser.add_argument("--gazebo-apf-consistency-threshold", type=float,
+                       default=float(os.getenv("GAZEBO_APF_CONSISTENCY_THRESHOLD", "0.05")),
+                       help="Mismatch threshold for Gazebo APF consistency validation")
     
     # 🔧 新增：地形感知模式参数（仅用于评估时APF地形力计算）
     parser.add_argument("--terrain-sensing-mode", type=str, default="local",
@@ -6201,16 +8586,28 @@ HTML交互式轨迹图功能:
                        help="Enable FR feature (Force Ratio as separate input)")
     parser.add_argument("--use-pf-feature", type=lambda x: (str(x).lower() in ('1','true','yes','on')), default=True,
                        help="Enable PF feature (Potential field force appended to obs)")
+    parser.add_argument("--pf-feature-dim", type=int, default=int(os.getenv("PF_FEATURE_DIM", "3")),
+                       help="PF feature dimension used by actor/critic auxiliary inputs")
     
-    # 🔧 修复：与训练脚本保持一致的势场参数默认值
-    parser.add_argument("--goal-attraction", type=float, default=15.0, help="Goal attraction force，默认15.0")
-    parser.add_argument("--lambda-1-base", type=float, default=8.5, help="Lambda_1 base value，默认8.5")
-    parser.add_argument("--terrain-repulsion", type=float, default=3800.0, help="Terrain repulsion force，默认3800.0")
-    parser.add_argument("--agent-influence-range", type=float, default=10.0, help="Agent influence range，默认10.0")
-    parser.add_argument("--delta-k-att", type=float, default=0.5, help="Delta K_att，默认0.5")
-    parser.add_argument("--delta-lambda-1", type=float, default=2.5, help="Delta Lambda_1，默认2.5")
-    parser.add_argument("--delta-k-rep", type=float, default=40.0, help="Delta K_rep，默认40.0")
-    parser.add_argument("--delta-radius", type=float, default=5.0, help="Delta Radius，默认5.0")
+    # 🔧 修复：与当前run_optimized.sh默认值保持一致；run_evaluation.sh会优先回读训练结果JSON覆盖这些兜底值
+    parser.add_argument("--goal-attraction", type=float, default=float(os.getenv("GOAL_ATTRACTION", "26.0")),
+                        help="Goal attraction force，默认26.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--lambda-1-base", type=float, default=float(os.getenv("LAMBDA_1_BASE", "8.5")),
+                        help="Lambda_1 base value，默认8.5（与当前run_optimized.sh一致）")
+    parser.add_argument("--terrain-repulsion", type=float, default=float(os.getenv("TERRAIN_REPULSION", "1600.0")),
+                        help="Terrain repulsion force，默认1600.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--agent-influence-range", type=float, default=float(os.getenv("AGENT_INFLUENCE_RANGE", "150.0")),
+                        help="Agent influence range，默认150.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-k-att", type=float, default=float(os.getenv("DELTA_K_ATT", "5.0")),
+                        help="Delta K_att，默认5.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-lambda-1", type=float, default=float(os.getenv("DELTA_LAMBDA_1", "2.2")),
+                        help="Delta Lambda_1，默认2.2（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-k-rep", type=float, default=float(os.getenv("DELTA_K_REP", "600.0")),
+                        help="Delta K_rep，默认600.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-radius", type=float, default=float(os.getenv("DELTA_RADIUS", "80.0")),
+                        help="Delta Radius，默认80.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--max-force-magnitude", type=float, default=float(os.getenv("MAX_FORCE_MAGNITUDE", "80.0")),
+                       help="最大势场力幅值，默认80.0（与当前run_optimized.sh训练默认一致）")
     
     # 🔧 新增：算法选择
     parser.add_argument("--algorithm", type=str, default="matd3", choices=["maddpg", "matd3", "mappo"],
@@ -6237,15 +8634,15 @@ HTML交互式轨迹图功能:
     parser.add_argument("--collision-reduction-weight", type=float, default=None, help="碰撞次数减少奖励权重")
     parser.add_argument("--global-weight", type=float, default=None, help="全局奖励权重")
     parser.add_argument("--shaping-weight", type=float, default=None, help="潜势函数 shaping 权重")
-    parser.add_argument("--max-reward", type=float, default=None, help="最大奖励值")
-    parser.add_argument("--min-reward", type=float, default=None, help="最小奖励值")
-    parser.add_argument("--success-reward-value", type=float, default=None, help="成功一次性奖励值")
-    parser.add_argument("--no-collision-reward-value", type=float, default=None, help="无碰撞奖励值")
-    parser.add_argument("--success-distance-threshold", type=float, default=None, help="成功判定距离阈值")
-    parser.add_argument("--collision-penalty-value", type=float, default=None, help="碰撞惩罚绝对值")
-    parser.add_argument("--collision-distance-threshold", type=float, default=None, help="碰撞/接触距离阈值")
-    parser.add_argument("--global-reward-mode", type=str, default=None, help="全局奖励模式")
-    parser.add_argument("--shaping-gamma", type=float, default=None, help="潜势函数 gamma")
+    parser.add_argument("--max-reward", type=float, default=1000.0, help="最大奖励值")
+    parser.add_argument("--min-reward", type=float, default=-2500.0, help="最小奖励值")
+    parser.add_argument("--success-reward-value", type=float, default=150.0, help="成功一次性奖励值")
+    parser.add_argument("--no-collision-reward-value", type=float, default=0.0, help="无碰撞奖励值")
+    parser.add_argument("--success-distance-threshold", type=float, default=2.0, help="成功判定距离阈值")
+    parser.add_argument("--collision-penalty-value", type=float, default=30.0, help="碰撞惩罚绝对值")
+    parser.add_argument("--collision-distance-threshold", type=float, default=0.5, help="碰撞/接触距离阈值")
+    parser.add_argument("--global-reward-mode", type=str, default="success_rate", help="全局奖励模式")
+    parser.add_argument("--shaping-gamma", type=float, default=0.95, help="潜势函数 gamma")
     
     # 模型和保存路径
     default_model_path = os.getenv('MODEL_PATH', 'models/optimized_exp')
@@ -6281,18 +8678,246 @@ HTML交互式轨迹图功能:
     return parser.parse_args()
 
 
+@contextmanager
+def _temporary_env(updates):
+    old_values = {}
+    for key, value in (updates or {}).items():
+        old_values[key] = os.environ.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[str(key)] = str(value)
+    try:
+        yield
+    finally:
+        for key, value in old_values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _validation_backend_env(args, backend):
+    validation_dir = str(Path(getattr(args, "validation_output_dir", "results/gazebo_live_validation")).expanduser().resolve())
+    try:
+        sim_dt = float(getattr(args, "simulation_dt", None) or os.getenv("SIMULATION_DT", "0.08"))
+    except Exception:
+        sim_dt = 0.08
+    gazebo_step_iterations = os.getenv("GAZEBO_LIVE_STEP_ITERATIONS", "0")
+    default_wall_time_step_ms = (
+        str(max(1, int(round(float(sim_dt) * 1000.0))))
+        if str(gazebo_step_iterations).strip() in ("", "0")
+        else "0"
+    )
+    default_command_sleep = "0.0"
+    consistency_mode = os.getenv("GAZEBO_LIVE_CONSISTENCY_MODE", "gazebo_authoritative").strip().lower()
+    if consistency_mode in ("python", "python_only", "python_authoritative", "mirror", "follow_python"):
+        consistency_mode = "python_authoritative"
+    else:
+        consistency_mode = "gazebo_authoritative"
+    python_authoritative = consistency_mode == "python_authoritative"
+    common = {
+        "EVAL_BACKEND": backend,
+        "GAZEBO_LIVE_VALIDATION": "1",
+        "GAZEBO_LIVE_VALIDATION_DIR": validation_dir,
+        "SAVE_EVAL_TRAJECTORY_JSON": "1",
+        "EVAL_EPISODE_PARALLELISM": "1",
+        "EVAL_ENV_STEP_THREADS": "1",
+    }
+    if backend == "gazebo_live":
+        common.update(
+            {
+                "GAZEBO_LIVE_SYNC": "1",
+                "GAZEBO_LIVE_AUTOLAUNCH": "1",
+                "GAZEBO_LIVE_AUTOLAUNCH_RUN": os.getenv("GAZEBO_LIVE_AUTOLAUNCH_RUN", "0"),
+                "GAZEBO_LIVE_SEMANTIC_MODE": os.getenv("GAZEBO_LIVE_SEMANTIC_MODE", "transfer_equivalence"),
+                "GAZEBO_LIVE_CONSISTENCY_MODE": consistency_mode,
+                "GAZEBO_LIVE_CONTROL_MODE": "velocity",
+                "GAZEBO_LIVE_STATE_FEEDBACK": "1",
+                "GAZEBO_LIVE_FEEDBACK_VELOCITY_MODE": os.getenv("GAZEBO_LIVE_FEEDBACK_VELOCITY_MODE", "clamp"),
+                "GAZEBO_LIVE_FEEDBACK_ACCELERATION_MODE": os.getenv("GAZEBO_LIVE_FEEDBACK_ACCELERATION_MODE", "estimate"),
+                "GAZEBO_LIVE_AUTHORITATIVE_FEEDBACK": os.getenv(
+                    "GAZEBO_LIVE_AUTHORITATIVE_FEEDBACK",
+                    "0" if python_authoritative else "1",
+                ),
+                "GAZEBO_LIVE_CONTACT_FEEDBACK": "1",
+                "GAZEBO_LIVE_CONTACT_AUTHORITATIVE": os.getenv(
+                    "GAZEBO_LIVE_CONTACT_AUTHORITATIVE",
+                    "0",
+                ),
+                "GAZEBO_LIVE_CONTACT_MARKS_COLLISION": os.getenv(
+                    "GAZEBO_LIVE_CONTACT_MARKS_COLLISION",
+                    "0",
+                ),
+                "GAZEBO_LIVE_CONTACT_TERMINATES": os.getenv("GAZEBO_LIVE_CONTACT_TERMINATES", "0"),
+                "GAZEBO_LIVE_POSE_CORRECTION": os.getenv(
+                    "GAZEBO_LIVE_POSE_CORRECTION",
+                    "1" if python_authoritative else "0",
+                ),
+                "GAZEBO_LIVE_STEP_ITERATIONS": gazebo_step_iterations,
+                "GAZEBO_LIVE_COMMAND_SLEEP": os.getenv("GAZEBO_LIVE_COMMAND_SLEEP", default_command_sleep),
+                "GAZEBO_LIVE_WALL_TIME_STEP_MS": os.getenv("GAZEBO_LIVE_WALL_TIME_STEP_MS", default_wall_time_step_ms),
+                "GAZEBO_LIVE_WAIT_ACK": os.getenv("GAZEBO_LIVE_WAIT_ACK", "1"),
+                "GAZEBO_LIVE_ACK_TIMEOUT": os.getenv("GAZEBO_LIVE_ACK_TIMEOUT", "2.0"),
+                "GAZEBO_LIVE_PAUSE_FOR_STEP": os.getenv("GAZEBO_LIVE_PAUSE_FOR_STEP", "0"),
+                "GAZEBO_LIVE_PRE_STEP_SLEEP_MS": os.getenv("GAZEBO_LIVE_PRE_STEP_SLEEP_MS", "20"),
+                "GAZEBO_LIVE_POST_STEP_SLEEP_MS": os.getenv("GAZEBO_LIVE_POST_STEP_SLEEP_MS", "20"),
+                "GAZEBO_LIVE_STATE_FEEDBACK_DT": os.getenv("GAZEBO_LIVE_STATE_FEEDBACK_DT", str(sim_dt)),
+                "GAZEBO_LIVE_SCENE_CHECK_REQUIRED": "1",
+                "EVAL_EPISODE_PARALLELISM": "1",
+                "EVAL_ENV_STEP_THREADS": "1",
+            }
+        )
+    else:
+        common.update(
+            {
+                "GAZEBO_LIVE_SYNC": "0",
+                "GAZEBO_LIVE_AUTOLAUNCH": "0",
+                "GAZEBO_LIVE_CONTROL_MODE": "pose",
+            }
+        )
+    return common
+
+
+def _ensure_paired_seed_env(args):
+    updates = {}
+    episode_count = max(1, int(getattr(args, "eval_episodes", 1) or 1))
+    try:
+        base_seed = int(
+            getattr(args, "terrain_seed", None)
+            if getattr(args, "terrain_seed", None) is not None
+            else os.getenv("SCENARIO_SEED", os.getenv("TERRAIN_BASE_SEED", "88"))
+        )
+    except Exception:
+        base_seed = 88
+
+    random_terrain_requested = (
+        bool(getattr(args, "random_terrain", False))
+        or os.getenv("RANDOM_TERRAIN", "0").lower() in ("1", "true", "yes", "on")
+        or bool(os.getenv("TERRAIN_SEED_SEQUENCE", "").strip())
+    )
+    if random_terrain_requested and not os.getenv("TERRAIN_SEED_SEQUENCE", "").strip():
+        updates["TERRAIN_SEED_SEQUENCE"] = ",".join(str(base_seed + idx) for idx in range(episode_count))
+    if getattr(args, "terrain_complexity_level", None) is None and not os.getenv("TERRAIN_COMPLEXITY_LEVEL_SEQUENCE", "").strip():
+        rng = np.random.default_rng(base_seed + 20000)
+        updates["TERRAIN_COMPLEXITY_LEVEL_SEQUENCE"] = ",".join(
+            str(int(v)) for v in rng.integers(1, 5, size=episode_count)
+        )
+    auto_obstacle_sequence = os.getenv(
+        "GAZEBO_LIVE_AUTO_OBSTACLE_SEED_SEQUENCE",
+        os.getenv("VALIDATION_AUTO_OBSTACLE_SEED_SEQUENCE", "0"),
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if auto_obstacle_sequence and not os.getenv("OBSTACLE_SEED_SEQUENCE", "").strip():
+        updates["OBSTACLE_SEED_SEQUENCE"] = ",".join(str(base_seed + 10000 + idx) for idx in range(episode_count))
+    updates.setdefault("SCENARIO_SEED", str(base_seed))
+    updates.setdefault("TERRAIN_BASE_SEED", str(base_seed))
+    return updates
+
+
+def _validation_base_seed(args):
+    try:
+        return int(os.getenv("GAZEBO_LIVE_VALIDATION_RANDOM_SEED", "").strip())
+    except Exception:
+        pass
+    try:
+        if getattr(args, "terrain_seed", None) is not None:
+            return int(getattr(args, "terrain_seed"))
+    except Exception:
+        pass
+    try:
+        return int(os.getenv("SCENARIO_SEED", os.getenv("TERRAIN_BASE_SEED", "88")))
+    except Exception:
+        return 88
+
+
+def _reset_validation_random_state(args):
+    seed = int(_validation_base_seed(args)) % (2**32)
+    try:
+        import random as _random
+        _random.seed(seed)
+    except Exception:
+        pass
+    try:
+        np.random.seed(seed)
+    except Exception:
+        pass
+    try:
+        tf.random.set_seed(seed)
+    except Exception:
+        pass
+    return seed
+
+
+def _run_single_backend_evaluation(args, backend, save_viz_path=None):
+    run_args = copy.deepcopy(args)
+    run_args.eval_backend = backend
+    if save_viz_path is not None:
+        run_args.save_viz_path = str(save_viz_path)
+    run_args.eval_episode_parallelism = 1
+    run_args.eval_env_step_threads = 1
+    with _temporary_env(_validation_backend_env(run_args, backend)):
+        _reset_validation_random_state(run_args)
+        evaluator = ModelEvaluator(run_args)
+        return evaluator.run_evaluation()
+
+
+def _run_paired_backend_evaluation(args):
+    from gazebo_live_validation import write_validation_outputs
+
+    validation_root = Path(getattr(args, "validation_output_dir", "results/gazebo_live_validation")).expanduser().resolve()
+    validation_root.mkdir(parents=True, exist_ok=True)
+    seed_updates = _ensure_paired_seed_env(args)
+    results_by_backend = {}
+    with _temporary_env(seed_updates):
+        for backend in ("python_only", "gazebo_live"):
+            backend_dir = validation_root / backend
+            backend_dir.mkdir(parents=True, exist_ok=True)
+            print(f"\n[GazeboLiveValidation] running backend={backend}, output={backend_dir}")
+            results_by_backend[backend] = _run_single_backend_evaluation(
+                args,
+                backend,
+                save_viz_path=backend_dir,
+            )
+    validation = write_validation_outputs(results_by_backend=results_by_backend, output_dir=validation_root)
+    print(f"[GazeboLiveValidation] episode_metrics={validation_root / 'episode_metrics.csv'}")
+    print(f"[GazeboLiveValidation] summary={validation_root / 'summary.json'}")
+    print(f"[GazeboLiveValidation] difference_cases={validation_root / 'difference_cases.json'}")
+    return {
+        "results_by_backend": results_by_backend,
+        "validation": validation,
+    }
+
+
 def main():
     """主函数"""
     _apply_fast_artifact_env_defaults()
     args = parse_args()
+    try:
+        _validate_load_model_path_arg(args)
+    except ValueError as e:
+        print(f"\n❌ 参数错误: {e}")
+        sys.exit(2)
+    if bool(getattr(args, "gazebo_live_gui", False)):
+        os.environ["GAZEBO_LIVE_AUTOLAUNCH_GUI"] = "1"
+    if bool(getattr(args, "gazebo_live_gui_required", False)):
+        os.environ["GAZEBO_LIVE_GUI_REQUIRED"] = "1"
     disable_viz_env = _env_flag("EVAL_DISABLE_VISUALIZATION", False)
     light_mode_env = _env_flag("EVAL_LIGHT_MODE", False)
     save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", True)
     save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
     save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
     save_control_diagnostics = _env_flag("SAVE_EVAL_CONTROL_DIAGNOSTICS", False)
+    save_gazebo_replay = _env_flag("SAVE_GAZEBO_REPLAY", False)
+    save_gazebo_dynamic_replay = _env_flag("SAVE_GAZEBO_DYNAMIC_REPLAY", False)
+    save_trajectory_snapshot = _env_flag("SAVE_TRAJECTORY_SNAPSHOT", save_gazebo_replay or save_gazebo_dynamic_replay)
     keep_viz_artifacts_in_light_mode = (
-        save_trajectory_png or save_team_success_html or save_actor_sequence or save_control_diagnostics
+        save_trajectory_png
+        or save_team_success_html
+        or save_actor_sequence
+        or save_control_diagnostics
+        or save_gazebo_replay
+        or save_gazebo_dynamic_replay
+        or save_trajectory_snapshot
     )
     if disable_viz_env or (light_mode_env and not keep_viz_artifacts_in_light_mode):
         args.disable_visualization = True
@@ -6368,11 +8993,25 @@ def main():
         print("🌐 HTML交互式轨迹图生成: 禁用")
     
     try:
-        # 创建评估器
-        evaluator = ModelEvaluator(args)
-        
-        # 运行评估
-        results = evaluator.run_evaluation()
+        requested_backend = getattr(args, "eval_backend", None)
+        if requested_backend == "both":
+            results = _run_paired_backend_evaluation(args)
+        elif requested_backend in ("python_only", "gazebo_live"):
+            results = _run_single_backend_evaluation(args, requested_backend)
+            try:
+                from gazebo_live_validation import write_validation_outputs, validation_root_from_args
+                validation_root = validation_root_from_args(args)
+                write_validation_outputs(
+                    results_by_backend={requested_backend: results},
+                    output_dir=validation_root,
+                )
+                print(f"[GazeboLiveValidation] episode_metrics={validation_root / 'episode_metrics.csv'}")
+                print(f"[GazeboLiveValidation] summary={validation_root / 'summary.json'}")
+            except Exception as validation_err:
+                print(f"⚠️ Gazebo-live validation summary failed: {validation_err}")
+        else:
+            evaluator = ModelEvaluator(args)
+            results = evaluator.run_evaluation()
         
         print("\n🎉 评估完成!")
         

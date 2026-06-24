@@ -8,7 +8,7 @@ numpy向量化奖励计算器
 import numpy as np
 import os
 import time
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 
 def _bilinear_interpolate_terrain_xy(
@@ -138,6 +138,24 @@ class VectorizedRewardCalculator:
             max_reward: 最大奖励值
             min_reward: 最小奖励值
         """
+        def _finite_or(value, default):
+            try:
+                if value is None:
+                    return float(default)
+                value = float(value)
+                return value if np.isfinite(value) else float(default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        max_reward = _finite_or(max_reward, 800.0)
+        min_reward = _finite_or(min_reward, -800.0)
+        success_reward_value = _finite_or(success_reward_value, 150.0)
+        success_distance_threshold = _finite_or(success_distance_threshold, 2.0)
+        collision_penalty_value = _finite_or(collision_penalty_value, 30.0)
+        collision_distance_threshold = _finite_or(collision_distance_threshold, 0.5)
+        no_collision_reward_value = _finite_or(no_collision_reward_value, 0.0)
+        shaping_gamma = _finite_or(shaping_gamma, 0.95)
+
         # 将权重转换为numpy数组，按固定顺序排列（16通道，必须与分项索引严格一致）
         self.reward_weights = np.array([
             reward_weights['distance'],          # 0
@@ -168,6 +186,7 @@ class VectorizedRewardCalculator:
         self._terrain_cache = {}   # 地形数据缓存
         self._goal_cache = {}      # 目标数据缓存
         self._terrain_distance_scratch = {}
+        self.last_reward_diagnostics = None
         
         # 其他参数（预转换为合适类型避免运行时转换）
         self.success_reward_value = np.float32(success_reward_value)
@@ -279,6 +298,14 @@ class VectorizedRewardCalculator:
                 '18:20,10:35,6:55,3.5:80'
             )
             self.goal_ring_radii, self.goal_ring_bonus_values = self._parse_goal_ring_schedule(goal_ring_schedule)
+            self.team_gated_goal_reward = (
+                str(os.getenv('TEAM_GATED_GOAL_REWARD', '1')).lower()
+                in ('1', 'true', 'yes', 'on')
+            )
+            self.team_gated_goal_reward_require_safe = (
+                str(os.getenv('TEAM_GATED_GOAL_REWARD_REQUIRE_SAFE', '1')).lower()
+                in ('1', 'true', 'yes', 'on')
+            )
         except Exception:
             self.penetration_alpha = np.float32(0.5)
             self.expl_reward_strict = False
@@ -311,6 +338,8 @@ class VectorizedRewardCalculator:
             self.goal_ring_radii, self.goal_ring_bonus_values = self._parse_goal_ring_schedule(
                 '18:20,10:35,6:55,3.5:80'
             )
+            self.team_gated_goal_reward = True
+            self.team_gated_goal_reward_require_safe = True
         
         # 性能优化开关
         self.debug_mode = False  # 关闭调试输出
@@ -330,7 +359,7 @@ class VectorizedRewardCalculator:
             'height',      # 8
             'success',     # 9
             'collision',   # 10
-            'global',      # 11 (主训练中承载 team-sync dense + 终局团队语义)
+            'global',      # 11 (主训练中承载 team-sync dense / optional global reward)
             'shaping',     # 12
             'clearance',   # 13
             'lateral',     # 14
@@ -573,11 +602,105 @@ class VectorizedRewardCalculator:
             np.asarray(bonuses, dtype=np.float32)[order],
         )
 
+    def _resolve_reward_world(self, scenario: Any = None, world: Any = None) -> Any:
+        if world is not None:
+            return world
+        try:
+            return getattr(scenario, 'world', None)
+        except Exception:
+            return None
+
+    def _agent_goal_position_for_reward(self, agent: Any, scenario: Any = None) -> Optional[np.ndarray]:
+        try:
+            goal_a = getattr(agent, 'goal_a', None)
+            goal_state = getattr(goal_a, 'state', None)
+            goal_pos = getattr(goal_state, 'p_pos', None)
+            if goal_pos is not None:
+                return np.asarray(goal_pos, dtype=np.float32)
+        except Exception:
+            pass
+
+        try:
+            goal_pos = getattr(scenario, 'goal_pos', None)
+            if goal_pos is not None:
+                return np.asarray(goal_pos, dtype=np.float32)
+        except Exception:
+            pass
+        return None
+
+    def _team_goal_distances_for_reward(
+        self,
+        scenario: Any = None,
+        world: Any = None,
+    ) -> Optional[np.ndarray]:
+        try:
+            reward_world = self._resolve_reward_world(scenario, world)
+            agents = list(getattr(reward_world, 'agents', None) or getattr(reward_world, 'policy_agents', None) or [])
+            if not agents:
+                return None
+
+            distances = []
+            for ag in agents:
+                pos = getattr(getattr(ag, 'state', None), 'p_pos', None)
+                goal = self._agent_goal_position_for_reward(ag, scenario)
+                if pos is None or goal is None:
+                    return None
+                dist = float(np.linalg.norm(np.asarray(pos, dtype=np.float32) - goal))
+                if not np.isfinite(dist):
+                    return None
+                distances.append(dist)
+
+            if not distances:
+                return None
+            return np.asarray(distances, dtype=np.float32)
+        except Exception:
+            return None
+
+    def _team_all_within_goal_radius(
+        self,
+        radius: float,
+        scenario: Any = None,
+        world: Any = None,
+    ) -> bool:
+        distances = self._team_goal_distances_for_reward(scenario=scenario, world=world)
+        if distances is None or distances.size == 0:
+            return False
+        try:
+            return bool(np.all(distances <= float(radius)))
+        except Exception:
+            return False
+
+    def _team_safe_so_far(self, scenario: Any = None, world: Any = None) -> bool:
+        try:
+            reward_world = self._resolve_reward_world(scenario, world)
+            agents = list(getattr(reward_world, 'agents', None) or getattr(reward_world, 'policy_agents', None) or [])
+            if not agents:
+                return False
+            return all(self._agent_safe_so_far(ag) for ag in agents)
+        except Exception:
+            return False
+
+    def _goal_reward_team_gate(
+        self,
+        radius: float,
+        scenario: Any = None,
+        world: Any = None,
+    ) -> bool:
+        if not bool(getattr(self, 'team_gated_goal_reward', True)):
+            return True
+        if not self._team_all_within_goal_radius(radius, scenario=scenario, world=world):
+            return False
+        if bool(getattr(self, 'team_gated_goal_reward_require_safe', True)):
+            return self._team_safe_so_far(scenario=scenario, world=world)
+        return True
+
     def _goal_ring_bonus_vectorized(
         self,
         agent: Any,
         distances: np.ndarray,
         success_state: Dict[str, Any],
+        scenario: Any = None,
+        world: Any = None,
     ) -> np.ndarray:
         """一次性阶段奖励：首次进入若干目标半径时发放小额 bonus。"""
         rewards = np.zeros(len(distances), dtype=np.float32)
@@ -592,9 +715,17 @@ class VectorizedRewardCalculator:
             for idx, (radius, bonus) in enumerate(zip(self.goal_ring_radii, self.goal_ring_bonus_values)):
                 if ring_state[idx]:
                     continue
-                ring_mask = distances <= float(radius)
+                radius_value = float(radius)
+                bonus_value = float(bonus)
+                if bool(getattr(self, 'team_gated_goal_reward', True)):
+                    if self._goal_reward_team_gate(radius_value, scenario=scenario, world=world):
+                        rewards += bonus_value
+                        ring_state[idx] = True
+                    continue
+
+                ring_mask = distances <= radius_value
                 if np.any(ring_mask):
-                    rewards[ring_mask] += float(bonus)
+                    rewards[ring_mask] += bonus_value
                     ring_state[idx] = True
 
             success_state['goal_ring_rewards_given'] = ring_state
@@ -787,7 +918,13 @@ class VectorizedRewardCalculator:
             if world is None:
                 return False
 
+            if bool(getattr(world, '_episode_terminal', False)):
+                return True
+
             if bool(getattr(world, '_episode_success', False)):
+                return True
+
+            if bool(getattr(world, '_episode_all_reached', False)):
                 return True
 
             episode_length = None
@@ -1013,6 +1150,36 @@ class VectorizedRewardCalculator:
             self._terrain_distance_scratch[key] = scratch
         return scratch
 
+    def _agent_radii_for_positions(
+        self,
+        world: Any,
+        num_positions: int,
+        default: float = 0.0,
+        agent_indices: Any = None,
+    ) -> np.ndarray:
+        """返回与 positions 对齐的智能体物理半径；拿不到时回退为 default。"""
+        radii = np.full(int(num_positions), float(default), dtype=np.float32)
+        try:
+            agents = list(getattr(world, 'agents', []) or [])
+            if not agents or int(num_positions) <= 0:
+                return radii
+
+            if agent_indices is not None:
+                indices = np.asarray(agent_indices, dtype=np.int64).reshape(-1)
+                if indices.size == 1 and int(num_positions) > 1:
+                    indices = np.full(int(num_positions), int(indices[0]), dtype=np.int64)
+                for out_idx in range(min(int(num_positions), int(indices.size))):
+                    agent_idx = int(indices[out_idx])
+                    if 0 <= agent_idx < len(agents):
+                        radii[out_idx] = max(0.0, float(getattr(agents[agent_idx], 'size', default)))
+                return radii
+
+            for idx in range(min(int(num_positions), len(agents))):
+                radii[idx] = max(0.0, float(getattr(agents[idx], 'size', default)))
+        except Exception:
+            pass
+        return radii
+
     def _compute_obstacle_distance_data(
         self,
         positions: np.ndarray,
@@ -1028,6 +1195,7 @@ class VectorizedRewardCalculator:
         obstacle_min_dist = np.full(num_positions, np.inf, dtype=np.float32)
         nearest_obstacle_centers = np.zeros((num_positions, 3), dtype=np.float32)
         nearest_obstacle_radii = np.zeros(num_positions, dtype=np.float32)
+        agent_radii = self._agent_radii_for_positions(world, num_positions)
 
         cached_data = cached_data if isinstance(cached_data, dict) else {}
         obstacles_centers = cached_data.get('obstacles_centers')
@@ -1046,7 +1214,7 @@ class VectorizedRewardCalculator:
                 ):
                     diff = positions[:, None, :] - centers[None, :, :3]
                     center_dist = np.linalg.norm(diff, axis=-1)
-                    surface_dist = center_dist - radii[None, :]
+                    surface_dist = center_dist - radii[None, :] - agent_radii[:, None]
                     nearest_indices = np.argmin(surface_dist, axis=1)
                     obstacle_min_dist = surface_dist[np.arange(num_positions), nearest_indices].astype(np.float32)
                     nearest_obstacle_centers = centers[nearest_indices, :3].astype(np.float32)
@@ -1063,7 +1231,7 @@ class VectorizedRewardCalculator:
                 obstacle_center = np.asarray(obstacle_data['center'][:3], dtype=np.float32)
                 obstacle_radius = float(obstacle_data['radius'])
                 dist_3d = np.linalg.norm(positions - obstacle_center, axis=-1)
-                dist_to_surface = dist_3d - obstacle_radius
+                dist_to_surface = dist_3d - obstacle_radius - agent_radii
                 update_mask = dist_to_surface < obstacle_min_dist
                 if np.any(update_mask):
                     nearest_obstacle_centers[update_mask] = obstacle_center
@@ -1077,6 +1245,8 @@ class VectorizedRewardCalculator:
         positions: np.ndarray,
         scenario: Any,
         cached_data: Dict[str, Any] = None,
+        world: Any = None,
+        agent_indices: Any = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """计算当前位置对应的地形高度、地形最小距离和参考点。"""
         if positions.ndim == 1:
@@ -1093,6 +1263,12 @@ class VectorizedRewardCalculator:
 
         cached_data = cached_data if isinstance(cached_data, dict) else {}
         cached_map_size = int(cached_data.get('map_size', getattr(scenario, 'map_size', 200.0)))
+        agent_radii = self._agent_radii_for_positions(
+            world,
+            num_positions,
+            default=float(getattr(scenario, 'agent_size', 0.0)),
+            agent_indices=agent_indices,
+        )
 
         try:
             map_size = float(getattr(scenario, 'map_size', cached_map_size if cached_map_size > 0 else 200.0))
@@ -1151,7 +1327,7 @@ class VectorizedRewardCalculator:
             valid_current_terrain = np.isfinite(terrain_heights_current)
             if np.any(valid_current_terrain):
                 terrain_min_dist[valid_current_terrain] = (
-                    positions[valid_current_terrain, 2] - terrain_heights_current[valid_current_terrain]
+                    positions[valid_current_terrain, 2] - agent_radii[valid_current_terrain] - terrain_heights_current[valid_current_terrain]
                 ).astype(np.float32)
                 terrain_reference_points[valid_current_terrain, 0] = positions[valid_current_terrain, 0]
                 terrain_reference_points[valid_current_terrain, 1] = positions[valid_current_terrain, 1]
@@ -1163,6 +1339,7 @@ class VectorizedRewardCalculator:
                 np.float32,
                 copy=False,
             )
+            sample_distances -= agent_radii[:, None]
             sample_distances[~np.isfinite(sample_heights)] = np.inf
 
             nearest_sample_idx = np.argmin(sample_distances, axis=1)
@@ -1204,6 +1381,7 @@ class VectorizedRewardCalculator:
             positions,
             scenario,
             cached_data=cached_data,
+            world=world,
         )
 
         return {
@@ -1231,6 +1409,7 @@ class VectorizedRewardCalculator:
         num_positions = positions.shape[0]
         if num_positions == 0:
             return np.zeros(0, dtype=np.float32)
+        agent_radii = self._agent_radii_for_positions(world, num_positions)
 
         if len(agents) != num_positions:
             rewards = np.zeros(num_positions, dtype=np.float32)
@@ -1285,6 +1464,7 @@ class VectorizedRewardCalculator:
                 positions,
                 scenario,
                 cached_data=cached_data,
+                world=world,
             )
 
         obstacle_reference_points = positions.copy()
@@ -1498,6 +1678,7 @@ class VectorizedRewardCalculator:
         num_positions = positions.shape[0]
         if num_positions == 0:
             return np.zeros(0, dtype=np.float32)
+        agent_radii = self._agent_radii_for_positions(world, num_positions)
 
         if len(agents) != num_positions or cached_data is None or not self.use_fast_path:
             penalties = np.zeros(num_positions, dtype=np.float32)
@@ -1535,6 +1716,7 @@ class VectorizedRewardCalculator:
                     positions,
                     scenario,
                     cached_data=cached_data,
+                    world=world,
                 )
             except Exception:
                 terrain_heights_current = np.full(num_positions, np.nan, dtype=np.float32)
@@ -1568,12 +1750,13 @@ class VectorizedRewardCalculator:
                     -float(self.terrain_penalty_value),
                 )
                 terrain_heights = terrain_heights.copy()
-                terrain_heights[invalid_mask] = positions[invalid_mask, 2]
+                terrain_heights[invalid_mask] = positions[invalid_mask, 2] - agent_radii[invalid_mask]
 
             eps = float(self.terrain_collision_eps)
-            penetration_mask = (positions[:, 2] < terrain_heights + eps) & (~distance_based_collision_mask)
+            body_bottom_z = positions[:, 2] - agent_radii
+            penetration_mask = (body_bottom_z < terrain_heights + eps) & (~distance_based_collision_mask)
             if np.any(penetration_mask):
-                terrain_signed_clearance = positions[penetration_mask, 2] - terrain_heights[penetration_mask]
+                terrain_signed_clearance = body_bottom_z[penetration_mask] - terrain_heights[penetration_mask]
                 penalties[penetration_mask] = np.minimum(
                     penalties[penetration_mask],
                     self._piecewise_collision_penalty(
@@ -1592,10 +1775,10 @@ class VectorizedRewardCalculator:
                     dists_to_goal = np.linalg.norm(positions - goal_pos, axis=-1)
                     in_goal_area = dists_to_goal <= success_thresh
 
-            contact_mask = positions[:, 2] <= (terrain_heights + float(self.terrain_contact_eps))
+            contact_mask = body_bottom_z <= (terrain_heights + float(self.terrain_contact_eps))
             contact_penalty_mask = contact_mask & (~in_goal_area) & (~distance_based_collision_mask)
             if np.any(contact_penalty_mask):
-                contact_signed_clearance = positions[contact_penalty_mask, 2] - terrain_heights[contact_penalty_mask]
+                contact_signed_clearance = body_bottom_z[contact_penalty_mask] - terrain_heights[contact_penalty_mask]
                 penalties[contact_penalty_mask] = np.minimum(
                     penalties[contact_penalty_mask],
                     self._piecewise_collision_penalty(
@@ -1606,7 +1789,7 @@ class VectorizedRewardCalculator:
                 )
                 collision_eps = float(self.terrain_collision_eps)
                 actual_penetration_mask = contact_penalty_mask & (
-                    positions[:, 2] <= terrain_heights + collision_eps
+                    body_bottom_z <= terrain_heights + collision_eps
                 )
 
         obs_collision_mask = (obstacle_min_dist < 0.0) & (~distance_based_collision_mask)
@@ -1837,6 +2020,7 @@ class VectorizedRewardCalculator:
         reward_timing = self._new_reward_timing_bucket() if reward_timing_enabled else None
         _reward_perf_counter = time.perf_counter if reward_timing_enabled else None
         self._last_reward_timing = None
+        self.last_reward_diagnostics = None
         try:
             batch_size = len(agents_batch)
             n_agents = len(agents_batch[0]) if batch_size > 0 else 0
@@ -1937,6 +2121,9 @@ class VectorizedRewardCalculator:
                         weights_vec = weights_vec[:ch]
             except Exception:
                 pass
+            diagnostic_weights_vec = np.array(weights_vec, copy=True)
+            diagnostic_active_indices = list(range(rewards_mat.shape[2]))
+
             # === 主奖励：默认启用“结构收缩”的 dense reward ===
             # dense: 仅保留少数核心项（progress / success / collision / clearance / height / stationary / team-sync）；
             # 其余通道仍可保留实现与日志，但不参与主优化目标。
@@ -1945,6 +2132,7 @@ class VectorizedRewardCalculator:
                 if getattr(self, 'dense_energy_enabled', False):
                     dense_indices.append(7)  # energy 作为弱正则
                 dense_indices = [int(i) for i in dense_indices if 0 <= int(i) < rewards_mat.shape[2]]
+                diagnostic_active_indices = list(dense_indices)
                 if dense_indices:
                     if getattr(self, 'progress_merge_enabled', False) and weights_vec.shape[0] > 6:
                         dense_weights_vec = np.array(weights_vec, copy=True)
@@ -1955,10 +2143,17 @@ class VectorizedRewardCalculator:
                     dense_rewards = rewards_mat[:, :, dense_indices]
                     dense_weights = dense_weights_vec[dense_indices]
                     total_rewards = np.sum(dense_rewards * dense_weights[None, None, :], axis=2)
+                    diagnostic_weights_vec = np.array(dense_weights_vec, copy=True)
                 else:
                     total_rewards = np.zeros(rewards_mat.shape[:2], dtype=np.float32)
+                    diagnostic_weights_vec = np.zeros_like(diagnostic_weights_vec)
             else:
                 total_rewards = np.sum(rewards_mat * weights_vec, axis=2)
+
+            terminal_failure_diag = np.zeros_like(total_rewards, dtype=np.float32)
+            terminal_success_diag = np.zeros_like(total_rewards, dtype=np.float32)
+            terminal_quality_diag = np.zeros_like(total_rewards, dtype=np.float32)
+            terminal_unsafe_arrival_diag = np.zeros_like(total_rewards, dtype=np.float32)
 
             # === 终局项：episode end 单独结算（不参与逐步累积竞争） ===
             # - team_success_bonus（团队成功主导项）
@@ -1985,6 +2180,7 @@ class VectorizedRewardCalculator:
                             world,
                         ).astype(np.float32)
                         total_rewards[b] = total_rewards[b] + penalties
+                        terminal_failure_diag[b] = terminal_failure_diag[b] + penalties
                     except Exception:
                         pass
 
@@ -1995,7 +2191,9 @@ class VectorizedRewardCalculator:
                         # 2) 团队成功终局奖励：平均分配
                         tsb = float(getattr(self, 'team_success_bonus', 0.0))
                         if tsb != 0.0:
-                            total_rewards[b] = total_rewards[b] + (tsb / float(n_agents_b))
+                            bonus = np.float32(tsb / float(n_agents_b))
+                            total_rewards[b] = total_rewards[b] + bonus
+                            terminal_success_diag[b] = terminal_success_diag[b] + bonus
 
                         # 3) success-only 质量奖励：净空（D_min^(k)）越大越好
                         try:
@@ -2014,7 +2212,9 @@ class VectorizedRewardCalculator:
                                 q = float(np.clip(dmin / safe_d, 0.0, 1.0))
                                 cqb = float(getattr(self, 'clearance_quality_bonus_weight', 0.0)) * q
                                 if cqb != 0.0:
-                                    total_rewards[b] = total_rewards[b] + (cqb / float(n_agents_b))
+                                    bonus = np.float32(cqb / float(n_agents_b))
+                                    total_rewards[b] = total_rewards[b] + bonus
+                                    terminal_quality_diag[b] = terminal_quality_diag[b] + bonus
                         except Exception:
                             pass
 
@@ -2036,14 +2236,18 @@ class VectorizedRewardCalculator:
                             eff = float(np.clip(1.0 - (eff_steps / ep_len), 0.0, 1.0))
                             eb = float(getattr(self, 'efficiency_bonus_weight', 0.0)) * eff
                             if eb != 0.0:
-                                total_rewards[b] = total_rewards[b] + (eb / float(n_agents_b))
+                                bonus = np.float32(eb / float(n_agents_b))
+                                total_rewards[b] = total_rewards[b] + bonus
+                                terminal_quality_diag[b] = terminal_quality_diag[b] + bonus
                         except Exception:
                             pass
                     else:
                         # 全员到达但不安全成功：终局惩罚（平均分配）
                         uap = float(getattr(self, 'unsafe_arrival_penalty', 0.0))
                         if all_reached and uap != 0.0:
-                            total_rewards[b] = total_rewards[b] - (uap / float(n_agents_b))
+                            penalty = np.float32(-(uap / float(n_agents_b)))
+                            total_rewards[b] = total_rewards[b] + penalty
+                            terminal_unsafe_arrival_diag[b] = terminal_unsafe_arrival_diag[b] + penalty
             except Exception:
                 pass
             
@@ -2098,7 +2302,36 @@ class VectorizedRewardCalculator:
                 self._last_reward_timing = reward_timing
             
             # 限制范围
-            return np.clip(total_rewards, self.min_reward, self.max_reward)
+            total_before_clip = np.asarray(total_rewards, dtype=np.float32).copy()
+            clipped_rewards = np.clip(total_rewards, self.min_reward, self.max_reward)
+            try:
+                component_weights = np.zeros((rewards_mat.shape[2],), dtype=np.float32)
+                usable_len = min(component_weights.shape[0], diagnostic_weights_vec.shape[0])
+                component_weights[:usable_len] = np.asarray(diagnostic_weights_vec[:usable_len], dtype=np.float32)
+                if diagnostic_active_indices:
+                    active_mask = np.zeros_like(component_weights, dtype=bool)
+                    active_mask[np.asarray(diagnostic_active_indices, dtype=np.int64)] = True
+                    component_weights = np.where(active_mask, component_weights, np.float32(0.0))
+                else:
+                    component_weights[:] = 0.0
+                weighted_components = np.asarray(rewards_mat, dtype=np.float32) * component_weights[None, None, :]
+                self.last_reward_diagnostics = {
+                    'reward_names': tuple(self.reward_names),
+                    'component_weights': component_weights.copy(),
+                    'weighted_components': weighted_components.astype(np.float32, copy=True),
+                    'terminal_failure': terminal_failure_diag.astype(np.float32, copy=True),
+                    'terminal_success': terminal_success_diag.astype(np.float32, copy=True),
+                    'terminal_quality': terminal_quality_diag.astype(np.float32, copy=True),
+                    'terminal_unsafe_arrival': terminal_unsafe_arrival_diag.astype(np.float32, copy=True),
+                    'total_before_clip': total_before_clip,
+                    'total_after_clip': np.asarray(clipped_rewards, dtype=np.float32).copy(),
+                    'clip_delta': (np.asarray(clipped_rewards, dtype=np.float32) - total_before_clip),
+                    'restructured_reward_enabled': bool(getattr(self, 'restructured_reward_enabled', False)),
+                    'active_indices': [int(i) for i in diagnostic_active_indices],
+                }
+            except Exception:
+                self.last_reward_diagnostics = None
+            return clipped_rewards
             
         except Exception as e:
             if reward_timing is not None:
@@ -2214,6 +2447,13 @@ class VectorizedRewardCalculator:
                 if goal_pos is not None:
                     goal_positions[a] = goal_pos
                     valid_goal_mask[a] = True
+
+            try:
+                arrays['goals'][b].fill(np.nan)
+                if np.any(valid_goal_mask):
+                    arrays['goals'][b, valid_goal_mask] = goal_positions[valid_goal_mask]
+            except Exception:
+                pass
 
             if np.any(valid_goal_mask) and (
                 _full_ch or (0 in _need_ch) or (4 in _need_ch) or (6 in _need_ch) or (9 in _need_ch) or (11 in _need_ch)
@@ -2661,16 +2901,6 @@ class VectorizedRewardCalculator:
                     arrays['rewards'][b, :, 11] = arrays['rewards'][b, :, 11] + (global_val / len(agents_batch[b]))
             elif _full_ch:
                 arrays['rewards'][b, :, 11] = arrays['rewards'][b, :, 11]
-                terminal_failure_penalty = self._terminal_failure_penalty_batch(
-                    agents_batch[b],
-                    pos_batch,
-                    goal_positions,
-                    valid_goal_mask,
-                    start_pos_batch,
-                    world,
-                )
-                if np.any(terminal_failure_penalty < 0.0):
-                    arrays['rewards'][b, :, 11] += terminal_failure_penalty
 
             # 结构收缩且不算全通道时：不往 ch9 写团队无碰撞奖励（主目标不含该通道），但必须清零标志避免累积
             try:
@@ -3551,9 +3781,22 @@ class VectorizedRewardCalculator:
                 else:
                     success_mask = distances <= self.success_distance_threshold
 
-                ring_bonus = self._goal_ring_bonus_vectorized(agent, distances, success_state)
+                ring_bonus = self._goal_ring_bonus_vectorized(
+                    agent,
+                    distances,
+                    success_state,
+                    scenario=scenario,
+                    world=world,
+                )
                 if np.any(ring_bonus > 0.0):
                     rewards = np.maximum(rewards, ring_bonus.astype(np.float32))
+
+                if np.any(success_mask) and not self._goal_reward_team_gate(
+                    float(self.success_distance_threshold),
+                    scenario=scenario,
+                    world=world,
+                ):
+                    success_mask = np.zeros_like(success_mask, dtype=bool)
                 
                 if np.any(success_mask):
                     # 🚨 关键修复：奖励值必须总是被计算和设置，即使success_reward_given已经是True
@@ -4055,9 +4298,22 @@ class VectorizedRewardCalculator:
             distances = np.linalg.norm(positions - goal_pos_fallback, axis=-1)
             success_mask = distances <= self.success_distance_threshold
 
-            ring_bonus = self._goal_ring_bonus_vectorized(agent, distances, success_state)
+            ring_bonus = self._goal_ring_bonus_vectorized(
+                agent,
+                distances,
+                success_state,
+                scenario=scenario,
+                world=world,
+            )
             if np.any(ring_bonus > 0.0):
                 rewards = np.maximum(rewards, ring_bonus.astype(np.float32))
+
+            if np.any(success_mask) and not self._goal_reward_team_gate(
+                float(self.success_distance_threshold),
+                scenario=scenario,
+                world=world,
+            ):
+                success_mask = np.zeros_like(success_mask, dtype=bool)
             
             if np.any(success_mask):
                 # 一次性成功奖励（防重复）
@@ -4462,7 +4718,14 @@ class VectorizedRewardCalculator:
         
         return rewards
 
-    def _terrain_min_distance_3d(self, positions: np.ndarray, scenario: Any, cached_data: Dict[str, Any] = None, world: Any = None) -> np.ndarray:
+    def _terrain_min_distance_3d(
+        self,
+        positions: np.ndarray,
+        scenario: Any,
+        cached_data: Dict[str, Any] = None,
+        world: Any = None,
+        agent_indices: Any = None,
+    ) -> np.ndarray:
         """
         计算位置到地形的 3D 最小距离，与净空奖励 _clearance_reward_vectorized 中地形距离定义一致。
         用于碰撞惩罚与净空奖励共用同一套 d_min 定义，避免信号矛盾。
@@ -4473,6 +4736,8 @@ class VectorizedRewardCalculator:
             positions,
             scenario,
             cached_data=cached_data,
+            world=world,
+            agent_indices=agent_indices,
         )
         return terrain_min_dist
 
@@ -4489,6 +4754,12 @@ class VectorizedRewardCalculator:
             positions = positions.reshape(1, -1)
         
         penalties = np.zeros(len(positions), dtype=np.float32)
+        agent_radius = 0.0
+        try:
+            if hasattr(world, 'agents') and 0 <= int(agent_idx) < len(world.agents):
+                agent_radius = max(0.0, float(getattr(world.agents[int(agent_idx)], 'size', 0.0)))
+        except Exception:
+            agent_radius = 0.0
         
         # 🚨 关键修复：首先计算综合最小距离（障碍物和地形的综合距离）
         # 这是检测碰撞的主要方法，比Z坐标检测更准确（能捕获侧面碰撞）
@@ -4507,11 +4778,17 @@ class VectorizedRewardCalculator:
                         obstacle_radius = float(obstacle_data['radius'])
                         # 计算3D距离
                         dist_3d = np.linalg.norm(positions - obstacle_center, axis=-1)
-                        dist_to_surface = dist_3d - obstacle_radius  # 到障碍物表面的距离
+                        dist_to_surface = dist_3d - obstacle_radius - agent_radius  # 到机体-障碍物表面的距离
                         obstacle_min_dist = np.minimum(obstacle_min_dist, dist_to_surface)
             
             # 地形距离：与净空路径一致，使用 3D 最近距离（垂向 + 多方向采样取最小）
-            terrain_min_dist = self._terrain_min_distance_3d(positions, scenario, cached_data=cached_data, world=world)
+            terrain_min_dist = self._terrain_min_distance_3d(
+                positions,
+                scenario,
+                cached_data=cached_data,
+                world=world,
+                agent_indices=np.full(len(positions), int(agent_idx), dtype=np.int64),
+            )
             
             # 综合最小距离：取障碍物和地形距离的最小值
             d_min_current = np.minimum(obstacle_min_dist, terrain_min_dist)
@@ -4681,7 +4958,7 @@ class VectorizedRewardCalculator:
                     )
                     # 填入当前位置高度，避免后续出现 NaN/Inf
                     try:
-                        terrain_heights[invalid_mask] = positions[invalid_mask, 2]
+                        terrain_heights[invalid_mask] = positions[invalid_mask, 2] - agent_radius
                     except Exception:
                         terrain_heights[invalid_mask] = 0.0
                     try:
@@ -4708,8 +4985,9 @@ class VectorizedRewardCalculator:
                 # 🚨 关键修复2：使用真实碰撞阈值（0.3米），而不是净空监测阈值（1.5米）
                 # 原问题：使用1.5米阈值导致智能体在0.5-1.0米高度飞行也被误报为"穿透"
                 eps = float(self.terrain_collision_eps)  # 使用真实碰撞阈值（0.3米）
-                # Z坐标穿透检测：智能体Z坐标 < 地形高度 + eps（只检测真实接触）
-                penetration_mask = positions[:, 2] < terrain_heights + eps
+                body_bottom_z = positions[:, 2] - agent_radius
+                # Z坐标穿透检测：机体底部 < 地形高度 + eps（只检测真实接触）
+                penetration_mask = body_bottom_z < terrain_heights + eps
                 # 🚨 关键修复：排除已经被距离检测捕获的碰撞，避免重复计数
                 # 如果距离检测已经检测到碰撞，Z坐标检测不再重复计数
                 penetration_mask = penetration_mask & (~distance_based_collision_mask)
@@ -4721,8 +4999,11 @@ class VectorizedRewardCalculator:
                     if debug_collision and (len(positions) > 0):
                         # 计算一些统计信息用于调试
                         z_positions = positions[:, 2]
+                        body_z_positions = body_bottom_z
                         z_min = float(np.min(z_positions)) if len(z_positions) > 0 else 0.0
                         z_max = float(np.max(z_positions)) if len(z_positions) > 0 else 0.0
+                        body_z_min = float(np.min(body_z_positions)) if len(body_z_positions) > 0 else 0.0
+                        body_z_max = float(np.max(body_z_positions)) if len(body_z_positions) > 0 else 0.0
                         terrain_h_min = float(np.min(terrain_heights)) if len(terrain_heights) > 0 and np.any(np.isfinite(terrain_heights)) else 0.0
                         terrain_h_max = float(np.max(terrain_heights)) if len(terrain_heights) > 0 and np.any(np.isfinite(terrain_heights)) else 0.0
                         penetration_count_debug = int(np.sum(penetration_mask))
@@ -4739,14 +5020,14 @@ class VectorizedRewardCalculator:
                         # 🚨 关键调试：输出world.agents信息
                         print(f"[碰撞检测调试] agent_idx={agent_idx}, 本批次位置数={len(positions)}, "
                               f"穿透检测={penetration_count_debug}, 当前累计计数={current_count}, "
-                              f"eps={eps:.3f}, Z范围=[{z_min:.2f}, {z_max:.2f}], "
-                              f"地形高度范围=[{terrain_h_min:.2f}, {terrain_h_max:.2f}], "
-                              f"穿透条件满足={penetration_count_debug > 0}, "
-                              f"world.agents存在={has_world_agents}, world.agents长度={world_agents_len}, "
-                              f"agent_idx有效={agent_idx_valid}, "
-                              f"位置Z={z_positions[0] if len(z_positions) > 0 else 'N/A':.2f}, "
-                              f"地形高度={terrain_heights[0] if len(terrain_heights) > 0 and np.isfinite(terrain_heights[0]) else 'N/A':.2f}, "
-                              f"条件检查: Z({z_positions[0] if len(z_positions) > 0 else 'N/A':.2f}) < 地形({terrain_heights[0] if len(terrain_heights) > 0 and np.isfinite(terrain_heights[0]) else 'N/A':.2f}) + eps({eps:.2f}) = {terrain_heights[0] + eps if len(terrain_heights) > 0 and np.isfinite(terrain_heights[0]) else 'N/A':.2f}")
+                                  f"eps={eps:.3f}, Z范围=[{z_min:.2f}, {z_max:.2f}], 机体底部Z范围=[{body_z_min:.2f}, {body_z_max:.2f}], "
+                                  f"地形高度范围=[{terrain_h_min:.2f}, {terrain_h_max:.2f}], "
+                                  f"穿透条件满足={penetration_count_debug > 0}, "
+                                  f"world.agents存在={has_world_agents}, world.agents长度={world_agents_len}, "
+                                  f"agent_idx有效={agent_idx_valid}, "
+                                  f"位置Z={z_positions[0] if len(z_positions) > 0 else 'N/A':.2f}, 机体底部Z={body_z_positions[0] if len(body_z_positions) > 0 else 'N/A':.2f}, "
+                                  f"地形高度={terrain_heights[0] if len(terrain_heights) > 0 and np.isfinite(terrain_heights[0]) else 'N/A':.2f}, "
+                                  f"条件检查: bodyZ({body_z_positions[0] if len(body_z_positions) > 0 else 'N/A':.2f}) < 地形({terrain_heights[0] if len(terrain_heights) > 0 and np.isfinite(terrain_heights[0]) else 'N/A':.2f}) + eps({eps:.2f}) = {terrain_heights[0] + eps if len(terrain_heights) > 0 and np.isfinite(terrain_heights[0]) else 'N/A':.2f}")
                 except Exception as e:
                     import os
                     if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
@@ -4754,7 +5035,7 @@ class VectorizedRewardCalculator:
                     pass
                 
                 if np.any(penetration_mask):
-                    terrain_signed_clearance = positions[penetration_mask, 2] - terrain_heights[penetration_mask]
+                    terrain_signed_clearance = body_bottom_z[penetration_mask] - terrain_heights[penetration_mask]
                     terrain_penalties = self._piecewise_collision_penalty(
                         terrain_signed_clearance,
                         float(self.terrain_collision_eps),
@@ -4815,7 +5096,7 @@ class VectorizedRewardCalculator:
                                     enable_collision_debug = os.getenv('ENABLE_COLLISION_DEBUG', '0').lower() in ('1','true','yes','on')
                                     if enable_collision_debug and (new_count % 100 == 0 or old_count == 0):
                                         # 计算穿透深度范围用于调试
-                                        penetration_depths = terrain_heights[penetration_mask] - positions[penetration_mask, 2]
+                                        penetration_depths = terrain_heights[penetration_mask] - body_bottom_z[penetration_mask]
                                         depth_min = float(np.min(penetration_depths)) if len(penetration_depths) > 0 else 0.0
                                         depth_max = float(np.max(penetration_depths)) if len(penetration_depths) > 0 else 0.0
                                         print(f"[碰撞检测] ✅ 成功更新计数: agent_idx={agent_idx}, 本批次穿透={penetration_count}, "
@@ -4843,7 +5124,7 @@ class VectorizedRewardCalculator:
                 #   - terrain_contact_eps 用于地形穿透/接触检测（高度容差）
                 #   - 两者应该独立使用，不应该混合
                 # 修复：移除错误的 collision_distance_threshold 使用，只使用 terrain_contact_eps
-                contact_mask = positions[:, 2] <= (terrain_heights + float(self.terrain_contact_eps))
+                contact_mask = body_bottom_z <= (terrain_heights + float(self.terrain_contact_eps))
 
                 # 目标范围判定（使用缓存的中央目标位置与 success_distance_threshold）
                 success_thresh = float(getattr(self, 'success_distance_threshold', 2.0))
@@ -4861,7 +5142,7 @@ class VectorizedRewardCalculator:
                 contact_penalty_mask = contact_mask & (~in_goal_area) & (~distance_based_collision_mask)
                 if np.any(contact_penalty_mask):
                     contact_penalties = np.full(len(positions), 0.0, dtype=np.float32)
-                    contact_signed_clearance = positions[contact_penalty_mask, 2] - terrain_heights[contact_penalty_mask]
+                    contact_signed_clearance = body_bottom_z[contact_penalty_mask] - terrain_heights[contact_penalty_mask]
                     contact_penalties[contact_penalty_mask] = self._piecewise_collision_penalty(
                         contact_signed_clearance,
                         float(self.terrain_contact_eps),
@@ -4881,7 +5162,7 @@ class VectorizedRewardCalculator:
                                 ag.debug_info = {}
                             # 只有 z <= terrain_height + collision_eps 才视为“真实碰撞事件”
                             collision_eps = float(self.terrain_collision_eps)  # 默认0.3米，真实碰撞阈值
-                            actual_penetration_mask = contact_penalty_mask & (positions[:, 2] <= terrain_heights + collision_eps)
+                            actual_penetration_mask = contact_penalty_mask & (body_bottom_z <= terrain_heights + collision_eps)
                             if np.any(actual_penetration_mask):
                                 ag._had_penetration_or_collision = True
                                 ag._had_terrain_contact_or_penetration = True
@@ -4919,7 +5200,7 @@ class VectorizedRewardCalculator:
                 distances = np.sqrt(np.sum(diff**2, axis=-1))  # (N, M)
                 
                 # 计算穿透深度
-                penetrations = obstacles_radii[None, :] - distances  # (N, M)
+                penetrations = obstacles_radii[None, :] + agent_radius - distances  # (N, M)
                 collision_masks = penetrations > 0
                 
                 # 取最大穿透深度
@@ -5058,10 +5339,11 @@ class VectorizedRewardCalculator:
                     valid_indices = np.where(valid_mask)[0]
                     terrain_heights[valid_indices] = terrain[int_pos[valid_indices, 1], int_pos[valid_indices, 0]]
             
-            penetration = terrain_heights - positions[:, 2]
+            body_bottom_z = positions[:, 2] - agent_radius
+            penetration = terrain_heights - body_bottom_z
             collision_mask = penetration > 0
             if np.any(collision_mask):
-                terrain_signed_clearance = positions[collision_mask, 2] - terrain_heights[collision_mask]
+                terrain_signed_clearance = body_bottom_z[collision_mask] - terrain_heights[collision_mask]
                 terrain_penalties = self._piecewise_collision_penalty(
                     terrain_signed_clearance,
                     float(self.terrain_collision_eps),
@@ -5354,6 +5636,7 @@ class VectorizedRewardCalculator:
             if speed < 0.1:
                 return rewards
             vel_dir = vel / max(speed, 1e-6)
+            agent_radius = max(0.0, float(getattr(agent, 'size', 0.0)))
 
             activation_dist = float(getattr(scenario, 'lateral_activation_distance', 15.0)) if scenario is not None else 15.0
             activation_dist = max(activation_dist, 1e-6)
@@ -5365,13 +5648,15 @@ class VectorizedRewardCalculator:
                 # 障碍物法向量（从障碍物中心指向智能体）
                 if world is not None and hasattr(world, 'landmarks'):
                     for landmark in getattr(world, 'landmarks', []):
+                        if not getattr(landmark, 'collide', False):
+                            continue
                         if landmark is None or not hasattr(landmark, 'state') or landmark.state.p_pos is None:
                             continue
                         obstacle_pos = np.asarray(landmark.state.p_pos, dtype=np.float32)
                         to_obstacle = obstacle_pos - pos
                         dist_center = float(np.linalg.norm(to_obstacle))
                         radius = float(getattr(landmark, 'size', getattr(landmark, 'radius', 1.0)))
-                        dist_surface = max(0.0, dist_center - radius)
+                        dist_surface = max(0.0, dist_center - radius - agent_radius)
                         if dist_surface < min_dist and dist_surface < activation_dist:
                             min_dist = dist_surface
                             if dist_center > 1e-6:
@@ -5383,7 +5668,7 @@ class VectorizedRewardCalculator:
                 if scenario is not None and hasattr(scenario, 'get_terrain_height'):
                     try:
                         terrain_h = float(scenario.get_terrain_height(float(pos[0]), float(pos[1])))
-                        dist_terrain = max(0.0, float(pos[2]) - terrain_h)
+                        dist_terrain = max(0.0, float(pos[2]) - agent_radius - terrain_h)
                         if dist_terrain < min_dist and dist_terrain < activation_dist:
                             min_dist = dist_terrain
                             danger_normal = self._estimate_terrain_normal(scenario, float(pos[0]), float(pos[1]))
@@ -5542,6 +5827,7 @@ class VectorizedRewardCalculator:
             positions,
             scenario,
             cached_data=cached_data,
+            world=world,
         )
 
         d_min_current = np.minimum(obstacle_min_dist, terrain_warning_dist).astype(np.float32)

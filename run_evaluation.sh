@@ -50,6 +50,7 @@ STRICT_EVAL_MATCH=${STRICT_EVAL_MATCH:-1}
 EVAL_EPISODE_LENGTH_MULTIPLIER=${EVAL_EPISODE_LENGTH_MULTIPLIER:-${POST_EVAL_EPISODE_LENGTH_MULTIPLIER:-1}}
 EVAL_EPISODE_PARALLELISM=${EVAL_EPISODE_PARALLELISM:-1}
 EVAL_ENV_STEP_THREADS=${EVAL_ENV_STEP_THREADS:-1}
+APF_BACKEND=${APF_BACKEND:-python_original}
 
 echo ""
 echo "评估参数:"
@@ -63,6 +64,7 @@ echo "  - 禁用提前终止: $DISABLE_EARLY_TERMINATION"
 echo "  - 严格对齐训练配置: $STRICT_EVAL_MATCH"
 echo "  - Episode内并行(方案A): $EVAL_EPISODE_PARALLELISM"
 echo "  - env.step线程数(方案A): $EVAL_ENV_STEP_THREADS"
+echo "  - APF后端: $APF_BACKEND"
 echo ""
 
 # 🔧 关键修复：确保路径变量正确引用，支持中文路径
@@ -258,6 +260,7 @@ TRAINING_COLLISION_DISTANCE_THRESHOLD=""
 TRAINING_TERRAIN_CONTACT_EPS=""
 TRAINING_GRAVITY=""
 TRAINING_CONTROL_ACCEL_GAIN=""
+TRAINING_AGENT_SIZE=""
 TRAINING_AGENT_MAX_SPEED=""
 TRAINING_AGENT_ACCEL=""
 TRAINING_USE_QUADROTOR_DYNAMICS=""
@@ -324,12 +327,14 @@ CMD_ARGS="--load-model-path \"$MODEL_PATH\" --eval-episodes $EVAL_EPISODES --sav
 # 🔧 修复：设置默认物理参数（与训练脚本完全一致）
 export GRAVITY=${GRAVITY:-0.0}
 export CONTROL_ACCEL_GAIN=${CONTROL_ACCEL_GAIN:-1.0}
+export AGENT_SIZE=${AGENT_SIZE:-0.5}
 export AGENT_MAX_SPEED=${AGENT_MAX_SPEED:-37.5}  # 🔧 修复：与训练脚本一致（32.5→37.5）
 export AGENT_ACCEL=${AGENT_ACCEL:-3.6}  # 🔧 修复：与训练脚本一致（2.6→3.6）
 
 # 通过环境变量传入物理与动作范围参数
 CMD_ARGS="$CMD_ARGS --gravity $GRAVITY"
 CMD_ARGS="$CMD_ARGS --control-accel-gain $CONTROL_ACCEL_GAIN"
+CMD_ARGS="$CMD_ARGS --agent-size $AGENT_SIZE"
 CMD_ARGS="$CMD_ARGS --agent-max-speed $AGENT_MAX_SPEED"
 CMD_ARGS="$CMD_ARGS --agent-accel $AGENT_ACCEL"
 # 🔧 关键修复：设置动作范围参数（优先级：训练配置 > 环境变量 > 默认值）
@@ -555,6 +560,7 @@ try:
             'delta_lambda_1',
             'delta_k_rep',
             'delta_radius',
+            'max_force_magnitude',
             'action_range_x',
             'action_range_y',
             'action_range_z',
@@ -642,11 +648,13 @@ if [ -n "$TRAINING_PARAMS" ]; then
         TRAINING_DELTA_LAMBDA_1=$(json_get_from_training_params delta_lambda_1)
         TRAINING_DELTA_K_REP=$(json_get_from_training_params delta_k_rep)
         TRAINING_DELTA_RADIUS=$(json_get_from_training_params delta_radius)
+        TRAINING_MAX_FORCE_MAGNITUDE=$(json_get_from_training_params max_force_magnitude)
         TRAINING_ACTION_RANGE_X=$(json_get_from_training_params action_range_x)
         TRAINING_ACTION_RANGE_Y=$(json_get_from_training_params action_range_y)
         TRAINING_ACTION_RANGE_Z=$(json_get_from_training_params action_range_z)
         TRAINING_GRAVITY=$(json_get_from_training_params gravity)
         TRAINING_CONTROL_ACCEL_GAIN=$(json_get_from_training_params control_accel_gain)
+        TRAINING_AGENT_SIZE=$(json_get_from_training_params agent_size)
         TRAINING_AGENT_MAX_SPEED=$(json_get_from_training_params agent_max_speed)
         TRAINING_AGENT_ACCEL=$(json_get_from_training_params agent_accel)
         TRAINING_DAMPING=$(json_get_from_training_params damping)
@@ -704,11 +712,29 @@ if [ -n "$TRAINING_PARAMS" ]; then
         if [ -n "$TRAINING_GOAL_ATTRACTION" ]; then
             echo "✅ 从训练配置读取GOAL_ATTRACTION: $TRAINING_GOAL_ATTRACTION"
         fi
+        if [ -n "$TRAINING_LAMBDA_1_BASE" ]; then
+            echo "✅ 从训练配置读取LAMBDA_1_BASE: $TRAINING_LAMBDA_1_BASE"
+        fi
         if [ -n "$TRAINING_TERRAIN_REPULSION" ]; then
             echo "✅ 从训练配置读取TERRAIN_REPULSION: $TRAINING_TERRAIN_REPULSION"
         fi
         if [ -n "$TRAINING_AGENT_INFLUENCE_RANGE" ]; then
             echo "✅ 从训练配置读取AGENT_INFLUENCE_RANGE: $TRAINING_AGENT_INFLUENCE_RANGE"
+        fi
+        if [ -n "$TRAINING_DELTA_K_ATT" ]; then
+            echo "✅ 从训练配置读取DELTA_K_ATT: $TRAINING_DELTA_K_ATT"
+        fi
+        if [ -n "$TRAINING_DELTA_LAMBDA_1" ]; then
+            echo "✅ 从训练配置读取DELTA_LAMBDA_1: $TRAINING_DELTA_LAMBDA_1"
+        fi
+        if [ -n "$TRAINING_DELTA_K_REP" ]; then
+            echo "✅ 从训练配置读取DELTA_K_REP: $TRAINING_DELTA_K_REP"
+        fi
+        if [ -n "$TRAINING_DELTA_RADIUS" ]; then
+            echo "✅ 从训练配置读取DELTA_RADIUS: $TRAINING_DELTA_RADIUS"
+        fi
+        if [ -n "$TRAINING_MAX_FORCE_MAGNITUDE" ]; then
+            echo "✅ 从训练配置读取MAX_FORCE_MAGNITUDE: $TRAINING_MAX_FORCE_MAGNITUDE"
         fi
         if [ -n "$TRAINING_ACTION_RANGE_X" ]; then
             echo "✅ 从训练配置读取ACTION_RANGE_X: $TRAINING_ACTION_RANGE_X"
@@ -923,6 +949,7 @@ fi
 # 这里在训练配置读取完成后再次统一回写，确保最终命令真正使用训练时的值。
 apply_training_or_default GRAVITY TRAINING_GRAVITY 0.0
 apply_training_or_default CONTROL_ACCEL_GAIN TRAINING_CONTROL_ACCEL_GAIN 1.0
+apply_training_or_default AGENT_SIZE TRAINING_AGENT_SIZE 0.5
 apply_training_or_default AGENT_MAX_SPEED TRAINING_AGENT_MAX_SPEED 37.5
 apply_training_or_default AGENT_ACCEL TRAINING_AGENT_ACCEL 3.6
 apply_training_or_default ACTION_RANGE_X TRAINING_ACTION_RANGE_X 2.5
@@ -956,6 +983,15 @@ if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$ST
     [ -z "$TRAINING_EPISODE_LENGTH" ] && missing_keys+=("episode_length")
     [ -z "$TRAINING_SUCCESS_DISTANCE_THRESHOLD" ] && missing_keys+=("success_distance_threshold")
     [ -z "$TRAINING_COLLISION_DISTANCE_THRESHOLD" ] && missing_keys+=("collision_distance_threshold")
+    [ -z "$TRAINING_GOAL_ATTRACTION" ] && missing_keys+=("goal_attraction")
+    [ -z "$TRAINING_LAMBDA_1_BASE" ] && missing_keys+=("lambda_1_base")
+    [ -z "$TRAINING_TERRAIN_REPULSION" ] && missing_keys+=("terrain_repulsion")
+    [ -z "$TRAINING_AGENT_INFLUENCE_RANGE" ] && missing_keys+=("agent_influence_range")
+    [ -z "$TRAINING_DELTA_K_ATT" ] && missing_keys+=("delta_k_att")
+    [ -z "$TRAINING_DELTA_LAMBDA_1" ] && missing_keys+=("delta_lambda_1")
+    [ -z "$TRAINING_DELTA_K_REP" ] && missing_keys+=("delta_k_rep")
+    [ -z "$TRAINING_DELTA_RADIUS" ] && missing_keys+=("delta_radius")
+    [ -z "$TRAINING_MAX_FORCE_MAGNITUDE" ] && missing_keys+=("max_force_magnitude")
     if [ ${#missing_keys[@]} -gt 0 ]; then
         echo "❌ 严格模式：训练配置缺少关键字段: ${missing_keys[*]}"
         echo "   为避免评估与训练口径不一致，已中止。"
@@ -1025,7 +1061,7 @@ export FORCE_PARAM_DETECTION_RADIUS_RANGE=${FORCE_PARAM_DETECTION_RADIUS_RANGE:-
 if [ -n "$TRAINING_GOAL_ATTRACTION" ]; then
     export GOAL_ATTRACTION=$TRAINING_GOAL_ATTRACTION
 elif [ -z "${GOAL_ATTRACTION}" ]; then
-    export GOAL_ATTRACTION=${GOAL_ATTRACTION:-6.0}  # 🔧 修复：与训练脚本一致（15.0→6.0）
+    export GOAL_ATTRACTION=${GOAL_ATTRACTION:-26.0}  # 与run_optimized.sh当前训练默认一致
 fi
 
 if [ -n "$TRAINING_LAMBDA_1_BASE" ]; then
@@ -1037,7 +1073,7 @@ fi
 if [ -n "$TRAINING_TERRAIN_REPULSION" ]; then
     export TERRAIN_REPULSION=$TRAINING_TERRAIN_REPULSION
 elif [ -z "${TERRAIN_REPULSION}" ]; then
-    export TERRAIN_REPULSION=${TERRAIN_REPULSION:-8000.0}  # 🔧 修复：与训练脚本一致（3800.0→8000.0）
+    export TERRAIN_REPULSION=${TERRAIN_REPULSION:-1600.0}  # 与run_optimized.sh当前训练默认一致
 fi
 
 if [ -n "$TRAINING_AGENT_INFLUENCE_RANGE" ]; then
@@ -1062,7 +1098,7 @@ fi
 if [ -n "$TRAINING_DELTA_K_REP" ]; then
     export DELTA_K_REP=$TRAINING_DELTA_K_REP
 elif [ -z "${DELTA_K_REP}" ]; then
-    export DELTA_K_REP=${DELTA_K_REP:-1200.0}  # 🔧 修复：与训练脚本一致（1000.0→1200.0）
+    export DELTA_K_REP=${DELTA_K_REP:-600.0}  # 与run_optimized.sh当前训练默认一致
 fi
 
 if [ -n "$TRAINING_DELTA_RADIUS" ]; then
@@ -1071,11 +1107,18 @@ elif [ -z "${DELTA_RADIUS}" ]; then
     export DELTA_RADIUS=${DELTA_RADIUS:-80.0}  # 🔧 修复：与训练脚本一致（60.0→80.0）
 fi
 
+if [ -n "$TRAINING_MAX_FORCE_MAGNITUDE" ]; then
+    export MAX_FORCE_MAGNITUDE=$TRAINING_MAX_FORCE_MAGNITUDE
+elif [ -z "${MAX_FORCE_MAGNITUDE}" ]; then
+    export MAX_FORCE_MAGNITUDE=${MAX_FORCE_MAGNITUDE:-80.0}  # 与run_optimized.sh当前训练默认一致
+fi
+
 CMD_ARGS="$CMD_ARGS --action-force-ratio $ACTION_FORCE_RATIO"
 if [ -n "${FORCE_EVAL_ACTION_FORCE_RATIO}" ]; then
     CMD_ARGS="$CMD_ARGS --force-action-force-ratio $FORCE_EVAL_ACTION_FORCE_RATIO"
 fi
 CMD_ARGS="$CMD_ARGS --use-tf-potential-field $USE_TF_POTENTIAL_FIELD"
+CMD_ARGS="$CMD_ARGS --apf-backend $APF_BACKEND"
 CMD_ARGS="$CMD_ARGS --use-fr-feature $USE_FR_FEATURE"
 CMD_ARGS="$CMD_ARGS --use-pf-feature $USE_PF_FEATURE"
 CMD_ARGS="$CMD_ARGS --terrain-sensing-mode $TERRAIN_SENSING_MODE"  # 🔧 新增：地形感知模式
@@ -1092,6 +1135,7 @@ CMD_ARGS="$CMD_ARGS --delta-k-att $DELTA_K_ATT"
 CMD_ARGS="$CMD_ARGS --delta-lambda-1 $DELTA_LAMBDA_1"
 CMD_ARGS="$CMD_ARGS --delta-k-rep $DELTA_K_REP"
 CMD_ARGS="$CMD_ARGS --delta-radius $DELTA_RADIUS"
+CMD_ARGS="$CMD_ARGS --max-force-magnitude $MAX_FORCE_MAGNITUDE"
 
 # 势场/动作修正相关参数（可选）
 if [ -n "$ENABLE_ACTION_CORRECTION" ]; then
@@ -1109,7 +1153,6 @@ fi
 
 # 设置默认地形复杂度等级（与训练脚本保持一致）
 export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3}  # 🔧 修复：与训练脚本一致的地形复杂度
-CMD_ARGS="$CMD_ARGS --terrain-contact-eps $TERRAIN_CONTACT_EPS"
 CMD_ARGS="$CMD_ARGS --terrain-complexity-level $TERRAIN_COMPLEXITY_LEVEL"
 
 # 🔧 修复：奖励参数优先完全回读训练配置，其次才使用外部环境变量/脚本默认值
@@ -1143,6 +1186,8 @@ apply_training_or_default COLLISION_DISTANCE_THRESHOLD TRAINING_COLLISION_DISTAN
 apply_training_or_default COLLISION_PENALTY_VALUE TRAINING_COLLISION_PENALTY_VALUE 60.0
 apply_training_or_default GLOBAL_REWARD_MODE TRAINING_GLOBAL_REWARD_MODE avg_progress
 apply_training_or_default SHAPING_GAMMA TRAINING_SHAPING_GAMMA 0.9
+
+CMD_ARGS="$CMD_ARGS --terrain-contact-eps $TERRAIN_CONTACT_EPS"
 
 # 添加分项加权奖励参数（如果使用加权场景）
 CMD_ARGS="$CMD_ARGS --distance-weight $DISTANCE_WEIGHT"
@@ -1259,7 +1304,8 @@ export SAVE_EVAL_CONTROL_DIAGNOSTICS=${SAVE_EVAL_CONTROL_DIAGNOSTICS:-0}
 export DISABLE_TRAJECTORY_RECORDING=${DISABLE_TRAJECTORY_RECORDING:-0}
 export EVAL_LIGHT_ACTION_PATH=${EVAL_LIGHT_ACTION_PATH:-0}
 export EVAL_LIGHT_INFO=${EVAL_LIGHT_INFO:-0}
-export EVAL_ACTOR_ONLY=${EVAL_ACTOR_ONLY:-0}
+# Policy evaluation only needs Actor weights; set EVAL_ACTOR_ONLY=0 only for critic loading audits.
+export EVAL_ACTOR_ONLY=${EVAL_ACTOR_ONLY:-1}
 export EVAL_VERIFY_WEIGHT_COVERAGE=${EVAL_VERIFY_WEIGHT_COVERAGE:-0}
 export TIMING_DETAIL=${TIMING_DETAIL:-0}
 export TIMING_LEVEL=${TIMING_LEVEL:-1}
@@ -1318,6 +1364,7 @@ EVAL_CMD=(
     --algorithm "$ALGORITHM"
     --gravity "$GRAVITY"
     --control-accel-gain "$CONTROL_ACCEL_GAIN"
+    --agent-size "$AGENT_SIZE"
     --agent-max-speed "$AGENT_MAX_SPEED"
     --agent-accel "$AGENT_ACCEL"
     --action-range-x "$ACTION_RANGE_X"
@@ -1333,6 +1380,7 @@ EVAL_CMD=(
     --reward-neg-scale "$REWARD_NEG_SCALE"
     --action-force-ratio "$ACTION_FORCE_RATIO"
     --use-tf-potential-field "$USE_TF_POTENTIAL_FIELD"
+    --apf-backend "$APF_BACKEND"
     --use-fr-feature "$USE_FR_FEATURE"
     --use-pf-feature "$USE_PF_FEATURE"
     --terrain-sensing-mode "$TERRAIN_SENSING_MODE"
@@ -1344,6 +1392,7 @@ EVAL_CMD=(
     --delta-lambda-1 "$DELTA_LAMBDA_1"
     --delta-k-rep "$DELTA_K_REP"
     --delta-radius "$DELTA_RADIUS"
+    --max-force-magnitude "$MAX_FORCE_MAGNITUDE"
     --terrain-contact-eps "$TERRAIN_CONTACT_EPS"
     --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
     --distance-weight "$DISTANCE_WEIGHT"

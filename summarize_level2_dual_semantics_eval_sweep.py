@@ -21,6 +21,19 @@ from summarize_level2_official_eval import COLOR_MAP, DISPLAY_NAME_MAP, eval_con
 
 DEFAULT_LABELS = [
     "matd3_full_dual_semantic",
+    "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_agent_quality",
+    "matd3_cross_agent_ref_soft_advantage",
+    "matd3_cross_agent_ref_selector_mix",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail0",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail01",
+    "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_tail10",
+    "matd3_cross_agent_ref_progress_gate",
+    "matd3_cross_agent_ref_agent_success_behavior_label",
+    "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_no_quality_gate",
+    "matd3_cross_agent_ref_behavior_label",
     "matd3_collapsed_replay",
     "matd3_no_corrected_target_reconstruction",
 ]
@@ -291,6 +304,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--expected-episodes", type=int, default=30)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument(
+        "--allow-forced-fr",
+        action="store_true",
+        help="Accept evaluation runs with action_force_ratio_source=forced_override; use for fixed-FR control evals.",
+    )
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--filename-tag", default="", help="Optional suffix for output files, e.g. model_fr")
     return parser.parse_args()
@@ -323,6 +341,14 @@ def main() -> int:
                     )
                     continue
                 row = _load_result_row(label=label, train_seed=int(train_seed), eval_seed=int(eval_seed), result_path=result_path)
+                if args.allow_forced_fr and row.get("config_errors"):
+                    errors = [
+                        item
+                        for item in str(row.get("config_errors") or "").split("; ")
+                        if item and item != "forced_override action_force_ratio_source"
+                    ]
+                    row["config_errors"] = "; ".join(errors)
+                    row["config_valid"] = not errors
                 if row.get("episodes") != int(args.expected_episodes):
                     missing.append(
                         {

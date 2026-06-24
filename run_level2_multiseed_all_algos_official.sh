@@ -120,7 +120,10 @@ label_supported() {
     matd3_single_q|matd3_dual_q|matd3_separated_gradient|matd3_separated_hybrid_actor|matd3_separated_hybrid_actor_alpha20)
       return 0
       ;;
-    matd3_full_dual_semantic|matd3_collapsed_replay|matd3_no_corrected_target_reconstruction)
+    matd3_full_dual_semantic|matd3_collapsed_replay|matd3_no_corrected_target_reconstruction|matd3_full_dual_semantic_cross_agent_ref|matd3_cross_agent_ref_agent_quality|matd3_cross_agent_ref_soft_advantage|matd3_cross_agent_ref_selector_mix|matd3_cross_agent_ref_reward_to_success_selector|matd3_cross_agent_ref_reward_to_success_selector_tail0|matd3_cross_agent_ref_reward_to_success_selector_tail01|matd3_cross_agent_ref_reward_to_success_selector_tail10|matd3_cross_agent_ref_no_quality_gate|matd3_cross_agent_ref_behavior_label)
+      return 0
+      ;;
+    ds_matd3_original|ds_matd3_uniform|ds_matd3_legacy_per)
       return 0
       ;;
     maddpg_baseline|maddpg_dual_q|maddpg_separated_gradient)
@@ -456,9 +459,21 @@ run_level2_job() {
   local exp="${RUN_TAG}_${label}_seed${seed}"
   local log_file="${RUN_LOG_ROOT}/${label}_seed${seed}.log"
   local resume_env=()
+  local r2s_tail_weight="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}"
   if [ -n "$resume_model" ]; then
     resume_env+=(RESUME_MODEL_ENV="$resume_model")
   fi
+  case "$label" in
+    matd3_cross_agent_ref_reward_to_success_selector_tail0)
+      r2s_tail_weight="0.0"
+      ;;
+    matd3_cross_agent_ref_reward_to_success_selector_tail01)
+      r2s_tail_weight="0.1"
+      ;;
+    matd3_cross_agent_ref_reward_to_success_selector_tail10)
+      r2s_tail_weight="1.0"
+      ;;
+  esac
 
   (
     case "$label" in
@@ -486,6 +501,247 @@ run_level2_job() {
           MATD3_HYBRID_ACTOR_ALPHA=0.80 \
           MATD3_ACTION_SEMANTICS_MODE=dual \
           MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=hard \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_full_dual_semantic_cross_agent_ref)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=1 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=1 \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=hard \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_cross_agent_ref_agent_quality)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=1 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=1 \
+          CROSS_AGENT_REFERENCE_GATE_MODE=agent_quality \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=hard \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_cross_agent_ref_soft_advantage)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=1 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=1 \
+          CROSS_AGENT_REFERENCE_GATE_MODE=agent_quality \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=soft_advantage \
+          CROSS_AGENT_REFERENCE_SELECTOR_ALPHA="${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU="${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP="${CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP:-5.0}" \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_cross_agent_ref_selector_mix)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=1 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=1 \
+          CROSS_AGENT_REFERENCE_GATE_MODE=agent_quality \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=selector_mix \
+          CROSS_AGENT_REFERENCE_SELECTOR_ALPHA="${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU="${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_LR="${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN="${CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN:-128,64}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT="${CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT:--2.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP="${CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP:-5.0}" \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_cross_agent_ref_reward_to_success_selector|matd3_cross_agent_ref_reward_to_success_selector_tail0|matd3_cross_agent_ref_reward_to_success_selector_tail01|matd3_cross_agent_ref_reward_to_success_selector_tail10)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="$r2s_tail_weight" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=1 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=1 \
+          CROSS_AGENT_REFERENCE_GATE_MODE=agent_quality \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=reward_to_success_priority \
+          CROSS_AGENT_REFERENCE_SELECTOR_ALPHA="${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU="${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_LR="${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN="${CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN:-128,64}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT="${CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT:--2.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP="${CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP:-5.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU="${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU:-500.0}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK="${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK:-0.05}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW="${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW:-100}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA="${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA:-0.02}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE="${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE:-0.05}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES="${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES:-200}" \
+          CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES="${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES:-50}" \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_cross_agent_ref_no_quality_gate)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=1 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=hard \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      matd3_cross_agent_ref_behavior_label)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_HYBRID_ACTOR_ALPHA=0.80 \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=1 \
+          CROSS_AGENT_REFERENCE_COEF="${CROSS_AGENT_REFERENCE_COEF:-0.03}" \
+          CROSS_AGENT_REFERENCE_START_EPISODE="${CROSS_AGENT_REFERENCE_START_EPISODE:-50}" \
+          CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD="${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}" \
+          CROSS_AGENT_REFERENCE_MARGIN="${CROSS_AGENT_REFERENCE_MARGIN:-0.0}" \
+          CROSS_AGENT_REFERENCE_HEAD_WEIGHT="${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}" \
+          CROSS_AGENT_REFERENCE_TAIL_WEIGHT="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}" \
+          CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL=0 \
+          CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM=1 \
+          CROSS_AGENT_REFERENCE_QUALITY_GATE=1 \
+          CROSS_AGENT_REFERENCE_SELECTOR_ENABLED=0 \
+          CROSS_AGENT_REFERENCE_SELECTOR_MODE=hard \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      ds_matd3_uniform)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          ALGORITHM_NAME=DS_MATD3_UNIFORM \
+          PER_ENABLED=0 \
+          ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
+        ;;
+      ds_matd3_legacy_per|ds_matd3_original)
+        env "${COMMON_ENV[@]}" "${resume_env[@]}" \
+          SEED="$seed" \
+          OFFICIAL_POST_EVAL_SPEC="$spec" \
+          USE_FR_FEATURE=1 \
+          USE_PF_FEATURE=1 \
+          MATD3_USE_DUAL_Q=true \
+          MATD3_USE_SEPARATED_GRADIENT=true \
+          MATD3_USE_HYBRID_ACTOR_OBJECTIVE=false \
+          MATD3_ACTION_SEMANTICS_MODE=dual \
+          MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          ALGORITHM_NAME=DS_MATD3_LEGACY_PER \
+          PER_ENABLED=1 \
           ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
         ;;
       matd3_collapsed_replay)
@@ -500,6 +756,7 @@ run_level2_job() {
           MATD3_HYBRID_ACTOR_ALPHA=0.80 \
           MATD3_ACTION_SEMANTICS_MODE=collapsed_replay \
           MATD3_RECONSTRUCT_CORRECTED_TARGET=true \
+          CROSS_AGENT_REFERENCE_ENABLED=0 \
           ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
         ;;
       matd3_no_corrected_target_reconstruction)
@@ -514,6 +771,7 @@ run_level2_job() {
           MATD3_HYBRID_ACTOR_ALPHA=0.80 \
           MATD3_ACTION_SEMANTICS_MODE=dual \
           MATD3_RECONSTRUCT_CORRECTED_TARGET=false \
+          CROSS_AGENT_REFERENCE_ENABLED=0 \
           ./run_optimized.sh "$EPISODES" "$BATCH_SIZE" "$exp" 1 matd3
         ;;
       matd3_dual_q)

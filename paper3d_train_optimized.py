@@ -52,6 +52,10 @@ import copy
 import functools
 import itertools
 import random
+import csv
+import hashlib
+from dataclasses import dataclass
+from collections import defaultdict, deque
 
 
 def _make_json_safe(value):
@@ -323,84 +327,48 @@ class ReplayBuffer:
     def sample(self, batch_size):
         buffer_size = self.size()
         if buffer_size <= 0:
-            empty_shape = (0, self.n_agents, self.obs_dim)
-            return (
-                np.empty(empty_shape, dtype=np.float32),
-                np.empty(empty_shape, dtype=np.float32),
-                np.empty((0, self.n_agents, self.act_dim), dtype=np.float32),
-                np.empty((0, self.n_agents), dtype=np.float32),
-                np.empty((0, self.n_agents), dtype=np.float32),
-                np.empty((0,), dtype=np.float32),
-                np.empty((0,), dtype=np.int32),
-            )
-        # 简单均匀采样（放回）
-        # 🚨 关键修复：使用独立的RandomState，确保可重复性
-        indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
-        obs_batch = self.obs[indices].astype(np.float32, copy=False)
-        next_obs_batch = self.next_obs[indices].astype(np.float32, copy=False)
-        act_batch = self.act[indices].astype(np.float32, copy=False)
-        rew_batch = self.rew[indices].astype(np.float32, copy=False)
-        done_batch = self.done[indices].astype(np.float32, copy=False)
-        weights = np.ones((batch_size,), dtype=np.float32)
-        return (
-            obs_batch,
-            next_obs_batch,
-            act_batch,
-            rew_batch,
-            done_batch,
-            weights,
-            indices.astype(np.int32),
+            return self._build_replay_batch(np.empty((0,), dtype=np.int64), weights=np.empty((0,), dtype=np.float32))
+
+        indices, weights, _source_labels, generations, _diag = self._sample_original_per_mixed_indices(
+            batch_size,
+            buffer_size=buffer_size,
+            force_per=bool(self.use_per),
+            source_prefix="global",
         )
+        return self._build_replay_batch(indices, weights=weights, generations=generations)
+
     def size(self):
         return int(self.current_size)
     
     def clear(self, keep_recent_n=0):
         """清空经验回放缓冲区（用于课程学习解锁时清理旧经验）
-        
+
         参数:
             keep_recent_n: 保留最近N条经验（渐进式清空），0表示完全清空
         """
-        if keep_recent_n > 0 and self.current_size > keep_recent_n:
-            # 渐进式清空：保留最近N条经验
-            # 由于是循环缓冲区，最近的经验在position附近
-            # 需要将最近N条经验移动到缓冲区开头
-            recent_start = (self.position - keep_recent_n) % self.capacity
-            if recent_start < 0:
-                recent_start += self.capacity
-            
-            # 如果最近的经验跨越了缓冲区边界，需要分两部分复制
-            if recent_start + keep_recent_n <= self.capacity:
-                # 不跨越边界，直接复制
-                self.obs[:keep_recent_n] = self.obs[recent_start:recent_start + keep_recent_n]
-                self.next_obs[:keep_recent_n] = self.next_obs[recent_start:recent_start + keep_recent_n]
-                self.act[:keep_recent_n] = self.act[recent_start:recent_start + keep_recent_n]
-                self.rew[:keep_recent_n] = self.rew[recent_start:recent_start + keep_recent_n]
-                self.done[:keep_recent_n] = self.done[recent_start:recent_start + keep_recent_n]
-            else:
-                # 跨越边界，分两部分复制
-                part1_len = self.capacity - recent_start
-                part2_len = keep_recent_n - part1_len
-                self.obs[:part1_len] = self.obs[recent_start:]
-                self.obs[part1_len:keep_recent_n] = self.obs[:part2_len]
-                self.next_obs[:part1_len] = self.next_obs[recent_start:]
-                self.next_obs[part1_len:keep_recent_n] = self.next_obs[:part2_len]
-                self.act[:part1_len] = self.act[recent_start:]
-                self.act[part1_len:keep_recent_n] = self.act[:part2_len]
-                self.rew[:part1_len] = self.rew[recent_start:]
-                self.rew[part1_len:keep_recent_n] = self.rew[:part2_len]
-                self.done[:part1_len] = self.done[recent_start:]
-                self.done[part1_len:keep_recent_n] = self.done[:part2_len]
-            
+        if keep_recent_n > 0 and self.current_size > 0:
+            keep_n = int(max(0, min(int(keep_recent_n), int(self.current_size), int(self.capacity))))
+            recent_start = (int(self.position) - keep_n) % int(self.capacity)
+            recent_idx = (recent_start + np.arange(keep_n, dtype=np.int64)) % int(self.capacity)
+            self.obs[:keep_n] = self.obs[recent_idx].copy()
+            self.next_obs[:keep_n] = self.next_obs[recent_idx].copy()
+            self.act[:keep_n] = self.act[recent_idx].copy()
+            if hasattr(self, 'act_policy_clean'):
+                self.act_policy_clean[:keep_n] = self.act_policy_clean[recent_idx].copy()
+            if hasattr(self, 'random_action_mask'):
+                self.random_action_mask[:keep_n] = self.random_action_mask[recent_idx].copy()
+            self.rew[:keep_n] = self.rew[recent_idx].copy()
+            self.done[:keep_n] = self.done[recent_idx].copy()
             # 更新位置和大小
-            self.position = keep_recent_n
-            self.current_size = keep_recent_n
+            self.position = keep_n % int(self.capacity)
+            self.current_size = keep_n
         else:
             # 完全清空
             self.position = 0
             self.current_size = 0
         # 注意：不需要重置数组内容（会被新数据覆盖），只重置索引和计数器
     
-    def update_priorities(self, indices, td_errors):
+    def update_priorities(self, indices, td_errors, generations=None):
         # 非PER，无需实现
         return
 
@@ -450,7 +418,7 @@ def _worker(remote, parent_remote, env_fn):
                 base_seed = int(scenario.seed)
         except Exception:
             pass
-        
+
         # 如果scenario中没有seed，尝试从world中获取
         if base_seed is None:
             try:
@@ -1919,11 +1887,44 @@ class SumTree:
         return (leaf_indices.astype(np.int32), priorities.astype(np.float32), data_indices.astype(np.int32))
 
 
+@dataclass
+class ReplayBatch:
+    obs: np.ndarray
+    actions_raw: np.ndarray
+    actions_corr: np.ndarray
+    actions_policy_clean: object
+    random_action_mask: object
+    rewards: np.ndarray
+    next_obs: np.ndarray
+    dones: np.ndarray
+    fr: np.ndarray
+    pf_forces: np.ndarray
+    pf_features: object
+    next_pf_features: object
+    next_actions_corr_compat: object
+    sample_indices: np.ndarray
+    sample_generation: object
+    sample_weights: object = None
+    next_pf_geometry_cache: object = None
+    next_pf_forces_compat: object = None
+    agent_episode_success: object = None
+    agent_episode_reach: object = None
+    agent_episode_safe: object = None
+    team_episode_success: object = None
+    agent_episode_progress: object = None
+    agent_final_goal_distance: object = None
+    agent_episode_quality_valid: object = None
+
+
 # 轻量级、预分配的经验回放缓冲区（内存友好）
 class LiteReplayBuffer:
-    def __init__(self, capacity, n_agents, obs_dims, act_dims, negative_slope=0.6, beta=0.4, beta_increment=0.002, epsilon=0.01, use_per=False, storage_dtype=np.float32, per_replace=True,
-                 per_uniform_mix=0.05, priority_td_weight=1.0, priority_reward_weight=0.0, priority_age_decay=1.0, 
-                 priority_clearance_weight=0.0, priority_attitude_weight=0.0, map_size=200.0, seed=None):
+    def __init__(self, capacity, n_agents, obs_dims, act_dims,
+                 negative_slope=0.6, beta=0.4, beta_increment=0.002,
+                 epsilon=0.01, use_per=False, storage_dtype=np.float32,
+                 per_replace=True, per_uniform_mix=0.05,
+                 priority_td_weight=1.0, priority_reward_weight=0.0,
+                 priority_age_decay=1.0, priority_clearance_weight=0.0,
+                 priority_attitude_weight=0.0, map_size=200.0, seed=None):
         # 检查并处理智能体维度一致性
         if isinstance(obs_dims, (list, tuple)):
             if len(set(obs_dims)) != 1:
@@ -1958,6 +1959,19 @@ class LiteReplayBuffer:
         self.obs = np.zeros((self.capacity, self.n_agents, self.obs_dim), dtype=self.storage_dtype)
         self.next_obs = np.zeros((self.capacity, self.n_agents, self.obs_dim), dtype=self.storage_dtype)
         self.act = np.zeros((self.capacity, self.n_agents, self.act_dim), dtype=self.storage_dtype)
+        # Actor clean policy output before OU noise / epsilon-random replacement.
+        # Used only by optional cross-agent reference learning; defaults preserve old replay behavior.
+        self.act_policy_clean = np.zeros((self.capacity, self.n_agents, self.act_dim), dtype=self.storage_dtype)
+        self.random_action_mask = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.stores_policy_clean_actions = False
+        self.stores_random_action_mask = False
+        self.agent_episode_success = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.agent_episode_reach = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.agent_episode_safe = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.team_episode_success = np.zeros((self.capacity,), dtype=np.float32)
+        self.agent_episode_progress = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.agent_final_goal_distance = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.agent_episode_quality_valid = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
         # 🔧 新增：同时存储修正后的动作（混合动作），用于Critic学习
         # 形状：(capacity, n_agents, act_dim)，存储混合动作：corrected = raw + FR * (pf_force - raw)
         self.act_corrected = np.zeros((self.capacity, self.n_agents, self.act_dim), dtype=self.storage_dtype)
@@ -1979,7 +1993,10 @@ class LiteReplayBuffer:
         self.next_pf_features = np.zeros((self.capacity, self.n_agents, 3), dtype=np.float32)
         self.stores_pf_features = False
         self.stores_next_pf_features = False
-        
+
+        self.generation = np.full((self.capacity,), -1, dtype=np.int64)
+        self.write_generation_counter = 0
+
         # 设置PER相关参数
         self.negative_slope = float(negative_slope)
         self.beta = float(beta)
@@ -2041,6 +2058,81 @@ class LiteReplayBuffer:
             self._per_debug_print_interval = max(0, int(_os.getenv('PER_DEBUG_PRINT_INTERVAL', '2000')))
         except Exception:
             self._per_debug_print_interval = 2000
+
+    def _reset_episode_quality_labels_at(self, positions):
+        try:
+            pos = np.asarray(positions, dtype=np.int64).reshape(-1)
+            if pos.size == 0:
+                return
+            pos = pos % int(self.capacity)
+            self.agent_episode_success[pos] = 0.0
+            self.agent_episode_reach[pos] = 0.0
+            self.agent_episode_safe[pos] = 0.0
+            self.team_episode_success[pos] = 0.0
+            self.agent_episode_progress[pos] = 0.0
+            self.agent_final_goal_distance[pos] = 0.0
+            self.agent_episode_quality_valid[pos] = 0.0
+        except Exception:
+            pass
+
+    def set_episode_quality_labels(self, indices, generations=None, agent_success=None,
+                                   agent_reach=None, agent_safe=None, team_success=0.0,
+                                   agent_progress=None, agent_final_goal_distance=None):
+        """Back-fill per-agent trajectory quality labels for already inserted episode transitions."""
+        try:
+            idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        except Exception:
+            return 0
+        if idx.size == 0:
+            return 0
+        idx = idx % int(self.capacity)
+        if generations is not None:
+            try:
+                gen = np.asarray(generations, dtype=np.int64).reshape(-1)
+                if gen.size != idx.size:
+                    gen = None
+            except Exception:
+                gen = None
+        else:
+            gen = None
+        valid = np.ones((idx.size,), dtype=bool)
+        if gen is not None:
+            valid = self.generation[idx] == gen
+        if not np.any(valid):
+            return 0
+        idx_valid = idx[valid]
+
+        def _agent_vec(values, default=0.0):
+            out = np.full((self.n_agents,), float(default), dtype=np.float32)
+            if values is None:
+                return out
+            try:
+                arr = np.asarray(values, dtype=np.float32).reshape(-1)
+                n = min(self.n_agents, arr.size)
+                if n > 0:
+                    out[:n] = arr[:n]
+            except Exception:
+                pass
+            return out
+
+        success_vec = _agent_vec(agent_success, 0.0)
+        reach_vec = _agent_vec(agent_reach, 0.0)
+        safe_vec = _agent_vec(agent_safe, 0.0)
+        progress_vec = _agent_vec(agent_progress, 0.0)
+        final_dist_vec = _agent_vec(agent_final_goal_distance, 0.0)
+        try:
+            team_val = 1.0 if float(team_success) >= 0.5 else 0.0
+        except Exception:
+            team_val = 0.0
+
+        self.agent_episode_success[idx_valid] = success_vec
+        self.agent_episode_reach[idx_valid] = reach_vec
+        self.agent_episode_safe[idx_valid] = safe_vec
+        self.team_episode_success[idx_valid] = team_val
+        self.agent_episode_progress[idx_valid] = progress_vec
+        self.agent_final_goal_distance[idx_valid] = final_dist_vec
+        self.agent_episode_quality_valid[idx_valid] = 1.0
+        return int(idx_valid.size)
 
     def _fit_vec(self, vec, expected_dim):
         arr = np.asarray(vec, dtype=np.float32)
@@ -2207,9 +2299,72 @@ class LiteReplayBuffer:
                         out[i] = 0.0
             return out
 
+    def _build_replay_batch(self, indices, weights=None, generations=None):
+        indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if weights is None:
+            weights = np.ones((indices.size,), dtype=np.float32)
+        weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+        if weights.size != indices.size:
+            fixed_w = np.ones((indices.size,), dtype=np.float32)
+            n_w = min(weights.size, fixed_w.size)
+            if n_w > 0:
+                fixed_w[:n_w] = weights[:n_w]
+            weights = fixed_w
+        if generations is None:
+            generations = self.generation[indices].astype(np.int64, copy=False) if indices.size else np.empty((0,), dtype=np.int64)
+        else:
+            generations = np.asarray(generations, dtype=np.int64).reshape(-1)
+            if generations.size != indices.size:
+                fixed_gen = self.generation[indices].astype(np.int64, copy=False) if indices.size else np.empty((0,), dtype=np.int64)
+                n_gen = min(generations.size, fixed_gen.size)
+                if n_gen > 0:
+                    fixed_gen[:n_gen] = generations[:n_gen]
+                generations = fixed_gen
+        obs_batch = self.obs[indices]
+        next_obs_batch = self.next_obs[indices]
+        act_batch = self.act[indices]
+        act_policy_clean_batch = self.act_policy_clean[indices].astype(np.float32, copy=False)
+        random_action_mask_batch = self.random_action_mask[indices].astype(np.float32, copy=False)
+        rew_batch = self.rew[indices]
+        done_batch = self.done[indices]
+        fr_batch = self.fr[indices].astype(np.float32, copy=False)
+        pf_forces_batch = self.pf_forces[indices].astype(np.float32, copy=False)
+        pf_features_batch = self.pf_features[indices].astype(np.float32, copy=False)
+        next_pf_features_batch = self.next_pf_features[indices].astype(np.float32, copy=False)
+        act_corrected_batch = self.act_corrected[indices].astype(np.float32, copy=False)
+        next_act_corrected_batch = self.next_act_corrected[indices].astype(np.float32, copy=False)
+        return ReplayBatch(
+            obs=obs_batch,
+            actions_raw=act_batch,
+            actions_corr=act_corrected_batch,
+            actions_policy_clean=act_policy_clean_batch,
+            random_action_mask=random_action_mask_batch,
+            rewards=rew_batch,
+            next_obs=next_obs_batch,
+            dones=done_batch,
+            fr=fr_batch,
+            pf_forces=pf_forces_batch,
+            pf_features=pf_features_batch,
+            next_pf_features=next_pf_features_batch,
+            next_actions_corr_compat=next_act_corrected_batch,
+            sample_indices=indices.astype(np.int32),
+            sample_generation=generations.astype(np.int64, copy=False),
+            sample_weights=weights,
+            next_pf_geometry_cache=None,
+            next_pf_forces_compat=None,
+            agent_episode_success=self.agent_episode_success[indices].astype(np.float32, copy=False),
+            agent_episode_reach=self.agent_episode_reach[indices].astype(np.float32, copy=False),
+            agent_episode_safe=self.agent_episode_safe[indices].astype(np.float32, copy=False),
+            team_episode_success=self.team_episode_success[indices].astype(np.float32, copy=False),
+            agent_episode_progress=self.agent_episode_progress[indices].astype(np.float32, copy=False),
+            agent_final_goal_distance=self.agent_final_goal_distance[indices].astype(np.float32, copy=False),
+            agent_episode_quality_valid=self.agent_episode_quality_valid[indices].astype(np.float32, copy=False),
+        )
+
     def add(self, obs_n, next_obs_n, act_n, rew_n, done_n, fr_value=None, pf_forces=None,
             act_corrected=None, next_pf_forces=None, next_act_corrected=None,
-            pf_features=None, next_pf_features=None, next_pf_geometry_cache=None):
+            pf_features=None, next_pf_features=None, next_pf_geometry_cache=None,
+            act_policy_clean=None, random_action_mask=None):
         # `next_pf_forces` 仅为兼容旧调用保留；next_pf_features 表示下一状态的 base PF 特征。
         # 数据验证
         if len(obs_n) != self.n_agents:
@@ -2230,6 +2385,30 @@ class LiteReplayBuffer:
             act_arr = act_n.astype(self.storage_dtype, copy=False)
         else:
             act_arr = self._fit_mat(act_n, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+
+        if act_policy_clean is not None:
+            if isinstance(act_policy_clean, np.ndarray) and act_policy_clean.shape == (self.n_agents, self.act_dim):
+                act_policy_clean_arr = act_policy_clean.astype(self.storage_dtype, copy=False)
+            else:
+                act_policy_clean_arr = self._fit_mat(act_policy_clean, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+        else:
+            act_policy_clean_arr = act_arr
+
+        if random_action_mask is not None:
+            try:
+                random_action_mask_arr = np.asarray(random_action_mask, dtype=np.float32).reshape(-1)
+                if random_action_mask_arr.shape != (self.n_agents,):
+                    fixed_mask = np.zeros((self.n_agents,), dtype=np.float32)
+                    n_mask = min(fixed_mask.size, random_action_mask_arr.size)
+                    if n_mask > 0:
+                        fixed_mask[:n_mask] = random_action_mask_arr[:n_mask]
+                    random_action_mask_arr = fixed_mask
+                else:
+                    random_action_mask_arr = random_action_mask_arr.astype(np.float32, copy=False)
+            except Exception:
+                random_action_mask_arr = np.zeros((self.n_agents,), dtype=np.float32)
+        else:
+            random_action_mask_arr = np.zeros((self.n_agents,), dtype=np.float32)
 
         # 奖励/完成标志
         # 🔧 性能优化：向量化处理奖励和完成标志，避免Python循环
@@ -2271,6 +2450,12 @@ class LiteReplayBuffer:
         self.obs[self.position] = obs_arr
         self.next_obs[self.position] = next_obs_arr
         self.act[self.position] = act_arr  # 原始动作
+        self.act_policy_clean[self.position] = act_policy_clean_arr
+        self.random_action_mask[self.position] = random_action_mask_arr
+        if act_policy_clean is not None:
+            self.stores_policy_clean_actions = True
+        if random_action_mask is not None:
+            self.stores_random_action_mask = True
         
         # 🔧 新增：存储修正后的动作（混合动作）
         # 如果提供了act_corrected，直接使用；否则从原始动作+势场力+FR计算
@@ -2380,32 +2565,42 @@ class LiteReplayBuffer:
         else:
             # 如果没有提供，使用零向量（向后兼容）
             self.next_act_corrected[self.position] = np.zeros((self.n_agents, self.act_dim), dtype=self.storage_dtype)
-        
+
+        write_generation = int(self.write_generation_counter)
+        self.generation[self.position] = write_generation
+        self.write_generation_counter += 1
+        self._reset_episode_quality_labels_at([self.position])
+
         # 记录插入时间步
         self._insert_step[self.position] = self._global_insert_counter
         # 🔧 关键修复：新样本初始优先级也需要限制，防止继承过大的max_priority
         # 限制max_priority使用值，避免新样本优先级过大
-        safe_max_priority = min(float(self.max_priority), 5000.0)
-        initial_priority = safe_max_priority ** float(self.negative_slope)
-        # 再次限制最终优先级值
-        initial_priority = min(initial_priority, 50000.0)
-        self.sum_tree.add(initial_priority)
+        if self.use_per:
+            safe_max_priority = min(float(self.max_priority), 5000.0)
+            initial_priority = safe_max_priority ** float(self.negative_slope)
+            # 再次限制最终优先级值
+            initial_priority = min(initial_priority, 50000.0)
+            self.sum_tree.add(initial_priority)
         # 移动指针
         self.position = (self.position + 1) % self.capacity
         if self.current_size < self.capacity:
             self.current_size += 1
         self._global_insert_counter += 1
+        return int((self.position - 1) % self.capacity), int(write_generation)
 
     def add_single_aligned(self, obs_n, next_obs_n, act_n, rew_n, done_n,
                            fr_value=None, pf_forces=None, act_corrected=None,
                            next_act_corrected=None, pf_features=None,
-                           next_pf_features=None, next_pf_geometry_cache=None):
+                           next_pf_features=None, next_pf_geometry_cache=None,
+                           act_policy_clean=None, random_action_mask=None):
         """
         当前默认单环境训练主线专用的快速写入路径。
 
         约定:
             - obs_n / next_obs_n: (n_agents, obs_dim)
             - act_n / act_corrected / next_act_corrected: (n_agents, act_dim)
+            - act_policy_clean: (n_agents, act_dim), clean Actor output before exploration
+            - random_action_mask: (n_agents,), 1 when this transition used epsilon-random action
             - rew_n / done_n: (n_agents,)
             - pf_forces: (n_agents, 3)
             - pf_features / next_pf_features: (n_agents, 3)
@@ -2429,6 +2624,31 @@ class LiteReplayBuffer:
             act_arr = self._fit_mat(act_n, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
         else:
             act_arr = act_arr.astype(self.storage_dtype, copy=False)
+
+        if act_policy_clean is not None:
+            act_policy_clean_arr = np.asarray(act_policy_clean, dtype=self.storage_dtype)
+            if act_policy_clean_arr.shape != (self.n_agents, self.act_dim):
+                act_policy_clean_arr = self._fit_mat(act_policy_clean, self.n_agents, self.act_dim).astype(self.storage_dtype, copy=False)
+            else:
+                act_policy_clean_arr = act_policy_clean_arr.astype(self.storage_dtype, copy=False)
+        else:
+            act_policy_clean_arr = act_arr
+
+        if random_action_mask is not None:
+            try:
+                random_action_mask_arr = np.asarray(random_action_mask, dtype=np.float32).reshape(-1)
+                if random_action_mask_arr.shape != (self.n_agents,):
+                    fixed_mask = np.zeros((self.n_agents,), dtype=np.float32)
+                    n_mask = min(fixed_mask.size, random_action_mask_arr.size)
+                    if n_mask > 0:
+                        fixed_mask[:n_mask] = random_action_mask_arr[:n_mask]
+                    random_action_mask_arr = fixed_mask
+                else:
+                    random_action_mask_arr = random_action_mask_arr.astype(np.float32, copy=False)
+            except Exception:
+                random_action_mask_arr = np.zeros((self.n_agents,), dtype=np.float32)
+        else:
+            random_action_mask_arr = np.zeros((self.n_agents,), dtype=np.float32)
 
         rew_vec = np.asarray(rew_n, dtype=self.storage_dtype).reshape(-1)
         if rew_vec.shape != (self.n_agents,):
@@ -2487,27 +2707,83 @@ class LiteReplayBuffer:
         else:
             next_act_corrected_arr = None
 
-        # 直接写入，复用 add() 已验证过的单样本语义。
-        self.add(
-            obs_arr,
-            next_obs_arr,
-            act_arr,
-            rew_vec,
-            done_vec,
-            fr_value=fr_value,
-            pf_forces=pf_arr,
-            act_corrected=act_corrected_arr,
-            next_pf_forces=None,
-            next_act_corrected=next_act_corrected_arr,
-            pf_features=pf_features_arr,
-            next_pf_features=next_pf_features_arr,
-        )
+        pos = int(self.position)
+        self.obs[pos] = obs_arr
+        self.next_obs[pos] = next_obs_arr
+        self.act[pos] = act_arr
+        self.act_policy_clean[pos] = act_policy_clean_arr
+        self.random_action_mask[pos] = random_action_mask_arr
+        self.rew[pos] = rew_vec
+        self.done[pos] = done_vec
+        if act_policy_clean is not None:
+            self.stores_policy_clean_actions = True
+        if random_action_mask is not None:
+            self.stores_random_action_mask = True
+        try:
+            self.fr[pos] = float(fr_value) if fr_value is not None else 0.0
+        except Exception:
+            self.fr[pos] = 0.0
+
+        if act_corrected_arr is not None:
+            self.act_corrected[pos] = act_corrected_arr
+        elif pf_arr is not None and fr_value is not None and float(fr_value) > 0.0:
+            try:
+                act_corr = act_arr.copy()
+                if act_corr.shape[1] >= 3:
+                    action_head = act_corr[:, :3]
+                    corrected_head = action_head + float(fr_value) * (pf_arr - action_head)
+                    act_corr[:, :3] = np.clip(corrected_head, -1.0, 1.0)
+                self.act_corrected[pos] = act_corr
+            except Exception:
+                self.act_corrected[pos] = act_arr
+        else:
+            self.act_corrected[pos] = act_arr
+
+        if pf_arr is not None:
+            self.pf_forces[pos] = pf_arr
+        else:
+            self.pf_forces[pos] = 0.0
+
+        if pf_features_arr is not None:
+            self.pf_features[pos] = pf_features_arr
+            self.stores_pf_features = True
+        else:
+            self.pf_features[pos] = 0.0
+
+        if next_pf_features_arr is not None:
+            self.next_pf_features[pos] = next_pf_features_arr
+            self.stores_next_pf_features = True
+        else:
+            self.next_pf_features[pos] = 0.0
+
+        if next_act_corrected_arr is not None:
+            self.next_act_corrected[pos] = next_act_corrected_arr
+            self.stores_next_act_corrected = True
+        else:
+            self.next_act_corrected[pos] = 0.0
+
+        write_generation = int(self.write_generation_counter)
+        self.generation[pos] = write_generation
+        self.write_generation_counter += 1
+        self._reset_episode_quality_labels_at([pos])
+
+        self._insert_step[pos] = self._global_insert_counter
+        if self.use_per:
+            safe_max_priority = min(float(self.max_priority), 5000.0)
+            initial_priority = min(safe_max_priority ** float(self.negative_slope), 50000.0)
+            self.sum_tree.add(initial_priority)
+        self.position = (pos + 1) % self.capacity
+        if self.current_size < self.capacity:
+            self.current_size += 1
+        self._global_insert_counter += 1
+        return int(pos), int(write_generation)
 
     def add_batch(self, obs_batch, next_obs_batch, act_batch, rew_batch, done_batch,
                   fr_values=None, pf_forces_batch=None, act_corrected_batch=None,
                   next_pf_forces_batch=None, next_act_corrected_batch=None,
                   pf_features_batch=None, next_pf_features_batch=None,
-                  next_pf_geometry_cache_batch=None):
+                  next_pf_geometry_cache_batch=None, act_policy_clean_batch=None,
+                  random_action_mask_batch=None):
         """
         🚀 真正的批量存储优化：使用numpy切片操作，避免Python循环
         参数:
@@ -2523,12 +2799,16 @@ class LiteReplayBuffer:
             next_act_corrected_batch: (batch_size, n_agents, act_dim) 或 list of (n_agents, act_dim)，默认None（延迟计算）
             pf_features_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
             next_pf_features_batch: (batch_size, n_agents, 3) 或 list of (n_agents, 3)，默认None
+            act_policy_clean_batch: (batch_size, n_agents, act_dim)，clean Actor输出，默认退化为 act_batch
+            random_action_mask_batch: (batch_size, n_agents)，epsilon-random探索标记
         """
         batch_size = len(obs_batch) if isinstance(obs_batch, (list, tuple)) else obs_batch.shape[0]
         if batch_size == 0:
             return
         if batch_size > self.capacity:
             # 极端情况下避免高级索引写入重复位置语义不清晰，退化为逐条写入。
+            written_positions = []
+            written_generations = []
             for i in range(batch_size):
                 obs_i = obs_batch[i] if isinstance(obs_batch, (list, tuple)) else obs_batch[i]
                 next_obs_i = next_obs_batch[i] if isinstance(next_obs_batch, (list, tuple)) else next_obs_batch[i]
@@ -2541,8 +2821,20 @@ class LiteReplayBuffer:
                 next_act_corrected_i = next_act_corrected_batch[i] if next_act_corrected_batch is not None and i < len(next_act_corrected_batch) else None
                 pf_feat_i = pf_features_batch[i] if pf_features_batch is not None and i < len(pf_features_batch) else None
                 next_pf_feat_i = next_pf_features_batch[i] if next_pf_features_batch is not None and i < len(next_pf_features_batch) else None
-                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i)
-            return
+                act_policy_clean_i = act_policy_clean_batch[i] if act_policy_clean_batch is not None and i < len(act_policy_clean_batch) else None
+                random_action_mask_i = random_action_mask_batch[i] if random_action_mask_batch is not None and i < len(random_action_mask_batch) else None
+                write_ref = self.add(
+                    obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i,
+                    act_corrected_i, None, next_act_corrected_i, pf_feat_i,
+                    next_pf_feat_i, None, act_policy_clean_i, random_action_mask_i
+                )
+                if write_ref is not None:
+                    written_positions.append(int(write_ref[0]))
+                    written_generations.append(int(write_ref[1]))
+            return (
+                np.asarray(written_positions, dtype=np.int32),
+                np.asarray(written_generations, dtype=np.int64),
+            )
 
         try:
             obs_arr = self._coerce_batch_matrix(obs_batch, batch_size, self.n_agents, self.obs_dim, self.storage_dtype)
@@ -2552,6 +2844,8 @@ class LiteReplayBuffer:
             done_arr = self._coerce_batch_vector(done_batch, batch_size, self.n_agents, self.storage_dtype)
         except Exception as e:
             print(f"[警告] 批量转换数据失败: {e}，回退到逐个添加")
+            written_positions = []
+            written_generations = []
             for i in range(batch_size):
                 obs_i = obs_batch[i] if isinstance(obs_batch, (list, tuple)) else obs_batch[i]
                 next_obs_i = next_obs_batch[i] if isinstance(next_obs_batch, (list, tuple)) else next_obs_batch[i]
@@ -2564,13 +2858,40 @@ class LiteReplayBuffer:
                 next_act_corrected_i = next_act_corrected_batch[i] if next_act_corrected_batch is not None and i < len(next_act_corrected_batch) else None
                 pf_feat_i = pf_features_batch[i] if pf_features_batch is not None and i < len(pf_features_batch) else None
                 next_pf_feat_i = next_pf_features_batch[i] if next_pf_features_batch is not None and i < len(next_pf_features_batch) else None
-                self.add(obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i, act_corrected_i, None, next_act_corrected_i, pf_feat_i, next_pf_feat_i)
-            return
+                act_policy_clean_i = act_policy_clean_batch[i] if act_policy_clean_batch is not None and i < len(act_policy_clean_batch) else None
+                random_action_mask_i = random_action_mask_batch[i] if random_action_mask_batch is not None and i < len(random_action_mask_batch) else None
+                write_ref = self.add(
+                    obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i,
+                    act_corrected_i, None, next_act_corrected_i, pf_feat_i,
+                    next_pf_feat_i, None, act_policy_clean_i, random_action_mask_i
+                )
+                if write_ref is not None:
+                    written_positions.append(int(write_ref[0]))
+                    written_generations.append(int(write_ref[1]))
+            return (
+                np.asarray(written_positions, dtype=np.int32),
+                np.asarray(written_generations, dtype=np.int64),
+            )
 
         fr_arr = self._coerce_batch_scalar(fr_values, batch_size, dtype=np.float32)
         pf_arr = self._coerce_batch_matrix(pf_forces_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
         pf_feat_arr = self._coerce_batch_matrix(pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
         next_pf_feat_arr = self._coerce_batch_matrix(next_pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
+        if act_policy_clean_batch is not None:
+            act_policy_clean_arr = self._coerce_batch_matrix(
+                act_policy_clean_batch, batch_size, self.n_agents, self.act_dim, self.storage_dtype, allow_none=True
+            )
+            if isinstance(act_policy_clean_batch, (list, tuple)):
+                limit = min(batch_size, len(act_policy_clean_batch))
+                for i in range(limit):
+                    if act_policy_clean_batch[i] is None:
+                        act_policy_clean_arr[i] = act_arr[i]
+        else:
+            act_policy_clean_arr = act_arr.copy()
+        if random_action_mask_batch is not None:
+            random_action_mask_arr = self._coerce_batch_vector(random_action_mask_batch, batch_size, self.n_agents, np.float32)
+        else:
+            random_action_mask_arr = np.zeros((batch_size, self.n_agents), dtype=np.float32)
         if act_corrected_batch is not None:
             act_corr_arr = self._coerce_batch_matrix(act_corrected_batch, batch_size, self.n_agents, self.act_dim, self.storage_dtype, allow_none=True)
             if isinstance(act_corrected_batch, (list, tuple)):
@@ -2598,10 +2919,20 @@ class LiteReplayBuffer:
 
         start_pos = self.position
         positions = (start_pos + np.arange(batch_size, dtype=np.int64)) % self.capacity
+        generation_values = np.arange(
+            self.write_generation_counter,
+            self.write_generation_counter + batch_size,
+            dtype=np.int64,
+        )
+        self.generation[positions] = generation_values
+        self.write_generation_counter += batch_size
+        self._reset_episode_quality_labels_at(positions)
 
         self.obs[positions] = obs_arr
         self.next_obs[positions] = next_obs_arr
         self.act[positions] = act_arr
+        self.act_policy_clean[positions] = act_policy_clean_arr
+        self.random_action_mask[positions] = random_action_mask_arr
         self.rew[positions] = rew_arr
         self.done[positions] = done_arr
         self.fr[positions] = fr_arr
@@ -2610,6 +2941,10 @@ class LiteReplayBuffer:
         self.next_pf_features[positions] = next_pf_feat_arr
         self.act_corrected[positions] = act_corr_arr
         self.next_act_corrected[positions] = next_act_corr_arr
+        if act_policy_clean_batch is not None:
+            self.stores_policy_clean_actions = True
+        if random_action_mask_batch is not None:
+            self.stores_random_action_mask = True
         if pf_features_batch is not None:
             self.stores_pf_features = True
         if next_pf_features_batch is not None:
@@ -2621,234 +2956,212 @@ class LiteReplayBuffer:
         self._insert_step[positions] = step_values
         self._global_insert_counter += batch_size
 
-        safe_max_priority = min(float(self.max_priority), 5000.0)
-        initial_priority = min(safe_max_priority ** float(self.negative_slope), 50000.0)
-        tree_indices = positions + self.sum_tree.leaf_start
-        self.sum_tree.update_batch(tree_indices, np.full((batch_size,), initial_priority, dtype=np.float32))
+        if self.use_per:
+            safe_max_priority = min(float(self.max_priority), 5000.0)
+            initial_priority = min(safe_max_priority ** float(self.negative_slope), 50000.0)
+            tree_indices = positions + self.sum_tree.leaf_start
+            self.sum_tree.update_batch(tree_indices, np.full((batch_size,), initial_priority, dtype=np.float32))
 
         self.position = (start_pos + batch_size) % self.capacity
         self.current_size = min(self.current_size + batch_size, self.capacity)
-        self.sum_tree.data_pointer = int(self.position)
+        if self.use_per:
+            self.sum_tree.data_pointer = int(self.position)
+        return positions.astype(np.int32, copy=False), generation_values.astype(np.int64, copy=False)
+
+    def _component_source_labels(self, component, count, source_prefix):
+        count = int(count)
+        if count <= 0:
+            return np.empty((0,), dtype='<U16')
+        prefix = str(source_prefix or "global").strip().lower()
+        if prefix == "legacy":
+            label = "legacy_per" if component == "per" else "legacy_uniform"
+        else:
+            label = "global"
+        return np.full((count,), label, dtype='<U16')
+
+    def _sample_original_per_mixed_indices(self, batch_size, buffer_size=None, force_per=None, source_prefix="global"):
+        """Sample with the PER/uniform semantics used by original replay."""
+        batch_size = int(batch_size)
+        if buffer_size is None:
+            buffer_size = self.size()
+        buffer_size = int(buffer_size)
+        if batch_size <= 0 or buffer_size <= 0:
+            empty_idx = np.empty((0,), dtype=np.int64)
+            return empty_idx, np.empty((0,), dtype=np.float32), np.empty((0,), dtype='<U16'), empty_idx, {
+                "legacy_fallback_uniform_count": 0,
+            }
+
+        use_per_draw = bool(self.use_per if force_per is None else force_per)
+        fallback_uniform_count = 0
+        if not use_per_draw:
+            if self.per_replace:
+                indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
+            else:
+                if buffer_size >= batch_size:
+                    indices = self._per_rng.choice(buffer_size, size=batch_size, replace=False).astype(np.int64)
+                else:
+                    indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
+            weights = np.ones((batch_size,), dtype=np.float32)
+            labels = self._component_source_labels("uniform", batch_size, source_prefix)
+            return indices, weights, labels, self.generation[indices].astype(np.int64, copy=False), {
+                "legacy_fallback_uniform_count": 0,
+            }
+
+        total_p = self.sum_tree.total()
+        if not np.isfinite(total_p) or total_p <= 0:
+            indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
+            weights = np.ones((batch_size,), dtype=np.float32)
+            labels = self._component_source_labels("uniform", batch_size, source_prefix)
+            return indices, weights, labels, self.generation[indices].astype(np.int64, copy=False), {
+                "legacy_fallback_uniform_count": int(batch_size),
+            }
+
+        if self.per_uniform_mix <= 1e-8:
+            indices = np.zeros(batch_size, dtype=np.int64)
+            weights = np.ones((batch_size,), dtype=np.float32)
+            segment = total_p / batch_size
+            segment_starts = np.arange(batch_size, dtype=np.float64) * segment
+            segment_rand = self._per_rng.uniform(0, segment, size=batch_size)
+            random_samples = segment_starts + segment_rand
+            _tidx, _p, _didx = self.sum_tree.get_batch(random_samples)
+            tree_indices = _tidx.astype(np.int32, copy=False)
+            priorities = _p.astype(np.float32, copy=False)
+            data_indices = _didx.astype(np.int64, copy=False)
+
+            if not self.per_replace:
+                if data_indices.size > 0:
+                    keep = np.sort(np.unique(data_indices, return_index=True)[1])
+                    tree_indices = tree_indices[keep]
+                    priorities = priorities[keep]
+                    data_indices = data_indices[keep]
+                    unique_count = data_indices.size
+                    if unique_count < batch_size:
+                        fill_src = np.arange(unique_count, batch_size, dtype=np.int64) % _didx.size
+                        tree_indices = np.concatenate([tree_indices, _tidx[fill_src].astype(np.int32, copy=False)], axis=0)
+                        priorities = np.concatenate([priorities, _p[fill_src].astype(np.float32, copy=False)], axis=0)
+                        data_indices = np.concatenate([data_indices, _didx[fill_src].astype(np.int64, copy=False)], axis=0)
+                data_indices = data_indices[:batch_size]
+                priorities = priorities[:batch_size]
+
+            indices[:data_indices.size] = data_indices[:batch_size]
+            valid_prob_mask = (priorities > 1e-8) & (total_p > 1e-8)
+            if np.any(valid_prob_mask):
+                prob = np.clip(buffer_size * priorities[valid_prob_mask] / total_p, 1e-8, 1e8)
+                weights[valid_prob_mask] = prob ** (-self.beta)
+            weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
+            max_w = np.max(weights)
+            if max_w > 1e-8:
+                weights = weights / max_w
+            else:
+                weights = np.ones_like(weights)
+            self.beta = min(1.0, self.beta + self.beta_increment)
+            labels = self._component_source_labels("per", batch_size, source_prefix)
+            return indices, weights, labels, self.generation[indices].astype(np.int64, copy=False), {
+                "legacy_fallback_uniform_count": 0,
+            }
+
+        m = float(self.per_uniform_mix)
+        indices = np.zeros(batch_size, dtype=np.int64)
+        weights = np.ones((batch_size,), dtype=np.float32)
+        chosen = set() if not self.per_replace else None
+        n_per = int(max(0, round((1.0 - m) * batch_size)))
+        n_uni = batch_size - n_per
+
+        per_priority = np.empty((0,), dtype=np.float32)
+        per_data = np.empty((0,), dtype=np.int64)
+        if n_per > 0:
+            seg = total_p / n_per if n_per > 0 else 0.0
+            seg_starts = np.arange(n_per, dtype=np.float64) * seg
+            seg_rand = self._per_rng.uniform(0, seg, size=n_per) if n_per > 0 else np.zeros((0,), dtype=np.float64)
+            rs = seg_starts + seg_rand
+            _tidx, _p, _didx = self.sum_tree.get_batch(rs)
+            if not self.per_replace:
+                if _didx.size > 0:
+                    keep = np.sort(np.unique(_didx.astype(np.int64, copy=False), return_index=True)[1])
+                    per_priority = _p[keep].astype(np.float32, copy=False)
+                    per_data = _didx[keep].astype(np.int64, copy=False)
+                    unique_count = per_data.size
+                    if unique_count < n_per:
+                        fill_src = np.arange(unique_count, n_per, dtype=np.int64) % _didx.size
+                        per_priority = np.concatenate([per_priority, _p[fill_src].astype(np.float32, copy=False)], axis=0)
+                        per_data = np.concatenate([per_data, _didx[fill_src].astype(np.int64, copy=False)], axis=0)
+                per_priority = per_priority[:n_per]
+                per_data = per_data[:n_per]
+                if chosen is not None and per_data.size > 0:
+                    chosen.update(per_data.tolist())
+            else:
+                per_priority = _p.astype(np.float32, copy=False)
+                per_data = _didx.astype(np.int64, copy=False)
+
+        uni_priority = np.empty((0,), dtype=np.float32)
+        uni_data = np.empty((0,), dtype=np.int64)
+        if n_uni > 0:
+            if self.per_replace:
+                rand_idx = self._per_rng.randint(0, buffer_size, size=n_uni).astype(np.int64)
+            else:
+                if chosen is not None and len(chosen) < buffer_size:
+                    rand_idx = self._sample_unique_excluding(buffer_size, n_uni, chosen)
+                else:
+                    if buffer_size >= n_uni:
+                        rand_idx = self._per_rng.choice(buffer_size, size=n_uni, replace=False).astype(np.int64)
+                    else:
+                        rand_idx = self._per_rng.randint(0, buffer_size, size=n_uni).astype(np.int64)
+            uni_data = rand_idx.astype(np.int64, copy=False)
+            uni_tree = uni_data + self.sum_tree.leaf_start
+            uni_priority = self.sum_tree.tree[uni_tree].astype(np.float32, copy=False)
+            if not self.per_replace and chosen is not None and uni_data.size > 0:
+                chosen.update(uni_data.tolist())
+
+        merged_priority = np.concatenate([per_priority, uni_priority], axis=0)
+        merged_data = np.concatenate([per_data, uni_data], axis=0)
+        labels = np.concatenate([
+            self._component_source_labels("per", per_data.size, source_prefix),
+            self._component_source_labels("uniform", uni_data.size, source_prefix),
+        ], axis=0)
+        if merged_data.size < batch_size:
+            fill_count = batch_size - merged_data.size
+            fill_data = self._per_rng.randint(0, buffer_size, size=fill_count).astype(np.int64)
+            fill_tree = fill_data + self.sum_tree.leaf_start
+            fill_priority = self.sum_tree.tree[fill_tree].astype(np.float32, copy=False)
+            merged_priority = np.concatenate([merged_priority, fill_priority], axis=0)
+            merged_data = np.concatenate([merged_data, fill_data], axis=0)
+            labels = np.concatenate([labels, self._component_source_labels("uniform", fill_count, source_prefix)], axis=0)
+            fallback_uniform_count += int(fill_count)
+
+        merged_priority = merged_priority[:batch_size]
+        merged_data = merged_data[:batch_size]
+        labels = labels[:batch_size]
+        indices[:merged_data.size] = merged_data
+        per_prob = np.full((batch_size,), 1.0 / buffer_size, dtype=np.float32)
+        if total_p > 1e-12:
+            valid_prob_mask = merged_priority > 0.0
+            if np.any(valid_prob_mask):
+                per_prob[valid_prob_mask] = np.clip(merged_priority[valid_prob_mask] / total_p, 1e-10, 1.0)
+        q_i = np.clip((1.0 - m) * per_prob + m * (1.0 / buffer_size), 1e-10, 1.0)
+        weights = (buffer_size * q_i) ** (-self.beta)
+        weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
+        max_w = np.max(weights)
+        if max_w > 1e-8:
+            weights = weights / max_w
+        else:
+            weights = np.ones_like(weights)
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        return indices, weights, labels, self.generation[indices].astype(np.int64, copy=False), {
+            "legacy_fallback_uniform_count": int(fallback_uniform_count),
+        }
 
     def sample(self, batch_size):
         buffer_size = self.size()
         if buffer_size <= 0:
-            empty_shape = (0, self.n_agents, self.obs_dim)
-            return (
-                np.empty(empty_shape, dtype=np.float32),
-                np.empty(empty_shape, dtype=np.float32),
-                np.empty((0, self.n_agents, self.act_dim), dtype=np.float32),
-                np.empty((0, self.n_agents), dtype=np.float32),
-                np.empty((0, self.n_agents), dtype=np.float32),
-                np.empty((0,), dtype=np.float32),
-                np.empty((0,), dtype=np.int32),
-                np.empty((0,), dtype=np.float32),
-                np.empty((0, self.n_agents, 3), dtype=np.float32),
-                np.empty((0, self.n_agents, 3), dtype=np.float32),
-                np.empty((0, self.n_agents, 3), dtype=np.float32),
-                np.empty((0, self.n_agents, self.act_dim), dtype=np.float32),
-                None,
-                np.empty((0, self.n_agents, self.act_dim), dtype=np.float32),
-            )
+            return self._build_replay_batch(np.empty((0,), dtype=np.int64), weights=np.empty((0,), dtype=np.float32))
 
-        # 🔧 性能优化：固定批大小，不再根据缓冲区大小缩小 batch_size
-
-        if not self.use_per:
-            # 🔧 性能优化：使用更高效的随机采样
-            # 按 per_replace 控制是否放回
-            if self.per_replace:
-                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
-            else:
-                # 无放回：当样本不足时退化为有放回，避免报错
-                if buffer_size >= batch_size:
-                    # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                    indices = self._per_rng.choice(buffer_size, size=batch_size, replace=False).astype(np.int64)
-                else:
-                    # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                    indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
-            weights = np.ones((batch_size,), dtype=np.float32)
-        else:
-            # PER+均匀混合采样
-            total_p = self.sum_tree.total()
-            
-            # 🔧 数值安全检查：防止total_p异常大或为NaN/Inf
-            if not np.isfinite(total_p) or total_p <= 0:
-                # 如果total_p无效，退化为均匀采样
-                print(f"[警告] PER total_p异常: {total_p}，退化为均匀采样")
-                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                indices = self._per_rng.randint(0, buffer_size, size=batch_size).astype(np.int64)
-                weights = np.ones((batch_size,), dtype=np.float32)
-            elif self.per_uniform_mix <= 1e-8:
-                # 退化为原PER流程
-                indices = np.zeros(batch_size, dtype=np.int64)
-                weights = np.ones((batch_size,), dtype=np.float32)
-                segment = total_p / batch_size
-                segment_starts = np.arange(batch_size, dtype=np.float64) * segment
-                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                segment_rand = self._per_rng.uniform(0, segment, size=batch_size)
-                random_samples = segment_starts + segment_rand
-                # 向量化 SumTree 检索，保持分布与语义不变
-                _tidx, _p, _didx = self.sum_tree.get_batch(random_samples)
-                tree_indices = _tidx.astype(np.int32, copy=False)
-                priorities = _p.astype(np.float32, copy=False)
-                data_indices = _didx.astype(np.int64, copy=False)
-
-                if not self.per_replace:
-                    if data_indices.size > 0:
-                        keep = np.sort(np.unique(data_indices, return_index=True)[1])
-                        tree_indices = tree_indices[keep]
-                        priorities = priorities[keep]
-                        data_indices = data_indices[keep]
-                        unique_count = data_indices.size
-                        if unique_count < batch_size:
-                            fill_src = np.arange(unique_count, batch_size, dtype=np.int64) % _didx.size
-                            tree_indices = np.concatenate([tree_indices, _tidx[fill_src].astype(np.int32, copy=False)], axis=0)
-                            priorities = np.concatenate([priorities, _p[fill_src].astype(np.float32, copy=False)], axis=0)
-                            data_indices = np.concatenate([data_indices, _didx[fill_src].astype(np.int64, copy=False)], axis=0)
-                    data_indices = data_indices[:batch_size]
-                    priorities = priorities[:batch_size]
-
-                indices[:data_indices.size] = data_indices[:batch_size]
-                valid_prob_mask = (priorities > 1e-8) & (total_p > 1e-8)
-                if np.any(valid_prob_mask):
-                    prob = np.clip(buffer_size * priorities[valid_prob_mask] / total_p, 1e-8, 1e8)
-                    weights[valid_prob_mask] = prob ** (-self.beta)
-                # 确保权重是有限的
-                weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
-                max_w = np.max(weights)
-                if max_w > 1e-8:
-                    weights = weights / max_w
-                else:
-                    weights = np.ones_like(weights)
-                self.beta = min(1.0, self.beta + self.beta_increment)
-            else:
-                # 混合分布：P_mix = (1-m)*P_per + m*P_uniform
-                m = float(self.per_uniform_mix)
-                indices = np.zeros(batch_size, dtype=np.int64)
-                weights = np.ones((batch_size,), dtype=np.float32)
-                chosen = set() if not self.per_replace else None
-                # 先生成PER部分
-                n_per = int(max(0, round((1.0 - m) * batch_size)))
-                n_uni = batch_size - n_per
-                # PER采样
-                per_tree = np.empty((0,), dtype=np.int32)
-                per_priority = np.empty((0,), dtype=np.float32)
-                per_data = np.empty((0,), dtype=np.int64)
-                if n_per > 0:
-                    seg = total_p / n_per if n_per > 0 else 0.0
-                    seg_starts = np.arange(n_per, dtype=np.float64) * seg
-                    # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                    seg_rand = self._per_rng.uniform(0, seg, size=n_per) if n_per > 0 else np.zeros((0,), dtype=np.float64)
-                    rs = seg_starts + seg_rand
-                    _tidx, _p, _didx = self.sum_tree.get_batch(rs)
-                    if not self.per_replace:
-                        if _didx.size > 0:
-                            keep = np.sort(np.unique(_didx.astype(np.int64, copy=False), return_index=True)[1])
-                            per_tree = _tidx[keep].astype(np.int32, copy=False)
-                            per_priority = _p[keep].astype(np.float32, copy=False)
-                            per_data = _didx[keep].astype(np.int64, copy=False)
-                            unique_count = per_data.size
-                            if unique_count < n_per:
-                                fill_src = np.arange(unique_count, n_per, dtype=np.int64) % _didx.size
-                                per_tree = np.concatenate([per_tree, _tidx[fill_src].astype(np.int32, copy=False)], axis=0)
-                                per_priority = np.concatenate([per_priority, _p[fill_src].astype(np.float32, copy=False)], axis=0)
-                                per_data = np.concatenate([per_data, _didx[fill_src].astype(np.int64, copy=False)], axis=0)
-                        per_tree = per_tree[:n_per]
-                        per_priority = per_priority[:n_per]
-                        per_data = per_data[:n_per]
-                        if chosen is not None and per_data.size > 0:
-                            chosen.update(per_data.tolist())
-                    else:
-                        per_tree = _tidx.astype(np.int32, copy=False)
-                        per_priority = _p.astype(np.float32, copy=False)
-                        per_data = _didx.astype(np.int64, copy=False)
-                # 均匀采样
-                uni_tree = np.empty((0,), dtype=np.int32)
-                uni_priority = np.empty((0,), dtype=np.float32)
-                uni_data = np.empty((0,), dtype=np.int64)
-                if n_uni > 0:
-                    if self.per_replace:
-                        # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                        rand_idx = self._per_rng.randint(0, buffer_size, size=n_uni).astype(np.int64)
-                    else:
-                        if chosen is not None and len(chosen) < buffer_size:
-                            rand_idx = self._sample_unique_excluding(buffer_size, n_uni, chosen)
-                        else:
-                            # 退化
-                            if buffer_size >= n_uni:
-                                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                                rand_idx = self._per_rng.choice(buffer_size, size=n_uni, replace=False).astype(np.int64)
-                            else:
-                                # 🚨 关键修复：使用独立的RandomState，确保可重复性
-                                rand_idx = self._per_rng.randint(0, buffer_size, size=n_uni).astype(np.int64)
-                    uni_data = rand_idx.astype(np.int64, copy=False)
-                    uni_tree = uni_data + self.sum_tree.leaf_start
-                    uni_priority = self.sum_tree.tree[uni_tree].astype(np.float32, copy=False)
-                    if not self.per_replace and chosen is not None and uni_data.size > 0:
-                        chosen.update(uni_data.tolist())
-                # 合并并计算混合权重
-                merged_priority = np.concatenate([per_priority, uni_priority], axis=0)
-                merged_data = np.concatenate([per_data, uni_data], axis=0)
-                if merged_data.size < batch_size:
-                    fill_count = batch_size - merged_data.size
-                    fill_data = self._per_rng.randint(0, buffer_size, size=fill_count).astype(np.int64)
-                    fill_tree = fill_data + self.sum_tree.leaf_start
-                    fill_priority = self.sum_tree.tree[fill_tree].astype(np.float32, copy=False)
-                    merged_priority = np.concatenate([merged_priority, fill_priority], axis=0)
-                    merged_data = np.concatenate([merged_data, fill_data], axis=0)
-                merged_priority = merged_priority[:batch_size]
-                merged_data = merged_data[:batch_size]
-                indices[:merged_data.size] = merged_data
-                per_prob = np.full((batch_size,), 1.0 / buffer_size, dtype=np.float32)
-                if total_p > 1e-12:
-                    valid_prob_mask = merged_priority > 0.0
-                    if np.any(valid_prob_mask):
-                        per_prob[valid_prob_mask] = np.clip(merged_priority[valid_prob_mask] / total_p, 1e-10, 1.0)
-                q_i = np.clip((1.0 - m) * per_prob + m * (1.0 / buffer_size), 1e-10, 1.0)
-                weights = (buffer_size * q_i) ** (-self.beta)
-                # 确保权重是有限的
-                weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
-                max_w = np.max(weights)
-                if max_w > 1e-8:
-                    weights = weights / max_w
-                else:
-                    weights = np.ones_like(weights)
-                self.beta = min(1.0, self.beta + self.beta_increment)
-
-        # 切片取批次
-        # 直接使用FP32存储，无需类型转换
-        obs_batch = self.obs[indices]
-        next_obs_batch = self.next_obs[indices]
-        act_batch = self.act[indices]
-        rew_batch = self.rew[indices]
-        done_batch = self.done[indices]
-
-        fr_batch = self.fr[indices].astype(np.float32, copy=False)
-        # 🚨 新增：返回势场力（pf_forces），用于恢复修正后的动作
-        pf_forces_batch = self.pf_forces[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, 3)
-        pf_features_batch = self.pf_features[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, 3)
-        next_pf_features_batch = self.next_pf_features[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, 3)
-        # 🔧 新增：返回修正后的动作（混合动作），用于Critic学习
-        act_corrected_batch = self.act_corrected[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, act_dim)
-        # 🔧 新增：返回下一步的修正后动作，用于 Target Q 计算
-        next_act_corrected_batch = self.next_act_corrected[indices].astype(np.float32, copy=False)  # (batch_size, n_agents, act_dim)
-        return (
-            obs_batch,
-            next_obs_batch,
-            act_batch,
-            rew_batch,
-            done_batch,
-            weights,
-            indices.astype(np.int32),
-            fr_batch,
-            pf_forces_batch,  # 新增：势场力批次
-            pf_features_batch,  # 当前状态的 base PF 特征
-            next_pf_features_batch,  # 下一状态的 base PF 特征
-            act_corrected_batch,  # 🔧 新增：修正后的动作批次
-            None,  # next_pf_forces_batch 保留兼容位
-            next_act_corrected_batch,  # 🔧 新增：下一步的修正后动作批次
+        indices, weights, _source_labels, generations, _diag = self._sample_original_per_mixed_indices(
+            batch_size,
+            buffer_size=buffer_size,
+            force_per=bool(self.use_per),
+            source_prefix="global",
         )
+        return self._build_replay_batch(indices, weights=weights, generations=generations)
 
     def size(self):
         return int(self.current_size)
@@ -2859,88 +3172,59 @@ class LiteReplayBuffer:
         参数:
             keep_recent_n: 保留最近N条经验（渐进式清空），0表示完全清空
         """
-        if keep_recent_n > 0 and self.current_size > keep_recent_n:
-            # 渐进式清空：保留最近N条经验
-            # 由于是循环缓冲区，最近的经验在position附近
-            # 需要将最近N条经验移动到缓冲区开头
-            recent_start = (self.position - keep_recent_n) % self.capacity
-            if recent_start < 0:
-                recent_start += self.capacity
-            
-            # 如果最近的经验跨越了缓冲区边界，需要分两部分复制
-            if recent_start + keep_recent_n <= self.capacity:
-                # 不跨越边界，直接复制
-                self.obs[:keep_recent_n] = self.obs[recent_start:recent_start + keep_recent_n]
-                self.next_obs[:keep_recent_n] = self.next_obs[recent_start:recent_start + keep_recent_n]
-                self.act[:keep_recent_n] = self.act[recent_start:recent_start + keep_recent_n]
-                self.rew[:keep_recent_n] = self.rew[recent_start:recent_start + keep_recent_n]
-                self.done[:keep_recent_n] = self.done[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'act_corrected'):
-                    self.act_corrected[:keep_recent_n] = self.act_corrected[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'next_act_corrected'):
-                    self.next_act_corrected[:keep_recent_n] = self.next_act_corrected[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'fr'):
-                    self.fr[:keep_recent_n] = self.fr[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'pf_forces'):
-                    self.pf_forces[:keep_recent_n] = self.pf_forces[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'pf_features'):
-                    self.pf_features[:keep_recent_n] = self.pf_features[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, 'next_pf_features'):
-                    self.next_pf_features[:keep_recent_n] = self.next_pf_features[recent_start:recent_start + keep_recent_n]
-                if hasattr(self, '_insert_step'):
-                    self._insert_step[:keep_recent_n] = self._insert_step[recent_start:recent_start + keep_recent_n]
-            else:
-                # 跨越边界，分两部分复制
-                part1_len = self.capacity - recent_start
-                part2_len = keep_recent_n - part1_len
-                self.obs[:part1_len] = self.obs[recent_start:]
-                self.obs[part1_len:keep_recent_n] = self.obs[:part2_len]
-                self.next_obs[:part1_len] = self.next_obs[recent_start:]
-                self.next_obs[part1_len:keep_recent_n] = self.next_obs[:part2_len]
-                self.act[:part1_len] = self.act[recent_start:]
-                self.act[part1_len:keep_recent_n] = self.act[:part2_len]
-                self.rew[:part1_len] = self.rew[recent_start:]
-                self.rew[part1_len:keep_recent_n] = self.rew[:part2_len]
-                self.done[:part1_len] = self.done[recent_start:]
-                self.done[part1_len:keep_recent_n] = self.done[:part2_len]
-                if hasattr(self, 'act_corrected'):
-                    self.act_corrected[:part1_len] = self.act_corrected[recent_start:]
-                    self.act_corrected[part1_len:keep_recent_n] = self.act_corrected[:part2_len]
-                if hasattr(self, 'next_act_corrected'):
-                    self.next_act_corrected[:part1_len] = self.next_act_corrected[recent_start:]
-                    self.next_act_corrected[part1_len:keep_recent_n] = self.next_act_corrected[:part2_len]
-                if hasattr(self, 'fr'):
-                    self.fr[:part1_len] = self.fr[recent_start:]
-                    self.fr[part1_len:keep_recent_n] = self.fr[:part2_len]
-                if hasattr(self, 'pf_forces'):
-                    self.pf_forces[:part1_len] = self.pf_forces[recent_start:]
-                    self.pf_forces[part1_len:keep_recent_n] = self.pf_forces[:part2_len]
-                if hasattr(self, 'pf_features'):
-                    self.pf_features[:part1_len] = self.pf_features[recent_start:]
-                    self.pf_features[part1_len:keep_recent_n] = self.pf_features[:part2_len]
-                if hasattr(self, 'next_pf_features'):
-                    self.next_pf_features[:part1_len] = self.next_pf_features[recent_start:]
-                    self.next_pf_features[part1_len:keep_recent_n] = self.next_pf_features[:part2_len]
-                if hasattr(self, '_insert_step'):
-                    self._insert_step[:part1_len] = self._insert_step[recent_start:]
-                    self._insert_step[part1_len:keep_recent_n] = self._insert_step[:part2_len]
-            
+        if keep_recent_n > 0 and self.current_size > 0:
+            keep_n = int(max(0, min(int(keep_recent_n), int(self.current_size), int(self.capacity))))
+            recent_start = (int(self.position) - keep_n) % int(self.capacity)
+            recent_idx = (recent_start + np.arange(keep_n, dtype=np.int64)) % int(self.capacity)
+            self.obs[:keep_n] = self.obs[recent_idx].copy()
+            self.next_obs[:keep_n] = self.next_obs[recent_idx].copy()
+            self.act[:keep_n] = self.act[recent_idx].copy()
+            self.rew[:keep_n] = self.rew[recent_idx].copy()
+            self.done[:keep_n] = self.done[recent_idx].copy()
+            if hasattr(self, 'act_corrected'):
+                self.act_corrected[:keep_n] = self.act_corrected[recent_idx].copy()
+            if hasattr(self, 'next_act_corrected'):
+                self.next_act_corrected[:keep_n] = self.next_act_corrected[recent_idx].copy()
+            if hasattr(self, 'fr'):
+                self.fr[:keep_n] = self.fr[recent_idx].copy()
+            if hasattr(self, 'pf_forces'):
+                self.pf_forces[:keep_n] = self.pf_forces[recent_idx].copy()
+            if hasattr(self, 'pf_features'):
+                self.pf_features[:keep_n] = self.pf_features[recent_idx].copy()
+            if hasattr(self, 'next_pf_features'):
+                self.next_pf_features[:keep_n] = self.next_pf_features[recent_idx].copy()
+            if hasattr(self, '_insert_step'):
+                self._insert_step[:keep_n] = self._insert_step[recent_idx].copy()
+            if hasattr(self, 'generation'):
+                self.generation[:keep_n] = self.generation[recent_idx].copy()
+            for _quality_name in (
+                'agent_episode_success',
+                'agent_episode_reach',
+                'agent_episode_safe',
+                'team_episode_success',
+                'agent_episode_progress',
+                'agent_final_goal_distance',
+                'agent_episode_quality_valid',
+            ):
+                if hasattr(self, _quality_name):
+                    arr = getattr(self, _quality_name)
+                    arr[:keep_n] = arr[recent_idx].copy()
             # 更新位置和大小
-            self.position = keep_recent_n
-            self.current_size = keep_recent_n
+            self.position = keep_n % int(self.capacity)
+            self.current_size = keep_n
             
             # 重置SumTree（需要重新计算优先级）
             if hasattr(self, 'sum_tree'):
                 self.sum_tree = SumTree(self.capacity)
                 # 为保留的经验重新添加优先级
-                safe_max_priority = min(float(self.max_priority), 5000.0)
-                initial_priority = safe_max_priority ** float(self.negative_slope)
-                initial_priority = min(initial_priority, 50000.0)
-                if keep_recent_n > 0:
-                    tree_indices = self.sum_tree.leaf_start + np.arange(keep_recent_n, dtype=np.int64)
-                    priorities = np.full((keep_recent_n,), initial_priority, dtype=np.float32)
+                if (self.use_per) and self.current_size > 0:
+                    safe_max_priority = min(float(self.max_priority), 5000.0)
+                    initial_priority = safe_max_priority ** float(self.negative_slope)
+                    initial_priority = min(initial_priority, 50000.0)
+                    tree_indices = self.sum_tree.leaf_start + np.arange(self.current_size, dtype=np.int64)
+                    priorities = np.full((self.current_size,), initial_priority, dtype=np.float32)
                     self.sum_tree.update_batch(tree_indices, priorities)
-                    self.sum_tree.data_pointer = int(keep_recent_n % self.capacity)
+                    self.sum_tree.data_pointer = int(self.position)
         else:
             # 完全清空
             self.position = 0
@@ -2956,16 +3240,38 @@ class LiteReplayBuffer:
                 self._global_insert_counter = 0
             if hasattr(self, '_insert_step'):
                 self._insert_step.fill(0)
+            if hasattr(self, 'generation'):
+                self.generation.fill(-1)
+            if hasattr(self, 'write_generation_counter'):
+                self.write_generation_counter = 0
             if hasattr(self, 'stores_pf_features'):
                 self.stores_pf_features = False
             if hasattr(self, 'stores_next_pf_features'):
                 self.stores_next_pf_features = False
             if hasattr(self, 'stores_next_act_corrected'):
                 self.stores_next_act_corrected = False
+            if hasattr(self, 'stores_policy_clean_actions'):
+                self.stores_policy_clean_actions = False
+            if hasattr(self, 'stores_random_action_mask'):
+                self.stores_random_action_mask = False
+            for _quality_name in (
+                'agent_episode_success',
+                'agent_episode_reach',
+                'agent_episode_safe',
+                'team_episode_success',
+                'agent_episode_progress',
+                'agent_final_goal_distance',
+                'agent_episode_quality_valid',
+            ):
+                if hasattr(self, _quality_name):
+                    try:
+                        getattr(self, _quality_name).fill(0.0)
+                    except Exception:
+                        pass
         # 注意：不需要重置数组内容（会被新数据覆盖），只重置索引和计数器
 
-    def update_priorities(self, indices, td_errors):
-        if not self.use_per or self.size() == 0:
+    def update_priorities(self, indices, td_errors, generations=None):
+        if not (self.use_per) or self.size() == 0:
             return
         
         # 🔧 输入验证：检查 td_errors 是否包含 NaN/Inf
@@ -2984,6 +3290,14 @@ class LiteReplayBuffer:
                 return
         except Exception:
             return
+        generation_filter = None
+        if generations is not None:
+            try:
+                generation_filter = np.asarray(generations, dtype=np.int64).reshape(-1)
+                if generation_filter.size == 0:
+                    generation_filter = None
+            except Exception:
+                generation_filter = None
         
         # 基础TD误差
         td_errors = np.abs(td_errors) + self.epsilon
@@ -3010,12 +3324,25 @@ class LiteReplayBuffer:
         clipped_errors = np.clip(td_errors, 1e-6, MAX_TD_ERROR).reshape(-1)
 
         n = min(indices.size, clipped_errors.size)
+        if generation_filter is not None:
+            n = min(n, generation_filter.size)
         if n <= 0:
             return
         indices = indices[:n]
         clipped_errors = clipped_errors[:n]
+        if generation_filter is not None:
+            generation_filter = generation_filter[:n]
 
         valid_mask = (indices >= 0) & (indices < self.size())
+        if generation_filter is not None and hasattr(self, 'generation'):
+            try:
+                valid_index = (indices >= 0) & (indices < int(self.capacity))
+                current_generation = np.full(indices.shape, -2, dtype=np.int64)
+                if np.any(valid_index):
+                    current_generation[valid_index] = self.generation[indices[valid_index]]
+                valid_mask = valid_mask & (generation_filter == current_generation)
+            except Exception:
+                valid_mask = np.zeros(indices.shape, dtype=bool)
         if not np.any(valid_mask):
             return
         indices = indices[valid_mask].astype(np.int32, copy=False)
@@ -3489,92 +3816,91 @@ def _safe_tensor_to_numpy(tensor, max_retries=5, retry_delay=0.02):
 
 
 def _unpack_replay_sample(sample_result):
-    """兼容旧/新回放样本结构，统一返回 15 元组。"""
-    batch_len = len(sample_result)
-    if batch_len == 15:
+    """Normalize all replay sample formats into ReplayBatch."""
+    if isinstance(sample_result, ReplayBatch):
         return sample_result
-    if batch_len == 14:
-        return (
-            sample_result[0],
-            sample_result[1],
-            sample_result[2],
-            sample_result[3],
-            sample_result[4],
-            sample_result[5],
-            sample_result[6],
-            sample_result[7],
-            sample_result[8],
-            sample_result[9],
-            sample_result[10],
-            None,
-            sample_result[11],
-            sample_result[12],
-            sample_result[13],
-        )
-    if batch_len == 12:
+    batch_len = len(sample_result)
+    next_pf_geometry_cache = None
+    next_pf_forces_compat = None
+    if batch_len == 15:
         (
-            obs_n,
-            next_obs_n,
-            act_n,
-            rew_n,
-            done_n,
-            weights,
-            indices,
-            fr_batch,
-            pf_forces_batch,
-            act_corrected_batch,
-            next_pf_forces_batch,
+            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices,
+            fr_batch, pf_forces_batch, pf_features_batch, next_pf_features_batch,
+            next_pf_geometry_cache, act_corrected_batch, next_pf_forces_compat,
             next_act_corrected_batch,
         ) = sample_result
-        return (
-            obs_n,
-            next_obs_n,
-            act_n,
-            rew_n,
-            done_n,
-            weights,
-            indices,
-            fr_batch,
-            pf_forces_batch,
-            None,
-            None,
-            None,
-            act_corrected_batch,
-            next_pf_forces_batch,
-            next_act_corrected_batch,
-        )
-    if batch_len == 11:
+    elif batch_len == 14:
         (
-            obs_n,
-            next_obs_n,
-            act_n,
-            rew_n,
-            done_n,
-            weights,
-            indices,
-            fr_batch,
-            pf_forces_batch,
-            act_corrected_batch,
+            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices,
+            fr_batch, pf_forces_batch, pf_features_batch, next_pf_features_batch,
+            act_corrected_batch, next_pf_forces_compat, next_act_corrected_batch,
+        ) = sample_result
+    elif batch_len == 12:
+        (
+            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices,
+            fr_batch, pf_forces_batch, act_corrected_batch,
+            next_pf_forces_compat, next_act_corrected_batch,
+        ) = sample_result
+        pf_features_batch = None
+        next_pf_features_batch = None
+    elif batch_len == 11:
+        (
+            obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices,
+            fr_batch, pf_forces_batch, act_corrected_batch,
             next_act_corrected_batch,
         ) = sample_result
-        return (
-            obs_n,
-            next_obs_n,
-            act_n,
-            rew_n,
-            done_n,
-            weights,
-            indices,
-            fr_batch,
-            pf_forces_batch,
-            None,
-            None,
-            None,
-            act_corrected_batch,
-            None,
-            next_act_corrected_batch,
-        )
-    raise ValueError(f"当前训练主线仅接受11/12/14/15元组回放样本，实际 len(sample_result)={batch_len}")
+        pf_features_batch = None
+        next_pf_features_batch = None
+    elif batch_len == 7:
+        obs_n, next_obs_n, act_n, rew_n, done_n, weights, indices = sample_result
+        act_arr = np.asarray(act_n, dtype=np.float32)
+        batch_size = int(act_arr.shape[0]) if act_arr.ndim >= 1 else 0
+        n_agents = int(act_arr.shape[1]) if act_arr.ndim >= 2 else 0
+        fr_batch = np.zeros((batch_size,), dtype=np.float32)
+        pf_forces_batch = np.zeros((batch_size, n_agents, 3), dtype=np.float32)
+        pf_features_batch = np.zeros((batch_size, n_agents, 3), dtype=np.float32)
+        next_pf_features_batch = np.zeros((batch_size, n_agents, 3), dtype=np.float32)
+        act_corrected_batch = act_n
+        next_act_corrected_batch = np.zeros_like(act_arr, dtype=np.float32)
+    else:
+        raise ValueError(f"当前训练主线仅接受7/11/12/14/15元组或 ReplayBatch，实际 len(sample_result)={batch_len}")
+
+    act_arr = np.asarray(act_n, dtype=np.float32)
+    batch_size = int(act_arr.shape[0]) if act_arr.ndim >= 1 else 0
+    n_agents = int(act_arr.shape[1]) if act_arr.ndim >= 2 else 0
+    act_dim = int(act_arr.shape[2]) if act_arr.ndim >= 3 else 0
+    if fr_batch is None:
+        fr_batch = np.zeros((batch_size,), dtype=np.float32)
+    if pf_forces_batch is None:
+        pf_forces_batch = np.zeros((batch_size, n_agents, 3), dtype=np.float32)
+    if act_corrected_batch is None:
+        act_corrected_batch = act_arr
+    if next_act_corrected_batch is None:
+        next_act_corrected_batch = np.zeros((batch_size, n_agents, act_dim), dtype=np.float32)
+    act_policy_clean_batch = act_arr
+    random_action_mask_batch = np.zeros((batch_size, n_agents), dtype=np.float32)
+    sample_generation = np.full((batch_size,), -1, dtype=np.int64)
+
+    return ReplayBatch(
+        obs=obs_n,
+        actions_raw=act_arr,
+        actions_corr=act_corrected_batch,
+        actions_policy_clean=act_policy_clean_batch,
+        random_action_mask=random_action_mask_batch,
+        rewards=rew_n,
+        next_obs=next_obs_n,
+        dones=done_n,
+        fr=fr_batch,
+        pf_forces=pf_forces_batch,
+        pf_features=pf_features_batch,
+        next_pf_features=next_pf_features_batch,
+        next_actions_corr_compat=next_act_corrected_batch,
+        sample_indices=np.asarray(indices, dtype=np.int32),
+        sample_generation=sample_generation,
+        sample_weights=weights,
+        next_pf_geometry_cache=next_pf_geometry_cache,
+        next_pf_forces_compat=next_pf_forces_compat,
+    )
 
 
 def _coerce_pf_feature_batch_numpy(pf_batch, batch_size, n_agents, pf_feature_dim):
@@ -3705,18 +4031,34 @@ def _flush_pending_per_updates(owner, replay_buffer, warn_prefix="[PER警告]", 
 
     idx_parts = []
     pri_parts = []
-    for idx, pri in pending:
+    gen_parts = []
+    has_generation_parts = False
+    for pending_entry in pending:
         try:
+            if isinstance(pending_entry, (list, tuple)) and len(pending_entry) >= 3:
+                idx, pri, gen = pending_entry[:3]
+            else:
+                idx, pri = pending_entry[:2]
+                gen = None
             pri_np = _safe_tensor_to_numpy(tf.identity(pri))
             idx_np = np.asarray(idx, dtype=np.int64).reshape(-1)
             pri_np = np.asarray(pri_np, dtype=np.float32).reshape(-1)
             if idx_np.size == 0 or pri_np.size == 0:
                 continue
             n = min(idx_np.size, pri_np.size)
+            gen_np = None
+            if gen is not None:
+                gen_np = np.asarray(gen, dtype=np.int64).reshape(-1)
+                n = min(n, gen_np.size)
             if n <= 0:
                 continue
             idx_parts.append(idx_np[:n])
             pri_parts.append(pri_np[:n])
+            if gen_np is not None:
+                gen_parts.append(gen_np[:n])
+                has_generation_parts = True
+            else:
+                gen_parts.append(np.full((n,), -1, dtype=np.int64))
         except Exception as e:
             if not getattr(owner, '_per_update_warned', False):
                 print(f"{warn_prefix} 优先级转换失败: {e}")
@@ -3727,13 +4069,15 @@ def _flush_pending_per_updates(owner, replay_buffer, warn_prefix="[PER警告]", 
         try:
             merged_idx = np.concatenate(idx_parts, axis=0)
             merged_pri = np.concatenate(pri_parts, axis=0)
-            replay_buffer.update_priorities(merged_idx, merged_pri)
+            merged_gen = np.concatenate(gen_parts, axis=0) if has_generation_parts and gen_parts else None
+            replay_buffer.update_priorities(merged_idx, merged_pri, generations=merged_gen)
             update_count = int(merged_idx.size)
         except Exception as e:
             # 回退到逐批写入，避免单次合并异常影响训练。
-            for idx_np, pri_np in zip(idx_parts, pri_parts):
+            for part_i, (idx_np, pri_np) in enumerate(zip(idx_parts, pri_parts)):
                 try:
-                    replay_buffer.update_priorities(idx_np, pri_np)
+                    gen_np = gen_parts[part_i] if has_generation_parts and part_i < len(gen_parts) else None
+                    replay_buffer.update_priorities(idx_np, pri_np, generations=gen_np)
                     update_count += int(min(idx_np.size, pri_np.size))
                 except Exception as inner_e:
                     if not getattr(owner, '_per_update_warned', False):
@@ -3993,10 +4337,10 @@ def _populate_common_cached_constants(target, args):
     target.c_huber_delta = _tf_const('huber_delta', 1.0)  # 🔧 修复：降低Huber delta以增强梯度信号（10.0→1.0）
     target.c_q_clip = _tf_const('q_clip_value', 500.0)  # 🔧 修复：提高Q裁剪值以扩大Q值范围（200→500）
     target.c_reward_clip = _tf_const('reward_clip_value', -150.0)
-    target.c_reward_scale = _tf_const('reward_scale', 1.0 / 500.0)  # 🚨 修复：减小奖励缩放以增大Q值和Loss（1/2000→1/1000）
-                                                                       # 原因：之前缩放太强导致Loss太小（~0.01），Q值范围被过度压缩
-                                                                       # 新配置：APF Traditional 5,000,000 → 5,000; Action Only 45,000 → 45
-                                                                       # Q值范围: [-500, 500]; Loss范围: 0.1-1.0 (增大10-100倍)
+    target.c_reward_scale = _tf_const('reward_scale', 1.0 / 500.0)
+    # Critic TD target reward scaling. Keep the default at 1/500 for compatibility,
+    # but expose --reward-scale/REWARD_SCALE so short diagnostic runs can test
+    # whether the current critic loss is being over-compressed.
     target.c_grad_clip_norm = _tf_const('grad_clip_norm', 5.0)  # 🚨 修复训练波动：降低梯度裁剪阈值（10.0→5.0），提高稳定性
                                                                   # 原因：Critic损失持续上升，说明梯度可能过大，需要更严格的裁剪
     target.c_map_size = _tf_const('map_size', 200.0)
@@ -4010,28 +4354,28 @@ def _populate_common_cached_constants(target, args):
     control_gain = _float_arg('control_accel_gain', 1.0)
     denom = action_range_z * control_gain
     target.z_bias_cached = (gravity_val / denom) if denom != 0 else 0.0
-    target.c_max_force = _tf_const('max_force_magnitude', 8.0)
+    target.c_max_force = _tf_const('max_force_magnitude', 80.0)
     target.c_critic_q_reg = _tf_const('critic_q_reg', 0.0)
     target.use_fr_feature_flag = bool(getattr(args, 'use_fr_feature', False))
     target.use_pf_feature_flag = bool(getattr(args, 'use_pf_feature', False))
     target.c_pf_feature_dim = int(getattr(args, 'pf_feature_dim', 3))
 
     # 势场相关基值与delta
-    target.c_pf_goal_attraction = _tf_const('goal_attraction', 1.0)
-    target.c_pf_lambda_1_base = _tf_const('lambda_1_base', 5.0)
-    target.c_pf_terrain_repulsion = _tf_const('terrain_repulsion', 80.0)
-    target.c_pf_agent_influence_range = _tf_const('agent_influence_range', 10.0)
-    target.c_pf_delta_k_att = _tf_const('delta_k_att', 0.5)
-    target.c_pf_delta_lambda_1 = _tf_const('delta_lambda_1', 2.5)
-    target.c_pf_delta_k_rep = _tf_const('delta_k_rep', 40.0)
-    target.c_pf_delta_radius = _tf_const('delta_radius', 5.0)
+    target.c_pf_goal_attraction = _tf_const('goal_attraction', 26.0)
+    target.c_pf_lambda_1_base = _tf_const('lambda_1_base', 8.5)
+    target.c_pf_terrain_repulsion = _tf_const('terrain_repulsion', 1600.0)
+    target.c_pf_agent_influence_range = _tf_const('agent_influence_range', 150.0)
+    target.c_pf_delta_k_att = _tf_const('delta_k_att', 5.0)
+    target.c_pf_delta_lambda_1 = _tf_const('delta_lambda_1', 2.2)
+    target.c_pf_delta_k_rep = _tf_const('delta_k_rep', 600.0)
+    target.c_pf_delta_radius = _tf_const('delta_radius', 80.0)
     
     # 🔧 传统APF模式：如果所有delta都为0，则势场参数固定，不需要网络学习
     # 🔧 XLA友好：使用TensorFlow常量而不是Python布尔值
-    delta_k_att_val = _float_arg('delta_k_att', 0.5)
-    delta_lambda_1_val = _float_arg('delta_lambda_1', 2.5)
-    delta_k_rep_val = _float_arg('delta_k_rep', 40.0)
-    delta_radius_val = _float_arg('delta_radius', 5.0)
+    delta_k_att_val = _float_arg('delta_k_att', 5.0)
+    delta_lambda_1_val = _float_arg('delta_lambda_1', 2.2)
+    delta_k_rep_val = _float_arg('delta_k_rep', 600.0)
+    delta_radius_val = _float_arg('delta_radius', 80.0)
     # 计算是否为传统APF模式（所有delta都为0）
     is_traditional_apf = (delta_k_att_val == 0.0 and 
                           delta_lambda_1_val == 0.0 and 
@@ -4126,8 +4470,47 @@ def build_continuous_action_network(input_shape, action_dim=7, hidden_units=(256
     print(f"[Actor网络] 输出层正则化: L2(5e-4) (适度约束)")
     print(f"[Actor网络] 输出激活: tanh (输出范围[-1,1])")
     print(f"[Actor网络] ⚡ 关键改进: 初始动作接近0，让Force Ratio引导完全接管，避免随机'坠毁'")
-    
+
     return model
+
+
+CROSS_AGENT_REFERENCE_SELECTOR_MODES = (
+    'hard',
+    'soft_advantage',
+    'selector_mix',
+    'reward_to_success_priority',
+    'reward_to_success_head_tail',
+)
+CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES = (
+    'selector_mix',
+    'reward_to_success_priority',
+    'reward_to_success_head_tail',
+)
+
+
+def build_cross_agent_reference_selector(input_dim, hidden_units=(128, 64), init_logit=-2.0, output_dim=1):
+    """Predict whether a cross-agent reference sample should affect actor imitation."""
+    selector_input = tf.keras.layers.Input(shape=(int(input_dim),), name='cross_ref_selector_input')
+    x = tf.keras.layers.LayerNormalization(name='cross_ref_selector_input_ln')(selector_input)
+    for layer_idx, units in enumerate(hidden_units):
+        x = tf.keras.layers.Dense(
+            int(units),
+            activation=None,
+            kernel_initializer=tf.keras.initializers.HeUniform(),
+            kernel_regularizer=tf.keras.regularizers.l2(1e-5),
+            name=f'cross_ref_selector_dense_{layer_idx}',
+        )(x)
+        x = tf.keras.layers.LeakyReLU(alpha=0.01, name=f'cross_ref_selector_lrelu_{layer_idx}')(x)
+    logits = tf.keras.layers.Dense(
+        max(1, int(output_dim)),
+        activation=None,
+        kernel_initializer=tf.keras.initializers.RandomUniform(minval=-0.003, maxval=0.003),
+        bias_initializer=tf.keras.initializers.Constant(float(init_logit)),
+        name='cross_ref_selector_logit',
+    )(x)
+    score = tf.keras.layers.Activation('sigmoid', name='cross_ref_selector_score')(logits)
+    return tf.keras.Model(inputs=selector_input, outputs=score, name='cross_agent_reference_selector')
+
 
 def build_continuous_critic_network(state_shape, action_dim=7, hidden_units=(512, 512, 512, 512), n_agents=3,
                                     use_residual=True, use_fr_feature=False, use_pf_feature=False, pf_feature_dim=3):
@@ -4144,7 +4527,6 @@ def build_continuous_critic_network(state_shape, action_dim=7, hidden_units=(512
     action_input = tf.keras.layers.Input(shape=(total_action_dim,))
     fr_input = tf.keras.layers.Input(shape=(1,), name='fr_input') if use_fr_feature else None
     pf_input = tf.keras.layers.Input(shape=(pf_feature_dim * n_agents,), name='pf_input') if (use_pf_feature and pf_feature_dim > 0) else None
-
     # ========== 共享底座：状态路径 ==========
     x_s = tf.keras.layers.Dense(
         384,
@@ -4173,7 +4555,6 @@ def build_continuous_critic_network(state_shape, action_dim=7, hidden_units=(512
     state_features = x_s
     if pf_embedded is not None:
         state_features = tf.keras.layers.Concatenate(name='state_pf_fusion')([x_s, pf_embedded])
-    
     # 状态特征处理层
     state_features = tf.keras.layers.Dense(
         hidden_units[0],  # 512
@@ -4184,7 +4565,6 @@ def build_continuous_critic_network(state_shape, action_dim=7, hidden_units=(512
     )(state_features)
     state_features = tf.keras.layers.LayerNormalization(name='state_ln')(state_features)
     state_features = tf.keras.layers.LeakyReLU(alpha=0.01)(state_features)
-
     # ========== 动作特征提取（完整动作，包括前3维和后4维）==========
     # 标准MADDPG：使用完整动作特征
     action_features = tf.keras.layers.Dense(
@@ -4259,7 +4639,6 @@ def build_continuous_critic_network_matd3(state_shape, action_dim=7, hidden_unit
     action_input = tf.keras.layers.Input(shape=(total_action_dim,))
     fr_input = tf.keras.layers.Input(shape=(1,), name='fr_input') if use_fr_feature else None
     pf_input = tf.keras.layers.Input(shape=(pf_feature_dim * n_agents,), name='pf_input') if (use_pf_feature and pf_feature_dim > 0) else None
-
     # ========== 共享底座：状态路径 ==========
     x_s = tf.keras.layers.Dense(
         384,
@@ -4290,7 +4669,10 @@ def build_continuous_critic_network_matd3(state_shape, action_dim=7, hidden_unit
     shared_base_inputs = [x_s]
     if pf_embedded is not None:
         shared_base_inputs.append(pf_embedded)
-    shared_base = tf.keras.layers.Concatenate(name='shared_base_fusion')(shared_base_inputs)
+    if len(shared_base_inputs) == 1:
+        shared_base = shared_base_inputs[0]
+    else:
+        shared_base = tf.keras.layers.Concatenate(name='shared_base_fusion')(shared_base_inputs)
     
     # 共享底座处理层
     shared_base = tf.keras.layers.Dense(
@@ -4303,7 +4685,6 @@ def build_continuous_critic_network_matd3(state_shape, action_dim=7, hidden_unit
     )(shared_base)
     shared_base = tf.keras.layers.LayerNormalization(epsilon=1e-3, dtype='float32', name='shared_base_ln')(shared_base)
     shared_base = tf.keras.layers.LeakyReLU(alpha=0.01)(shared_base)
-
     # ========== 分离动作特征：前3维和后4维 ==========
     class _Split(tf.keras.layers.Layer):
         def __init__(self, idx, dim, **kw):
@@ -4507,6 +4888,10 @@ def load_scenario_module(scenario_name, args=None):
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
                 print(f"加载固定位置文件失败（忽略，回退到文件传参）: {_e}")
         
+        def _arg_or_default(name, default):
+            value = getattr(args, name, None) if args is not None else None
+            return default if value is None else value
+
         # 创建场景实例，传递基本参数
         try:
             # 准备场景参数
@@ -4548,34 +4933,34 @@ def load_scenario_module(scenario_name, args=None):
             # 如果是分项加权求和场景，添加权重参数
             if scenario_name in ['paper3d_terrain_weighted', 'paper3d_terrain_vectorized'] and args:
                 scenario_kwargs.update({
-                    'distance_weight': getattr(args, 'distance_weight', 1.0),
-                    'exploration_weight': getattr(args, 'exploration_weight', 0.5),
-                    'stationary_weight': getattr(args, 'stationary_weight', 1.0),
-                    'direction_weight': getattr(args, 'direction_weight', 0.3),
-                    'deviation_weight': getattr(args, 'deviation_weight', 0.3),
-                    'start_area_weight': getattr(args, 'start_area_weight', 0.2),
-                    'approach_weight': getattr(args, 'approach_weight', 1.0),
-                    'energy_weight': getattr(args, 'energy_weight', 0.1),
-                    'height_weight': getattr(args, 'height_weight', 0.2),
-                    'lateral_weight': getattr(args, 'lateral_weight', 0.3),
-                    'clearance_weight': getattr(args, 'clearance_weight', 0.4),
-                    'max_reward': getattr(args, 'max_reward', 1000.0),
-                    'min_reward': getattr(args, 'min_reward', -2500.0),
+                    'distance_weight': _arg_or_default('distance_weight', 1.0),
+                    'exploration_weight': _arg_or_default('exploration_weight', 0.5),
+                    'stationary_weight': _arg_or_default('stationary_weight', 1.0),
+                    'direction_weight': _arg_or_default('direction_weight', 0.3),
+                    'deviation_weight': _arg_or_default('deviation_weight', 0.3),
+                    'start_area_weight': _arg_or_default('start_area_weight', 0.2),
+                    'approach_weight': _arg_or_default('approach_weight', 1.0),
+                    'energy_weight': _arg_or_default('energy_weight', 0.1),
+                    'height_weight': _arg_or_default('height_weight', 0.2),
+                    'lateral_weight': _arg_or_default('lateral_weight', 0.3),
+                    'clearance_weight': _arg_or_default('clearance_weight', 0.4),
+                    'max_reward': _arg_or_default('max_reward', 1000.0),
+                    'min_reward': _arg_or_default('min_reward', -2500.0),
                     # 🔧 [验证代码] 检查参数传递到场景
                     # 新增分项：成功/碰撞/全局/潜势
-                    'success_weight': getattr(args, 'success_weight', 0.0),
-                    'collision_weight': getattr(args, 'collision_weight', 0.0),
-                    'collision_reduction_weight': getattr(args, 'collision_reduction_weight', 0.0),  # 🔧 新增：碰撞次数减少奖励权重
-                    'global_weight': getattr(args, 'global_weight', 0.0),
-                    'shaping_weight': getattr(args, 'shaping_weight', 0.0),
+                    'success_weight': _arg_or_default('success_weight', 0.0),
+                    'collision_weight': _arg_or_default('collision_weight', 0.0),
+                    'collision_reduction_weight': _arg_or_default('collision_reduction_weight', 0.0),  # 🔧 新增：碰撞次数减少奖励权重
+                    'global_weight': _arg_or_default('global_weight', 0.0),
+                    'shaping_weight': _arg_or_default('shaping_weight', 0.0),
                     # 分项参数
-                    'success_reward_value': getattr(args, 'success_reward_value', 150.0),
-                    'no_collision_reward_value': getattr(args, 'no_collision_reward_value', 0.0),
-                    'success_distance_threshold': getattr(args, 'success_distance_threshold', 2.0),
-                    'collision_penalty_value': getattr(args, 'collision_penalty_value', 30.0),
-                    'collision_distance_threshold': getattr(args, 'collision_distance_threshold', 0.5),
-                    'global_reward_mode': getattr(args, 'global_reward_mode', 'success_rate'),
-                    'shaping_gamma': getattr(args, 'shaping_gamma', 0.95)
+                    'success_reward_value': _arg_or_default('success_reward_value', 150.0),
+                    'no_collision_reward_value': _arg_or_default('no_collision_reward_value', 0.0),
+                    'success_distance_threshold': _arg_or_default('success_distance_threshold', 2.0),
+                    'collision_penalty_value': _arg_or_default('collision_penalty_value', 30.0),
+                    'collision_distance_threshold': _arg_or_default('collision_distance_threshold', 0.5),
+                    'global_reward_mode': _arg_or_default('global_reward_mode', 'success_rate'),
+                    'shaping_gamma': _arg_or_default('shaping_gamma', 0.95)
                 })
                 # 🔧 [验证代码] 检查参数传递到场景
                 # 高度奖励相关开关与范围
@@ -4709,7 +5094,7 @@ def _apply_force_params_to_corrector(fp_raw, corrector, args):
         
         # 保留脚本参数中的其余物理开关（垂直力抑制已移除）
         corrector.force_scale = float(getattr(args, 'force_scale', 5.0))
-        corrector.max_force_magnitude = float(getattr(args, 'max_force_magnitude', 8.0))
+        corrector.max_force_magnitude = float(getattr(args, 'max_force_magnitude', 80.0))
     except Exception:
         pass
 
@@ -5254,6 +5639,16 @@ class OptimizedMADDPG:
             'patience': int(os.getenv('ADAPTIVE_PATIENCE', '25')),  # 🔧 修复：增加patience（10 → 25），降低触发频率
             'lr_decay_factor': float(os.getenv('ADAPTIVE_LR_DECAY', '0.95')),  # 🔧 修复：降低衰减因子（0.8 → 0.95），减缓学习率下降
             'min_learning_rate': float(os.getenv('ADAPTIVE_MIN_LR', '2e-5')),  # 🔧 修复：提高最小学习率（1e-5 → 2e-5），保持学习能力
+            'actor_lr_decay_factor': float(os.getenv('ADAPTIVE_ACTOR_LR_DECAY', os.getenv('ADAPTIVE_LR_DECAY', '0.95'))),
+            'critic_lr_decay_factor': float(os.getenv('ADAPTIVE_CRITIC_LR_DECAY', os.getenv('ADAPTIVE_LR_DECAY', '0.95'))),
+            'min_actor_lr': float(os.getenv('ADAPTIVE_MIN_ACTOR_LR', os.getenv('ADAPTIVE_MIN_LR', '2e-5'))),
+            'min_critic_lr': float(os.getenv('ADAPTIVE_MIN_CRITIC_LR', os.getenv('ADAPTIVE_MIN_LR', '2e-5'))),
+            'window_plateau_enabled': os.getenv('ADAPTIVE_PLATEAU_ENABLED', '0').lower() in ('1', 'true', 'yes', 'on'),
+            'plateau_window': max(2, int(os.getenv('ADAPTIVE_PLATEAU_WINDOW', '50'))),
+            'plateau_rel_delta': float(os.getenv('ADAPTIVE_PLATEAU_REL_DELTA', '0.03')),
+            'plateau_slope_eps': float(os.getenv('ADAPTIVE_PLATEAU_SLOPE_EPS', '0.002')),
+            'reward_history': [],
+            'last_plateau_stats': {},
             'noise_boost_factor': 1.2,  # 🔧 修复噪声过大：降低噪声提升因子（1.5→1.2），减缓噪声增长
             'max_noise_scale': 2.0,  # 最大噪声尺度（硬上限，通常由ADAPTIVE_NOISE_MAX限制）
             'xla_reenable_pending': False,  # 🔧 XLA 延迟重新启用标志
@@ -5352,6 +5747,7 @@ class OptimizedMADDPG:
         self.force_scale_cached = float(getattr(self.args, 'force_scale', 5.0))
         # 🔧 放宽前三维正则化：降低默认正则化系数，允许更大的动作范围
         self.action_reg_coef_cached = float(getattr(self.args, 'action_reg_coef', 2e-2))  # 从5e-2降低到2e-2
+        self.action_reg_min_coef_cached = max(0.0, float(os.getenv('ACTION_REG_MIN_COEF', '0.0') or 0.0))
         # 负向Z轴专用正则系数（可选），用于抑制Actor长期输出负向Z加速度
         self.neg_z_reg_coef_cached = float(getattr(self.args, 'neg_z_reg_coef', 0.0))
         self.jit_compile_cached = bool(getattr(self.args, 'jit_compile', False))
@@ -5372,14 +5768,14 @@ class OptimizedMADDPG:
                 print("[MADDPG] FORCE_OUTER_JIT_COMPILE=1，保留 outer JIT。若单卡多进程不稳，可关闭该开关。")
         self.debug_pf_forces_cached = bool(getattr(self.args, 'debug_pf_forces', False))
         # 势场参数缓存
-        self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 1.0))
-        self.lambda_1_base_cached = float(getattr(self.args, 'lambda_1_base', 5.0))
-        self.terrain_repulsion_cached = float(getattr(self.args, 'terrain_repulsion', 80.0))
-        self.agent_influence_range_cached = float(getattr(self.args, 'agent_influence_range', 10.0))
-        self.delta_k_att_cached = float(getattr(self.args, 'delta_k_att', 0.5))
-        self.delta_lambda_1_cached = float(getattr(self.args, 'delta_lambda_1', 2.5))
-        self.delta_k_rep_cached = float(getattr(self.args, 'delta_k_rep', 40.0))
-        self.delta_radius_cached = float(getattr(self.args, 'delta_radius', 5.0))
+        self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 26.0))
+        self.lambda_1_base_cached = float(getattr(self.args, 'lambda_1_base', 8.5))
+        self.terrain_repulsion_cached = float(getattr(self.args, 'terrain_repulsion', 1600.0))
+        self.agent_influence_range_cached = float(getattr(self.args, 'agent_influence_range', 150.0))
+        self.delta_k_att_cached = float(getattr(self.args, 'delta_k_att', 5.0))
+        self.delta_lambda_1_cached = float(getattr(self.args, 'delta_lambda_1', 2.2))
+        self.delta_k_rep_cached = float(getattr(self.args, 'delta_k_rep', 600.0))
+        self.delta_radius_cached = float(getattr(self.args, 'delta_radius', 80.0))
         # 🔧 XLA修复：地形高度图缓存改为只读 Variable。
         # 这样 PF_JIT 热路径读取的是运行期资源，而不是会被 XLA constant folding 的大 tf.constant。
         default_map_size = int(getattr(self.args, 'map_size', 200))
@@ -5510,7 +5906,7 @@ class OptimizedMADDPG:
             if self.eval_actor_only:
                 self.agents.append(agent)
                 continue
-            
+
             agent['target_actor'] = tf.keras.models.clone_model(agent['actor'])
             agent['target_actor'].set_weights(agent['actor'].get_weights())
             
@@ -5851,22 +6247,94 @@ class OptimizedMADDPG:
         consec = int(self.adaptive_learning.get('consecutive_no_improve', 0))
         patience = int(self.adaptive_learning.get('patience', 10))
         return (consec >= max(1, patience // 2)) and ((cv != np.inf and cv < 0.05 and norm_slope < 0.01) or (abs(recent_mean) <= 1e-6 and recent_std < 50))
+
+    def _compute_adaptive_plateau_stats(self):
+        """Rolling-window plateau check for high-variance Level-3 training."""
+        rewards = self.adaptive_learning.get('reward_history', [])
+        window = max(2, int(self.adaptive_learning.get('plateau_window', 50)))
+        rel_delta = max(0.0, float(self.adaptive_learning.get('plateau_rel_delta', 0.03)))
+        slope_eps = max(0.0, float(self.adaptive_learning.get('plateau_slope_eps', 0.002)))
+        min_history = max(2 * window, window + int(self.adaptive_learning.get('patience', 25)))
+        stats = {
+            'plateau': False,
+            'ready': False,
+            'history_len': int(len(rewards)),
+            'window': int(window),
+            'prev_mean': None,
+            'curr_mean': None,
+            'rel_improve': None,
+            'slope_norm': None,
+        }
+        if len(rewards) < min_history:
+            stats['reason'] = 'warmup'
+            return stats
+        arr = np.asarray(rewards, dtype=np.float64)
+        finite_mask = np.isfinite(arr)
+        if not np.all(finite_mask):
+            arr = arr[finite_mask]
+        if arr.size < min_history:
+            stats['history_len'] = int(arr.size)
+            stats['reason'] = 'finite_warmup'
+            return stats
+        prev = arr[-2 * window:-window]
+        curr = arr[-window:]
+        if prev.size < window or curr.size < window:
+            stats['reason'] = 'window_short'
+            return stats
+        prev_mean = float(np.mean(prev))
+        curr_mean = float(np.mean(curr))
+        rel_improve = float((curr_mean - prev_mean) / (abs(prev_mean) + 1.0))
+        x = np.arange(curr.size, dtype=np.float64)
+        A = np.vstack([x, np.ones_like(x)]).T
+        slope = float(np.linalg.lstsq(A, curr, rcond=None)[0][0])
+        slope_norm = float(abs(slope) / (abs(curr_mean) + 1.0))
+        plateau = bool(rel_improve < rel_delta and slope_norm < slope_eps)
+        stats.update({
+            'plateau': plateau,
+            'ready': True,
+            'prev_mean': prev_mean,
+            'curr_mean': curr_mean,
+            'rel_improve': rel_improve,
+            'slope_norm': slope_norm,
+            'reason': 'plateau' if plateau else 'improving_or_trending',
+        })
+        return stats
     
     def _adaptive_learning_check(self, episode_reward):
         """检查是否需要自适应调整（借鉴旧版本paper3d_train）"""
         if not self.adaptive_learning['enabled']:
             return
+        try:
+            reward_value = float(episode_reward)
+        except Exception:
+            reward_value = 0.0
+        reward_history = self.adaptive_learning.setdefault('reward_history', [])
+        reward_history.append(reward_value)
+        if len(reward_history) > 1000:
+            del reward_history[:-1000]
         
         # 更新最佳奖励
-        if episode_reward > self.training_stats['best_reward']:
-            self.training_stats['best_reward'] = episode_reward
+        if reward_value > self.training_stats['best_reward']:
+            self.training_stats['best_reward'] = reward_value
             self.adaptive_learning['consecutive_no_improve'] = 0
         else:
             self.adaptive_learning['consecutive_no_improve'] += 1
         
         # 触发自适应调整
         if self.adaptive_learning['consecutive_no_improve'] >= self.adaptive_learning['patience']:
-            print(f"\n连续{self.adaptive_learning['consecutive_no_improve']}回合无改进，激活自适应调整...")
+            if self.adaptive_learning.get('window_plateau_enabled', False):
+                plateau_stats = self._compute_adaptive_plateau_stats()
+                self.adaptive_learning['last_plateau_stats'] = plateau_stats
+                if not plateau_stats.get('plateau', False):
+                    return
+                print(
+                    f"\n连续{self.adaptive_learning['consecutive_no_improve']}回合无改进，"
+                    f"rolling plateau确认，激活自适应调整 "
+                    f"(rel={plateau_stats.get('rel_improve'):.4f}, "
+                    f"slope={plateau_stats.get('slope_norm'):.4f})..."
+                )
+            else:
+                print(f"\n连续{self.adaptive_learning['consecutive_no_improve']}回合无改进，激活自适应调整...")
             self._adaptive_adjustment()
             self.adaptive_learning['consecutive_no_improve'] = 0
     def _adaptive_adjustment(self):
@@ -5880,11 +6348,13 @@ class OptimizedMADDPG:
             current_actor_lr = float(agent['actor_lr_var'].numpy())
             current_critic_lr = float(agent['critic_lr_var'].numpy())
             
-            # 计算新的学习率（乘以衰减因子但不低于最小值）
-            new_actor_lr = max(self.adaptive_learning['min_learning_rate'], 
-                             current_actor_lr * self.adaptive_learning['lr_decay_factor'])
-            new_critic_lr = max(self.adaptive_learning['min_learning_rate'], 
-                               current_critic_lr * self.adaptive_learning['lr_decay_factor'])
+            min_actor_lr = float(self.adaptive_learning.get('min_actor_lr', self.adaptive_learning.get('min_learning_rate', 0.0)))
+            min_critic_lr = float(self.adaptive_learning.get('min_critic_lr', self.adaptive_learning.get('min_learning_rate', 0.0)))
+            actor_decay = float(self.adaptive_learning.get('actor_lr_decay_factor', self.adaptive_learning.get('lr_decay_factor', 1.0)))
+            critic_decay = float(self.adaptive_learning.get('critic_lr_decay_factor', self.adaptive_learning.get('lr_decay_factor', 1.0)))
+            # 计算新的学习率（actor/critic分离下限与衰减）
+            new_actor_lr = max(min_actor_lr, current_actor_lr * actor_decay)
+            new_critic_lr = max(min_critic_lr, current_critic_lr * critic_decay)
             
             # 🔧 XLA修复：使用Variable.assign更新，不会触发重新编译
             agent['actor_lr_var'].assign(tf.cast(new_actor_lr, tf.float32))
@@ -5997,7 +6467,8 @@ class OptimizedMADDPG:
             # 同步更新Python属性（保持兼容性）
             self.args.noise_scale = new_noise
 
-            print(f"智能体{i}: 学习率 {current_actor_lr:.6f}->{new_actor_lr:.6f}, "
+            print(f"智能体{i}: Actor LR {current_actor_lr:.6f}->{new_actor_lr:.6f}, "
+                  f"Critic LR {current_critic_lr:.6f}->{new_critic_lr:.6f}, "
                   f"噪声 {current_noise:.4f}->{new_noise:.4f} (target={target_noise:.4f}, cap={hard_cap:.2f}, beta={beta:.2f})")
         
         # 🚨 XLA修复：安全地更新向量化OU噪声std_dev
@@ -6211,12 +6682,13 @@ class OptimizedMADDPG:
         """
         完全向量化的批量动作选择 - 优化版本
         states: (num_envs, n_agents, obs_dim)
-        返回: (actions_for_storage, actions_for_execution, pf_forces, raw_actor_outputs, pf_features_current)
+        返回: (actions_for_storage, actions_for_execution, pf_forces, raw_actor_outputs, pf_features_current, random_action_mask)
             - actions_for_storage: (num_envs, n_agents, act_dim) 回放区原始动作
             - actions_for_execution: (num_envs, n_agents, act_dim) 环境执行动作
             - pf_forces: (num_envs, n_agents, 3) 行为执行时的 PF 力（behavior force）
             - raw_actor_outputs: (num_envs, n_agents, act_dim) Actor 原始7维输出（噪声/PF前）
             - pf_features_current: (num_envs, n_agents, 3) 当前状态的 base PF 特征
+            - random_action_mask: (num_envs, n_agents) epsilon-random 动作标记
         """
         # 统一张量类型与形状，避免 retracing
         if not tf.is_tensor(states):
@@ -6412,13 +6884,14 @@ class OptimizedMADDPG:
             pf_force_network
         )
         
-        # 返回五个值：
+        # 返回六个值：
         # 1. actions_for_storage: 存入回放区（原始+噪声，无修正）
         # 2. actions_for_execution: 交给环境（原始+噪声+修正）
         # 3. pf_forces_final: 行为执行时的 PF 力
         # 4. network_actions: Actor原始输出（用于时序图）
         # 5. pf_forces_pre: 当前状态的 base PF 特征
-        return actions_for_storage, actions_for_execution, pf_forces_final, network_actions, pf_forces_pre
+        # 6. random_action_mask: 随机探索动作标记
+        return actions_for_storage, actions_for_execution, pf_forces_final, network_actions, pf_forces_pre, tf.cast(rand_mask, tf.float32)
 
     def _extract_pf_obs_context_tf(self, obs):
         """提取与 action 无关的 PF 观测上下文，供同一步多次修正复用。"""
@@ -8475,6 +8948,8 @@ class OptimizedMADDPG:
                 arc_eff = _arc * (tf.cast(1.0, tf.float32) - tf.cast(0.7, tf.float32) * tf.reduce_mean(danger))
             except Exception:
                 arc_eff = _arc
+            arc_min = tf.cast(self.action_reg_min_coef_cached, tf.float32)
+            arc_eff = tf.clip_by_value(arc_eff, arc_min, tf.cast(10.0, tf.float32))
             # 🔧 修复边界饱和：使用边界惩罚而非简单的L2正则
             # L2正则对接近±1的动作惩罚不足，改用边界惩罚：对接近边界的动作给予指数级增长的惩罚
             action_head = new_action[:, :3]
@@ -8759,31 +9234,37 @@ class OptimizedMADDPG:
         # 🚀 性能优化：统一为 11/12 元组兼容解包，避免旧回放结构直接中断训练
         if detail_enabled:
             _t_upd_phase = _upd_perf_counter()
-        sample_result = replay_buffer.sample(batch_size)
-        (
-            obs_n,
-            next_obs_n,
-            act_n,
-            rew_n,
-            done_n,
-            weights,
-            indices,
-            fr_batch,
-            pf_forces_batch,
-            pf_features_batch,
-            next_pf_features_batch,
-            next_pf_geometry_cache_batch,
-            act_corrected_batch,
-            next_pf_forces_batch,
-            next_act_corrected_batch,
-        ) = _unpack_replay_sample(sample_result)
+        try:
+            if hasattr(replay_buffer, 'set_current_episode_idx'):
+                replay_buffer.set_current_episode_idx(getattr(self, '_current_episode_idx', 0))
+        except Exception:
+            pass
+        replay_batch = _unpack_replay_sample(replay_buffer.sample(batch_size))
+        obs_n = replay_batch.obs
+        next_obs_n = replay_batch.next_obs
+        act_n = replay_batch.actions_raw
+        rew_n = replay_batch.rewards
+        done_n = replay_batch.dones
+        weights = replay_batch.sample_weights
+        indices = replay_batch.sample_indices
+        sample_generation = replay_batch.sample_generation
+        fr_batch = replay_batch.fr
+        pf_forces_batch = replay_batch.pf_forces
+        pf_features_batch = replay_batch.pf_features
+        next_pf_features_batch = replay_batch.next_pf_features
+        next_pf_geometry_cache_batch = replay_batch.next_pf_geometry_cache
+        act_corrected_batch = replay_batch.actions_corr
+        act_policy_clean_batch = replay_batch.actions_policy_clean
+        random_action_mask_batch = replay_batch.random_action_mask
+        next_pf_forces_batch = replay_batch.next_pf_forces_compat
+        next_act_corrected_batch = replay_batch.next_actions_corr_compat
         if detail_enabled:
             update_timing['upd_sample'] += _upd_perf_counter() - _t_upd_phase
             _t_upd_phase = _upd_perf_counter()
         
         # 🔧 调试：检查PER权重是否有效（每500次更新检查一次，降低I/O开销）
         self._update_count = getattr(self, '_update_count', 0)
-        if self._update_count % 500 == 0 and getattr(self.args, 'per_enabled', False):
+        if self._update_count % 500 == 0 and getattr(self.args, 'per_enabled', False) and bool(getattr(replay_buffer, 'use_per', False) or getattr(replay_buffer, 'use_global_per', False)):
             weights_array = np.asarray(weights, dtype=np.float32)
             weights_min = float(np.min(weights_array))
             weights_max = float(np.max(weights_array))
@@ -9328,7 +9809,7 @@ class OptimizedMADDPG:
 
         # 可选：PER优先级更新（轻量版），按批次样本的平均|TD误差|
         # 注意：PER机制与教师经验监督机制可能存在冲突，需要协调
-        if getattr(self.args, 'per_enabled', False) and losses is not None:
+        if getattr(self.args, 'per_enabled', False) and bool(getattr(replay_buffer, 'use_per', False) or getattr(replay_buffer, 'use_global_per', False)) and losses is not None:
             try:
                 td_err = None
                 # ✅ 快路径：复用训练中已计算的Q值，避免PER额外前向
@@ -9368,7 +9849,7 @@ class OptimizedMADDPG:
                 # 🚀 GPU优化：批量累积PER更新，减少同步频率
                 if not hasattr(self, '_per_update_buffer'):
                     self._per_update_buffer = []
-                self._per_update_buffer.append((indices, enhanced_priority))
+                self._per_update_buffer.append((indices, enhanced_priority, sample_generation))
                 
                 # 🔧 修复：降低批量更新阈值（从20改为5），确保PER更新更及时
                 # 每5次更新或回合结束时才批量同步
@@ -9620,6 +10101,27 @@ class OptimizedMATD3:
         self._q_debug_counter = tf.Variable(0, dtype=tf.int32, trainable=False)
         self._grad_debug_counter = tf.Variable(0, dtype=tf.int32, trainable=False)
         self._pf_invalid_goal_counter = tf.Variable(0, dtype=tf.int32, trainable=False)  # 🔧 修复：添加缺失的无效目标计数器
+
+        # Selector网络与优化器在 _init_networks/_init_optimizers 中创建，必须早于建网缓存。
+        self.cross_agent_reference_selector_enabled = bool(
+            getattr(self.args, 'cross_agent_reference_selector_enabled', False)
+        )
+        self.cross_agent_reference_selector_mode_cached = str(
+            getattr(self.args, 'cross_agent_reference_selector_mode', 'hard') or 'hard'
+        ).strip().lower()
+        if self.cross_agent_reference_selector_mode_cached not in CROSS_AGENT_REFERENCE_SELECTOR_MODES:
+            self.cross_agent_reference_selector_mode_cached = 'hard'
+        if self.cross_agent_reference_selector_enabled and self.cross_agent_reference_selector_mode_cached == 'hard':
+            self.cross_agent_reference_selector_mode_cached = 'selector_mix'
+        self.cross_agent_reference_selector_lr_cached = float(
+            getattr(self.args, 'cross_agent_reference_selector_lr', 1e-4)
+        )
+        self.cross_agent_reference_selector_hidden_cached = (
+            parse_hidden_units(getattr(self.args, 'cross_agent_reference_selector_hidden', None)) or (128, 64)
+        )
+        self.cross_agent_reference_selector_init_logit_cached = float(
+            getattr(self.args, 'cross_agent_reference_selector_init_logit', -2.0)
+        )
         
         # 初始化网络
         self.agents = []
@@ -9696,6 +10198,16 @@ class OptimizedMATD3:
             'patience': int(os.getenv('ADAPTIVE_PATIENCE', '25')),  # 🔧 修复：增加patience（10 → 25），降低触发频率
             'lr_decay_factor': float(os.getenv('ADAPTIVE_LR_DECAY', '0.95')),  # 🔧 修复：降低衰减因子（0.8 → 0.95），减缓学习率下降
             'min_learning_rate': float(os.getenv('ADAPTIVE_MIN_LR', '2e-5')),  # 🔧 修复：提高最小学习率（1e-5 → 2e-5），保持学习能力
+            'actor_lr_decay_factor': float(os.getenv('ADAPTIVE_ACTOR_LR_DECAY', os.getenv('ADAPTIVE_LR_DECAY', '0.95'))),
+            'critic_lr_decay_factor': float(os.getenv('ADAPTIVE_CRITIC_LR_DECAY', os.getenv('ADAPTIVE_LR_DECAY', '0.95'))),
+            'min_actor_lr': float(os.getenv('ADAPTIVE_MIN_ACTOR_LR', os.getenv('ADAPTIVE_MIN_LR', '2e-5'))),
+            'min_critic_lr': float(os.getenv('ADAPTIVE_MIN_CRITIC_LR', os.getenv('ADAPTIVE_MIN_LR', '2e-5'))),
+            'window_plateau_enabled': os.getenv('ADAPTIVE_PLATEAU_ENABLED', '0').lower() in ('1', 'true', 'yes', 'on'),
+            'plateau_window': max(2, int(os.getenv('ADAPTIVE_PLATEAU_WINDOW', '50'))),
+            'plateau_rel_delta': float(os.getenv('ADAPTIVE_PLATEAU_REL_DELTA', '0.03')),
+            'plateau_slope_eps': float(os.getenv('ADAPTIVE_PLATEAU_SLOPE_EPS', '0.002')),
+            'reward_history': [],
+            'last_plateau_stats': {},
             'noise_boost_factor': 1.2,  # 🔧 修复噪声过大：降低噪声提升因子（1.5→1.2），减缓噪声增长
             'max_noise_scale': 2.0,  # 最大噪声尺度（硬上限，通常由ADAPTIVE_NOISE_MAX限制）
             'xla_reenable_pending': False,  # 🔧 XLA 延迟重新启用标志
@@ -9745,6 +10257,112 @@ class OptimizedMATD3:
         self.force_scale_cached = float(getattr(self.args, 'force_scale', 5.0))
         # 🔧 放宽前三维正则化：降低默认正则化系数，允许更大的动作范围
         self.action_reg_coef_cached = float(getattr(self.args, 'action_reg_coef', 2e-2))  # 从5e-2降低到2e-2
+        self.action_reg_min_coef_cached = max(0.0, float(os.getenv('ACTION_REG_MIN_COEF', '0.0') or 0.0))
+        self.cross_agent_reference_enabled = bool(getattr(self.args, 'cross_agent_reference_enabled', False))
+        self.cross_agent_reference_coef_cached = float(getattr(self.args, 'cross_agent_reference_coef', 0.03))
+        self.cross_agent_reference_start_episode = int(getattr(self.args, 'cross_agent_reference_start_episode', 50))
+        self.cross_agent_reference_actor_start_episode = int(
+            getattr(self.args, 'cross_agent_reference_actor_start_episode', self.cross_agent_reference_start_episode)
+        )
+        self.cross_agent_reference_actor_ramp_episodes_cached = max(
+            0,
+            int(getattr(self.args, 'cross_agent_reference_actor_ramp_episodes', 0) or 0),
+        )
+        self.cross_agent_reference_actor_require_success = bool(
+            getattr(self.args, 'cross_agent_reference_actor_require_success', False)
+        )
+        self._cross_ref_actor_effective_start_episode = None
+        self.cross_agent_reference_update_interval_cached = max(
+            1,
+            int(getattr(self.args, 'cross_agent_reference_update_interval', 1) or 1),
+        )
+        self.cross_agent_reference_pairs_per_agent_cached = max(
+            0,
+            int(getattr(self.args, 'cross_agent_reference_pairs_per_agent', 0) or 0),
+        )
+        self.cross_agent_reference_progress_threshold_cached = float(getattr(self.args, 'cross_agent_reference_progress_threshold', 0.0005))
+        self.cross_agent_reference_margin_cached = float(getattr(self.args, 'cross_agent_reference_margin', 0.0))
+        self.cross_agent_reference_head_weight_cached = float(getattr(self.args, 'cross_agent_reference_head_weight', 1.0))
+        self.cross_agent_reference_tail_weight_cached = float(getattr(self.args, 'cross_agent_reference_tail_weight', 0.3))
+        self.cross_agent_reference_use_clean_label = bool(getattr(self.args, 'cross_agent_reference_use_clean_label', True))
+        self.cross_agent_reference_target_semantics_cached = str(
+            getattr(self.args, 'cross_agent_reference_target_semantics', 'legacy') or 'legacy'
+        ).strip().lower()
+        if self.cross_agent_reference_target_semantics_cached not in ('legacy', 'split_raw_head_corrected_tail'):
+            self.cross_agent_reference_target_semantics_cached = 'legacy'
+        self.cross_agent_reference_exclude_random = bool(getattr(self.args, 'cross_agent_reference_exclude_random', True))
+        self.cross_agent_reference_quality_gate = bool(getattr(self.args, 'cross_agent_reference_quality_gate', True))
+        self.cross_agent_reference_gate_mode_cached = str(
+            getattr(self.args, 'cross_agent_reference_gate_mode', 'progress') or 'progress'
+        ).strip().lower()
+        self.cross_agent_reference_selector_enabled = bool(
+            getattr(self.args, 'cross_agent_reference_selector_enabled', False)
+        )
+        self.cross_agent_reference_selector_mode_cached = str(
+            getattr(self.args, 'cross_agent_reference_selector_mode', 'hard') or 'hard'
+        ).strip().lower()
+        if self.cross_agent_reference_selector_mode_cached not in CROSS_AGENT_REFERENCE_SELECTOR_MODES:
+            self.cross_agent_reference_selector_mode_cached = 'hard'
+        if self.cross_agent_reference_selector_enabled and self.cross_agent_reference_selector_mode_cached == 'hard':
+            self.cross_agent_reference_selector_mode_cached = 'selector_mix'
+        self.cross_agent_reference_selector_alpha_cached = float(
+            getattr(self.args, 'cross_agent_reference_selector_alpha', 0.7)
+        )
+        self.cross_agent_reference_selector_alpha_cached = float(
+            np.clip(self.cross_agent_reference_selector_alpha_cached, 0.0, 1.0)
+        )
+        self.cross_agent_reference_selector_q_tau_cached = max(
+            float(getattr(self.args, 'cross_agent_reference_selector_q_tau', 500.0)),
+            1e-6,
+        )
+        self.cross_agent_reference_selector_lr_cached = float(
+            getattr(self.args, 'cross_agent_reference_selector_lr', 1e-4)
+        )
+        self.cross_agent_reference_selector_hidden_cached = (
+            parse_hidden_units(getattr(self.args, 'cross_agent_reference_selector_hidden', None)) or (128, 64)
+        )
+        self.cross_agent_reference_selector_init_logit_cached = float(
+            getattr(self.args, 'cross_agent_reference_selector_init_logit', -2.0)
+        )
+        self.cross_agent_reference_selector_adv_clip_cached = float(
+            getattr(self.args, 'cross_agent_reference_selector_adv_clip', 5.0)
+        )
+        self.cross_agent_reference_selector_reward_tau_cached = max(
+            float(getattr(self.args, 'cross_agent_reference_selector_reward_tau', 500.0)),
+            1e-6,
+        )
+        self.cross_agent_reference_selector_reward_tiebreak_cached = float(
+            np.clip(float(getattr(self.args, 'cross_agent_reference_selector_reward_tiebreak', 0.05)), 0.0, 0.24)
+        )
+        self.cross_agent_reference_selector_success_stable_window_cached = max(
+            2,
+            int(getattr(self.args, 'cross_agent_reference_selector_success_stable_window', 100) or 100),
+        )
+        self.cross_agent_reference_selector_success_stable_delta_cached = max(
+            0.0,
+            float(getattr(self.args, 'cross_agent_reference_selector_success_stable_delta', 0.02)),
+        )
+        self.cross_agent_reference_selector_success_stable_min_rate_cached = float(
+            np.clip(float(getattr(self.args, 'cross_agent_reference_selector_success_stable_min_rate', 0.05)), 0.0, 1.0)
+        )
+        self.cross_agent_reference_selector_success_stable_min_episodes_cached = max(
+            0,
+            int(getattr(self.args, 'cross_agent_reference_selector_success_stable_min_episodes', 200) or 200),
+        )
+        self.cross_agent_reference_selector_success_ramp_episodes_cached = max(
+            0,
+            int(getattr(self.args, 'cross_agent_reference_selector_success_ramp_episodes', 50) or 50),
+        )
+        self._cross_ref_selector_success_phase_start_episode = None
+        self._cross_ref_selector_local_phase_start_episode = None
+        self._cross_ref_selector_team_phase_start_episode = None
+        self._last_cross_ref_selector_success_weight = 0.0
+        self._last_cross_ref_selector_success_phase = 'reward'
+        self.cross_agent_reference_goal_distance_index = 59
+        self.cross_agent_reference_success_distance_norm_cached = (
+            float(getattr(self.args, 'success_distance_threshold', 2.0))
+            / max(float(getattr(self.args, 'map_size', 200.0)), 1e-6)
+        )
         self.jit_compile_cached = bool(getattr(self.args, 'jit_compile', False))
         self.force_outer_jit_compile_cached = _env_flag_enabled('FORCE_OUTER_JIT_COMPILE', default=False)
         if self.jit_compile_cached and self.use_dual_q and self.use_separated_gradient and not self.force_outer_jit_compile_cached:
@@ -9761,14 +10379,14 @@ class OptimizedMATD3:
                 print("[MATD3] FORCE_OUTER_JIT_COMPILE=1，保留 separated-gradient 热路径的 outer JIT。若不稳可回退。")
         self.debug_pf_forces_cached = bool(getattr(self.args, 'debug_pf_forces', False))
         # 势场参数缓存
-        self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 1.0))
-        self.lambda_1_base_cached = float(getattr(self.args, 'lambda_1_base', 5.0))
-        self.terrain_repulsion_cached = float(getattr(self.args, 'terrain_repulsion', 80.0))
-        self.agent_influence_range_cached = float(getattr(self.args, 'agent_influence_range', 10.0))
-        self.delta_k_att_cached = float(getattr(self.args, 'delta_k_att', 0.5))
-        self.delta_lambda_1_cached = float(getattr(self.args, 'delta_lambda_1', 2.5))
-        self.delta_k_rep_cached = float(getattr(self.args, 'delta_k_rep', 40.0))
-        self.delta_radius_cached = float(getattr(self.args, 'delta_radius', 5.0))
+        self.goal_attraction_cached = float(getattr(self.args, 'goal_attraction', 26.0))
+        self.lambda_1_base_cached = float(getattr(self.args, 'lambda_1_base', 8.5))
+        self.terrain_repulsion_cached = float(getattr(self.args, 'terrain_repulsion', 1600.0))
+        self.agent_influence_range_cached = float(getattr(self.args, 'agent_influence_range', 150.0))
+        self.delta_k_att_cached = float(getattr(self.args, 'delta_k_att', 5.0))
+        self.delta_lambda_1_cached = float(getattr(self.args, 'delta_lambda_1', 2.2))
+        self.delta_k_rep_cached = float(getattr(self.args, 'delta_k_rep', 600.0))
+        self.delta_radius_cached = float(getattr(self.args, 'delta_radius', 80.0))
         # 🔧 XLA修复：地形高度图缓存改为只读 Variable。
         # 这样 PF_JIT 热路径读取的是运行期资源，而不是会被 XLA constant folding 的大 tf.constant。
         default_map_size = int(getattr(self.args, 'map_size', 200))
@@ -9920,6 +10538,129 @@ class OptimizedMATD3:
             self._last_agent_success_rates = [0.0 for _ in range(self.n_agents)]
             self._last_agent_fairness_weights = base_weights.tolist()
             return base_weights
+
+    def _compute_cross_ref_selector_success_weight(self):
+        """Return the R2S phase weight using local success before team success."""
+        if str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard')) not in (
+            'reward_to_success_priority',
+            'reward_to_success_head_tail',
+        ):
+            return 1.0
+        try:
+            team_flags = getattr(self, '_episode_team_success_flags', None)
+            if team_flags is None or len(team_flags) == 0:
+                team_flags = getattr(self, '_episode_success_flags', [])
+            team_arr = np.asarray(team_flags, dtype=np.float32).reshape(-1)
+            team_arr = np.where(np.isfinite(team_arr), team_arr, 0.0)
+            team_arr = (team_arr >= 0.5).astype(np.float32)
+            episode_count = int(team_arr.size)
+            window = int(getattr(self, 'cross_agent_reference_selector_success_stable_window_cached', 100))
+            min_episodes_cfg = int(getattr(self, 'cross_agent_reference_selector_success_stable_min_episodes_cached', 200))
+            team_min_episodes = max(min_episodes_cfg, window * 2)
+            local_min_episodes = max(10, min(min_episodes_cfg, max(10, window // 2)))
+            if episode_count < local_min_episodes:
+                self._last_cross_ref_selector_success_weight = 0.0
+                self._last_cross_ref_selector_success_phase = 'reward'
+                return 0.0
+
+            agent_flags = getattr(self, '_episode_agent_success_flags', None)
+            local_arr = team_arr
+            if agent_flags is not None and len(agent_flags) > 0:
+                agent_arr = np.asarray(agent_flags, dtype=np.float32)
+                if agent_arr.ndim == 1:
+                    agent_arr = agent_arr.reshape(-1, 1)
+                if agent_arr.shape[0] > 0:
+                    agent_arr = np.where(np.isfinite(agent_arr), agent_arr, 0.0)
+                    agent_arr = (agent_arr >= 0.5).astype(np.float32)
+                    local_arr = (np.max(agent_arr, axis=1) >= 0.5).astype(np.float32)
+                    if int(local_arr.size) != episode_count:
+                        n = min(int(local_arr.size), episode_count)
+                        local_arr = local_arr[-n:] if n > 0 else team_arr
+                        team_arr = team_arr[-n:] if n > 0 else team_arr
+                        episode_count = int(n)
+            if episode_count <= 0:
+                self._last_cross_ref_selector_success_weight = 0.0
+                self._last_cross_ref_selector_success_phase = 'reward'
+                return 0.0
+
+            local_window_size = min(max(window, 1), episode_count)
+            local_recent = local_arr[-local_window_size:]
+            local_recent_rate = float(np.mean(local_recent)) if local_recent.size > 0 else 0.0
+            local_cumulative_rate = float(np.mean(local_arr)) if local_arr.size > 0 else 0.0
+
+            stable_delta = float(getattr(self, 'cross_agent_reference_selector_success_stable_delta_cached', 0.02))
+            min_rate = float(getattr(self, 'cross_agent_reference_selector_success_stable_min_rate_cached', 0.05))
+
+            local_ready = (
+                episode_count >= local_min_episodes
+                and max(local_recent_rate, local_cumulative_rate) >= min_rate
+            )
+            if local_ready and self._cross_ref_selector_local_phase_start_episode is None:
+                self._cross_ref_selector_local_phase_start_episode = episode_count
+                self._cross_ref_selector_success_phase_start_episode = episode_count
+
+            if episode_count >= team_min_episodes:
+                prev_window = team_arr[-2 * window:-window]
+                recent_window = team_arr[-window:]
+                prev_rate = float(np.mean(prev_window)) if prev_window.size > 0 else 0.0
+                recent_rate = float(np.mean(recent_window)) if recent_window.size > 0 else 0.0
+                team_stable = recent_rate >= min_rate and abs(recent_rate - prev_rate) <= stable_delta
+                if team_stable and self._cross_ref_selector_team_phase_start_episode is None:
+                    self._cross_ref_selector_team_phase_start_episode = episode_count
+
+            start_ep = self._cross_ref_selector_local_phase_start_episode
+            if start_ep is None:
+                self._last_cross_ref_selector_success_weight = 0.0
+                self._last_cross_ref_selector_success_phase = 'reward'
+                return 0.0
+
+            ramp = int(getattr(self, 'cross_agent_reference_selector_success_ramp_episodes_cached', 50))
+            if ramp <= 0:
+                weight = 1.0
+            else:
+                weight = float(np.clip((episode_count - int(start_ep) + 1) / float(ramp), 0.0, 1.0))
+            self._last_cross_ref_selector_success_weight = weight
+            if self._cross_ref_selector_team_phase_start_episode is not None:
+                self._last_cross_ref_selector_success_phase = 'team_success' if weight >= 1.0 else 'team_ramp'
+            else:
+                self._last_cross_ref_selector_success_phase = 'local_success' if weight >= 1.0 else 'local_ramp'
+            return weight
+        except Exception:
+            self._last_cross_ref_selector_success_weight = 0.0
+            self._last_cross_ref_selector_success_phase = 'reward'
+            return 0.0
+
+    def _compute_cross_ref_actor_weight(self):
+        """Delay actor imitation while allowing selector pretraining."""
+        try:
+            if not bool(getattr(self, 'cross_agent_reference_enabled', False)):
+                return 0.0
+            episode_idx = int(getattr(self, '_current_episode_idx', 0))
+            start_ep = int(
+                getattr(
+                    self,
+                    'cross_agent_reference_actor_start_episode',
+                    getattr(self, 'cross_agent_reference_start_episode', 0),
+                )
+            )
+            if episode_idx < start_ep:
+                return 0.0
+            if bool(getattr(self, 'cross_agent_reference_actor_require_success', False)):
+                if (
+                    getattr(self, '_cross_ref_selector_local_phase_start_episode', None) is None
+                    and getattr(self, '_cross_ref_selector_team_phase_start_episode', None) is None
+                ):
+                    self._cross_ref_actor_effective_start_episode = None
+                    return 0.0
+            if self._cross_ref_actor_effective_start_episode is None:
+                self._cross_ref_actor_effective_start_episode = episode_idx
+            ramp = int(getattr(self, 'cross_agent_reference_actor_ramp_episodes_cached', 0) or 0)
+            if ramp <= 0:
+                return 1.0
+            effective_start = int(self._cross_ref_actor_effective_start_episode)
+            return float(np.clip((episode_idx - effective_start + 1) / float(ramp), 0.0, 1.0))
+        except Exception:
+            return 0.0
     
     def _init_networks(self):
         """初始化所有网络（MATD3使用Twin Critic）"""
@@ -9982,7 +10723,30 @@ class OptimizedMATD3:
             if self.eval_actor_only:
                 self.agents.append(agent)
                 continue
-            
+
+            if (
+                bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
+                and str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard')) in CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES
+            ):
+                selector_mode = str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard'))
+                selector_scalar_dim = 15
+                if selector_mode in ('reward_to_success_priority', 'reward_to_success_head_tail'):
+                    selector_scalar_dim += 1
+                selector_input_dim = int(self.obs_shapes[i]) + int(self.action_dims[i]) * 3 + selector_scalar_dim
+                selector_output_dim = 2 if selector_mode == 'reward_to_success_head_tail' else 1
+                agent['reference_selector'] = build_cross_agent_reference_selector(
+                    input_dim=selector_input_dim,
+                    hidden_units=getattr(self, 'cross_agent_reference_selector_hidden_cached', (128, 64)),
+                    init_logit=getattr(self, 'cross_agent_reference_selector_init_logit_cached', -2.0),
+                    output_dim=selector_output_dim,
+                )
+                if i == 0:
+                    print(
+                        "[MATD3网络] Cross-agent reference selector 已启用 "
+                        f"(input_dim={selector_input_dim}, output_dim={selector_output_dim}, "
+                        f"hidden={getattr(self, 'cross_agent_reference_selector_hidden_cached', (128, 64))})"
+                    )
+
             agent['target_actor'] = tf.keras.models.clone_model(agent['actor'])
             agent['target_actor'].set_weights(agent['actor'].get_weights())
             
@@ -10168,6 +10932,14 @@ class OptimizedMATD3:
                 agent['actor_optimizer'] = base_actor_opt
                 agent['critic1_optimizer'] = base_critic1_opt
                 agent['critic2_optimizer'] = base_critic2_opt
+
+            if 'reference_selector' in agent:
+                agent['reference_selector_optimizer'] = tf.keras.optimizers.Adam(
+                    learning_rate=float(getattr(self, 'cross_agent_reference_selector_lr_cached', 1e-4)),
+                    beta_1=0.9,
+                    beta_2=0.999,
+                    epsilon=1e-8,
+                )
             
             # 🔧 XLA修复：在初始化后立即调用build注册所有变量
             # 在XLA模式下，优化器需要先build才能识别所有变量
@@ -10178,12 +10950,16 @@ class OptimizedMATD3:
                     agent['critic2_optimizer'].build(agent['critic2'].trainable_variables)
                 if hasattr(agent['actor_optimizer'], 'build'):
                     agent['actor_optimizer'].build(agent['actor'].trainable_variables)
+                if 'reference_selector_optimizer' in agent and hasattr(agent['reference_selector_optimizer'], 'build'):
+                    agent['reference_selector_optimizer'].build(agent['reference_selector'].trainable_variables)
             except Exception:
                 pass  # 如果build失败，继续使用apply_gradients注册
             
             # 保存学习率调度器引用（用于日志记录）
             agent['actor_lr_schedule'] = actor_lr_schedule
             agent['critic_lr_schedule'] = critic_lr_schedule
+            if 'reference_selector' in agent:
+                agent['reference_selector_lr'] = float(getattr(self, 'cross_agent_reference_selector_lr_cached', 1e-4))
             
             # 🔧 XLA修复：使用tf.Variable存储学习率，避免自适应调整时触发XLA重新编译
             agent['actor_lr_var'] = tf.Variable(
@@ -10318,6 +11094,33 @@ class OptimizedMATD3:
                 pairs = [(g, v) for g, v in zip(grads, act_vars) if g is not None]
                 if pairs:
                     agent['actor_optimizer'].apply_gradients(pairs)
+
+                if 'reference_selector' in agent and 'reference_selector_optimizer' in agent:
+                    try:
+                        selector_input_dim = int(agent['reference_selector'].input_shape[-1])
+                    except Exception:
+                        selector_scalar_dim = 15
+                        if str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard')) in (
+                            'reward_to_success_priority',
+                            'reward_to_success_head_tail',
+                        ):
+                            selector_scalar_dim += 1
+                        selector_input_dim = int(self.obs_shapes[i]) + int(self.action_dims[i]) * 3 + selector_scalar_dim
+                    with tf.GradientTape() as tape_sel:
+                        selector_dummy = tf.zeros([batch_size, selector_input_dim], dtype=tf.float32)
+                        selector_score = agent['reference_selector'](selector_dummy, training=True)
+                        selector_dummy_loss = tf.reduce_mean(selector_score)
+                    selector_vars = agent['reference_selector'].trainable_variables
+                    try:
+                        if hasattr(agent['reference_selector_optimizer'], 'build'):
+                            agent['reference_selector_optimizer'].build(selector_vars)
+                    except Exception:
+                        pass
+                    selector_grads = tape_sel.gradient(selector_dummy_loss, selector_vars)
+                    selector_grads = [tf.zeros_like(g) if g is not None else None for g in selector_grads]
+                    selector_pairs = [(g, v) for g, v in zip(selector_grads, selector_vars) if g is not None]
+                    if selector_pairs:
+                        agent['reference_selector_optimizer'].apply_gradients(selector_pairs)
 
                 print(f"[MATD3] 智能体{i}优化器预热完成")
 
@@ -10513,12 +11316,13 @@ class OptimizedMATD3:
         """
         MATD3的向量化批量动作选择（与MADDPG接口一致）
         states: (num_envs, n_agents, obs_dim)
-        返回: (actions_for_storage, actions_for_execution, pf_forces, raw_actor_outputs, pf_features_current)
+        返回: (actions_for_storage, actions_for_execution, pf_forces, raw_actor_outputs, pf_features_current, random_action_mask)
             - actions_for_storage: (num_envs, n_agents, act_dim) 回放区原始动作
             - actions_for_execution: (num_envs, n_agents, act_dim) 环境执行动作
             - pf_forces: (num_envs, n_agents, 3) 行为执行时的 PF 力（behavior force）
             - raw_actor_outputs: (num_envs, n_agents, act_dim) Actor 原始7维输出（噪声/PF前）
             - pf_features_current: (num_envs, n_agents, 3) 当前状态的 base PF 特征
+            - random_action_mask: (num_envs, n_agents) epsilon-random 动作标记
         """
         # 统一张量类型与形状，避免 retracing
         if not tf.is_tensor(states):
@@ -10701,13 +11505,14 @@ class OptimizedMATD3:
             pf_force_network
         )
         
-        # 返回五个值：
+        # 返回六个值：
         # 1. actions_for_storage: 存入回放区（原始+噪声，无修正）
         # 2. actions_for_execution: 交给环境（原始+噪声+修正）
         # 3. pf_forces_final: 行为执行时的 PF 力
         # 4. raw_actor_actions: Actor 原始输出（用于时序图）
         # 5. pf_forces_pre: 当前状态的 base PF 特征
-        return actions_for_storage, actions_for_execution, pf_forces_final, raw_actor_actions, pf_forces_pre
+        # 6. random_action_mask: 随机探索动作标记
+        return actions_for_storage, actions_for_execution, pf_forces_final, raw_actor_actions, pf_forces_pre, tf.cast(rand_mask, tf.float32)
 
     def flush_pending_per_updates(self, replay_buffer):
         return _flush_pending_per_updates(
@@ -10718,6 +11523,7 @@ class OptimizedMATD3:
 
     def update(self, replay_buffer, batch_size=128):
         """MATD3更新（优化版本：预计算目标策略平滑）"""
+        update_wall_t0 = time.perf_counter()
         detail_enabled = False
         try:
             cached = getattr(self, '_timing_detail_enabled_cache', None)
@@ -10762,24 +11568,30 @@ class OptimizedMATD3:
         # 采样经验
         if detail_enabled:
             _t_upd_phase = _upd_perf_counter()
-        batch = replay_buffer.sample(batch_size)
-        (
-            obs_n,
-            next_obs_n,
-            act_n,
-            rew_n,
-            done_n,
-            weights,
-            indices,
-            fr_batch,
-            pf_forces_batch,
-            pf_features_batch,
-            next_pf_features_batch,
-            next_pf_geometry_cache_batch,
-            act_corrected_batch,
-            next_pf_forces_batch,
-            next_act_corrected_batch,
-        ) = _unpack_replay_sample(batch)
+        try:
+            if hasattr(replay_buffer, 'set_current_episode_idx'):
+                replay_buffer.set_current_episode_idx(getattr(self, '_current_episode_idx', 0))
+        except Exception:
+            pass
+        replay_batch = _unpack_replay_sample(replay_buffer.sample(batch_size))
+        obs_n = replay_batch.obs
+        next_obs_n = replay_batch.next_obs
+        act_n = replay_batch.actions_raw
+        rew_n = replay_batch.rewards
+        done_n = replay_batch.dones
+        weights = replay_batch.sample_weights
+        indices = replay_batch.sample_indices
+        sample_generation = replay_batch.sample_generation
+        fr_batch = replay_batch.fr
+        pf_forces_batch = replay_batch.pf_forces
+        pf_features_batch = replay_batch.pf_features
+        next_pf_features_batch = replay_batch.next_pf_features
+        next_pf_geometry_cache_batch = replay_batch.next_pf_geometry_cache
+        act_corrected_batch = replay_batch.actions_corr
+        act_policy_clean_batch = replay_batch.actions_policy_clean
+        random_action_mask_batch = replay_batch.random_action_mask
+        next_pf_forces_batch = replay_batch.next_pf_forces_compat
+        next_act_corrected_batch = replay_batch.next_actions_corr_compat
         if detail_enabled:
             update_timing['upd_sample'] += _upd_perf_counter() - _t_upd_phase
             _t_upd_phase = _upd_perf_counter()
@@ -10808,7 +11620,66 @@ class OptimizedMATD3:
         # 🚨 关键修复：保存原始动作（在重构之前），用于Actor路径1学习
         act_n_raw = act_n.copy()  # (batch_size, n_agents, act_dim) - 原始动作
         act_n_raw_tensor = tf.convert_to_tensor(act_n_raw, dtype=tf.float32)
-        
+        if act_policy_clean_batch is not None and bool(getattr(replay_buffer, 'stores_policy_clean_actions', False)):
+            act_policy_clean_np = np.asarray(act_policy_clean_batch, dtype=np.float32)
+            if act_policy_clean_np.shape != act_n_raw.shape:
+                act_policy_clean_np = act_n_raw.copy()
+        else:
+            act_policy_clean_np = act_n_raw.copy()
+        if random_action_mask_batch is not None and bool(getattr(replay_buffer, 'stores_random_action_mask', False)):
+            random_action_mask_np = np.asarray(random_action_mask_batch, dtype=np.float32)
+            expected_mask_shape = (act_n_raw.shape[0], self.n_agents)
+            if random_action_mask_np.shape != expected_mask_shape:
+                random_action_mask_np = np.zeros(expected_mask_shape, dtype=np.float32)
+        else:
+            random_action_mask_np = np.zeros((act_n_raw.shape[0], self.n_agents), dtype=np.float32)
+        expected_label_shape = (act_n_raw.shape[0], self.n_agents)
+
+        def _coerce_cross_ref_label_matrix(values, default=0.0):
+            out = np.full(expected_label_shape, float(default), dtype=np.float32)
+            if values is None:
+                return out
+            try:
+                arr = np.asarray(values, dtype=np.float32)
+                if arr.shape == expected_label_shape:
+                    return arr.astype(np.float32, copy=False)
+                flat = arr.reshape(-1)
+                n = min(out.size, flat.size)
+                if n > 0:
+                    out.flat[:n] = flat[:n]
+            except Exception:
+                pass
+            return out
+
+        def _coerce_cross_ref_label_vector(values, default=0.0):
+            out = np.full((act_n_raw.shape[0],), float(default), dtype=np.float32)
+            if values is None:
+                return out
+            try:
+                arr = np.asarray(values, dtype=np.float32).reshape(-1)
+                n = min(out.size, arr.size)
+                if n > 0:
+                    out[:n] = arr[:n]
+            except Exception:
+                pass
+            return out
+
+        cross_agent_success_np = _coerce_cross_ref_label_matrix(getattr(replay_batch, 'agent_episode_success', None))
+        cross_agent_reach_np = _coerce_cross_ref_label_matrix(getattr(replay_batch, 'agent_episode_reach', None))
+        cross_agent_safe_np = _coerce_cross_ref_label_matrix(getattr(replay_batch, 'agent_episode_safe', None))
+        cross_agent_progress_np = _coerce_cross_ref_label_matrix(getattr(replay_batch, 'agent_episode_progress', None))
+        cross_agent_final_goal_np = _coerce_cross_ref_label_matrix(getattr(replay_batch, 'agent_final_goal_distance', None))
+        cross_agent_quality_valid_np = _coerce_cross_ref_label_matrix(getattr(replay_batch, 'agent_episode_quality_valid', None))
+        cross_agent_team_success_np = _coerce_cross_ref_label_vector(getattr(replay_batch, 'team_episode_success', None))
+        random_action_mask_tensor = tf.convert_to_tensor(random_action_mask_np, dtype=tf.float32)
+        cross_agent_success_tensor = tf.convert_to_tensor(cross_agent_success_np, dtype=tf.float32)
+        cross_agent_reach_tensor = tf.convert_to_tensor(cross_agent_reach_np, dtype=tf.float32)
+        cross_agent_safe_tensor = tf.convert_to_tensor(cross_agent_safe_np, dtype=tf.float32)
+        cross_agent_progress_tensor = tf.convert_to_tensor(cross_agent_progress_np, dtype=tf.float32)
+        cross_agent_final_goal_tensor = tf.convert_to_tensor(cross_agent_final_goal_np, dtype=tf.float32)
+        cross_agent_quality_valid_tensor = tf.convert_to_tensor(cross_agent_quality_valid_np, dtype=tf.float32)
+        cross_agent_team_success_tensor = tf.convert_to_tensor(cross_agent_team_success_np, dtype=tf.float32)
+
         # 🔧 修复：优先使用存储的修正动作，如果没有则从原始动作+势场力+FR计算
         # 🔧 XLA友好：这部分在Python代码中执行，不在@tf.function中，对XLA无影响
         if act_corrected_batch is not None:
@@ -10828,6 +11699,17 @@ class OptimizedMATD3:
         
         # 🔧 关键修改：使用修正后的动作（混合动作）进行Critic学习，与实际执行一致
         act_n = act_n_corrected
+        if not bool(getattr(self, 'cross_agent_reference_use_clean_label', True)):
+            target_semantics = str(getattr(self, 'cross_agent_reference_target_semantics_cached', 'legacy') or 'legacy')
+            if target_semantics == 'split_raw_head_corrected_tail':
+                # Head learns the pre-APF behavior proposal; tail learns the executed APF/control parameters.
+                act_policy_clean_np = act_n_corrected.copy()
+                if act_policy_clean_np.ndim == 3 and act_policy_clean_np.shape[2] >= 3:
+                    act_policy_clean_np[:, :, :3] = act_n_raw[:, :, :3]
+            else:
+                # Legacy behavior label: imitate the action actually executed in the environment.
+                act_policy_clean_np = act_n_corrected.copy()
+        act_policy_clean_tensor = tf.convert_to_tensor(act_policy_clean_np, dtype=tf.float32)
         pf_feat_dim = self.pf_feature_dim if self.pf_feature_dim > 0 else 3
         current_pf_features_np = None
         next_pf_features_np = None
@@ -10925,7 +11807,7 @@ class OptimizedMATD3:
         shared_next_correction_supported = bool(
             shared_next_pf_supported and len(self.action_dims) > 0 and self.action_dims[0] >= 3
         )
-        need_shared_next_context = bool(
+        need_shared_next_pf_context = bool(
             (
                 (self.use_pf_feature_flag and next_pf_features_np is None and shared_next_pf_supported)
                 or (
@@ -10948,7 +11830,7 @@ class OptimizedMATD3:
             except Exception:
                 next_obs_valid_inputs = None
                 next_obs_geometry_context = None
-        elif need_shared_next_context:
+        elif need_shared_next_pf_context:
             try:
                 correct_obs_dim = self.obs_shapes[0] if len(self.obs_shapes) > 0 else tf.shape(all_next_obs[0])[1]
                 next_obs_stacked = next_obs_n_tensor[:, :, :correct_obs_dim]
@@ -11182,6 +12064,43 @@ class OptimizedMATD3:
         # separated-gradient 路径直接使用 Python bool，让 _multi_agent_update_step 只保留两张稳定图。
         should_update_actor_bool = (self.total_it % self.policy_freq == 0)
         should_update_actor = tf.constant(should_update_actor_bool, dtype=tf.bool)
+        cross_agent_reference_interval = max(
+            1,
+            int(getattr(self, 'cross_agent_reference_update_interval_cached', 1) or 1),
+        )
+        cross_agent_reference_interval_active = bool(
+            (int(getattr(self, 'total_it', 0)) % cross_agent_reference_interval) == 0
+        )
+        cross_agent_reference_pairs_per_agent = max(
+            0,
+            int(getattr(self, 'cross_agent_reference_pairs_per_agent_cached', 0) or 0),
+        )
+        cross_agent_reference_pair_pool = max(int(getattr(self, 'n_agents', 0)) - 1, 1)
+        cross_agent_reference_actor_stride = max(1, int(getattr(self, 'policy_freq', 1) or 1))
+        cross_agent_reference_common_stride = (
+            cross_agent_reference_actor_stride
+            * cross_agent_reference_interval
+            // math.gcd(cross_agent_reference_actor_stride, cross_agent_reference_interval)
+        )
+        cross_agent_reference_pair_slot = int(
+            (int(getattr(self, 'total_it', 0)) // max(1, cross_agent_reference_common_stride))
+            % cross_agent_reference_pair_pool
+        )
+        cross_agent_reference_active_bool = bool(
+            getattr(self, 'cross_agent_reference_enabled', False)
+            and int(getattr(self, '_current_episode_idx', 0)) >= int(getattr(self, 'cross_agent_reference_start_episode', 0))
+            and cross_agent_reference_interval_active
+        )
+        cross_agent_reference_selector_success_weight = self._compute_cross_ref_selector_success_weight()
+        cross_agent_reference_selector_success_weight_tensor = tf.constant(
+            float(np.clip(cross_agent_reference_selector_success_weight, 0.0, 1.0)),
+            dtype=tf.float32,
+        )
+        cross_agent_reference_actor_weight = self._compute_cross_ref_actor_weight()
+        cross_agent_reference_actor_weight_tensor = tf.constant(
+            float(np.clip(cross_agent_reference_actor_weight, 0.0, 1.0)),
+            dtype=tf.float32,
+        )
         
         # ✅ 优化：一次大图执行逐智能体更新，减少 Python→Graph 往返
         sample_weights = tf.convert_to_tensor(weights, dtype=tf.float32)
@@ -11199,7 +12118,7 @@ class OptimizedMATD3:
         # - single_q baseline: 回到 single-head total-Q critic + joint actor update
         # 这样 single_q 才能代表 baseline，而不是保留 dual-head / separated 路径的梯度痕迹。
         td_err_vec = None
-        critic_vec, actor_vec, valid_counts_tf, td_err_vec = self._multi_agent_update_step(
+        critic_vec, actor_vec, valid_counts_tf, td_err_vec, matd3_q_diag_vec = self._multi_agent_update_step(
             obs_n_tensor, next_obs_n_tensor, act_n, rew_n_tensor, done_n_tensor,
             global_state, global_next_state, global_actions,
             sample_weights,
@@ -11211,6 +12130,20 @@ class OptimizedMATD3:
             global_a_next_corr,
             current_pf_batch_flat_shared,
             next_pf_batch_flat_shared,
+            act_policy_clean_tensor,
+            random_action_mask_tensor,
+            cross_agent_success_tensor,
+            cross_agent_reach_tensor,
+            cross_agent_safe_tensor,
+            cross_agent_progress_tensor,
+            cross_agent_final_goal_tensor,
+            cross_agent_quality_valid_tensor,
+            cross_agent_team_success_tensor,
+            cross_agent_reference_active_bool,
+            cross_agent_reference_pair_slot,
+            cross_agent_reference_pairs_per_agent,
+            cross_agent_reference_selector_success_weight_tensor,
+            cross_agent_reference_actor_weight_tensor,
         )
         try:
             valid_counts_np = [batch_size] * self.n_agents
@@ -11244,28 +12177,74 @@ class OptimizedMATD3:
             try:
                 c_vec_flat = tf.reshape(critic_vec, [-1])
                 a_vec_flat = tf.reshape(actor_vec, [-1])
-                combined_tensor = tf.concat([c_vec_flat, a_vec_flat], axis=0)
+                q_diag_flat = tf.reshape(matd3_q_diag_vec, [-1])
+                combined_tensor = tf.concat([c_vec_flat, a_vec_flat, q_diag_flat], axis=0)
                 combined_np = _safe_tensor_to_numpy(tf.identity(combined_tensor))
                 n_c_val = self.n_agents
                 c_np = combined_np[:n_c_val]
-                a_np = combined_np[n_c_val:]
+                a_np = combined_np[n_c_val:n_c_val * 2]
+                q_np = combined_np[n_c_val * 2:]
             except Exception:
                 try:
                     c_np = _safe_tensor_to_numpy(tf.identity(critic_vec))
                     a_np = _safe_tensor_to_numpy(tf.identity(actor_vec))
+                    q_np = _safe_tensor_to_numpy(tf.identity(matd3_q_diag_vec))
                 except Exception:
                     c_np = np.array([0.0] * self.n_agents)
                     a_np = np.array([0.0] * self.n_agents)
+                    q_np = np.array([], dtype=np.float32)
 
             c_np = np.asarray(c_np).flatten()
             a_np = np.asarray(a_np).flatten()
+            q_np = np.asarray(q_np, dtype=np.float32).flatten()
             if c_np.ndim == 0:
                 c_np = np.array([float(c_np)])
             if a_np.ndim == 0:
                 a_np = np.array([float(a_np)])
+            cross_diag = {}
+            if q_np.size >= 32:
+                cross_diag = {
+                    'cross_ref_loss': float(q_np[28]),
+                    'cross_ref_valid_ratio': float(q_np[29]),
+                    'cross_ref_coef': float(q_np[30]),
+                    'cross_ref_active': float(q_np[31]),
+                }
+                if q_np.size >= 39:
+                    cross_diag.update({
+                        'cross_ref_selector_loss': float(q_np[32]),
+                        'cross_ref_selector_score': float(q_np[33]),
+                        'cross_ref_y_hindsight': float(q_np[34]),
+                        'cross_ref_y_q': float(q_np[35]),
+                        'cross_ref_y_mix': float(q_np[36]),
+                        'cross_ref_selector_target': float(q_np[36]),
+                        'cross_ref_advantage': float(q_np[37]),
+                        'cross_ref_advantage_pos_ratio': float(q_np[38]),
+                    })
+                if q_np.size >= 43:
+                    cross_diag.update({
+                        'cross_ref_selector_head_score': float(q_np[39]),
+                        'cross_ref_selector_tail_score': float(q_np[40]),
+                        'cross_ref_selector_head_target': float(q_np[41]),
+                        'cross_ref_selector_tail_target': float(q_np[42]),
+                    })
+                if q_np.size >= 44:
+                    cross_diag.update({
+                        'cross_ref_actor_weight': float(q_np[43]),
+                    })
+            if str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard')) in (
+                'reward_to_success_priority',
+                'reward_to_success_head_tail',
+            ):
+                cross_diag.update({
+                    'cross_ref_selector_success_weight': float(getattr(self, '_last_cross_ref_selector_success_weight', 0.0)),
+                    'cross_ref_selector_phase': str(getattr(self, '_last_cross_ref_selector_success_phase', 'reward')),
+                })
+            self._last_cross_agent_reference_diag = dict(cross_diag)
             self._last_synced_loss_values = {
                 'critic': c_np.copy(),
                 'actor': a_np.copy(),
+                'matd3_q_diag': q_np.copy(),
+                'cross_agent_reference': dict(cross_diag),
             }
 
             for i in range(self.n_agents):
@@ -11279,9 +12258,12 @@ class OptimizedMATD3:
                     ai = float(a_np[0].item() if hasattr(a_np[0], 'item') else a_np[0])
                 losses[i]['critic_loss'] = ci
                 losses[i]['actor_loss'] = ai
+                if cross_diag:
+                    losses[i].update(cross_diag)
         elif cached_loss_values is not None:
             c_np = np.asarray(cached_loss_values.get('critic', []), dtype=np.float32).flatten()
             a_np = np.asarray(cached_loss_values.get('actor', []), dtype=np.float32).flatten()
+            cross_diag = cached_loss_values.get('cross_agent_reference', {}) or {}
             for i in range(self.n_agents):
                 if c_np.size > 0:
                     ci = float(c_np[i] if i < c_np.size else c_np[0])
@@ -11289,6 +12271,8 @@ class OptimizedMATD3:
                 if a_np.size > 0:
                     ai = float(a_np[i] if i < a_np.size else a_np[0])
                     losses[i]['actor_loss'] = ai
+                if cross_diag:
+                    losses[i].update(cross_diag)
         if detail_enabled:
             update_timing['upd_train'] += _upd_perf_counter() - _t_upd_phase
             _t_upd_phase = _upd_perf_counter()
@@ -11303,13 +12287,13 @@ class OptimizedMATD3:
             _t_upd_phase = _upd_perf_counter()
         
         # 可选：PER优先级更新（与MADDPG一致的逻辑，使用Twin Critic的min(Q1,Q2)）
-        if getattr(self.args, 'per_enabled', False):
+        if getattr(self.args, 'per_enabled', False) and bool(getattr(replay_buffer, 'use_per', False) or getattr(replay_buffer, 'use_global_per', False)):
             try:
                 if td_err_vec is not None:
                     # ✅ 快路径：复用训练中已计算的TD误差，避免PER额外前向
                     if not hasattr(self, '_per_update_buffer'):
                         self._per_update_buffer = []
-                    self._per_update_buffer.append((indices, td_err_vec))
+                    self._per_update_buffer.append((indices, td_err_vec, sample_generation))
                     
                     # 每20次更新时才批量同步
                     if len(self._per_update_buffer) >= 20:
@@ -11326,7 +12310,7 @@ class OptimizedMATD3:
         if detail_enabled:
             update_timing['upd_per'] += _upd_perf_counter() - _t_upd_phase
             self._last_update_timing = update_timing
-        
+
         return losses
     
     @tf.function(reduce_retracing=True)
@@ -11687,22 +12671,94 @@ class OptimizedMATD3:
         consec = int(self.adaptive_learning.get('consecutive_no_improve', 0))
         patience = int(self.adaptive_learning.get('patience', 10))
         return (consec >= max(1, patience // 2)) and ((cv != np.inf and cv < 0.05 and norm_slope < 0.01) or (abs(recent_mean) <= 1e-6 and recent_std < 1e-6))
+
+    def _compute_adaptive_plateau_stats(self):
+        """Rolling-window plateau check for high-variance Level-3 training."""
+        rewards = self.adaptive_learning.get('reward_history', [])
+        window = max(2, int(self.adaptive_learning.get('plateau_window', 50)))
+        rel_delta = max(0.0, float(self.adaptive_learning.get('plateau_rel_delta', 0.03)))
+        slope_eps = max(0.0, float(self.adaptive_learning.get('plateau_slope_eps', 0.002)))
+        min_history = max(2 * window, window + int(self.adaptive_learning.get('patience', 25)))
+        stats = {
+            'plateau': False,
+            'ready': False,
+            'history_len': int(len(rewards)),
+            'window': int(window),
+            'prev_mean': None,
+            'curr_mean': None,
+            'rel_improve': None,
+            'slope_norm': None,
+        }
+        if len(rewards) < min_history:
+            stats['reason'] = 'warmup'
+            return stats
+        arr = np.asarray(rewards, dtype=np.float64)
+        finite_mask = np.isfinite(arr)
+        if not np.all(finite_mask):
+            arr = arr[finite_mask]
+        if arr.size < min_history:
+            stats['history_len'] = int(arr.size)
+            stats['reason'] = 'finite_warmup'
+            return stats
+        prev = arr[-2 * window:-window]
+        curr = arr[-window:]
+        if prev.size < window or curr.size < window:
+            stats['reason'] = 'window_short'
+            return stats
+        prev_mean = float(np.mean(prev))
+        curr_mean = float(np.mean(curr))
+        rel_improve = float((curr_mean - prev_mean) / (abs(prev_mean) + 1.0))
+        x = np.arange(curr.size, dtype=np.float64)
+        A = np.vstack([x, np.ones_like(x)]).T
+        slope = float(np.linalg.lstsq(A, curr, rcond=None)[0][0])
+        slope_norm = float(abs(slope) / (abs(curr_mean) + 1.0))
+        plateau = bool(rel_improve < rel_delta and slope_norm < slope_eps)
+        stats.update({
+            'plateau': plateau,
+            'ready': True,
+            'prev_mean': prev_mean,
+            'curr_mean': curr_mean,
+            'rel_improve': rel_improve,
+            'slope_norm': slope_norm,
+            'reason': 'plateau' if plateau else 'improving_or_trending',
+        })
+        return stats
     
     def _adaptive_learning_check(self, episode_reward):
         """检查是否需要自适应调整（与MADDPG保持一致）"""
         if not self.adaptive_learning['enabled']:
             return
+        try:
+            reward_value = float(episode_reward)
+        except Exception:
+            reward_value = 0.0
+        reward_history = self.adaptive_learning.setdefault('reward_history', [])
+        reward_history.append(reward_value)
+        if len(reward_history) > 1000:
+            del reward_history[:-1000]
         
         # 更新最佳奖励
-        if episode_reward > self.training_stats['best_reward']:
-            self.training_stats['best_reward'] = episode_reward
+        if reward_value > self.training_stats['best_reward']:
+            self.training_stats['best_reward'] = reward_value
             self.adaptive_learning['consecutive_no_improve'] = 0
         else:
             self.adaptive_learning['consecutive_no_improve'] += 1
         
         # 触发自适应调整
         if self.adaptive_learning['consecutive_no_improve'] >= self.adaptive_learning['patience']:
-            print(f"\n连续{self.adaptive_learning['consecutive_no_improve']}回合无改进，激活自适应调整...")
+            if self.adaptive_learning.get('window_plateau_enabled', False):
+                plateau_stats = self._compute_adaptive_plateau_stats()
+                self.adaptive_learning['last_plateau_stats'] = plateau_stats
+                if not plateau_stats.get('plateau', False):
+                    return
+                print(
+                    f"\n连续{self.adaptive_learning['consecutive_no_improve']}回合无改进，"
+                    f"rolling plateau确认，激活自适应调整 "
+                    f"(rel={plateau_stats.get('rel_improve'):.4f}, "
+                    f"slope={plateau_stats.get('slope_norm'):.4f})..."
+                )
+            else:
+                print(f"\n连续{self.adaptive_learning['consecutive_no_improve']}回合无改进，激活自适应调整...")
             self._adaptive_adjustment()
             self.adaptive_learning['consecutive_no_improve'] = 0
     
@@ -11717,15 +12773,19 @@ class OptimizedMATD3:
             current_actor_lr = float(agent['actor_lr_var'].numpy())
             current_critic_lr = float(agent['critic_lr_var'].numpy())
             
-            # 计算新的学习率（乘以衰减因子但不低于最小值）
-            new_actor_lr = max(self.adaptive_learning['min_learning_rate'], 
-                             current_actor_lr * self.adaptive_learning['lr_decay_factor'])
-            new_critic_lr = max(self.adaptive_learning['min_learning_rate'], 
-                               current_critic_lr * self.adaptive_learning['lr_decay_factor'])
+            min_actor_lr = float(self.adaptive_learning.get('min_actor_lr', self.adaptive_learning.get('min_learning_rate', 0.0)))
+            min_critic_lr = float(self.adaptive_learning.get('min_critic_lr', self.adaptive_learning.get('min_learning_rate', 0.0)))
+            actor_decay = float(self.adaptive_learning.get('actor_lr_decay_factor', self.adaptive_learning.get('lr_decay_factor', 1.0)))
+            critic_decay = float(self.adaptive_learning.get('critic_lr_decay_factor', self.adaptive_learning.get('lr_decay_factor', 1.0)))
+            # 计算新的学习率（actor/critic分离下限与衰减）
+            new_actor_lr = max(min_actor_lr, current_actor_lr * actor_decay)
+            new_critic_lr = max(min_critic_lr, current_critic_lr * critic_decay)
             
             # 🔧 XLA修复：使用Variable.assign更新，不会触发重新编译
             agent['actor_lr_var'].assign(tf.cast(new_actor_lr, tf.float32))
             agent['critic_lr_var'].assign(tf.cast(new_critic_lr, tf.float32))
+            agent['actor_lr'] = new_actor_lr
+            agent['critic_lr'] = new_critic_lr
             
             # 更新优化器学习率（安全方式：兼容调度器/混合精度包装器/EagerTensor）
             def _safe_set_lr(opt, lr_var):
@@ -12186,6 +13246,8 @@ class OptimizedMATD3:
                     arc_eff2 = _arc2 * (tf.cast(1.0, tf.float32) - tf.cast(0.7, tf.float32) * tf.reduce_mean(danger))
                 except Exception:
                     arc_eff2 = _arc2
+                arc_min2 = tf.cast(self.action_reg_min_coef_cached, tf.float32)
+                arc_eff2 = tf.clip_by_value(arc_eff2, arc_min2, tf.cast(10.0, tf.float32))
                 action_head = new_action[:, :3]
                 action_tail = new_action[:, 3:]
                 
@@ -12294,6 +13356,22 @@ class OptimizedMATD3:
         q2_a, q2_b = tf.split(q2_all, 2, axis=0)
         return q1_a, q2_a, q1_b, q2_b
 
+    def _forward_twin_critic_quad(self, critic, inputs_a, inputs_b, inputs_c, inputs_d, training):
+        """单次前向同时评估四组输入，供 reference advantage 批量比较使用。"""
+        merged_inputs = [
+            tf.concat(
+                [tf.cast(a, tf.float32), tf.cast(b, tf.float32), tf.cast(c, tf.float32), tf.cast(d, tf.float32)],
+                axis=0,
+            )
+            for a, b, c, d in zip(inputs_a, inputs_b, inputs_c, inputs_d)
+        ]
+        q1_all, q2_all = critic(merged_inputs, training=training)
+        q1_all = tf.cast(q1_all, tf.float32)
+        q2_all = tf.cast(q2_all, tf.float32)
+        q1_a, q1_b, q1_c, q1_d = tf.split(q1_all, 4, axis=0)
+        q2_a, q2_b, q2_c, q2_d = tf.split(q2_all, 4, axis=0)
+        return q1_a, q2_a, q1_b, q2_b, q1_c, q2_c, q1_d, q2_d
+
     @tf.function(reduce_retracing=True)
     def _forward_target_actors_batch(self, next_obs_n_tensor, fr_next, next_pf_features_tensor, pf_feat_dim):
         """将逐 agent target actor 前向收进单个图，减少 update() 外层 eager 调度开销。"""
@@ -12365,13 +13443,97 @@ class OptimizedMATD3:
                                  sample_weights, fr_batch, should_update_actor,
                                  global_actions_raw_all=None, global_actions_corrected_all=None,
                                  global_a_next_smooth=None, global_a_next_corr=None,
-                                 current_pf_batch_flat_precomputed=None, next_pf_batch_flat_precomputed=None):
+                                 current_pf_batch_flat_precomputed=None, next_pf_batch_flat_precomputed=None,
+                                 cross_agent_reference_actions=None, cross_agent_random_mask=None,
+                                 cross_agent_success_labels=None, cross_agent_reach_labels=None,
+                                 cross_agent_safe_labels=None, cross_agent_progress_labels=None,
+                                 cross_agent_final_goal_distance=None,
+                                 cross_agent_quality_valid_labels=None,
+                                 cross_agent_team_success_labels=None,
+                                 cross_agent_reference_active=False,
+                                 cross_agent_reference_pair_slot=0,
+                                 cross_agent_reference_pairs_per_agent=0,
+                                 cross_agent_reference_selector_success_weight=1.0,
+                                 cross_agent_reference_actor_weight=1.0):
         # 说明：为了减少 Python→Graph 往返开销，将逐智能体的训练合并到一次 tf.function 执行
         # 注意：这里不返回 Python 字典，直接在图内应用梯度更新
         # 统一张量类型与形状，避免 retracing
         obs_n = tf.ensure_shape(tf.convert_to_tensor(obs_n), [None, self.n_agents, None])
         next_obs_n = tf.ensure_shape(tf.convert_to_tensor(next_obs_n), [None, self.n_agents, None])
         act_n = tf.ensure_shape(tf.convert_to_tensor(act_n), [None, self.n_agents, None])
+        cross_agent_reference_selector_success_weight = tf.clip_by_value(
+            tf.cast(tf.convert_to_tensor(cross_agent_reference_selector_success_weight), tf.float32),
+            0.0,
+            1.0,
+        )
+        cross_agent_reference_actor_weight = tf.clip_by_value(
+            tf.cast(tf.convert_to_tensor(cross_agent_reference_actor_weight), tf.float32),
+            0.0,
+            1.0,
+        )
+        if cross_agent_reference_actions is None:
+            cross_agent_reference_actions = act_n
+        else:
+            cross_agent_reference_actions = tf.ensure_shape(
+                tf.convert_to_tensor(cross_agent_reference_actions),
+                [None, self.n_agents, None],
+            )
+        if cross_agent_random_mask is None:
+            cross_agent_random_mask = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_random_mask = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_random_mask), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_success_labels is None:
+            cross_agent_success_labels = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_success_labels = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_success_labels), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_reach_labels is None:
+            cross_agent_reach_labels = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_reach_labels = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_reach_labels), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_safe_labels is None:
+            cross_agent_safe_labels = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_safe_labels = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_safe_labels), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_progress_labels is None:
+            cross_agent_progress_labels = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_progress_labels = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_progress_labels), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_final_goal_distance is None:
+            cross_agent_final_goal_distance = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_final_goal_distance = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_final_goal_distance), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_quality_valid_labels is None:
+            cross_agent_quality_valid_labels = tf.zeros([tf.shape(act_n)[0], self.n_agents], dtype=tf.float32)
+        else:
+            cross_agent_quality_valid_labels = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_quality_valid_labels), tf.float32),
+                [None, self.n_agents],
+            )
+        if cross_agent_team_success_labels is None:
+            cross_agent_team_success_labels = tf.zeros([tf.shape(act_n)[0]], dtype=tf.float32)
+        else:
+            cross_agent_team_success_labels = tf.ensure_shape(
+                tf.cast(tf.convert_to_tensor(cross_agent_team_success_labels), tf.float32),
+                [None],
+            )
         # 兼容 fp16/bf16 缓冲区：先转张量，再安全 cast 到计算精度
         rew_n = tf.ensure_shape(tf.cast(tf.convert_to_tensor(rew_n), tf.float32), [None, self.n_agents])
         done_n = tf.ensure_shape(tf.cast(tf.convert_to_tensor(done_n), tf.float32), [None, self.n_agents])
@@ -12457,7 +13619,7 @@ class OptimizedMATD3:
             current_pf_batch_flat = tf.zeros([batch_size, self.n_agents * pf_feat_dim], dtype=tf.float32)
             next_pf_batch_flat = tf.zeros([batch_size, self.n_agents * pf_feat_dim], dtype=tf.float32)
             pf_forces_recomputed = None
-        
+
         # 🚨 标准MATD3：分别训练两个独立的Critic网络（使用persistent tape）
         with tf.GradientTape(persistent=True) as tape_c:
             total_critic1_loss = tf.constant(0.0, dtype=tf.float32)
@@ -12473,6 +13635,25 @@ class OptimizedMATD3:
             sw = tf.cast(sample_weights, tf.float32) if sample_weights is not None else None
             td_err_sum = tf.zeros([batch_size], dtype=tf.float32)
             td_err_cnt = tf.zeros([batch_size], dtype=tf.float32)
+            q_diag_count = tf.constant(0.0, dtype=tf.float32)
+            q_diag_current_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_current_sq_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_current_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_target_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_target_sq_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_target_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_y_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_y_sq_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_y_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_scaled_reward_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_scaled_reward_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_td_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_twin_gap_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            q_diag_reg_sum = tf.constant(0.0, dtype=tf.float32)
+            critic_diag_grad_none_fraction_sum = tf.constant(0.0, dtype=tf.float32)
+            critic_diag_grad_applied_fraction_sum = tf.constant(0.0, dtype=tf.float32)
+            critic_diag_var_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            critic_diag_grad_network_count = tf.constant(0.0, dtype=tf.float32)
             for i in range(self.n_agents):
                 agent_fairness_weight = tf.gather(fairness_weights, i)
                 rewards = tf.cast(rew_n[:, i], tf.float32)
@@ -12610,6 +13791,28 @@ class OptimizedMATD3:
                 td_err_sum += td_abs
                 td_err_cnt += tf.cast(_mask_all, tf.float32)
 
+                q_diag_mask = tf.cast(_mask_all, tf.float32)
+                q_diag_count_i = tf.reduce_sum(q_diag_mask)
+                current_q_mean_pair = tf.squeeze(0.5 * (current_qtot_1 + current_qtot_2), axis=1)
+                target_q_vec = tf.squeeze(target_q_next, axis=1)
+                y_vec = tf.squeeze(y_tot, axis=1)
+                scaled_reward_vec = tf.squeeze(scaled_rewards, axis=1)
+                twin_gap_vec = tf.squeeze(tf.abs(current_qtot_1 - current_qtot_2), axis=1)
+                q_diag_count += q_diag_count_i
+                q_diag_current_sum += tf.reduce_sum(current_q_mean_pair * q_diag_mask)
+                q_diag_current_sq_sum += tf.reduce_sum(tf.square(current_q_mean_pair) * q_diag_mask)
+                q_diag_current_abs_sum += tf.reduce_sum(tf.abs(current_q_mean_pair) * q_diag_mask)
+                q_diag_target_sum += tf.reduce_sum(target_q_vec * q_diag_mask)
+                q_diag_target_sq_sum += tf.reduce_sum(tf.square(target_q_vec) * q_diag_mask)
+                q_diag_target_abs_sum += tf.reduce_sum(tf.abs(target_q_vec) * q_diag_mask)
+                q_diag_y_sum += tf.reduce_sum(y_vec * q_diag_mask)
+                q_diag_y_sq_sum += tf.reduce_sum(tf.square(y_vec) * q_diag_mask)
+                q_diag_y_abs_sum += tf.reduce_sum(tf.abs(y_vec) * q_diag_mask)
+                q_diag_scaled_reward_sum += tf.reduce_sum(scaled_reward_vec * q_diag_mask)
+                q_diag_scaled_reward_abs_sum += tf.reduce_sum(tf.abs(scaled_reward_vec) * q_diag_mask)
+                q_diag_td_abs_sum += tf.reduce_sum(td_abs * q_diag_mask)
+                q_diag_twin_gap_abs_sum += tf.reduce_sum(twin_gap_vec * q_diag_mask)
+
                 td1 = tf.where(_mask_all, td1_full, tf.zeros_like(td1_full))
                 abs_td1 = tf.abs(td1)
                 squared_loss1 = 0.5 * tf.square(td1)
@@ -12650,6 +13853,7 @@ class OptimizedMATD3:
 
                 critic1_loss += critic1_reg_add
                 critic2_loss += critic2_reg_add
+                q_diag_reg_sum += (critic1_reg_add + critic2_reg_add) * q_diag_count_i
                 critic1_loss = critic1_loss * agent_fairness_weight
                 critic2_loss = critic2_loss * agent_fairness_weight
 
@@ -12681,30 +13885,70 @@ class OptimizedMATD3:
         for i in range(self.n_agents):
             s, e = per_agent_critic1_slices[i]
             agent_vars = self.agents[i]['critic1'].trainable_variables
-            agent_grads = [g for g in critic1_grads[s:e] if g is not None]
-            if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
+            agent_grad_var_pairs = [
+                (g, v) for g, v in zip(critic1_grads[s:e], agent_vars)
+                if g is not None
+            ]
+            agent_var_count = len(agent_vars)
+            agent_var_count_tf = tf.cast(max(agent_var_count, 1), tf.float32)
+            applied_fraction = tf.constant(0.0, dtype=tf.float32)
+            grad_abs_mean = tf.constant(0.0, dtype=tf.float32)
+            if agent_grad_var_pairs:
+                agent_grads = [g for g, _ in agent_grad_var_pairs]
+                grad_abs_values = [
+                    tf.reduce_mean(tf.abs(tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))))
+                    for g in agent_grads
+                ]
+                grad_abs_mean = tf.add_n(grad_abs_values) / tf.cast(len(grad_abs_values), tf.float32)
                 pairs, _ = _build_safe_gradient_pairs(
                     agent_grads,
-                    agent_vars,
+                    [v for _, v in agent_grad_var_pairs],
                     self.c_grad_clip_norm,
                     per_tensor_clip=1.0,
                 )
+                applied_fraction = tf.cast(len(pairs), tf.float32) / agent_var_count_tf
                 if pairs:
                     self.agents[i]['critic1_optimizer'].apply_gradients(pairs)
+            critic_diag_grad_none_fraction_sum += (
+                tf.cast(agent_var_count - len(agent_grad_var_pairs), tf.float32) / agent_var_count_tf
+            )
+            critic_diag_grad_applied_fraction_sum += applied_fraction
+            critic_diag_var_grad_abs_sum += grad_abs_mean
+            critic_diag_grad_network_count += tf.constant(1.0, dtype=tf.float32)
 
         for i in range(self.n_agents):
             s, e = per_agent_critic2_slices[i]
             agent_vars = self.agents[i]['critic2'].trainable_variables
-            agent_grads = [g for g in critic2_grads[s:e] if g is not None]
-            if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
+            agent_grad_var_pairs = [
+                (g, v) for g, v in zip(critic2_grads[s:e], agent_vars)
+                if g is not None
+            ]
+            agent_var_count = len(agent_vars)
+            agent_var_count_tf = tf.cast(max(agent_var_count, 1), tf.float32)
+            applied_fraction = tf.constant(0.0, dtype=tf.float32)
+            grad_abs_mean = tf.constant(0.0, dtype=tf.float32)
+            if agent_grad_var_pairs:
+                agent_grads = [g for g, _ in agent_grad_var_pairs]
+                grad_abs_values = [
+                    tf.reduce_mean(tf.abs(tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))))
+                    for g in agent_grads
+                ]
+                grad_abs_mean = tf.add_n(grad_abs_values) / tf.cast(len(grad_abs_values), tf.float32)
                 pairs, _ = _build_safe_gradient_pairs(
                     agent_grads,
-                    agent_vars,
+                    [v for _, v in agent_grad_var_pairs],
                     self.c_grad_clip_norm,
                     per_tensor_clip=1.0,
                 )
+                applied_fraction = tf.cast(len(pairs), tf.float32) / agent_var_count_tf
                 if pairs:
                     self.agents[i]['critic2_optimizer'].apply_gradients(pairs)
+            critic_diag_grad_none_fraction_sum += (
+                tf.cast(agent_var_count - len(agent_grad_var_pairs), tf.float32) / agent_var_count_tf
+            )
+            critic_diag_grad_applied_fraction_sum += applied_fraction
+            critic_diag_var_grad_abs_sum += grad_abs_mean
+            critic_diag_grad_network_count += tf.constant(1.0, dtype=tf.float32)
         del tape_c
 
         # === 统一训练所有 Actor（仅在延迟更新步进入）===
@@ -12713,8 +13957,68 @@ class OptimizedMATD3:
         # 正确修复是：在 Python 侧使用 should_update_actor_bool，让 tf.function 只保留两张稳定图
         # （更新 Actor / 不更新 Actor），从而彻底跳过非延迟步的 Actor 分支，而不重新引入图内条件控制流。
         if should_update_actor:
+            actor_diag_count = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_pg_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_to_pg_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_arc_eff_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_total_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_pg_action_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_action_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_to_pg_action_grad_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_grad_none_fraction_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_grad_applied_fraction_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_var_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_grad_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_loss_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_valid_ratio_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_loss_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_score_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_y_hindsight_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_y_q_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_y_mix_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_adv_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_adv_pos_ratio_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_head_score_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_tail_score_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_head_target_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_tail_target_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_active_float = tf.cast(bool(cross_agent_reference_active), tf.float32)
             actor_has_shared_pf_context = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
             actor_uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1 and self.action_dims[0] >= 3
+            cross_ref_supported = bool(
+                bool(cross_agent_reference_active)
+                and bool(getattr(self, 'cross_agent_reference_enabled', False))
+                and actor_has_shared_pf_context
+                and actor_uniform_action_dims
+                and len(self.obs_shapes) > 0
+                and self.obs_shapes[0] > int(getattr(self, 'cross_agent_reference_goal_distance_index', 59))
+            )
+            cross_ref_selector_mode = str(
+                getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard') or 'hard'
+            ).strip().lower()
+            cross_ref_r2s_mode = cross_ref_selector_mode in (
+                'reward_to_success_priority',
+                'reward_to_success_head_tail',
+            )
+            cross_ref_head_tail_selector = cross_ref_selector_mode == 'reward_to_success_head_tail'
+            cross_ref_uses_advantage = bool(
+                cross_ref_supported
+                and cross_ref_selector_mode in (
+                    'soft_advantage',
+                    'selector_mix',
+                    'reward_to_success_priority',
+                    'reward_to_success_head_tail',
+                )
+            )
+            cross_ref_uses_selector = bool(
+                cross_ref_supported
+                and cross_ref_selector_mode in CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES
+                and bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
+                and all('reference_selector' in self.agents[_idx] for _idx in range(self.n_agents))
+            )
             actor_pf_context_by_agent = None
             actor_pf_context_flat = ()
             actor_pf_geometry_context_flat = ()
@@ -12736,8 +14040,18 @@ class OptimizedMATD3:
                     actor_pf_context_flat[5],
                     actor_pf_context_flat[6],
                 )
+                actor_pf_context_by_agent = (
+                    tf.reshape(actor_pf_context_flat[0], [self.n_agents, -1, correct_obs_dim_actor]),
+                    tf.reshape(actor_pf_context_flat[1], [self.n_agents, -1, 3]),
+                    tf.reshape(actor_pf_context_flat[2], [self.n_agents, -1, 3]),
+                    tf.reshape(actor_pf_context_flat[3], [self.n_agents, -1, 1]),
+                    tf.reshape(actor_pf_context_flat[4], [self.n_agents, -1, 32]),
+                    tf.reshape(actor_pf_context_flat[5], [self.n_agents, -1, 15]),
+                    tf.reshape(actor_pf_context_flat[6], [self.n_agents, -1, 12]),
+                )
             with tf.GradientTape(persistent=True) as tape_a:
                 total_actor_loss = tf.constant(0.0, dtype=tf.float32)
+                total_selector_loss = tf.constant(0.0, dtype=tf.float32)
                 actor_losses = []
                 current_force_ratio_actor = fr_batch_safe
                 actor_use_pf = self.use_tf_potential_field_cached and tf.reduce_any(
@@ -12753,6 +14067,8 @@ class OptimizedMATD3:
                 actor_pf_params_for_tail_list = []
                 actor_action_for_tail_list = []
                 actor_arc_eff_list = []
+                actor_loss_pg_diag_list = []
+                actor_action_reg_diag_list = []
                 pf_mask = tf.reshape(self.c_pf_params_fixed, [1, 1])
                 base_actions_raw_f32 = (
                     tf.cast(global_actions_raw_all, tf.float32)
@@ -12801,6 +14117,7 @@ class OptimizedMATD3:
                         new_action_safe = tf.ensure_shape(new_action_safe, [None, agent_action_dim])
                     except Exception:
                         pass
+                    tape_a.watch(new_action_safe)
 
                     na_tail = new_action_safe[:, 3:agent_action_dim]
                     na_tail_safe = tf.clip_by_value(na_tail, -10.0, 10.0)
@@ -12832,7 +14149,8 @@ class OptimizedMATD3:
                     r_min_safe = tf.clip_by_value(r_min, -100.0, 100.0)
                     danger = tf.clip_by_value((tf.cast(3.0, tf.float32) - r_min_safe) / tf.cast(3.0, tf.float32), 0.0, 1.0)
                     arc_eff = _arc * (tf.cast(1.0, tf.float32) - tf.cast(0.7, tf.float32) * tf.reduce_mean(danger))
-                    arc_eff = tf.clip_by_value(arc_eff, 0.01, 10.0)
+                    arc_min = tf.cast(self.action_reg_min_coef_cached, tf.float32)
+                    arc_eff = tf.clip_by_value(arc_eff, arc_min, tf.cast(10.0, tf.float32))
 
                     actor_agent_fairness_weights.append(agent_fairness_weight)
                     actor_agents_list.append(agent)
@@ -12866,7 +14184,7 @@ class OptimizedMATD3:
                         tf.reshape(actor_pf_context_flat[0], [self.n_agents, -1, correct_obs_dim_actor]),
                         tf.reshape(actor_pf_context_flat[1], [self.n_agents, -1, 3]),
                         tf.reshape(actor_pf_context_flat[2], [self.n_agents, -1, 3]),
-                        actor_pf_context_flat[3],
+                        tf.reshape(actor_pf_context_flat[3], [self.n_agents, -1, 1]),
                         tf.reshape(actor_pf_context_flat[4], [self.n_agents, -1, 32]),
                         tf.reshape(actor_pf_context_flat[5], [self.n_agents, -1, 15]),
                         tf.reshape(actor_pf_context_flat[6], [self.n_agents, -1, 12]),
@@ -12897,7 +14215,7 @@ class OptimizedMATD3:
                                         actor_pf_context_by_agent[0][i],
                                         actor_pf_context_by_agent[1][i],
                                         actor_pf_context_by_agent[2][i],
-                                        actor_pf_context_by_agent[3],
+                                        actor_pf_context_by_agent[3][i],
                                         actor_pf_context_by_agent[4][i],
                                         actor_pf_context_by_agent[5][i],
                                         actor_pf_context_by_agent[6][i],
@@ -12963,16 +14281,12 @@ class OptimizedMATD3:
                             actor_q_corrected_tail = tf.minimum(actor_q2_corrected_1, actor_q2_corrected_2)
 
                             actor_q_raw_clipped = tf.clip_by_value(actor_q_raw, -q_clip, q_clip)
-                            _sum_q_raw = tf.reduce_sum(actor_q_raw_clipped)
-                            _cnt_q_raw = tf.cast(tf.size(actor_q_raw_clipped), tf.float32)
-                            loss_head = -(_sum_q_raw / tf.maximum(_cnt_q_raw, 1.0))
-
                             actor_q_corrected_tail_clipped = tf.clip_by_value(actor_q_corrected_tail, -q_clip, q_clip)
-                            _sum_q_corrected_tail = tf.reduce_sum(actor_q_corrected_tail_clipped)
-                            _cnt_q_corrected_tail = tf.cast(tf.size(actor_q_corrected_tail_clipped), tf.float32)
-                            loss_tail = -(_sum_q_corrected_tail / tf.maximum(_cnt_q_corrected_tail, 1.0))
 
-                            separated_loss_pg = head_weight * loss_head + tail_weight * loss_tail
+                            separated_loss_pg = -tf.reduce_mean(
+                                head_weight * actor_q_raw_clipped
+                                + tail_weight * actor_q_corrected_tail_clipped
+                            )
                             if hybrid_actor_mode:
                                 actor_qtot_1 = actor_q1_raw_1 + actor_q2_corrected_1
                                 actor_qtot_2 = actor_q1_raw_2 + actor_q2_corrected_2
@@ -13057,9 +14371,579 @@ class OptimizedMATD3:
 
                     action_reg = (head_reg + tail_reg) * tf.cast(arc_eff, new_action_safe.dtype) * tf.cast(1.2, arc_eff.dtype) * reg_scale
                     action_reg = tf.clip_by_value(action_reg, -1e6, 1e6)
-                    actor_loss = actor_loss_pg + tf.cast(action_reg, tf.float32)
+                    cross_ref_loss_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_valid_ratio_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_loss_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_score_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_y_hindsight_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_y_q_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_y_mix_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_adv_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_adv_pos_ratio_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_head_score_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_tail_score_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_head_target_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_selector_tail_target_i = tf.constant(0.0, dtype=tf.float32)
+                    if cross_ref_supported:
+                        ref_losses_i = []
+                        ref_valid_ratios_i = []
+                        ref_selector_losses_i = []
+                        ref_selector_scores_i = []
+                        ref_selector_head_scores_i = []
+                        ref_selector_tail_scores_i = []
+                        ref_selector_head_targets_i = []
+                        ref_selector_tail_targets_i = []
+                        ref_selector_y_hindsight_i = []
+                        ref_selector_y_q_i = []
+                        ref_selector_y_mix_i = []
+                        ref_selector_adv_i = []
+                        ref_selector_adv_pos_i = []
+                        ref_goal_idx = int(getattr(self, 'cross_agent_reference_goal_distance_index', 59))
+                        ref_head_weight = tf.cast(getattr(self, 'cross_agent_reference_head_weight_cached', 1.0), tf.float32)
+                        ref_tail_weight = tf.cast(getattr(self, 'cross_agent_reference_tail_weight_cached', 0.3), tf.float32)
+                        ref_progress_threshold = tf.cast(
+                            getattr(self, 'cross_agent_reference_progress_threshold_cached', 0.0005)
+                            + getattr(self, 'cross_agent_reference_margin_cached', 0.0),
+                            tf.float32,
+                        )
+                        ref_near_goal = tf.cast(
+                            getattr(self, 'cross_agent_reference_success_distance_norm_cached', 0.01),
+                            tf.float32,
+                        )
+                        ref_huber_delta = tf.cast(1.0, tf.float32)
+                        ref_batch_size_float = tf.maximum(tf.cast(batch_size, tf.float32), tf.cast(1.0, tf.float32))
+                        ref_pair_pool = max(int(self.n_agents) - 1, 0)
+                        ref_pair_limit = max(0, int(cross_agent_reference_pairs_per_agent or 0))
+                        ref_pair_slot = int(cross_agent_reference_pair_slot or 0)
+                        ref_pair_rotation_enabled = bool(0 < ref_pair_limit < ref_pair_pool)
+                        if ref_pair_rotation_enabled:
+                            ref_pair_limit = min(ref_pair_limit, ref_pair_pool)
+                            ref_pair_slot = ref_pair_slot % ref_pair_pool
+                        for ref_j in range(self.n_agents):
+                            if ref_j == i:
+                                continue
+                            if ref_pair_rotation_enabled:
+                                ref_rank = ref_j if ref_j < i else ref_j - 1
+                                ref_rank_from_slot = (ref_rank - ref_pair_slot) % ref_pair_pool
+                                if ref_rank_from_slot >= ref_pair_limit:
+                                    continue
+                            ref_obs = tf.cast(obs_n[:, ref_j, :self.obs_shapes[i]], tf.float32)
+                            ref_actor_inputs = [ref_obs]
+                            if self.use_fr_feature_flag:
+                                ref_actor_inputs.append(fr_batch_safe)
+                            if self.use_pf_feature_flag:
+                                pf_start_ref = ref_j * pf_feat_dim
+                                ref_pf_force = current_pf_batch_flat[:, pf_start_ref:pf_start_ref + pf_feat_dim]
+                                ref_actor_inputs.append(ref_pf_force)
+                            if len(ref_actor_inputs) == 1:
+                                ref_pred = agent['actor'](ref_actor_inputs[0], training=True)
+                            else:
+                                ref_pred = agent['actor'](ref_actor_inputs, training=True)
+                            ref_pred = tf.clip_by_value(tf.cast(ref_pred, tf.float32), -1.0, 1.0)
+                            ref_target = tf.stop_gradient(
+                                tf.clip_by_value(
+                                    tf.cast(cross_agent_reference_actions[:, ref_j, :agent_action_dim], tf.float32),
+                                    -1.0,
+                                    1.0,
+                                )
+                            )
+                            ref_delta = ref_pred - ref_target
+                            ref_abs = tf.abs(ref_delta)
+                            ref_quad = tf.minimum(ref_abs, ref_huber_delta)
+                            ref_linear = ref_abs - ref_quad
+                            ref_huber = tf.cast(0.5, tf.float32) * tf.square(ref_quad) + ref_huber_delta * ref_linear
+                            ref_head_loss = tf.reduce_mean(ref_huber[:, :3], axis=1)
+                            if agent_action_dim > 3:
+                                ref_tail_loss = tf.reduce_mean(ref_huber[:, 3:agent_action_dim], axis=1)
+                            else:
+                                ref_tail_loss = tf.zeros_like(ref_head_loss)
+                            ref_sample_loss = ref_head_weight * ref_head_loss + ref_tail_weight * ref_tail_loss
+
+                            ref_current_goal = tf.cast(obs_n[:, ref_j, ref_goal_idx], tf.float32)
+                            ref_next_goal = tf.cast(next_obs_n[:, ref_j, ref_goal_idx], tf.float32)
+                            ref_progress = ref_current_goal - ref_next_goal
+                            ref_finite_bool = tf.logical_and(
+                                tf.math.is_finite(ref_sample_loss),
+                                tf.reduce_all(tf.math.is_finite(ref_target), axis=1),
+                            )
+                            ref_gate_mode = str(
+                                getattr(self, 'cross_agent_reference_gate_mode_cached', 'progress') or 'progress'
+                            ).strip().lower()
+                            ref_label_valid_bool = tf.greater_equal(
+                                cross_agent_quality_valid_labels[:, ref_j],
+                                tf.cast(0.5, tf.float32),
+                            )
+                            ref_safe_bool = tf.greater_equal(
+                                cross_agent_safe_labels[:, ref_j],
+                                tf.cast(0.5, tf.float32),
+                            )
+                            ref_reach_bool = tf.greater_equal(
+                                cross_agent_reach_labels[:, ref_j],
+                                tf.cast(0.5, tf.float32),
+                            )
+                            ref_success_bool = tf.greater_equal(
+                                cross_agent_success_labels[:, ref_j],
+                                tf.cast(0.5, tf.float32),
+                            )
+                            ref_traj_progress_bool = tf.greater_equal(
+                                cross_agent_progress_labels[:, ref_j],
+                                ref_progress_threshold,
+                            )
+                            ref_traj_near_bool = tf.less_equal(
+                                cross_agent_final_goal_distance[:, ref_j],
+                                ref_near_goal,
+                            )
+                            if bool(getattr(self, 'cross_agent_reference_quality_gate', True)):
+                                if ref_gate_mode == 'agent_success':
+                                    ref_quality_bool = tf.logical_and(
+                                        ref_label_valid_bool,
+                                        ref_success_bool,
+                                    )
+                                elif ref_gate_mode == 'agent_quality':
+                                    ref_quality_bool = tf.logical_and(
+                                        tf.logical_and(ref_label_valid_bool, ref_safe_bool),
+                                        tf.logical_or(
+                                            ref_success_bool,
+                                            tf.logical_or(ref_reach_bool, tf.logical_or(ref_traj_progress_bool, ref_traj_near_bool)),
+                                        ),
+                                    )
+                                elif ref_gate_mode == 'team_success':
+                                    ref_quality_bool = tf.logical_and(
+                                        ref_label_valid_bool,
+                                        tf.greater_equal(cross_agent_team_success_labels, tf.cast(0.5, tf.float32)),
+                                    )
+                                else:
+                                    ref_quality_bool = tf.logical_or(
+                                        tf.greater_equal(ref_progress, ref_progress_threshold),
+                                        tf.less_equal(ref_next_goal, ref_near_goal),
+                                    )
+                            else:
+                                ref_quality_bool = tf.ones_like(ref_finite_bool, dtype=tf.bool)
+                            ref_base_valid = tf.cast(ref_finite_bool, tf.float32)
+                            ref_random = tf.clip_by_value(
+                                tf.cast(cross_agent_random_mask[:, ref_j], tf.float32),
+                                0.0,
+                                1.0,
+                            )
+                            if bool(getattr(self, 'cross_agent_reference_exclude_random', True)):
+                                ref_base_valid = ref_base_valid * (tf.cast(1.0, tf.float32) - ref_random)
+                            ref_hindsight = tf.cast(ref_quality_bool, tf.float32)
+
+                            ref_q_ref = tf.zeros_like(ref_sample_loss)
+                            ref_q_cur = tf.zeros_like(ref_sample_loss)
+                            ref_advantage = tf.zeros_like(ref_sample_loss)
+                            ref_y_q = tf.fill(tf.shape(ref_sample_loss), tf.cast(0.5, tf.float32))
+                            if cross_ref_uses_advantage:
+                                source_agent = self.agents[ref_j]
+                                ref_target_q_action = tf.stop_gradient(ref_target)
+                                ref_pred_q_action = tf.stop_gradient(ref_pred)
+
+                                def _build_ref_candidate_inputs(candidate_action):
+                                    candidate_action = tf.clip_by_value(tf.cast(candidate_action, tf.float32), -1.0, 1.0)
+                                    candidate_head = candidate_action[:, :3]
+                                    candidate_tail = candidate_action[:, 3:agent_action_dim]
+                                    candidate_raw_mapped = self._merge_action_head_tail_static(
+                                        candidate_head,
+                                        candidate_tail,
+                                        agent_action_dim,
+                                    )
+                                    if actor_use_pf:
+                                        pf_candidate_obs_context = (
+                                            actor_pf_context_by_agent[0][ref_j],
+                                            actor_pf_context_by_agent[1][ref_j],
+                                            actor_pf_context_by_agent[2][ref_j],
+                                            actor_pf_context_by_agent[3][ref_j],
+                                            actor_pf_context_by_agent[4][ref_j],
+                                            actor_pf_context_by_agent[5][ref_j],
+                                            actor_pf_context_by_agent[6][ref_j],
+                                        )
+                                        corrected_candidate_head, _ = self._apply_potential_field_correction_from_context_tf(
+                                            candidate_action,
+                                            current_force_ratio_actor,
+                                            *pf_candidate_obs_context,
+                                        )
+                                    else:
+                                        corrected_candidate_head = candidate_head
+                                    candidate_corrected_mapped = self._merge_action_head_tail_static(
+                                        corrected_candidate_head,
+                                        candidate_tail,
+                                        agent_action_dim,
+                                    )
+                                    candidate_raw_global = self._replace_agent_action_slice_static(
+                                        base_actions_raw_f32,
+                                        candidate_raw_mapped,
+                                        ref_j,
+                                    )
+                                    candidate_corrected_global = self._replace_agent_action_slice_static(
+                                        base_actions_corrected_f32,
+                                        candidate_corrected_mapped,
+                                        ref_j,
+                                    )
+                                    candidate_raw_inputs = [global_state, candidate_raw_global]
+                                    candidate_corrected_inputs = [global_state, candidate_corrected_global]
+                                    if self.use_fr_feature_flag:
+                                        candidate_raw_inputs.append(fr_batch_safe)
+                                        candidate_corrected_inputs.append(fr_batch_safe)
+                                    if self.use_pf_feature_flag:
+                                        candidate_raw_inputs.append(current_pf_batch_flat)
+                                        candidate_corrected_inputs.append(current_pf_batch_flat)
+                                    return candidate_raw_inputs, candidate_corrected_inputs
+
+                                ref_raw_inputs, ref_corrected_inputs = _build_ref_candidate_inputs(ref_target_q_action)
+                                cur_raw_inputs, cur_corrected_inputs = _build_ref_candidate_inputs(ref_pred_q_action)
+                                if dual_q_mode:
+                                    (
+                                        ref_q1_head_1,
+                                        _,
+                                        _,
+                                        ref_q1_tail_1,
+                                        cur_q1_head_1,
+                                        _,
+                                        _,
+                                        cur_q1_tail_1,
+                                    ) = self._forward_twin_critic_quad(
+                                        source_agent['critic1'],
+                                        ref_raw_inputs,
+                                        ref_corrected_inputs,
+                                        cur_raw_inputs,
+                                        cur_corrected_inputs,
+                                        training=False,
+                                    )
+                                    (
+                                        ref_q1_head_2,
+                                        _,
+                                        _,
+                                        ref_q1_tail_2,
+                                        cur_q1_head_2,
+                                        _,
+                                        _,
+                                        cur_q1_tail_2,
+                                    ) = self._forward_twin_critic_quad(
+                                        source_agent['critic2'],
+                                        ref_raw_inputs,
+                                        ref_corrected_inputs,
+                                        cur_raw_inputs,
+                                        cur_corrected_inputs,
+                                        training=False,
+                                    )
+                                    ref_q_ref = tf.squeeze(
+                                        tf.minimum(ref_q1_head_1 + ref_q1_tail_1, ref_q1_head_2 + ref_q1_tail_2),
+                                        axis=1,
+                                    )
+                                    ref_q_cur = tf.squeeze(
+                                        tf.minimum(cur_q1_head_1 + cur_q1_tail_1, cur_q1_head_2 + cur_q1_tail_2),
+                                        axis=1,
+                                    )
+                                else:
+                                    ref_q_out_1 = tf.cast(source_agent['critic1'](ref_corrected_inputs, training=False), tf.float32)
+                                    ref_q_out_2 = tf.cast(source_agent['critic2'](ref_corrected_inputs, training=False), tf.float32)
+                                    cur_q_out_1 = tf.cast(source_agent['critic1'](cur_corrected_inputs, training=False), tf.float32)
+                                    cur_q_out_2 = tf.cast(source_agent['critic2'](cur_corrected_inputs, training=False), tf.float32)
+                                    ref_q_ref = tf.squeeze(tf.minimum(ref_q_out_1, ref_q_out_2), axis=1)
+                                    ref_q_cur = tf.squeeze(tf.minimum(cur_q_out_1, cur_q_out_2), axis=1)
+                                ref_q_ref = tf.stop_gradient(tf.where(tf.math.is_finite(ref_q_ref), ref_q_ref, tf.zeros_like(ref_q_ref)))
+                                ref_q_cur = tf.stop_gradient(tf.where(tf.math.is_finite(ref_q_cur), ref_q_cur, tf.zeros_like(ref_q_cur)))
+                                ref_q_ref = tf.clip_by_value(ref_q_ref, -q_clip, q_clip)
+                                ref_q_cur = tf.clip_by_value(ref_q_cur, -q_clip, q_clip)
+                                ref_advantage = tf.stop_gradient(ref_q_ref - ref_q_cur)
+                                adv_tau = tf.cast(getattr(self, 'cross_agent_reference_selector_q_tau_cached', 500.0), tf.float32)
+                                adv_clip = tf.cast(getattr(self, 'cross_agent_reference_selector_adv_clip_cached', 5.0), tf.float32)
+                                ref_advantage_scaled = tf.clip_by_value(ref_advantage / tf.maximum(adv_tau, tf.cast(1e-6, tf.float32)), -adv_clip, adv_clip)
+                                ref_y_q = tf.stop_gradient(tf.sigmoid(ref_advantage_scaled))
+                            else:
+                                ref_advantage_scaled = tf.zeros_like(ref_sample_loss)
+                            selector_alpha = tf.cast(getattr(self, 'cross_agent_reference_selector_alpha_cached', 0.7), tf.float32)
+                            ref_y_mix = tf.stop_gradient(
+                                tf.clip_by_value(selector_alpha * ref_hindsight + (tf.cast(1.0, tf.float32) - selector_alpha) * ref_y_q, 0.0, 1.0)
+                            )
+                            ref_selector_target = ref_y_mix
+                            if cross_ref_r2s_mode:
+                                reward_tau = tf.cast(
+                                    getattr(self, 'cross_agent_reference_selector_reward_tau_cached', 500.0),
+                                    tf.float32,
+                                )
+                                reward_clip = tf.cast(
+                                    getattr(self, 'cross_agent_reference_selector_adv_clip_cached', 5.0),
+                                    tf.float32,
+                                )
+                                ref_reward = tf.stop_gradient(tf.cast(rew_n[:, ref_j], tf.float32))
+                                ref_reward_scaled = tf.clip_by_value(
+                                    ref_reward / tf.maximum(reward_tau, tf.cast(1e-6, tf.float32)),
+                                    -reward_clip,
+                                    reward_clip,
+                                )
+                                ref_y_reward = tf.stop_gradient(tf.sigmoid(ref_reward_scaled))
+                                ref_team_success_bool = tf.greater_equal(
+                                    cross_agent_team_success_labels,
+                                    tf.cast(0.5, tf.float32),
+                                )
+                                ref_reach_or_near_bool = tf.logical_or(ref_reach_bool, ref_traj_near_bool)
+                                ref_success_tier = tf.maximum(
+                                    tf.cast(tf.logical_and(ref_label_valid_bool, ref_team_success_bool), tf.float32) * tf.cast(4.0, tf.float32),
+                                    tf.cast(tf.logical_and(ref_label_valid_bool, ref_success_bool), tf.float32) * tf.cast(3.0, tf.float32),
+                                )
+                                ref_success_tier = tf.maximum(
+                                    ref_success_tier,
+                                    tf.cast(
+                                        tf.logical_and(
+                                            tf.logical_and(ref_label_valid_bool, ref_safe_bool),
+                                            ref_reach_or_near_bool,
+                                        ),
+                                        tf.float32,
+                                    ) * tf.cast(2.0, tf.float32),
+                                )
+                                ref_success_tier = tf.maximum(
+                                    ref_success_tier,
+                                    tf.cast(
+                                        tf.logical_or(
+                                            tf.logical_and(
+                                                tf.logical_and(ref_label_valid_bool, ref_safe_bool),
+                                                ref_traj_progress_bool,
+                                            ),
+                                            tf.logical_and(
+                                                tf.logical_not(ref_label_valid_bool),
+                                                tf.logical_or(ref_traj_progress_bool, ref_traj_near_bool),
+                                            ),
+                                        ),
+                                        tf.float32,
+                                    ),
+                                )
+                                ref_y_success_tier = tf.clip_by_value(ref_success_tier / tf.cast(4.0, tf.float32), 0.0, 1.0)
+                                reward_tiebreak = tf.cast(
+                                    getattr(self, 'cross_agent_reference_selector_reward_tiebreak_cached', 0.05),
+                                    tf.float32,
+                                )
+                                ref_y_success_priority = tf.clip_by_value(
+                                    ref_y_success_tier + reward_tiebreak * ref_y_reward,
+                                    0.0,
+                                    1.0,
+                                )
+                                success_phase_weight = tf.cast(
+                                    cross_agent_reference_selector_success_weight,
+                                    tf.float32,
+                                )
+                                ref_selector_target = tf.stop_gradient(
+                                    tf.clip_by_value(
+                                        (tf.cast(1.0, tf.float32) - success_phase_weight) * ref_y_reward
+                                        + success_phase_weight * ref_y_success_priority,
+                                        0.0,
+                                        1.0,
+                                    )
+                                )
+
+                            if cross_ref_selector_mode == 'soft_advantage':
+                                ref_weight = ref_base_valid * ref_y_mix
+                            elif cross_ref_uses_selector:
+                                q_norm = tf.maximum(tf.cast(q_clip, tf.float32), tf.cast(1.0, tf.float32))
+                                selector_feature_parts = [
+                                    tf.stop_gradient(ref_obs),
+                                    tf.stop_gradient(ref_target),
+                                    tf.stop_gradient(ref_pred),
+                                    tf.stop_gradient(ref_target - ref_pred),
+                                    tf.expand_dims(ref_progress, axis=1),
+                                    tf.expand_dims(ref_current_goal, axis=1),
+                                    tf.expand_dims(ref_next_goal, axis=1),
+                                    tf.expand_dims(cross_agent_final_goal_distance[:, ref_j], axis=1),
+                                    tf.expand_dims(tf.cast(ref_success_bool, tf.float32), axis=1),
+                                    tf.expand_dims(tf.cast(ref_reach_bool, tf.float32), axis=1),
+                                    tf.expand_dims(tf.cast(ref_safe_bool, tf.float32), axis=1),
+                                    tf.expand_dims(tf.cast(cross_agent_team_success_labels, tf.float32), axis=1),
+                                    tf.expand_dims(tf.cast(ref_label_valid_bool, tf.float32), axis=1),
+                                    tf.expand_dims(ref_random, axis=1),
+                                    tf.expand_dims(ref_base_valid, axis=1),
+                                    tf.expand_dims(ref_q_ref / q_norm, axis=1),
+                                    tf.expand_dims(ref_q_cur / q_norm, axis=1),
+                                    tf.expand_dims(ref_advantage_scaled, axis=1),
+                                    fr_batch_safe,
+                                ]
+                                if cross_ref_r2s_mode:
+                                    selector_feature_parts.append(tf.expand_dims(ref_reward_scaled, axis=1))
+                                selector_features = tf.concat(selector_feature_parts, axis=1)
+                                selector_features = tf.stop_gradient(selector_features)
+                                selector_base_sum = tf.reduce_sum(ref_base_valid)
+                                selector_output = tf.cast(agent['reference_selector'](selector_features, training=True), tf.float32)
+                                if cross_ref_head_tail_selector:
+                                    selector_score_head = selector_output[:, 0]
+                                    selector_score_tail = selector_output[:, 1]
+                                    selector_score_head = tf.clip_by_value(
+                                        tf.where(tf.math.is_finite(selector_score_head), selector_score_head, tf.zeros_like(selector_score_head)),
+                                        tf.cast(1e-5, tf.float32),
+                                        tf.cast(1.0 - 1e-5, tf.float32),
+                                    )
+                                    selector_score_tail = tf.clip_by_value(
+                                        tf.where(tf.math.is_finite(selector_score_tail), selector_score_tail, tf.zeros_like(selector_score_tail)),
+                                        tf.cast(1e-5, tf.float32),
+                                        tf.cast(1.0 - 1e-5, tf.float32),
+                                    )
+                                    selector_target_head = tf.stop_gradient(ref_selector_target)
+                                    selector_tail_valid = tf.cast(
+                                        tf.logical_and(ref_safe_bool, ref_label_valid_bool),
+                                        tf.float32,
+                                    )
+                                    selector_target_tail = tf.stop_gradient(
+                                        tf.clip_by_value(ref_selector_target * selector_tail_valid, 0.0, 1.0)
+                                    )
+                                    selector_head_bce = -(
+                                        selector_target_head * tf.math.log(selector_score_head)
+                                        + (tf.cast(1.0, tf.float32) - selector_target_head)
+                                        * tf.math.log(tf.cast(1.0, tf.float32) - selector_score_head)
+                                    )
+                                    selector_tail_bce = -(
+                                        selector_target_tail * tf.math.log(selector_score_tail)
+                                        + (tf.cast(1.0, tf.float32) - selector_target_tail)
+                                        * tf.math.log(tf.cast(1.0, tf.float32) - selector_score_tail)
+                                    )
+                                    selector_tail_loss_scale = tf.cast(0.5, tf.float32)
+                                    selector_bce = selector_head_bce + selector_tail_loss_scale * selector_tail_bce
+                                    head_actor_gate = tf.ones_like(ref_base_valid)
+                                    tail_actor_gate = tf.ones_like(ref_base_valid)
+                                    head_ref_weight = ref_base_valid * tf.stop_gradient(head_actor_gate * selector_score_head)
+                                    tail_ref_weight = ref_base_valid * tf.stop_gradient(
+                                        tail_actor_gate * tf.minimum(selector_score_tail, selector_score_head)
+                                    )
+                                    ref_weight = head_ref_weight
+                                    ref_weighted_sample_loss = (
+                                        ref_head_weight * ref_head_loss * head_ref_weight
+                                        + ref_tail_weight * ref_tail_loss * tail_ref_weight
+                                    )
+                                    ref_selector_scores_i.append(
+                                        tf.reduce_sum(selector_score_head * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_head_scores_i.append(
+                                        tf.reduce_sum(selector_score_head * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_tail_scores_i.append(
+                                        tf.reduce_sum(selector_score_tail * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_head_targets_i.append(
+                                        tf.reduce_sum(selector_target_head * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_tail_targets_i.append(
+                                        tf.reduce_sum(selector_target_tail * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                else:
+                                    selector_score = tf.squeeze(selector_output, axis=1)
+                                    selector_score = tf.clip_by_value(
+                                        tf.where(tf.math.is_finite(selector_score), selector_score, tf.zeros_like(selector_score)),
+                                        tf.cast(1e-5, tf.float32),
+                                        tf.cast(1.0 - 1e-5, tf.float32),
+                                    )
+                                    selector_bce = -(
+                                        ref_selector_target * tf.math.log(selector_score)
+                                        + (tf.cast(1.0, tf.float32) - ref_selector_target)
+                                        * tf.math.log(tf.cast(1.0, tf.float32) - selector_score)
+                                    )
+                                    ref_weight = ref_base_valid * tf.stop_gradient(selector_score)
+                                    ref_selector_scores_i.append(
+                                        tf.reduce_sum(selector_score * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_head_scores_i.append(
+                                        tf.reduce_sum(selector_score * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_tail_scores_i.append(
+                                        tf.reduce_sum(selector_score * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_head_targets_i.append(
+                                        tf.reduce_sum(ref_selector_target * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                    ref_selector_tail_targets_i.append(
+                                        tf.reduce_sum(ref_selector_target * ref_base_valid)
+                                        / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                    )
+                                selector_loss_j = tf.reduce_sum(selector_bce * ref_base_valid) / tf.maximum(selector_base_sum, tf.cast(1.0, tf.float32))
+                                selector_loss_j = tf.where(tf.math.is_finite(selector_loss_j), selector_loss_j, tf.cast(0.0, tf.float32))
+                                total_selector_loss += selector_loss_j
+                                ref_selector_losses_i.append(selector_loss_j)
+                            else:
+                                ref_weight = ref_base_valid * ref_hindsight
+                            if cross_ref_selector_mode == 'hard' and not bool(getattr(self, 'cross_agent_reference_quality_gate', True)):
+                                ref_weight = ref_base_valid
+                            ref_weight = tf.where(tf.math.is_finite(ref_weight), ref_weight, tf.zeros_like(ref_weight))
+                            ref_valid_sum = tf.reduce_sum(ref_weight)
+                            if cross_ref_head_tail_selector and cross_ref_uses_selector:
+                                ref_loss_j = tf.reduce_sum(ref_weighted_sample_loss) / tf.maximum(ref_valid_sum, tf.cast(1.0, tf.float32))
+                            else:
+                                ref_loss_j = tf.reduce_sum(ref_sample_loss * ref_weight) / tf.maximum(ref_valid_sum, tf.cast(1.0, tf.float32))
+                            ref_losses_i.append(ref_loss_j)
+                            ref_valid_ratios_i.append(ref_valid_sum / ref_batch_size_float)
+                            ref_diag_sum = tf.maximum(tf.reduce_sum(ref_base_valid), tf.cast(1.0, tf.float32))
+                            ref_selector_y_hindsight_i.append(tf.reduce_sum(ref_hindsight * ref_base_valid) / ref_diag_sum)
+                            ref_selector_y_q_i.append(tf.reduce_sum(ref_y_q * ref_base_valid) / ref_diag_sum)
+                            ref_selector_y_mix_i.append(tf.reduce_sum(ref_selector_target * ref_base_valid) / ref_diag_sum)
+                            ref_selector_adv_i.append(tf.reduce_sum(ref_advantage * ref_base_valid) / ref_diag_sum)
+                            ref_selector_adv_pos_i.append(
+                                tf.reduce_sum(tf.cast(ref_advantage > tf.cast(0.0, tf.float32), tf.float32) * ref_base_valid) / ref_diag_sum
+                            )
+                        if len(ref_losses_i) > 0:
+                            cross_ref_loss_i = tf.add_n(ref_losses_i) / tf.cast(len(ref_losses_i), tf.float32)
+                            cross_ref_valid_ratio_i = tf.add_n(ref_valid_ratios_i) / tf.cast(len(ref_valid_ratios_i), tf.float32)
+                            cross_ref_loss_i = tf.where(
+                                tf.math.is_finite(cross_ref_loss_i),
+                                cross_ref_loss_i,
+                                tf.cast(0.0, tf.float32),
+                            )
+                            cross_ref_valid_ratio_i = tf.where(
+                                tf.math.is_finite(cross_ref_valid_ratio_i),
+                                cross_ref_valid_ratio_i,
+                                tf.cast(0.0, tf.float32),
+                            )
+                            if len(ref_selector_losses_i) > 0:
+                                cross_ref_selector_loss_i = tf.add_n(ref_selector_losses_i) / tf.cast(len(ref_selector_losses_i), tf.float32)
+                                cross_ref_selector_score_i = tf.add_n(ref_selector_scores_i) / tf.cast(len(ref_selector_scores_i), tf.float32)
+                            if len(ref_selector_head_scores_i) > 0:
+                                cross_ref_selector_head_score_i = tf.add_n(ref_selector_head_scores_i) / tf.cast(len(ref_selector_head_scores_i), tf.float32)
+                                cross_ref_selector_tail_score_i = tf.add_n(ref_selector_tail_scores_i) / tf.cast(len(ref_selector_tail_scores_i), tf.float32)
+                                cross_ref_selector_head_target_i = tf.add_n(ref_selector_head_targets_i) / tf.cast(len(ref_selector_head_targets_i), tf.float32)
+                                cross_ref_selector_tail_target_i = tf.add_n(ref_selector_tail_targets_i) / tf.cast(len(ref_selector_tail_targets_i), tf.float32)
+                            if len(ref_selector_y_hindsight_i) > 0:
+                                cross_ref_selector_y_hindsight_i = tf.add_n(ref_selector_y_hindsight_i) / tf.cast(len(ref_selector_y_hindsight_i), tf.float32)
+                                cross_ref_selector_y_q_i = tf.add_n(ref_selector_y_q_i) / tf.cast(len(ref_selector_y_q_i), tf.float32)
+                                cross_ref_selector_y_mix_i = tf.add_n(ref_selector_y_mix_i) / tf.cast(len(ref_selector_y_mix_i), tf.float32)
+                                cross_ref_selector_adv_i = tf.add_n(ref_selector_adv_i) / tf.cast(len(ref_selector_adv_i), tf.float32)
+                                cross_ref_selector_adv_pos_ratio_i = tf.add_n(ref_selector_adv_pos_i) / tf.cast(len(ref_selector_adv_pos_i), tf.float32)
+                        cross_ref_loss_sum += cross_ref_loss_i
+                        cross_ref_valid_ratio_sum += cross_ref_valid_ratio_i
+                        cross_ref_agent_count += tf.constant(1.0, dtype=tf.float32)
+                        cross_ref_selector_loss_sum += cross_ref_selector_loss_i
+                        cross_ref_selector_score_sum += cross_ref_selector_score_i
+                        cross_ref_selector_y_hindsight_sum += cross_ref_selector_y_hindsight_i
+                        cross_ref_selector_y_q_sum += cross_ref_selector_y_q_i
+                        cross_ref_selector_y_mix_sum += cross_ref_selector_y_mix_i
+                        cross_ref_selector_adv_sum += cross_ref_selector_adv_i
+                        cross_ref_selector_adv_pos_ratio_sum += cross_ref_selector_adv_pos_ratio_i
+                        cross_ref_selector_head_score_sum += cross_ref_selector_head_score_i
+                        cross_ref_selector_tail_score_sum += cross_ref_selector_tail_score_i
+                        cross_ref_selector_head_target_sum += cross_ref_selector_head_target_i
+                        cross_ref_selector_tail_target_sum += cross_ref_selector_tail_target_i
+                        cross_ref_selector_agent_count += tf.constant(1.0, dtype=tf.float32)
+                    cross_ref_coef = (
+                        tf.cast(getattr(self, 'cross_agent_reference_coef_cached', 0.03), tf.float32)
+                        * cross_agent_reference_actor_weight
+                    )
+                    cross_ref_loss_weighted = cross_ref_coef * cross_ref_loss_i
+                    cross_ref_loss_weighted = tf.clip_by_value(cross_ref_loss_weighted, -1e6, 1e6)
+                    actor_loss = actor_loss_pg + tf.cast(action_reg, tf.float32) + tf.cast(cross_ref_loss_weighted, tf.float32)
                     actor_loss = actor_loss * agent_fairness_weight
                     actor_loss = tf.clip_by_value(actor_loss, -1e6, 1e6)
+                    pg_abs = tf.abs(tf.cast(actor_loss_pg, tf.float32))
+                    reg_abs = tf.abs(tf.cast(action_reg, tf.float32))
+                    actor_diag_count += tf.constant(1.0, dtype=tf.float32)
+                    actor_diag_pg_abs_sum += pg_abs
+                    actor_diag_reg_abs_sum += reg_abs
+                    actor_diag_reg_to_pg_sum += reg_abs / tf.maximum(pg_abs, tf.cast(1e-6, tf.float32))
+                    actor_diag_arc_eff_sum += tf.cast(arc_eff, tf.float32)
+                    actor_diag_total_abs_sum += tf.abs(tf.cast(actor_loss, tf.float32))
+                    actor_loss_pg_diag_list.append(actor_loss_pg)
+                    actor_action_reg_diag_list.append(action_reg)
                     actor_losses.append(actor_loss)
                     total_actor_loss += tf.cast(actor_loss, tf.float32)
 
@@ -13071,23 +14955,131 @@ class OptimizedMATD3:
                 all_actor_vars.extend(v)
                 per_agent_actor_slices.append((start, start + len(v)))
                 start += len(v)
+            for loss_pg_i, action_reg_i, action_i in zip(
+                actor_loss_pg_diag_list,
+                actor_action_reg_diag_list,
+                actor_new_action_safe_list,
+            ):
+                pg_action_grad = tape_a.gradient(
+                    loss_pg_i,
+                    action_i,
+                    unconnected_gradients=tf.UnconnectedGradients.ZERO,
+                )
+                reg_action_grad = tape_a.gradient(
+                    action_reg_i,
+                    action_i,
+                    unconnected_gradients=tf.UnconnectedGradients.ZERO,
+                )
+                pg_action_grad = tf.where(
+                    tf.math.is_finite(pg_action_grad),
+                    pg_action_grad,
+                    tf.zeros_like(pg_action_grad),
+                )
+                reg_action_grad = tf.where(
+                    tf.math.is_finite(reg_action_grad),
+                    reg_action_grad,
+                    tf.zeros_like(reg_action_grad),
+                )
+                pg_action_grad_abs = tf.reduce_mean(tf.abs(pg_action_grad))
+                reg_action_grad_abs = tf.reduce_mean(tf.abs(reg_action_grad))
+                actor_diag_pg_action_grad_abs_sum += pg_action_grad_abs
+                actor_diag_reg_action_grad_abs_sum += reg_action_grad_abs
+                actor_diag_reg_to_pg_action_grad_sum += (
+                    reg_action_grad_abs / tf.maximum(pg_action_grad_abs, tf.cast(1e-9, tf.float32))
+                )
             actor_grads = tape_a.gradient(total_actor_loss, all_actor_vars)
             for i in range(self.n_agents):
                 s, e = per_agent_actor_slices[i]
                 agent_vars = self.agents[i]['actor'].trainable_variables
-                agent_grads = [g for g in actor_grads[s:e] if g is not None]
-                if len(agent_grads) == len(agent_vars) and len(agent_grads) > 0:
+                agent_grad_var_pairs = [
+                    (g, v) for g, v in zip(actor_grads[s:e], agent_vars)
+                    if g is not None
+                ]
+                agent_var_count = len(agent_vars)
+                agent_var_count_tf = tf.cast(max(agent_var_count, 1), tf.float32)
+                applied_fraction = tf.constant(0.0, dtype=tf.float32)
+                grad_abs_mean = tf.constant(0.0, dtype=tf.float32)
+                if agent_grad_var_pairs:
+                    agent_grads = [g for g, _ in agent_grad_var_pairs]
+                    grad_abs_values = [
+                        tf.reduce_mean(tf.abs(tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))))
+                        for g in agent_grads
+                    ]
+                    grad_abs_mean = tf.add_n(grad_abs_values) / tf.cast(len(grad_abs_values), tf.float32)
                     pairs, _ = _build_safe_gradient_pairs(
                         agent_grads,
-                        agent_vars,
+                        [v for _, v in agent_grad_var_pairs],
                         self.c_grad_clip_norm,
                         per_tensor_clip=1.0,
                     )
+                    applied_fraction = tf.cast(len(pairs), tf.float32) / agent_var_count_tf
                     if pairs:
                         self.agents[i]['actor_optimizer'].apply_gradients(pairs)
+                actor_diag_grad_none_fraction_sum += (
+                    tf.cast(agent_var_count - len(agent_grad_var_pairs), tf.float32) / agent_var_count_tf
+                )
+                actor_diag_grad_applied_fraction_sum += applied_fraction
+                actor_diag_var_grad_abs_sum += grad_abs_mean
+                actor_diag_grad_agent_count += tf.constant(1.0, dtype=tf.float32)
+            if cross_ref_uses_selector:
+                all_selector_vars = []
+                per_agent_selector_slices = []
+                selector_start = 0
+                for i in range(self.n_agents):
+                    selector_vars_i = self.agents[i]['reference_selector'].trainable_variables
+                    all_selector_vars.extend(selector_vars_i)
+                    per_agent_selector_slices.append((selector_start, selector_start + len(selector_vars_i)))
+                    selector_start += len(selector_vars_i)
+                selector_grads = tape_a.gradient(total_selector_loss, all_selector_vars)
+                for i in range(self.n_agents):
+                    s, e = per_agent_selector_slices[i]
+                    selector_vars_i = self.agents[i]['reference_selector'].trainable_variables
+                    selector_grad_var_pairs = [
+                        (g, v) for g, v in zip(selector_grads[s:e], selector_vars_i)
+                        if g is not None
+                    ]
+                    if selector_grad_var_pairs:
+                        selector_grads_i = [g for g, _ in selector_grad_var_pairs]
+                        selector_pairs, _ = _build_safe_gradient_pairs(
+                            selector_grads_i,
+                            [v for _, v in selector_grad_var_pairs],
+                            self.c_grad_clip_norm,
+                            per_tensor_clip=1.0,
+                        )
+                        if selector_pairs:
+                            self.agents[i]['reference_selector_optimizer'].apply_gradients(selector_pairs)
             del tape_a
             actor_losses_vec = tf.stack(actor_losses) if len(actor_losses) > 0 else tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
         else:
+            actor_diag_count = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_pg_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_to_pg_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_arc_eff_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_total_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_pg_action_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_action_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_reg_to_pg_action_grad_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_grad_none_fraction_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_grad_applied_fraction_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_var_grad_abs_sum = tf.constant(0.0, dtype=tf.float32)
+            actor_diag_grad_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_loss_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_valid_ratio_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_loss_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_score_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_y_hindsight_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_y_q_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_y_mix_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_adv_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_adv_pos_ratio_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_head_score_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_tail_score_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_head_target_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_tail_target_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_active_float = tf.cast(bool(cross_agent_reference_active), tf.float32)
             actor_losses_vec = tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
 
         # === 图内软更新目标网络（彻底解决XLA兼容性问题）===
@@ -13117,8 +15109,76 @@ class OptimizedMATD3:
         td_err_vec = td_err_sum / td_err_cnt_safe
         td_err_vec = tf.where(tf.math.is_finite(td_err_vec), td_err_vec, tf.zeros_like(td_err_vec))
         td_err_vec = tf.stop_gradient(td_err_vec)
-        # 返回 loss 向量、有效样本计数与TD误差
-        return critic_losses_vec, actor_losses_vec, valid_counts, td_err_vec
+        q_diag_count_safe = tf.maximum(q_diag_count, tf.cast(1.0, tf.float32))
+        current_q_mean = q_diag_current_sum / q_diag_count_safe
+        current_q_var = tf.maximum(q_diag_current_sq_sum / q_diag_count_safe - tf.square(current_q_mean), 0.0)
+        target_q_mean = q_diag_target_sum / q_diag_count_safe
+        target_q_var = tf.maximum(q_diag_target_sq_sum / q_diag_count_safe - tf.square(target_q_mean), 0.0)
+        y_mean = q_diag_y_sum / q_diag_count_safe
+        y_var = tf.maximum(q_diag_y_sq_sum / q_diag_count_safe - tf.square(y_mean), 0.0)
+        critic_diag_grad_network_count_safe = tf.maximum(critic_diag_grad_network_count, tf.cast(1.0, tf.float32))
+        actor_diag_count_safe = tf.maximum(actor_diag_count, tf.cast(1.0, tf.float32))
+        actor_diag_grad_agent_count_safe = tf.maximum(actor_diag_grad_agent_count, tf.cast(1.0, tf.float32))
+        cross_ref_agent_count_safe = tf.maximum(cross_ref_agent_count, tf.cast(1.0, tf.float32))
+        cross_ref_selector_agent_count_safe = tf.maximum(cross_ref_selector_agent_count, tf.cast(1.0, tf.float32))
+        matd3_q_diag_vec = tf.stack([
+            current_q_mean,
+            tf.sqrt(current_q_var),
+            q_diag_current_abs_sum / q_diag_count_safe,
+            target_q_mean,
+            tf.sqrt(target_q_var),
+            q_diag_target_abs_sum / q_diag_count_safe,
+            y_mean,
+            tf.sqrt(y_var),
+            q_diag_y_abs_sum / q_diag_count_safe,
+            q_diag_scaled_reward_sum / q_diag_count_safe,
+            q_diag_scaled_reward_abs_sum / q_diag_count_safe,
+            q_diag_td_abs_sum / q_diag_count_safe,
+            q_diag_twin_gap_abs_sum / q_diag_count_safe,
+            q_diag_reg_sum / q_diag_count_safe,
+            critic_diag_grad_none_fraction_sum / critic_diag_grad_network_count_safe,
+            critic_diag_grad_applied_fraction_sum / critic_diag_grad_network_count_safe,
+            critic_diag_var_grad_abs_sum / critic_diag_grad_network_count_safe,
+            actor_diag_pg_abs_sum / actor_diag_count_safe,
+            actor_diag_reg_abs_sum / actor_diag_count_safe,
+            actor_diag_reg_to_pg_sum / actor_diag_count_safe,
+            actor_diag_arc_eff_sum / actor_diag_count_safe,
+            actor_diag_total_abs_sum / actor_diag_count_safe,
+            actor_diag_pg_action_grad_abs_sum / actor_diag_count_safe,
+            actor_diag_reg_action_grad_abs_sum / actor_diag_count_safe,
+            actor_diag_reg_to_pg_action_grad_sum / actor_diag_count_safe,
+            actor_diag_grad_none_fraction_sum / actor_diag_grad_agent_count_safe,
+            actor_diag_grad_applied_fraction_sum / actor_diag_grad_agent_count_safe,
+            actor_diag_var_grad_abs_sum / actor_diag_grad_agent_count_safe,
+            cross_ref_loss_sum / cross_ref_agent_count_safe,
+            cross_ref_valid_ratio_sum / cross_ref_agent_count_safe,
+            (
+                tf.cast(getattr(self, 'cross_agent_reference_coef_cached', 0.0), tf.float32)
+                * cross_ref_active_float
+                * cross_agent_reference_actor_weight
+            ),
+            cross_ref_active_float,
+            cross_ref_selector_loss_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_score_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_y_hindsight_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_y_q_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_y_mix_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_adv_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_adv_pos_ratio_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_head_score_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_tail_score_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_head_target_sum / cross_ref_selector_agent_count_safe,
+            cross_ref_selector_tail_target_sum / cross_ref_selector_agent_count_safe,
+            cross_agent_reference_actor_weight * cross_ref_active_float,
+        ])
+        matd3_q_diag_vec = tf.where(
+            tf.math.is_finite(matd3_q_diag_vec),
+            matd3_q_diag_vec,
+            tf.zeros_like(matd3_q_diag_vec),
+        )
+        matd3_q_diag_vec = tf.stop_gradient(matd3_q_diag_vec)
+        # 返回 loss 向量、有效样本计数、TD误差与Q尺度诊断
+        return critic_losses_vec, actor_losses_vec, valid_counts, td_err_vec, matd3_q_diag_vec
     
     def _soft_update_targets(self):
         """🚨 标准MATD3：软更新目标网络（包括两个独立的Twin Critic）"""
@@ -14474,6 +16534,8 @@ class OptimizedMATD3:
         # 保存每个智能体的网络
         for i, agent in enumerate(self.agents):
             agent['actor'].save_weights(os.path.join(path, f'actor_{i}.weights.h5'))
+            if 'reference_selector' in agent:
+                agent['reference_selector'].save_weights(os.path.join(path, f'reference_selector_{i}.weights.h5'))
             # 🚨 标准MATD3：保存两个独立的Critic网络
             agent['critic1'].save_weights(os.path.join(path, f'critic1_{i}.weights.h5'))
             agent['critic2'].save_weights(os.path.join(path, f'critic2_{i}.weights.h5'))
@@ -14510,6 +16572,12 @@ class OptimizedMATD3:
                     agent['target_critic2'].load_weights(target_critic2_path)
                 else:
                     agent['target_critic2'].set_weights(agent['critic2'].get_weights())
+                selector_path = os.path.join(path, f'reference_selector_{i}.weights.h5')
+                if 'reference_selector' in agent and os.path.exists(selector_path):
+                    try:
+                        agent['reference_selector'].load_weights(selector_path)
+                    except Exception as selector_exc:
+                        print(f"[模型加载] ⚠️  Agent{i} selector加载失败，保留随机初始化: {selector_exc}")
                 print(f"[模型加载] ✅ Agent{i} 加载成功（标准MATD3 Twin Critic）")
             except Exception as e:
                 print(f"[模型加载] ❌ Agent{i} 加载失败: {e}")
@@ -15131,6 +17199,39 @@ def train(args):
         return config
 
     def _capture_training_hyperparameters_config():
+        def _env_bool(name, fallback=False):
+            try:
+                raw = os.getenv(name, '')
+                if str(raw).strip():
+                    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                pass
+            return bool(fallback)
+
+        def _env_int(name, fallback):
+            try:
+                raw = os.getenv(name, '')
+                if str(raw).strip():
+                    return int(raw)
+            except Exception:
+                pass
+            return int(fallback)
+
+        def _env_float(name, fallback):
+            try:
+                raw = os.getenv(name, '')
+                if str(raw).strip():
+                    return float(raw)
+            except Exception:
+                pass
+            return float(fallback)
+
+        def _arg_float(name, fallback):
+            value = getattr(args, name, fallback)
+            if value is None:
+                return float(fallback)
+            return float(value)
+
         algo_name = str(getattr(args, "algo", "") or "").strip().lower()
         if algo_name == "matd3":
             use_dual_q = bool(getattr(args, "matd3_use_dual_q", True))
@@ -15167,6 +17268,50 @@ def train(args):
 
         return {
             "replay_buffer_size": int(getattr(args, "buffer_size", 0) or 0),
+            "learning_rate_actor": float(getattr(args, "learning_rate_actor", 0.0) or 0.0),
+            "learning_rate_critic": float(getattr(args, "learning_rate_critic", 0.0) or 0.0),
+            "huber_delta": float(getattr(args, "huber_delta", 0.0) or 0.0),
+            "lr_decay_enabled": bool(getattr(args, "lr_decay_enabled", False)),
+            "lr_decay_steps": int(getattr(args, "lr_decay_steps", 0) or 0),
+            "lr_decay_rate": float(getattr(args, "lr_decay_rate", 0.0) or 0.0),
+            "lr_min_actor": float(getattr(args, "lr_min_actor", 0.0) or 0.0),
+            "lr_min_critic": float(getattr(args, "lr_min_critic", 0.0) or 0.0),
+            "actor_hidden": str(getattr(args, "actor_hidden", "") or ""),
+            "critic_hidden": str(getattr(args, "critic_hidden", "") or ""),
+            "buffer_dtype": str(getattr(args, "buffer_dtype", "") or ""),
+            "update_rate": int(getattr(args, "update_rate", 0) or 0),
+            "actor_update_delay": int(getattr(args, "actor_update_delay", 0) or 0),
+            "policy_noise": float(getattr(args, "policy_noise", 0.0) or 0.0),
+            "noise_clip": float(getattr(args, "noise_clip", 0.0) or 0.0),
+            "policy_freq": int(getattr(args, "policy_freq", 0) or 0),
+            "per_replace": bool(getattr(args, "per_replace", False)),
+            "per_uniform_mix": float(getattr(args, "per_uniform_mix", 0.0) or 0.0),
+            "per_td_weight": float(getattr(args, "per_td_weight", 0.0) or 0.0),
+            "per_reward_weight": float(getattr(args, "per_reward_weight", 0.0) or 0.0),
+            "per_age_decay": float(getattr(args, "per_age_decay", 0.0) or 0.0),
+            "noise_scale": float(getattr(args, "noise_scale", 0.0) or 0.0),
+            "noise_decay": float(getattr(args, "noise_decay", 0.0) or 0.0),
+            "noise_min": float(getattr(args, "noise_min", 0.0) or 0.0),
+            "adaptive_patience": _env_int("ADAPTIVE_PATIENCE", 25),
+            "adaptive_lr_decay": _env_float("ADAPTIVE_LR_DECAY", 0.98),
+            "adaptive_actor_lr_decay": _env_float("ADAPTIVE_ACTOR_LR_DECAY", _env_float("ADAPTIVE_LR_DECAY", 0.98)),
+            "adaptive_critic_lr_decay": _env_float("ADAPTIVE_CRITIC_LR_DECAY", _env_float("ADAPTIVE_LR_DECAY", 0.98)),
+            "adaptive_min_lr": _env_float("ADAPTIVE_MIN_LR", 8e-5),
+            "adaptive_min_actor_lr": _env_float("ADAPTIVE_MIN_ACTOR_LR", _env_float("ADAPTIVE_MIN_LR", 8e-5)),
+            "adaptive_min_critic_lr": _env_float("ADAPTIVE_MIN_CRITIC_LR", _env_float("ADAPTIVE_MIN_LR", 8e-5)),
+            "adaptive_plateau_enabled": _env_bool("ADAPTIVE_PLATEAU_ENABLED", False),
+            "adaptive_plateau_window": _env_int("ADAPTIVE_PLATEAU_WINDOW", 50),
+            "adaptive_plateau_rel_delta": _env_float("ADAPTIVE_PLATEAU_REL_DELTA", 0.03),
+            "adaptive_plateau_slope_eps": _env_float("ADAPTIVE_PLATEAU_SLOPE_EPS", 0.002),
+            "adaptive_noise_max": _env_float("ADAPTIVE_NOISE_MAX", 0.12),
+            "adaptive_noise_smooth": _env_float("ADAPTIVE_NOISE_SMOOTH", 0.4),
+            "noise_restart_interval": _env_int("NOISE_RESTART_INTERVAL", 25),
+            "reward_scale": float(getattr(args, "reward_scale", 0.0) or 0.0),
+            "q_clip_value": float(getattr(args, "q_clip_value", 0.0) or 0.0),
+            "critic_q_reg": float(getattr(args, "critic_q_reg", 0.0) or 0.0),
+            "action_reg_coef": float(getattr(args, "action_reg_coef", 0.0) or 0.0),
+            "action_reg_min_coef": _env_float("ACTION_REG_MIN_COEF", 0.0),
+            "neg_z_reg_coef": float(getattr(args, "neg_z_reg_coef", 0.0) or 0.0),
             "action_force_ratio": float(getattr(args, "action_force_ratio", 0.0) or 0.0),
             "action_force_ratio_schedule_pct": str(getattr(args, "action_force_ratio_schedule_pct", "") or ""),
             "actor_objective_mode": str(actor_objective_mode),
@@ -15177,6 +17322,35 @@ def train(args):
             "action_semantics_mode": str(action_semantics_mode),
             "replay_action_semantics_mode": str(action_semantics_mode),
             "reconstruct_corrected_target": bool(reconstruct_corrected_target),
+            "cross_agent_reference_enabled": bool(getattr(args, "cross_agent_reference_enabled", False)),
+            "cross_agent_reference_coef": float(getattr(args, "cross_agent_reference_coef", 0.0) or 0.0),
+            "cross_agent_reference_start_episode": int(getattr(args, "cross_agent_reference_start_episode", 0) or 0),
+            "cross_agent_reference_update_interval": int(getattr(args, "cross_agent_reference_update_interval", 1) or 1),
+            "cross_agent_reference_pairs_per_agent": int(getattr(args, "cross_agent_reference_pairs_per_agent", 0) or 0),
+            "cross_agent_reference_progress_threshold": float(getattr(args, "cross_agent_reference_progress_threshold", 0.0) or 0.0),
+            "cross_agent_reference_margin": float(getattr(args, "cross_agent_reference_margin", 0.0) or 0.0),
+            "cross_agent_reference_head_weight": float(getattr(args, "cross_agent_reference_head_weight", 0.0) or 0.0),
+            "cross_agent_reference_tail_weight": float(getattr(args, "cross_agent_reference_tail_weight", 0.0) or 0.0),
+            "cross_agent_reference_use_clean_label": bool(getattr(args, "cross_agent_reference_use_clean_label", True)),
+            "cross_agent_reference_target_semantics": str(getattr(args, "cross_agent_reference_target_semantics", "legacy") or "legacy"),
+            "cross_agent_reference_exclude_random": bool(getattr(args, "cross_agent_reference_exclude_random", True)),
+            "cross_agent_reference_quality_gate": bool(getattr(args, "cross_agent_reference_quality_gate", True)),
+            "cross_agent_reference_gate_mode": str(getattr(args, "cross_agent_reference_gate_mode", "progress") or "progress"),
+            "cross_agent_reference_selector_enabled": bool(getattr(args, "cross_agent_reference_selector_enabled", False)),
+            "cross_agent_reference_selector_mode": str(getattr(args, "cross_agent_reference_selector_mode", "hard") or "hard"),
+            "cross_agent_reference_selector_alpha": _arg_float("cross_agent_reference_selector_alpha", 0.7),
+            "cross_agent_reference_selector_q_tau": _arg_float("cross_agent_reference_selector_q_tau", 500.0),
+            "cross_agent_reference_selector_lr": _arg_float("cross_agent_reference_selector_lr", 1e-4),
+            "cross_agent_reference_selector_hidden": str(getattr(args, "cross_agent_reference_selector_hidden", "128,64") or "128,64"),
+            "cross_agent_reference_selector_init_logit": _arg_float("cross_agent_reference_selector_init_logit", -2.0),
+            "cross_agent_reference_selector_adv_clip": _arg_float("cross_agent_reference_selector_adv_clip", 5.0),
+            "cross_agent_reference_selector_reward_tau": _arg_float("cross_agent_reference_selector_reward_tau", 500.0),
+            "cross_agent_reference_selector_reward_tiebreak": _arg_float("cross_agent_reference_selector_reward_tiebreak", 0.05),
+            "cross_agent_reference_selector_success_stable_window": int(getattr(args, "cross_agent_reference_selector_success_stable_window", 100) or 100),
+            "cross_agent_reference_selector_success_stable_delta": _arg_float("cross_agent_reference_selector_success_stable_delta", 0.02),
+            "cross_agent_reference_selector_success_stable_min_rate": _arg_float("cross_agent_reference_selector_success_stable_min_rate", 0.05),
+            "cross_agent_reference_selector_success_stable_min_episodes": int(getattr(args, "cross_agent_reference_selector_success_stable_min_episodes", 200) or 200),
+            "cross_agent_reference_selector_success_ramp_episodes": int(getattr(args, "cross_agent_reference_selector_success_ramp_episodes", 50) or 50),
         }
 
     args.training_environment_config = _capture_training_environment_config()
@@ -15190,6 +17364,10 @@ def train(args):
         _run_tag = str(int(time.time()))
     run_dir = os.path.join("logs", args.exp_name, _run_tag)
     os.makedirs(run_dir, exist_ok=True)
+    try:
+        args._run_dir = run_dir
+    except Exception:
+        pass
     # 启动 TensorFlow Profiler（按需）
     try:
         profiling = os.getenv('PROFILING', '0').lower() in ('1','true','yes','on') or bool(getattr(args, 'profiling', False))
@@ -15352,11 +17530,11 @@ def train(args):
     try:
         if bool(getattr(args, 'enable_action_correction', True)):
             # 从args中获取势场参数，与TF版本保持一致
-            goal_attraction = float(getattr(args, 'goal_attraction', 2.5))
-            lambda_1_base = float(getattr(args, 'lambda_1_base', 6.5))
-            terrain_repulsion = float(getattr(args, 'terrain_repulsion', 60.0))
-            agent_influence_range = float(getattr(args, 'agent_influence_range', 30.0))
-            max_force_magnitude = float(getattr(args, 'max_force_magnitude', 8.8))
+            goal_attraction = float(getattr(args, 'goal_attraction', 26.0))
+            lambda_1_base = float(getattr(args, 'lambda_1_base', 8.5))
+            terrain_repulsion = float(getattr(args, 'terrain_repulsion', 1600.0))
+            agent_influence_range = float(getattr(args, 'agent_influence_range', 150.0))
+            max_force_magnitude = float(getattr(args, 'max_force_magnitude', 80.0))
             
             # 创建NumPy势场修正器，参数与TF版本一致
             maddpg.pf_correctors = []
@@ -15448,7 +17626,7 @@ def train(args):
             priority_td_weight=float(getattr(args, 'per_td_weight', 1.0)),
             priority_reward_weight=float(getattr(args, 'per_reward_weight', 0.0)),
             priority_age_decay=float(getattr(args, 'per_age_decay', 1.0)),
-            seed=per_seed  # 🚨 关键修复：传递种子，确保PER采样可重复
+            seed=per_seed,  # 🚨 关键修复：传递种子，确保PER采样可重复
         )
     else:
         replay_buffer = ReplayBuffer(
@@ -15645,7 +17823,6 @@ def train(args):
                 file=tqdm_file
             )
         _rebuild_env_after_curriculum_change()
-        _clear_replay_buffer_for_curriculum()
         _reset_target_networks_for_curriculum()
         _reduce_learning_rate_once_for_curriculum()
         _reset_optimizer_state_for_curriculum()
@@ -15784,6 +17961,16 @@ def train(args):
                     actor_losses_history = checkpoint_state.get('actor_losses_history', [])
                     critic_losses_history = checkpoint_state.get('critic_losses_history', [])
                     noise_scale_var_history = checkpoint_state.get('noise_scale_var_history', [])
+                    try:
+                        maddpg.training_stats['best_reward'] = float(best_reward)
+                        maddpg.training_stats['best_episode'] = int(best_episode)
+                    except Exception:
+                        pass
+                    try:
+                        hist = [float(x) for x in episode_rewards[-1000:] if np.isfinite(float(x))]
+                        maddpg.adaptive_learning['reward_history'] = hist
+                    except Exception:
+                        pass
                     maddpg._episode_success_flags = list(restored_success_flags)
                     maddpg._episode_agent_success_flags = list(restored_agent_success_flags)
                     maddpg._episode_team_success_flags = list(restored_team_success_flags)
@@ -16711,6 +18898,40 @@ def train(args):
         _cached_env_structure = None
         _cached_agents_list = None  # 🔧 性能优化：缓存agents列表，避免每步重复访问
         pending_single_transition = None
+        episode_replay_refs_by_env = {}
+        cross_ref_goal_distance_idx = int(getattr(maddpg, 'cross_agent_reference_goal_distance_index', 59))
+
+        def _record_episode_replay_refs(env_idx, write_result):
+            if write_result is None:
+                return
+            try:
+                positions, generations = write_result
+            except Exception:
+                return
+            try:
+                pos_arr = np.asarray(positions, dtype=np.int64).reshape(-1)
+                gen_arr = np.asarray(generations, dtype=np.int64).reshape(-1)
+            except Exception:
+                return
+            if pos_arr.size == 0 or gen_arr.size == 0:
+                return
+            n_ref = min(pos_arr.size, gen_arr.size)
+            refs = episode_replay_refs_by_env.setdefault(int(env_idx), [])
+            refs.extend((int(pos_arr[k]), int(gen_arr[k])) for k in range(n_ref))
+
+        def _extract_goal_distance_matrix(obs_batch):
+            out = np.zeros((int(env.num_envs), int(n_agents)), dtype=np.float32)
+            try:
+                arr = np.asarray(obs_batch, dtype=np.float32)
+                if arr.ndim == 3 and arr.shape[0] > 0 and arr.shape[1] > 0 and arr.shape[2] > cross_ref_goal_distance_idx:
+                    n_env = min(out.shape[0], arr.shape[0])
+                    n_ag = min(out.shape[1], arr.shape[1])
+                    out[:n_env, :n_ag] = arr[:n_env, :n_ag, cross_ref_goal_distance_idx]
+            except Exception:
+                pass
+            return out
+
+        episode_initial_goal_distance_matrix = _extract_goal_distance_matrix(processed_obs)
 
         def _compute_single_next_pf_features(single_next_obs, fr_value):
             if not (
@@ -16738,7 +18959,7 @@ def train(args):
                     pending_single_transition['next_obs_n'],
                     pending_single_transition['fr_value'],
                 )
-            replay_buffer.add_single_aligned(
+            write_ref = replay_buffer.add_single_aligned(
                 obs_n=pending_single_transition['obs_n'],
                 next_obs_n=pending_single_transition['next_obs_n'],
                 act_n=pending_single_transition['act_n'],
@@ -16750,7 +18971,10 @@ def train(args):
                 next_act_corrected=None,
                 pf_features=pending_single_transition['pf_features'],
                 next_pf_features=next_pf_features_single,
+                act_policy_clean=pending_single_transition.get('act_policy_clean'),
+                random_action_mask=pending_single_transition.get('random_action_mask'),
             )
+            _record_episode_replay_refs(0, write_ref)
             pending_single_transition = None
 
         replay_action_semantics_mode = "dual"
@@ -16758,13 +18982,14 @@ def train(args):
             replay_action_semantics_mode = str(
                 getattr(args, 'matd3_action_semantics_mode', 'dual') or 'dual'
             ).strip().lower()
+        cross_agent_reference_enabled = bool(getattr(args, 'cross_agent_reference_enabled', False))
 
         def _select_replay_action_channels(raw_storage_actions, corrected_execution_actions):
             if replay_action_semantics_mode == 'collapsed_replay':
                 collapsed = np.ascontiguousarray(corrected_execution_actions, dtype=np.float32)
                 return collapsed, collapsed
             return raw_storage_actions, corrected_execution_actions
-        
+
         for step in range(args.episode_length):
             step_start = time.time() if _profiling_enabled else None
             if timing_enabled:
@@ -16790,21 +19015,32 @@ def train(args):
             # 🔧 性能优化：训练主线固定使用向量化多返回值接口
             if _profiling_enabled:
                 with tf.profiler.experimental.Trace('action_select', step_num=step, _r=1):
-                    (
-                        actions_for_storage_tensor,
-                        actions_for_execution_tensor,
-                        pf_forces_tensor,
-                        raw_actor_outputs_tensor,
-                        current_pf_features_tensor,
-                    ) = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
+                    action_select_outputs = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
             else:
+                action_select_outputs = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
+            if len(action_select_outputs) == 6:
                 (
                     actions_for_storage_tensor,
                     actions_for_execution_tensor,
                     pf_forces_tensor,
                     raw_actor_outputs_tensor,
                     current_pf_features_tensor,
-                ) = maddpg.batch_select_actions_vectorized(_obs_tensor_cached, add_noise=True)
+                    random_action_mask_tensor,
+                ) = action_select_outputs
+            elif len(action_select_outputs) == 5:
+                (
+                    actions_for_storage_tensor,
+                    actions_for_execution_tensor,
+                    pf_forces_tensor,
+                    raw_actor_outputs_tensor,
+                    current_pf_features_tensor,
+                ) = action_select_outputs
+                random_action_mask_tensor = tf.zeros(
+                    tf.shape(actions_for_storage_tensor)[:2],
+                    dtype=tf.float32,
+                )
+            else:
+                raise RuntimeError(f"batch_select_actions_vectorized返回值数量错误: {len(action_select_outputs)}")
             if timing_enabled:
                 _dt_action = _perf_counter() - _t_action_start
                 timing_ep['action'] += _dt_action
@@ -16820,6 +19056,7 @@ def train(args):
                 (step == 0 or step % actor_output_interval == 0)
             )
             raw_actor_outputs_np = None
+            random_action_mask_np = None
             try:
                 num_envs_sync = int(getattr(env, 'num_envs', 1))
                 n_agents_sync = int(getattr(maddpg, 'n_agents', 3))
@@ -16830,6 +19067,7 @@ def train(args):
                 size3 = num_envs_sync * n_agents_sync * 3
                 size4 = num_envs_sync * n_agents_sync * 3
                 size5 = num_envs_sync * n_agents_sync * raw_action_dim_sync
+                size6 = num_envs_sync * n_agents_sync
                 sync_dtype = tf.float32
                 concat_parts = [
                     tf.cast(tf.reshape(actions_for_storage_tensor, [-1]), sync_dtype),
@@ -16837,8 +19075,11 @@ def train(args):
                     tf.cast(tf.reshape(pf_forces_tensor, [-1]), sync_dtype),
                     tf.cast(tf.reshape(current_pf_features_tensor, [-1]), sync_dtype),
                 ]
-                if collect_actor_outputs_this_step:
+                collect_policy_labels_this_step = bool(collect_actor_outputs_this_step or cross_agent_reference_enabled)
+                if collect_policy_labels_this_step:
                     concat_parts.append(tf.cast(tf.reshape(raw_actor_outputs_tensor, [-1]), sync_dtype))
+                if cross_agent_reference_enabled:
+                    concat_parts.append(tf.cast(tf.reshape(random_action_mask_tensor, [-1]), sync_dtype))
                 try:
                     combined_tf = tf.concat(concat_parts, axis=0)
                     flat = np.ascontiguousarray(_safe_tensor_to_numpy(combined_tf), dtype=np.float32)
@@ -16849,8 +19090,12 @@ def train(args):
                     raw_start = pf_feat_start + size4
                     pf_forces_np = flat[pf_start:pf_feat_start].reshape(num_envs_sync, n_agents_sync, 3)
                     current_pf_features_np = flat[pf_feat_start:raw_start].reshape(num_envs_sync, n_agents_sync, 3)
-                    if collect_actor_outputs_this_step:
+                    mask_start = raw_start
+                    if collect_policy_labels_this_step:
                         raw_actor_outputs_np = flat[raw_start:raw_start + size5].reshape(num_envs_sync, n_agents_sync, raw_action_dim_sync)
+                        mask_start = raw_start + size5
+                    if cross_agent_reference_enabled:
+                        random_action_mask_np = flat[mask_start:mask_start + size6].reshape(num_envs_sync, n_agents_sync)
                 except (AttributeError, RuntimeError, ValueError) as e:
                     if episode == 0 and not quiet_output and step < 10:
                         print(f"[警告] 动作合并同步失败，回退到分次转换: {e}")
@@ -16858,8 +19103,10 @@ def train(args):
                     actions = np.ascontiguousarray(_safe_tensor_to_numpy(actions_for_execution_tensor), dtype=np.float32)
                     pf_forces_np = np.ascontiguousarray(_safe_tensor_to_numpy(pf_forces_tensor), dtype=np.float32)
                     current_pf_features_np = np.ascontiguousarray(_safe_tensor_to_numpy(current_pf_features_tensor), dtype=np.float32)
-                    if collect_actor_outputs_this_step:
+                    if collect_policy_labels_this_step:
                         raw_actor_outputs_np = np.ascontiguousarray(_safe_tensor_to_numpy(raw_actor_outputs_tensor), dtype=np.float32)
+                    if cross_agent_reference_enabled:
+                        random_action_mask_np = np.ascontiguousarray(_safe_tensor_to_numpy(random_action_mask_tensor), dtype=np.float32)
             except Exception as e:
                 raise RuntimeError(f"当前训练主线的动作同步失败: {e}") from e
             
@@ -17424,7 +19671,11 @@ def train(args):
             next_obs_is_tensor = (len(processed_next_obs) > 0 and isinstance(processed_next_obs[0], tf.Tensor))
             # 🔧 主训练默认是单环境；这里直接命中单环境快路径，避免每步构造 list 再批量 coercion。
             if num_envs == 1:
-                if pending_single_transition is not None:
+                defer_pending_context_alignment = bool(
+                    pending_single_transition is not None
+                    and not (already_done_mask_len > 0 and already_done_mask[0])
+                )
+                if pending_single_transition is not None and not defer_pending_context_alignment:
                     try:
                         next_pf_features_single = None
                         if pending_single_transition.get('need_pf_features', False):
@@ -17453,9 +19704,35 @@ def train(args):
                         act_corrected_single = None
                         if replay_actions_corrected is not None and replay_actions_corrected.shape[0] == 1 and replay_actions_corrected.shape[1] == n_agents:
                             act_corrected_single = np.ascontiguousarray(replay_actions_corrected[0], dtype=np.float32)
+                        act_policy_clean_single = None
+                        if cross_agent_reference_enabled:
+                            if raw_actor_outputs_np is None or raw_actor_outputs_np.shape[0] < 1 or raw_actor_outputs_np.shape[1] != n_agents:
+                                raise RuntimeError("跨agent参考学习已启用，但当前步缺少clean Actor动作标签")
+                            act_policy_clean_single = np.ascontiguousarray(raw_actor_outputs_np[0], dtype=np.float32)
+                        random_action_mask_single = None
+                        if cross_agent_reference_enabled:
+                            if random_action_mask_np is None or random_action_mask_np.shape[0] < 1 or random_action_mask_np.shape[1] != n_agents:
+                                raise RuntimeError("跨agent参考学习已启用，但当前步缺少随机动作mask")
+                            random_action_mask_single = np.ascontiguousarray(random_action_mask_np[0], dtype=np.float32)
+                        if pending_single_transition is not None:
+                            try:
+                                next_pf_features_single = None
+                                if pending_single_transition.get('need_pf_features', False):
+                                    if current_pf_features_np is not None and current_pf_features_np.shape == (1, n_agents, 3):
+                                        next_pf_features_single = np.ascontiguousarray(current_pf_features_np[0], dtype=np.float32)
+                                    else:
+                                        next_pf_features_single = _compute_single_next_pf_features(
+                                            pending_single_transition['next_obs_n'],
+                                            pending_single_transition['fr_value'],
+                                        )
+                                _flush_pending_single_transition(
+                                    next_pf_features_override=next_pf_features_single,
+                                )
+                            except Exception as e:
+                                raise RuntimeError(f"当前训练主线的单环境延迟回放写入失败: {e}") from e
                         if all_done_now:
                             terminal_next_pf_features = _compute_single_next_pf_features(next_obs_np, current_fr_value)
-                            replay_buffer.add_single_aligned(
+                            write_ref = replay_buffer.add_single_aligned(
                                 obs_n=obs_np,
                                 next_obs_n=next_obs_np,
                                 act_n=replay_actions_for_storage[0],
@@ -17467,12 +19744,17 @@ def train(args):
                                 next_act_corrected=None,
                                 pf_features=current_pf_features_single,
                                 next_pf_features=terminal_next_pf_features,
+                                act_policy_clean=act_policy_clean_single,
+                                random_action_mask=random_action_mask_single,
                             )
+                            _record_episode_replay_refs(0, write_ref)
                         else:
                             pending_single_transition = {
                                 'obs_n': obs_np,
                                 'next_obs_n': next_obs_np,
                                 'act_n': replay_actions_for_storage[0],
+                                'act_policy_clean': act_policy_clean_single,
+                                'random_action_mask': random_action_mask_single,
                                 'rew_n': rew_n[0],
                                 'done_n': done_n[0],
                                 'fr_value': current_fr_value,
@@ -17493,7 +19775,9 @@ def train(args):
                 pf_forces_list = []
                 pf_features_list = []
                 act_corrected_list = []
-
+                act_policy_clean_list = []
+                random_action_mask_list = []
+                env_index_list = []
                 for i in range(num_envs):
                     if i < already_done_mask_len and already_done_mask[i]:
                         continue
@@ -17509,6 +19793,16 @@ def train(args):
                         act_corrected_single = None
                         if replay_actions_corrected is not None and replay_actions_corrected.shape[1] == n_agents and i < replay_actions_corrected.shape[0]:
                             act_corrected_single = np.ascontiguousarray(replay_actions_corrected[i], dtype=np.float32)
+                        act_policy_clean_single = None
+                        if cross_agent_reference_enabled:
+                            if raw_actor_outputs_np is None or raw_actor_outputs_np.shape[1] != n_agents or i >= raw_actor_outputs_np.shape[0]:
+                                raise RuntimeError(f"跨agent参考学习已启用，但env={i}缺少clean Actor动作标签")
+                            act_policy_clean_single = np.ascontiguousarray(raw_actor_outputs_np[i], dtype=np.float32)
+                        random_action_mask_single = None
+                        if cross_agent_reference_enabled:
+                            if random_action_mask_np is None or random_action_mask_np.shape[1] != n_agents or i >= random_action_mask_np.shape[0]:
+                                raise RuntimeError(f"跨agent参考学习已启用，但env={i}缺少随机动作mask")
+                            random_action_mask_single = np.ascontiguousarray(random_action_mask_np[i], dtype=np.float32)
                         obs_list.append(obs_np)
                         next_obs_list.append(next_obs_np)
                         action_list.append(replay_actions_for_storage[i])
@@ -17518,12 +19812,15 @@ def train(args):
                         pf_forces_list.append(pf_forces_single)
                         pf_features_list.append(current_pf_features_single)
                         act_corrected_list.append(act_corrected_single)
+                        act_policy_clean_list.append(act_policy_clean_single)
+                        random_action_mask_list.append(random_action_mask_single)
+                        env_index_list.append(int(i))
                     except Exception as e:
                         raise RuntimeError(f"当前训练主线的批量回放收集失败，env={i}: {e}") from e
 
                 if obs_list:
                     try:
-                        replay_buffer.add_batch(
+                        write_refs = replay_buffer.add_batch(
                             obs_batch=obs_list,
                             next_obs_batch=next_obs_list,
                             act_batch=action_list,
@@ -17534,7 +19831,22 @@ def train(args):
                             pf_features_batch=pf_features_list,
                             act_corrected_batch=act_corrected_list,
                             next_act_corrected_batch=None,
+                            act_policy_clean_batch=act_policy_clean_list if cross_agent_reference_enabled else None,
+                            random_action_mask_batch=random_action_mask_list if cross_agent_reference_enabled else None,
                         )
+                        try:
+                            written_positions, written_generations = write_refs
+                            written_positions = np.asarray(written_positions, dtype=np.int64).reshape(-1)
+                            written_generations = np.asarray(written_generations, dtype=np.int64).reshape(-1)
+                            n_written = min(len(env_index_list), written_positions.size, written_generations.size)
+                            for k in range(n_written):
+                                _record_episode_replay_refs(
+                                    env_index_list[k],
+                                    (np.asarray([written_positions[k]], dtype=np.int64),
+                                     np.asarray([written_generations[k]], dtype=np.int64)),
+                                )
+                        except Exception:
+                            pass
                     except Exception as e:
                         raise RuntimeError(f"当前训练主线的批量回放写入失败: {e}") from e
             if timing_enabled:
@@ -17612,6 +19924,10 @@ def train(args):
                 upd_t0 = time.time() if _profiling_enabled else None
                 if timing_enabled:
                     _t_upd0 = _perf_counter()
+                try:
+                    maddpg._current_episode_idx = int(episode)
+                except Exception:
+                    pass
                 with _stack_watchdog(stack_dump_timeout, label=f"maddpg.update episode={episode+1} step={step}"):
                     if _profiling_enabled:
                         with tf.profiler.experimental.Trace('update', step_num=int(maddpg.training_stats.get('train_steps', 0)), _r=1):
@@ -17637,8 +19953,78 @@ def train(args):
 
                 avg_critic_loss = None
                 avg_actor_loss = None
+                avg_cross_ref_loss = None
+                avg_cross_ref_valid_ratio = None
+                avg_cross_ref_selector_loss = None
+                avg_cross_ref_selector_score = None
+                avg_cross_ref_y_mix = None
+                avg_cross_ref_selector_target = None
+                avg_cross_ref_selector_head_score = None
+                avg_cross_ref_selector_tail_score = None
+                avg_cross_ref_selector_head_target = None
+                avg_cross_ref_selector_tail_target = None
+                avg_cross_ref_advantage = None
+                avg_cross_ref_advantage_pos_ratio = None
+                avg_cross_ref_selector_success_weight = None
+                avg_cross_ref_actor_weight = None
+                cross_ref_selector_phase = None
                 if losses:
                     avg_critic_loss, avg_actor_loss = _compute_loss_stats(losses)
+                    try:
+                        def _mean_loss_field(field_name):
+                            vals = [
+                                float(loss.get(field_name))
+                                for loss in losses
+                                if isinstance(loss, dict) and loss.get(field_name) is not None
+                            ]
+                            vals = [v for v in vals if np.isfinite(v)]
+                            return float(np.mean(vals)) if vals else None
+
+                        cross_ref_loss_vals = [
+                            float(loss.get('cross_ref_loss'))
+                            for loss in losses
+                            if isinstance(loss, dict) and loss.get('cross_ref_loss') is not None
+                        ]
+                        cross_ref_loss_vals = [v for v in cross_ref_loss_vals if np.isfinite(v)]
+                        if cross_ref_loss_vals:
+                            avg_cross_ref_loss = float(np.mean(cross_ref_loss_vals))
+                        cross_ref_valid_vals = [
+                            float(loss.get('cross_ref_valid_ratio'))
+                            for loss in losses
+                            if isinstance(loss, dict) and loss.get('cross_ref_valid_ratio') is not None
+                        ]
+                        cross_ref_valid_vals = [v for v in cross_ref_valid_vals if np.isfinite(v)]
+                        if cross_ref_valid_vals:
+                            avg_cross_ref_valid_ratio = float(np.mean(cross_ref_valid_vals))
+                        avg_cross_ref_selector_loss = _mean_loss_field('cross_ref_selector_loss')
+                        avg_cross_ref_selector_score = _mean_loss_field('cross_ref_selector_score')
+                        avg_cross_ref_y_mix = _mean_loss_field('cross_ref_y_mix')
+                        avg_cross_ref_selector_target = _mean_loss_field('cross_ref_selector_target')
+                        avg_cross_ref_selector_head_score = _mean_loss_field('cross_ref_selector_head_score')
+                        avg_cross_ref_selector_tail_score = _mean_loss_field('cross_ref_selector_tail_score')
+                        avg_cross_ref_selector_head_target = _mean_loss_field('cross_ref_selector_head_target')
+                        avg_cross_ref_selector_tail_target = _mean_loss_field('cross_ref_selector_tail_target')
+                        avg_cross_ref_advantage = _mean_loss_field('cross_ref_advantage')
+                        avg_cross_ref_advantage_pos_ratio = _mean_loss_field('cross_ref_advantage_pos_ratio')
+                        avg_cross_ref_selector_success_weight = _mean_loss_field('cross_ref_selector_success_weight')
+                        avg_cross_ref_actor_weight = _mean_loss_field('cross_ref_actor_weight')
+                        cross_ref_selector_phase = str(getattr(maddpg, '_last_cross_ref_selector_success_phase', 'reward'))
+                    except Exception:
+                        avg_cross_ref_loss = None
+                        avg_cross_ref_valid_ratio = None
+                        avg_cross_ref_selector_loss = None
+                        avg_cross_ref_selector_score = None
+                        avg_cross_ref_y_mix = None
+                        avg_cross_ref_selector_target = None
+                        avg_cross_ref_selector_head_score = None
+                        avg_cross_ref_selector_tail_score = None
+                        avg_cross_ref_selector_head_target = None
+                        avg_cross_ref_selector_tail_target = None
+                        avg_cross_ref_advantage = None
+                        avg_cross_ref_advantage_pos_ratio = None
+                        avg_cross_ref_selector_success_weight = None
+                        avg_cross_ref_actor_weight = None
+                        cross_ref_selector_phase = None
                     # 🔧 记录最近一次平均loss，用于进度条实时展示
                     last_avg_actor_loss = avg_actor_loss
                     last_avg_critic_loss = avg_critic_loss
@@ -17648,7 +20034,22 @@ def train(args):
                         'step': int(maddpg.training_stats.get('train_steps', 0)),
                         'episode': episode,  # 🔧 新增：记录回合索引，用于分别生成首/最佳/最后回合的Loss图
                         'critic_loss': avg_critic_loss,
-                        'actor_loss': avg_actor_loss
+                        'actor_loss': avg_actor_loss,
+                        'cross_ref_loss': avg_cross_ref_loss,
+                        'cross_ref_valid_ratio': avg_cross_ref_valid_ratio,
+                        'cross_ref_selector_loss': avg_cross_ref_selector_loss,
+                        'cross_ref_selector_score': avg_cross_ref_selector_score,
+                        'cross_ref_y_mix': avg_cross_ref_y_mix,
+                        'cross_ref_selector_target': avg_cross_ref_selector_target,
+                        'cross_ref_selector_head_score': avg_cross_ref_selector_head_score,
+                        'cross_ref_selector_tail_score': avg_cross_ref_selector_tail_score,
+                        'cross_ref_selector_head_target': avg_cross_ref_selector_head_target,
+                        'cross_ref_selector_tail_target': avg_cross_ref_selector_tail_target,
+                        'cross_ref_advantage': avg_cross_ref_advantage,
+                        'cross_ref_advantage_pos_ratio': avg_cross_ref_advantage_pos_ratio,
+                        'cross_ref_selector_success_weight': avg_cross_ref_selector_success_weight,
+                        'cross_ref_actor_weight': avg_cross_ref_actor_weight,
+                        'cross_ref_selector_phase': cross_ref_selector_phase,
                     })
                     # 🔧 新增：同时追加到可视化用的loss历史列表
                     if avg_actor_loss is not None:
@@ -17708,6 +20109,23 @@ def train(args):
                             tqdm.write(f"   异常信息: {', '.join(nan_info)}", file=tqdm_file)
                     
                     msg = f"步骤 {maddpg.training_stats['train_steps']}: 更新率={adaptive['current_update_rate']}, 批次大小={args.batch_size}, actor损失={log_actor:.4f}, critic损失={log_critic:.4f}, 总损失={total_loss:.4f}"
+                    if avg_cross_ref_loss is not None:
+                        msg += f" | cross_ref={avg_cross_ref_loss:.5f}"
+                    if avg_cross_ref_valid_ratio is not None:
+                        msg += f" | cross_ref_valid={avg_cross_ref_valid_ratio:.3f}"
+                    if avg_cross_ref_selector_loss is not None and avg_cross_ref_selector_loss > 0.0:
+                        msg += f" | selector_loss={avg_cross_ref_selector_loss:.5f}"
+                    if avg_cross_ref_selector_score is not None and avg_cross_ref_selector_score > 0.0:
+                        msg += f" | selector_score={avg_cross_ref_selector_score:.3f}"
+                    if avg_cross_ref_selector_success_weight is not None:
+                        msg += (
+                            f" | selector_phase={cross_ref_selector_phase or 'reward'}"
+                            f":{avg_cross_ref_selector_success_weight:.2f}"
+                        )
+                    if avg_cross_ref_actor_weight is not None:
+                        msg += f" | cross_ref_actor_w={avg_cross_ref_actor_weight:.2f}"
+                    if avg_cross_ref_advantage_pos_ratio is not None and avg_cross_ref_advantage_pos_ratio > 0.0:
+                        msg += f" | adv_pos={avg_cross_ref_advantage_pos_ratio:.3f}"
                     if should_record_nan:
                         msg += " [NaN!]"
                     
@@ -17854,6 +20272,7 @@ def train(args):
                 _flush_pending_single_transition()
             except Exception as e:
                 raise RuntimeError(f"当前训练主线的回合末单环境回放补写失败: {e}") from e
+        episode_final_goal_distance_matrix = _extract_goal_distance_matrix(processed_obs)
 
         # 打印奖励调试信息
         if not quiet_output:
@@ -18032,6 +20451,7 @@ def train(args):
             agent_reach_flags = []    # 每个智能体的到达目标标志（用于详细打印）
             agent_safe_flags = []     # 每个智能体的无碰撞标志（用于详细打印）
             agent_goal_distances = [] # 每个智能体终止帧到各自目标点的距离（用于失败诊断）
+            episode_quality_labels_by_env = {}
             team_success_flag = 1  # 跨子环境聚合：任一智能体失败则 0
             
             for env_idx, single_env in envs_to_check:
@@ -18058,6 +20478,9 @@ def train(args):
                         f"safe={type(w_safe).__name__ if w_safe is not None else 'None'}({len(w_safe) if isinstance(w_safe, (list, tuple)) else 'NA'}), "
                         f"succ={type(w_succ).__name__ if w_succ is not None else 'None'}({len(w_succ) if isinstance(w_succ, (list, tuple)) else 'NA'})"
                     )
+                env_reach_flags = []
+                env_safe_flags = []
+                env_success_flags = []
                 for i in range(len(w_succ)):
                     r_i = int(w_reach[i])
                     s_i = int(w_safe[i])
@@ -18065,8 +20488,36 @@ def train(args):
                     agent_reach_flags.append(r_i)
                     agent_safe_flags.append(s_i)
                     agent_success_flags.append(c_i)
+                    env_reach_flags.append(r_i)
+                    env_safe_flags.append(s_i)
+                    env_success_flags.append(c_i)
                     if c_i == 0:
                         team_success_flag = 0
+
+                try:
+                    init_goal = episode_initial_goal_distance_matrix[int(env_idx)].astype(np.float32, copy=False)
+                except Exception:
+                    init_goal = np.zeros((n_agents,), dtype=np.float32)
+                try:
+                    final_goal = episode_final_goal_distance_matrix[int(env_idx)].astype(np.float32, copy=False)
+                except Exception:
+                    final_goal = np.zeros((n_agents,), dtype=np.float32)
+                if init_goal.shape[0] != n_agents:
+                    fixed_init = np.zeros((n_agents,), dtype=np.float32)
+                    fixed_init[:min(n_agents, init_goal.shape[0])] = init_goal[:min(n_agents, init_goal.shape[0])]
+                    init_goal = fixed_init
+                if final_goal.shape[0] != n_agents:
+                    fixed_final = np.zeros((n_agents,), dtype=np.float32)
+                    fixed_final[:min(n_agents, final_goal.shape[0])] = final_goal[:min(n_agents, final_goal.shape[0])]
+                    final_goal = fixed_final
+                episode_quality_labels_by_env[int(env_idx)] = {
+                    'agent_success': np.asarray(env_success_flags[:n_agents], dtype=np.float32),
+                    'agent_reach': np.asarray(env_reach_flags[:n_agents], dtype=np.float32),
+                    'agent_safe': np.asarray(env_safe_flags[:n_agents], dtype=np.float32),
+                    'team_success': 1.0 if (env_success_flags and all(v == 1 for v in env_success_flags)) else 0.0,
+                    'agent_progress': np.asarray(init_goal - final_goal, dtype=np.float32),
+                    'agent_final_goal_distance': np.asarray(final_goal, dtype=np.float32),
+                }
 
                 world_agents = list(getattr(world, 'agents', []) or [])
                 scenario_ref = getattr(base_env, 'scenario', None)
@@ -18118,6 +20569,37 @@ def train(args):
             
             # 🚨 与 [成功记录] 一致：本回合成功 = 团队成功标志，写入 _episode_success_flags 供 [解锁计数] 使用
             maddpg._episode_success_flags.append(success_flag)
+
+            if cross_agent_reference_enabled and hasattr(replay_buffer, 'set_episode_quality_labels'):
+                labeled_transition_count = 0
+                labeled_env_count = 0
+                for _env_idx, _labels in episode_quality_labels_by_env.items():
+                    _refs = episode_replay_refs_by_env.get(int(_env_idx), [])
+                    if not _refs:
+                        continue
+                    try:
+                        _positions = np.asarray([p for p, _g in _refs], dtype=np.int64)
+                        _generations = np.asarray([_g for _p, _g in _refs], dtype=np.int64)
+                        _count = replay_buffer.set_episode_quality_labels(
+                            _positions,
+                            generations=_generations,
+                            agent_success=_labels.get('agent_success'),
+                            agent_reach=_labels.get('agent_reach'),
+                            agent_safe=_labels.get('agent_safe'),
+                            team_success=_labels.get('team_success', 0.0),
+                            agent_progress=_labels.get('agent_progress'),
+                            agent_final_goal_distance=_labels.get('agent_final_goal_distance'),
+                        )
+                        labeled_transition_count += int(_count)
+                        labeled_env_count += 1 if int(_count) > 0 else 0
+                    except Exception as label_exc:
+                        if not quiet_output:
+                            print(f"[cross-agent-reference] 回合{episode+1} Env{_env_idx} 标签回填失败: {label_exc}")
+                try:
+                    maddpg._last_cross_agent_reference_labeled_transitions = int(labeled_transition_count)
+                    maddpg._last_cross_agent_reference_labeled_envs = int(labeled_env_count)
+                except Exception:
+                    pass
             
             # 🚨 关键修复：更新累计成功计数
             if episode_success:
@@ -18130,7 +20612,8 @@ def train(args):
             #          Safe_i := 整个回合无真实碰撞/真实穿透
             #          Succ_i := Reach_i ∧ Safe_i
             #          Succ_team := Λ_{i=1}^{M} Succ_i
-            debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', '1').lower() in ('1','true','yes','on')
+            debug_episode_summary_default = '0' if quiet_output else '1'
+            debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', debug_episode_summary_default).lower() in ('1','true','yes','on')
             if debug_episode_summary:
                 # 🚨 关键修复：明确打印成功定义，帮助理解为什么"到达目标"不等于"成功"
                 try:
@@ -18189,7 +20672,8 @@ def train(args):
         
         # 🔧 调试：输出碰撞统计信息（每10回合输出一次，或当有碰撞时）
         # 🚨 关键修复：即使total_collisions为0也输出，帮助诊断为什么碰撞数一直是0
-        debug_collision_summary = os.getenv('DEBUG_COLLISION_SUMMARY', '1').lower() in ('1','true','yes','on')
+        debug_collision_summary_default = '0' if quiet_output else '1'
+        debug_collision_summary = os.getenv('DEBUG_COLLISION_SUMMARY', debug_collision_summary_default).lower() in ('1','true','yes','on')
         if debug_collision_summary and (len(maddpg._episode_collision_counts) % 10 == 0 or total_collisions > 0):
             # 🚨 新增：显示每个智能体的碰撞数，帮助诊断问题
             agent_counts = []
@@ -18860,7 +21344,7 @@ def train(args):
         )
         tqdm.write(summary_line, file=tqdm_file)
         try:
-            if getattr(args, 'per_enabled', False) and hasattr(maddpg, 'flush_pending_per_updates'):
+            if getattr(args, 'per_enabled', False) and bool(getattr(replay_buffer, 'use_per', False) or getattr(replay_buffer, 'use_global_per', False)) and hasattr(maddpg, 'flush_pending_per_updates'):
                 maddpg.flush_pending_per_updates(replay_buffer)
         except Exception:
             pass
@@ -18980,7 +21464,8 @@ def train(args):
 
         # 固定/随机均输出成功计数（成功=到达且未碰撞）
         try:
-            debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', '1').lower() in ('1','true','yes','on')
+            debug_episode_summary_default = '0' if quiet_output else '1'
+            debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', debug_episode_summary_default).lower() in ('1','true','yes','on')
             if debug_episode_summary and not random_mode_active:
                 # 🔧 增强输出：显示本回合是否判定为成功
                 current_ep_success = bool(maddpg._episode_success_flags[-1]) if getattr(maddpg, '_episode_success_flags', None) else False
@@ -20331,6 +22816,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="优化的MADDPG/MATD3训练脚本")
     # 算法选择
     parser.add_argument("--algo", type=str, default="maddpg", choices=["maddpg","matd3"], help="选择训练算法")
+    parser.add_argument("--algorithm-name", type=str, default=os.getenv("ALGORITHM_NAME", None),
+                       help="实验配置中的方法名标签，例如 DS_MATD3；不改变底层 --algo 选择")
     
     # 环境参数
     parser.add_argument("--scenario", type=str, default="paper3d_terrain_energy", help="场景名称")
@@ -20434,6 +22921,207 @@ def parse_args():
         help="MATD3 TD target阶段是否重构APF-corrected target action（默认来自MATD3_RECONSTRUCT_CORRECTED_TARGET）"
     )
     parser.add_argument(
+        "--cross-agent-reference-enabled",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_ENABLED', '0')).lower() in ('true', '1', 'yes', 'on'),
+        help="是否启用跨agent参考模仿辅助Actor loss"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-coef",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_COEF', '0.03')),
+        help="跨agent参考模仿loss权重"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-start-episode",
+        type=int,
+        default=int(os.getenv('CROSS_AGENT_REFERENCE_START_EPISODE', '50')),
+        help="从第N个训练回合开始启用跨agent参考分支；selector也从这里开始训练"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-actor-start-episode",
+        type=int,
+        default=int(
+            os.getenv(
+                'CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE',
+                os.getenv('CROSS_AGENT_REFERENCE_START_EPISODE', '50')
+            )
+            or os.getenv('CROSS_AGENT_REFERENCE_START_EPISODE', '50')
+        ),
+        help="从第N个训练回合开始让跨agent参考loss影响Actor；可晚于start-episode以预训练selector"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-actor-ramp-episodes",
+        type=int,
+        default=max(0, int(os.getenv('CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES', '0') or 0)),
+        help="跨agent参考loss影响Actor时的线性ramp回合数；0表示到启动回合直接生效"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-actor-require-success",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS', '0')).lower() in ('true', '1', 'yes', 'on'),
+        help="是否要求R2S selector进入局部/团队成功相位后，跨agent参考loss才开始影响Actor"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-progress-threshold",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD', '0.0005')),
+        help="参考样本的归一化目标距离最小改善量"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-margin",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_MARGIN', '0.0')),
+        help="质量门控的额外进步余量，当前作用于progress阈值"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-head-weight",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_HEAD_WEIGHT', '1.0')),
+        help="跨agent参考loss前三维动作权重"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-tail-weight",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_TAIL_WEIGHT', '0.3')),
+        help="跨agent参考loss后四维PF参数权重"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-use-clean-label",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="参考标签使用clean Actor输出；关闭时使用replay行为动作"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-target-semantics",
+        type=str,
+        choices=["legacy", "split_raw_head_corrected_tail"],
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_TARGET_SEMANTICS', 'legacy')).strip().lower(),
+        help="关闭clean label时的teacher语义：legacy=全维度执行动作；split_raw_head_corrected_tail=head学原始行为动作、tail学执行后动作"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-exclude-random",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="跨agent参考loss是否排除epsilon-random探索动作"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-quality-gate",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_QUALITY_GATE', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="是否用目标距离改善/近目标条件筛选参考样本"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-gate-mode",
+        type=str,
+        choices=["progress", "agent_success", "agent_quality", "team_success"],
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_GATE_MODE', 'progress')).strip().lower(),
+        help="跨agent参考质量门模式：progress=旧单步进展；agent_success=单UAV成功轨迹；agent_quality=单UAV安全优质轨迹；team_success=团队成功轨迹"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-update-interval",
+        type=int,
+        default=max(1, int(os.getenv('CROSS_AGENT_REFERENCE_UPDATE_INTERVAL', '1'))),
+        help="跨agent参考loss/selector更新间隔；1=每个actor更新都启用，4=每4个训练update启用一次以降低50回合后的计算开销"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-pairs-per-agent",
+        type=int,
+        default=max(0, int(os.getenv('CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT', '0'))),
+        help="每个目标agent每次actor更新使用的reference agent数量；0=全部其他agent，1=轮换一个reference以降低跨agent分支计算量"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-enabled",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_ENABLED', '0')).lower() in ('true', '1', 'yes', 'on'),
+        help="是否启用可训练selector筛选跨agent参考样本"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-mode",
+        type=str,
+        choices=list(CROSS_AGENT_REFERENCE_SELECTOR_MODES),
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_MODE', 'hard')).strip().lower(),
+        help="跨agent参考样本权重模式：hard=旧硬门控；soft_advantage=hindsight+critic advantage软权重；selector_mix=训练selector拟合混合软标签；reward_to_success_priority=前期奖励优先，局部成功启动后转成功优先；reward_to_success_head_tail=R2S双输出selector分别控制head/tail借鉴"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-alpha",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_ALPHA', '0.7')),
+        help="selector混合标签中的hindsight权重alpha，1-alpha为critic advantage权重"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-q-tau",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU', '500.0')),
+        help="critic advantage转sigmoid软标签的温度tau"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-lr",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_LR', '1e-4')),
+        help="cross-agent reference selector优化器学习率"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-hidden",
+        type=str,
+        default=str(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN', '128,64')),
+        help="cross-agent reference selector隐藏层，例如128,64"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-init-logit",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT', '-2.0')),
+        help="selector输出层初始logit偏置，负值表示初始保守筛样本"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-adv-clip",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP', '5.0')),
+        help="critic advantage/tau进入sigmoid前的裁剪范围"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-reward-tau",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU', '500.0')),
+        help="reward_to_success_priority模式下，单步奖励转sigmoid标签的温度tau"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-reward-tiebreak",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK', '0.05')),
+        help="reward_to_success_priority成功优先阶段中，奖励作为同成功等级tie-break的最大权重"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-success-stable-window",
+        type=int,
+        default=int(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW', '100')),
+        help="reward_to_success_priority检测局部/团队成功率时使用的最近窗口长度"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-success-stable-delta",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA', '0.02')),
+        help="reward_to_success_priority检测团队成功率两段窗口差值不超过该阈值时视为稳定"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-success-stable-min-rate",
+        type=float,
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE', '0.05')),
+        help="reward_to_success_priority局部成功启动或团队成功稳定前，最近窗口成功率至少达到该值"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-success-stable-min-episodes",
+        type=int,
+        default=int(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES', '200')),
+        help="reward_to_success_priority开始检测团队成功稳定前的最小已完成回合数；局部成功阶段会更早用半窗口启动"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-selector-success-ramp-episodes",
+        type=int,
+        default=int(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES', '50')),
+        help="reward_to_success_priority从奖励优先过渡到成功优先的ramp回合数"
+    )
+    parser.add_argument(
         "--maddpg-use-dual-q",
         type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
         default=str(os.getenv('MADDPG_USE_DUAL_Q', '0')).lower() in ('true', '1', 'yes', 'on'),
@@ -20530,7 +23218,8 @@ def parse_args():
     parser.add_argument("--terrain-gradient-threshold", type=float, default=0.1, help="地形梯度阈值")
     parser.add_argument("--minimum-clearance", type=float, default=1.5, help="最小安全间距")
     parser.add_argument("--force-scale", type=float, default=5.0, help="力缩放因子（已废弃）")
-    parser.add_argument("--max-force-magnitude", type=float, default=8.0, help="最大力幅值")
+    parser.add_argument("--max-force-magnitude", type=float, default=float(os.getenv("MAX_FORCE_MAGNITUDE", "80.0")),
+                        help="最大力幅值，默认80.0（与当前run_optimized.sh一致）")
     # 动作混合模式已固定为 pre_tanh（未饱和空间叠加），移除可选项以简化配置
     parser.add_argument("--success-count-mode", type=str,
                         default=os.getenv('SUCCESS_COUNT_MODE', 'any'),
@@ -20560,16 +23249,24 @@ def parse_args():
     parser.add_argument("--scenario-kw", dest="scenario_kw", action='append', default=None,
                         help="传递给场景构造器的关键字参数，格式key=value，可多次指定")
     # 🔧 delta+base 模式的基准参数和绝对变化量（用于 TensorFlow 版本的势场参数调整）
-    parser.add_argument("--goal-attraction", type=float, default=1.0, help="目标吸引力基准值")
-    parser.add_argument("--lambda-1-base", type=float, default=5.0, help="lambda_1基准值（目标吸引力分段距离阈值）")
-    parser.add_argument("--terrain-repulsion", type=float, default=80.0, help="地形排斥力基准值")
-    parser.add_argument("--agent-influence-range", type=float, default=10.0, help="智能体影响范围基准值（检测半径）")
+    parser.add_argument("--goal-attraction", type=float, default=float(os.getenv("GOAL_ATTRACTION", "26.0")),
+                        help="目标吸引力基准值，默认26.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--lambda-1-base", type=float, default=float(os.getenv("LAMBDA_1_BASE", "8.5")),
+                        help="lambda_1基准值（目标吸引力分段距离阈值），默认8.5")
+    parser.add_argument("--terrain-repulsion", type=float, default=float(os.getenv("TERRAIN_REPULSION", "1600.0")),
+                        help="地形排斥力基准值，默认1600.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--agent-influence-range", type=float, default=float(os.getenv("AGENT_INFLUENCE_RANGE", "150.0")),
+                        help="智能体影响范围基准值（检测半径），默认150.0（与当前run_optimized.sh一致）")
     
     # 绝对变化量参数（网络输出[-1,1]映射到实际变化范围）
-    parser.add_argument("--delta-k-att", type=float, default=0.5, help="k_att的绝对变化量（±0.5）")
-    parser.add_argument("--delta-lambda-1", type=float, default=2.5, help="lambda_1的绝对变化量（±2.5）")
-    parser.add_argument("--delta-k-rep", type=float, default=40.0, help="k_rep的绝对变化量（±40.0）")
-    parser.add_argument("--delta-radius", type=float, default=5.0, help="radius的绝对变化量（±5.0）")
+    parser.add_argument("--delta-k-att", type=float, default=float(os.getenv("DELTA_K_ATT", "5.0")),
+                        help="k_att的绝对变化量，默认±5.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-lambda-1", type=float, default=float(os.getenv("DELTA_LAMBDA_1", "2.2")),
+                        help="lambda_1的绝对变化量，默认±2.2（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-k-rep", type=float, default=float(os.getenv("DELTA_K_REP", "600.0")),
+                        help="k_rep的绝对变化量，默认±600.0（与当前run_optimized.sh一致）")
+    parser.add_argument("--delta-radius", type=float, default=float(os.getenv("DELTA_RADIUS", "80.0")),
+                        help="radius的绝对变化量，默认±80.0（与当前run_optimized.sh一致）")
     
     # 势场力参数范围映射（类似action-range，控制网络输出的势场力参数映射范围）
     # 默认值与训练脚本中的范围保持一致
@@ -20613,6 +23310,8 @@ def parse_args():
     parser.add_argument("--q-clip-value", type=float, default=5000.0, help="目标Q值裁剪范围上限（对称裁剪）")
     parser.add_argument("--critic-q-reg", type=float, default=0.0, help="Critic Q值L2正则权重，抑制Q值过大")
     parser.add_argument("--reward-clip-value", type=float, default=-150.0, help="训练时TD目标计算的奖励裁剪下限（防止初期极端负奖励导致Q爆炸）")
+    parser.add_argument("--reward-scale", type=float, default=float(os.getenv("REWARD_SCALE", "0.002")),
+                       help="训练时TD目标计算的奖励缩放系数；默认0.002即1/500")
     parser.add_argument("--critic-pf-weight", type=float, default=None, help="Critic 势场权重（可选）")
     
     # 运行期开关：是否使用LiteReplayBuffer（默认不改默认值，仅提供开关入口）
@@ -20855,6 +23554,16 @@ if __name__ == "__main__":
             if training_environment.get(key) is not None:
                 results_args[key] = training_environment.get(key)
         results_args["use_quadrotor_dynamics"] = os.getenv('USE_QUADROTOR_DYNAMICS', '0').lower() in ('1', 'true', 'yes', 'on')
+        reward_version = str(os.getenv('REWARD_VERSION', os.getenv('reward_version', 'v1')) or 'v1').strip()
+        terminal_order_raw = str(os.getenv('REWARD_TERMINAL_ORDER_FIX', os.getenv('reward_terminal_order_fix', '')) or '').strip()
+        if terminal_order_raw:
+            reward_terminal_order_fix = terminal_order_raw.lower() in ('1', 'true', 'yes', 'on')
+        else:
+            reward_terminal_order_fix = True
+        results_args["reward_version"] = reward_version
+        results_args["reward_terminal_order_fix"] = bool(reward_terminal_order_fix)
+        training_hyperparameters["reward_version"] = reward_version
+        training_hyperparameters["reward_terminal_order_fix"] = bool(reward_terminal_order_fix)
 
         results = {
             'episodes': len(rewards),

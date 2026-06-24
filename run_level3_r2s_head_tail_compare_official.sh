@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="/home/tang/matd3"
+cd "$ROOT_DIR"
+
+export PYTHON_BIN="${PYTHON_BIN:-/home/tang/miniconda3/envs/maddpg_env/bin/python3}"
+
+# Reuse the official 10x30 spec and summary from the seed101 R2S run where R2S
+# had a clear positive result, so the new ablation only needs to train/eval H/T.
+export BASE_SPEC="${BASE_SPEC:-$ROOT_DIR/ablation_experiments/multi_seed_groupB_20260606_235235/seed_batches/batch_groupB_seed101_20260606_235235/results/post_eval_shared_spec.json}"
+export R2S_SUMMARY_DIR="${R2S_SUMMARY_DIR:-$ROOT_DIR/diagnostics/level3_r2s_selector_matchedval_official10x30_20260608_125056_summary_20260609_113654}"
+
+if [ ! -f "$BASE_SPEC" ]; then
+  echo "[r2s-head-tail] BASE_SPEC not found: $BASE_SPEC" >&2
+  exit 1
+fi
+if [ ! -d "$R2S_SUMMARY_DIR" ]; then
+  echo "[r2s-head-tail] R2S_SUMMARY_DIR not found: $R2S_SUMMARY_DIR" >&2
+  exit 1
+fi
+
+export RUN_TAG="${RUN_TAG:-level3_r2s_head_tail_vs_unified_seed101_ep1000_matchedval_official10x30_$(date +%Y%m%d_%H%M%S)}"
+
+export TRAIN_SEEDS="${TRAIN_SEEDS:-101}"
+export EVAL_SEEDS="${EVAL_SEEDS:-30088 30188 30288 30388 30488 30588 30688 30788 30888 30988}"
+export EVAL_EPISODES="${EVAL_EPISODES:-30}"
+export POST_EVAL_EPISODES="${POST_EVAL_EPISODES:-30}"
+export EPISODES="${EPISODES:-1000}"
+export TRAIN_EPISODES="${TRAIN_EPISODES:-$EPISODES}"
+export MAX_PARALLEL="${MAX_PARALLEL:-3}"
+
+export MISSING_TRAIN_LABELS="${MISSING_TRAIN_LABELS:-matd3_cross_agent_ref_reward_to_success_head_tail_selector}"
+export TRAIN_LABELS_OVERRIDE="${TRAIN_LABELS_OVERRIDE:-$MISSING_TRAIN_LABELS}"
+export EVAL_LABELS_OVERRIDE="${EVAL_LABELS_OVERRIDE:-$MISSING_TRAIN_LABELS}"
+export INTEGRATED_LABEL_ORDER="${INTEGRATED_LABEL_ORDER:-matd3_cross_agent_ref_reward_to_success_selector matd3_cross_agent_ref_reward_to_success_head_tail_selector}"
+export R2S_REUSE_LABELS="${R2S_REUSE_LABELS:-matd3_cross_agent_ref_reward_to_success_selector}"
+export STRICT_INTEGRATION="${STRICT_INTEGRATION:-1}"
+
+export MODEL_VARIANT="${MODEL_VARIANT:-auto}"
+export POST_EVAL_MODEL_VARIANT="${POST_EVAL_MODEL_VARIANT:-auto}"
+export SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-shared_matched_validation}"
+export POST_EVAL_SELECTION_PROTOCOL="${POST_EVAL_SELECTION_PROTOCOL:-matched_validation}"
+export SELECTION_VALIDATION_SEEDS="${SELECTION_VALIDATION_SEEDS:-114817}"
+export SELECTION_VALIDATION_EPISODES="${SELECTION_VALIDATION_EPISODES:-10}"
+export SELECTION_VALIDATION_CANDIDATES="${SELECTION_VALIDATION_CANDIDATES:-best_by_team_sr,best,checkpoint,final,latest_ep}"
+export POST_EVAL_VALIDATION_SEED="${POST_EVAL_VALIDATION_SEED:-114817}"
+export POST_EVAL_VALIDATION_EPISODES="${POST_EVAL_VALIDATION_EPISODES:-10}"
+export POST_EVAL_VALIDATION_CANDIDATES="${POST_EVAL_VALIDATION_CANDIDATES:-best_by_team_sr,best,checkpoint,final,latest_ep}"
+export SUMMARY_FILENAME_TAG="${SUMMARY_FILENAME_TAG:-model_fr}"
+export EVAL_FR_MODE="${EVAL_FR_MODE:-checkpoint}"
+export STRICT_SUMMARY="${STRICT_SUMMARY:-1}"
+
+export AGENT_SIZE="${AGENT_SIZE:-0.5}"
+export REWARD_TERMINAL_ORDER_FIX="${REWARD_TERMINAL_ORDER_FIX:-1}"
+export ACTION_FORCE_RATIO="${ACTION_FORCE_RATIO:-0.5}"
+export ACTION_FORCE_RATIO_SCHEDULE_PCT="${ACTION_FORCE_RATIO_SCHEDULE_PCT:-0%:0.50,25%:0.48,50%:0.45,70%:0.40,85%:0.35,100%:0.32}"
+
+export GROUP_B_PEAK_JITTER_RANGE="${GROUP_B_PEAK_JITTER_RANGE:-8.25}"
+export GROUP_B_PEAK_CENTER_JITTER_RANGE="${GROUP_B_PEAK_CENTER_JITTER_RANGE:-1.5}"
+export GROUP_B_PEAK_HEIGHT_JITTER_RATIO_MIN="${GROUP_B_PEAK_HEIGHT_JITTER_RATIO_MIN:-0.10}"
+export GROUP_B_PEAK_HEIGHT_JITTER_RATIO_MAX="${GROUP_B_PEAK_HEIGHT_JITTER_RATIO_MAX:-0.22}"
+export GROUP_B_PEAK_HEIGHT_MAX_SCALE="${GROUP_B_PEAK_HEIGHT_MAX_SCALE:-1.15}"
+export GROUP_B_TERRAIN_VARIANT_NOISE_RATIO="${GROUP_B_TERRAIN_VARIANT_NOISE_RATIO:-0.075}"
+export GROUP_B_SEMI_RANDOM_HOLD_MODE="${GROUP_B_SEMI_RANDOM_HOLD_MODE:-range}"
+export GROUP_B_SEMI_RANDOM_HOLD_EPISODES="${GROUP_B_SEMI_RANDOM_HOLD_EPISODES:-18}"
+export GROUP_B_SEMI_RANDOM_HOLD_MIN_EPISODES="${GROUP_B_SEMI_RANDOM_HOLD_MIN_EPISODES:-15}"
+export GROUP_B_SEMI_RANDOM_HOLD_MAX_EPISODES="${GROUP_B_SEMI_RANDOM_HOLD_MAX_EPISODES:-20}"
+
+export XLA_GLOBAL="${XLA_GLOBAL:-1}"
+export JIT_COMPILE="${JIT_COMPILE:-1}"
+export FORCE_OUTER_JIT_COMPILE="${FORCE_OUTER_JIT_COMPILE:-0}"
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
+export TF_SYNC_ON_FINISH="${TF_SYNC_ON_FINISH:-0}"
+export XLA_COMPILE_PARALLELISM="${XLA_COMPILE_PARALLELISM:-1}"
+export WORKER_LAUNCH_STAGGER_SECONDS="${WORKER_LAUNCH_STAGGER_SECONDS:-8}"
+
+export REUSE="${REUSE:-0}"
+export TRAIN_REUSE="${TRAIN_REUSE:-0}"
+export FORCE_RERUN="${FORCE_RERUN:-0}"
+export FORCE_POST_EVAL_RERUN="${FORCE_POST_EVAL_RERUN:-0}"
+export FORCE_POST_EVAL_TESTSET_REGEN="${FORCE_POST_EVAL_TESTSET_REGEN:-0}"
+
+echo "[r2s-head-tail] run tag: $RUN_TAG"
+echo "[r2s-head-tail] base spec: $BASE_SPEC"
+echo "[r2s-head-tail] reused R2S summary: $R2S_SUMMARY_DIR"
+echo "[r2s-head-tail] train/eval label: $MISSING_TRAIN_LABELS"
+echo "[r2s-head-tail] integrated order: $INTEGRATED_LABEL_ORDER"
+
+bash "$ROOT_DIR/run_level3_xref_integrated_ablations_official.sh"
