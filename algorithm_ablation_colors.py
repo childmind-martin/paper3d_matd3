@@ -112,6 +112,12 @@ ALGORITHM_ABLATION_STYLE_BY_LABEL: Dict[str, Dict[str, Any]] = {
         "marker": "s",
         "hatch": "..",
     },
+    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector": {
+        "color": "#009E73",  # teal green
+        "linestyle": (0, (6.0, 1.5, 1.2, 1.5)),
+        "marker": "P",
+        "hatch": "++",
+    },
     "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": {
         "color": "#E69F00",  # orange
         "linestyle": (0, (2.0, 1.2)),

@@ -127,6 +127,7 @@ DUAL_SEMANTICS_EXPERIMENT_LABELS = [
     "matd3_cross_agent_ref_reward_to_success_selector_tail01",
     "matd3_cross_agent_ref_reward_to_success_selector",
     "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector",
     "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_current",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40",
@@ -192,6 +193,7 @@ AUDIT_REFERENCE_LABEL_BY_EXPERIMENT = {
     "matd3_cross_agent_ref_reward_to_success_selector_tail01": "matd3_cross_agent_ref_reward_to_success_selector",
     "matd3_cross_agent_ref_reward_to_success_selector": "matd3_cross_agent_ref_selector_mix",
     "matd3_cross_agent_ref_reward_to_success_head_tail_selector": "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
     "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_current": "matd3_cross_agent_ref_reward_to_success_selector",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": "matd3_cross_agent_ref_reward_to_success_selector",
@@ -261,6 +263,7 @@ EXPERIMENT_ABBR_BY_LABEL = {
     "matd3_cross_agent_ref_reward_to_success_selector_tail01": "XRef-R2S-T01",
     "matd3_cross_agent_ref_reward_to_success_selector": "XRef-R2S",
     "matd3_cross_agent_ref_reward_to_success_head_tail_selector": "XRef-R2S-HT",
+    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector": "XRef-CL-HT",
     "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": "XRef-R2S-HT-SplitT",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_current": "R2S-CurFR",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": "R2S-FR40",
@@ -374,6 +377,7 @@ CROSS_AGENT_REFERENCE_ENV_KEYS = {
     "CROSS_AGENT_REFERENCE_UPDATE_INTERVAL",
     "CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT",
     "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED",
+    "CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH",
     "CROSS_AGENT_REFERENCE_SELECTOR_MODE",
     "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA",
     "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU",
@@ -388,6 +392,17 @@ CROSS_AGENT_REFERENCE_ENV_KEYS = {
     "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE",
     "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES",
     "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES",
+    "CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT",
+    "CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE",
+    "CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS",
+    "CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT",
+    "CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT",
+    "CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT",
 }
 
 CROSS_AGENT_REFERENCE_ARG_KEYS = {
@@ -409,6 +424,7 @@ CROSS_AGENT_REFERENCE_ARG_KEYS = {
     "--cross-agent-reference-update-interval",
     "--cross-agent-reference-pairs-per-agent",
     "--cross-agent-reference-selector-enabled",
+    "--cross-agent-reference-selector-train-in-graph",
     "--cross-agent-reference-selector-mode",
     "--cross-agent-reference-selector-alpha",
     "--cross-agent-reference-selector-q-tau",
@@ -423,11 +439,62 @@ CROSS_AGENT_REFERENCE_ARG_KEYS = {
     "--cross-agent-reference-selector-success-stable-min-rate",
     "--cross-agent-reference-selector-success-stable-min-episodes",
     "--cross-agent-reference-selector-success-ramp-episodes",
+    "--cross-agent-reference-closed-loop-feedback-weight",
+    "--cross-agent-reference-closed-loop-use-q-advantage",
+    "--cross-agent-reference-closed-loop-max-pending-updates",
+    "--cross-agent-reference-team-target-two-plus",
+    "--cross-agent-reference-team-target-single-near",
+    "--cross-agent-reference-team-target-single-safe",
+    "--cross-agent-reference-team-target-safe-near",
+    "--cross-agent-reference-team-target-progress",
+    "--cross-agent-reference-feedback-two-plus-weight",
+    "--cross-agent-reference-feedback-any-weight",
+    "--cross-agent-reference-feedback-progress-weight",
     "--cross-agent-reference-team-goal-relaxed-near-mult",
     "--cross-agent-reference-team-goal-single-cap",
     "--cross-agent-reference-team-goal-two-near-score",
     "--cross-agent-reference-team-goal-all-near-score",
     "--cross-agent-reference-team-goal-close-weight",
+}
+
+REWARD_SHAPING_OVERRIDE_ENV_KEYS = {
+    "GOAL_RING_INDIVIDUAL_SCALE",
+    "GOAL_RING_TEAM_GATED",
+    "GOAL_RING_REQUIRE_AGENT_SAFE",
+    "PROGRESS_DISTANCE_STATE_SCALE",
+    "PROGRESS_REWARD_SCALE",
+    "TEAM_PROGRESS_BOTTLENECK_ONLY",
+    "TEAM_PROGRESS_NON_BOTTLENECK_SCALE",
+    "TEAM_PROGRESS_BOTTLENECK_EPS",
+    "TEAM_SUCCESS_BONUS",
+    "UNSAFE_ARRIVAL_PENALTY",
+    "NON_SUCCESS_TERMINAL_GUARD_ENABLED",
+    "NON_SUCCESS_TERMINAL_PENALTY_BASE",
+    "NON_SUCCESS_TERMINAL_PENALTY_PER_METER",
+    "NON_SUCCESS_TERMINAL_PENALTY_MAX",
+    "TERMINAL_FAILURE_PENALTY_BASE",
+    "TERMINAL_FAILURE_PENALTY_PER_METER",
+    "TERMINAL_FAILURE_PENALTY_MAX",
+    "TEAM_SYNC_REWARD_ENABLED",
+    "TEAM_GOAL_OCCUPANCY_SCALE",
+    "TEAM_BOTTLENECK_PROGRESS_SCALE",
+    "TEAM_WAITING_SCALE",
+    "TEAM_BOTTLENECK_DELTA_CLIP",
+    "CLEARANCE_QUALITY_BONUS_WEIGHT",
+    "EFFICIENCY_BONUS_WEIGHT",
+    "CLEARANCE_DENSE_POSITIVE_SCALE",
+    "HEIGHT_DENSE_POSITIVE_SCALE",
+}
+
+SELECTOR_TARGET_OVERRIDE_ENV_KEYS = {
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR",
+    "CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS",
+    "CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT",
+    "CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT",
+    "CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT",
 }
 
 CROSS_AGENT_REFERENCE_LABELS = {
@@ -439,6 +506,7 @@ CROSS_AGENT_REFERENCE_LABELS = {
     "matd3_cross_agent_ref_reward_to_success_selector_tail01",
     "matd3_cross_agent_ref_reward_to_success_selector",
     "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector",
     "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_current",
     "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40",
@@ -3788,6 +3856,20 @@ def _resolve_model_variant_dir(model_root: Path, model_variant: str) -> Tuple[Op
 
 
 _POST_EVAL_MODEL_SIGNATURE_CACHE: Dict[str, Optional[str]] = {}
+POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION = 2
+POST_EVAL_SELECTION_GUARDED_MIN_COLLISION_FREE = 0.05
+POST_EVAL_SELECTION_GUARDED_COLLISION_COUNT_WEIGHT = 5.0
+POST_EVAL_SELECTION_SCORE_FIELDS = (
+    "team_success_rate",
+    "partial_success_mean",
+    "partial_success_max",
+    "partial_success_min",
+    "guarded_goal_progress_score",
+    "collision_free_rate",
+    "neg_avg_collision_count",
+    "neg_avg_team_final_goal_distance",
+    "neg_avg_team_total_path_length",
+)
 
 
 def _compute_post_eval_model_signature(model_dir: Path) -> Optional[str]:
@@ -3847,20 +3929,88 @@ def _build_matched_validation_spec(
     return spec
 
 
-def _score_post_eval_summary(summary: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
-    def _metric(key: str, *, fallback: float, invert: bool = False) -> float:
-        value = _safe_float(summary.get(key))
-        if value is None:
-            return fallback
-        value = float(value)
-        return -value if invert else value
+def _post_eval_selection_score_schema() -> Dict[str, Any]:
+    return {
+        "version": int(POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION),
+        "fields": list(POST_EVAL_SELECTION_SCORE_FIELDS),
+        "guarded_goal_progress": {
+            "min_collision_free_rate": float(POST_EVAL_SELECTION_GUARDED_MIN_COLLISION_FREE),
+            "collision_count_weight": float(POST_EVAL_SELECTION_GUARDED_COLLISION_COUNT_WEIGHT),
+        },
+        "ordering": "lexicographic_desc",
+    }
 
+
+def _post_eval_candidate_cache_key(candidate: Dict[str, Any], signature: Optional[str]) -> Optional[str]:
+    if not signature:
+        return None
+    try:
+        model_path = str(Path(candidate["model_path"]).resolve())
+    except Exception:
+        model_path = str(candidate.get("model_path", ""))
+    return "|".join(
+        (
+            str(signature),
+            str(candidate.get("candidate_alias", "")),
+            str(candidate.get("resolved_variant", "")),
+            model_path,
+        )
+    )
+
+
+def _post_eval_selection_metric(summary: Dict[str, Any], key: str, *, fallback: float) -> float:
+    value = _safe_float(summary.get(key))
+    if value is None:
+        return fallback
+    return float(value)
+
+
+def _post_eval_partial_success_scores(summary: Dict[str, Any]) -> Tuple[float, float, float]:
+    rates = summary.get("agent_success_rates")
+    if not isinstance(rates, list):
+        return 0.0, 0.0, 0.0
+    values: List[float] = []
+    for value in rates:
+        numeric = _safe_float(value)
+        if numeric is not None:
+            values.append(max(0.0, min(1.0, float(numeric))))
+    if not values:
+        return 0.0, 0.0, 0.0
     return (
-        _metric("team_success_rate", fallback=-1.0),
-        _metric("collision_free_rate", fallback=-1.0),
-        _metric("avg_team_final_goal_distance", fallback=-1e12, invert=True),
-        _metric("avg_collision_count", fallback=-1e12, invert=True),
-        _metric("avg_team_total_path_length", fallback=-1e12, invert=True),
+        float(sum(values) / len(values)),
+        float(max(values)),
+        float(min(values)),
+    )
+
+
+def _post_eval_guarded_goal_progress_score(summary: Dict[str, Any]) -> float:
+    distance = max(0.0, _post_eval_selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12))
+    collision_count = max(0.0, _post_eval_selection_metric(summary, "avg_collision_count", fallback=1e12))
+    collision_free = max(0.0, min(1.0, _post_eval_selection_metric(summary, "collision_free_rate", fallback=0.0)))
+
+    guarded_distance = (
+        distance / max(collision_free, POST_EVAL_SELECTION_GUARDED_MIN_COLLISION_FREE)
+        + collision_count * POST_EVAL_SELECTION_GUARDED_COLLISION_COUNT_WEIGHT
+    )
+    return -guarded_distance
+
+
+def _score_post_eval_summary(summary: Dict[str, Any]) -> Tuple[float, ...]:
+    partial_mean, partial_max, partial_min = _post_eval_partial_success_scores(summary)
+    collision_free = _post_eval_selection_metric(summary, "collision_free_rate", fallback=-1.0)
+    collision_count = _post_eval_selection_metric(summary, "avg_collision_count", fallback=1e12)
+    distance = _post_eval_selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12)
+    path_length = _post_eval_selection_metric(summary, "avg_team_total_path_length", fallback=1e12)
+    return (
+        _post_eval_selection_metric(summary, "team_success_rate", fallback=-1.0),
+        partial_mean,
+        partial_max,
+        partial_min,
+        _post_eval_guarded_goal_progress_score(summary),
+        collision_free,
+        -collision_count,
+        -distance,
+        -path_length,
     )
 
 
@@ -4167,14 +4317,15 @@ def _select_post_eval_checkpoint_with_matched_validation(
 
     scored_candidates: List[Dict[str, Any]] = []
     failed_candidates: List[Dict[str, Any]] = []
-    evaluated_candidates_by_signature: Dict[str, Dict[str, Any]] = {}
+    evaluated_candidates_by_identity: Dict[str, Dict[str, Any]] = {}
     for order_idx, candidate in enumerate(candidates):
         candidate_signature = _compute_post_eval_model_signature(Path(candidate["model_path"]))
-        if candidate_signature and candidate_signature in evaluated_candidates_by_signature:
-            cached_candidate = evaluated_candidates_by_signature[candidate_signature]
+        candidate_cache_key = _post_eval_candidate_cache_key(candidate, candidate_signature)
+        if candidate_cache_key and candidate_cache_key in evaluated_candidates_by_identity:
+            cached_candidate = evaluated_candidates_by_identity[candidate_cache_key]
             print(
                 f"[验证选模-{label}] 复用候选 {candidate['candidate_alias']} 的验证结果 "
-                f"(与 {cached_candidate['candidate_alias']} 权重一致)"
+                f"(与 {cached_candidate['candidate_alias']} 评估身份一致)"
             )
             scored_candidates.append(
                 {
@@ -4184,6 +4335,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                     "summary": cached_candidate["summary"],
                     "score": list(cached_candidate["score"]),
                     "model_signature": candidate_signature,
+                    "candidate_eval_cache_key": candidate_cache_key,
                     "reused_validation_from_candidate": str(cached_candidate["candidate_alias"]),
                 }
             )
@@ -4219,6 +4371,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                     **candidate,
                     "order": int(order_idx),
                     "model_signature": candidate_signature,
+                    "candidate_eval_cache_key": candidate_cache_key,
                     "failure_reason": failure_reason,
                     "eval_dir": str(candidate_eval_dir),
                 }
@@ -4237,10 +4390,11 @@ def _select_post_eval_checkpoint_with_matched_validation(
             "summary": summary,
             "score": list(score),
             "model_signature": candidate_signature,
+            "candidate_eval_cache_key": candidate_cache_key,
         }
         scored_candidates.append(scored_entry)
-        if candidate_signature:
-            evaluated_candidates_by_signature[candidate_signature] = {
+        if candidate_cache_key:
+            evaluated_candidates_by_identity[candidate_cache_key] = {
                 "candidate_alias": str(candidate["candidate_alias"]),
                 "eval_record": eval_record,
                 "summary": summary,
@@ -4263,7 +4417,10 @@ def _select_post_eval_checkpoint_with_matched_validation(
     )
 
     selection_summary = {
+        "schema_version": 2,
         "selection_protocol": "matched_validation",
+        "selection_score_schema_version": int(POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION),
+        "selection_score_schema": _post_eval_selection_score_schema(),
         "requested_model_variant": requested_variant,
         "validation_episodes": int(validation_base_spec["episodes"]),
         "validation_seed": int(validation_base_spec["seed"]),
@@ -4273,6 +4430,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                 "resolved_variant": item["resolved_variant"],
                 "model_path": str(item["model_path"]),
                 "model_signature": item.get("model_signature"),
+                "candidate_eval_cache_key": item.get("candidate_eval_cache_key"),
                 "reused_validation_from_candidate": item.get("reused_validation_from_candidate"),
                 "score": item["score"],
                 "summary": item["summary"],
@@ -4287,6 +4445,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
             "resolved_variant": best_candidate["resolved_variant"],
             "model_path": str(best_candidate["model_path"]),
             "model_signature": best_candidate.get("model_signature"),
+            "candidate_eval_cache_key": best_candidate.get("candidate_eval_cache_key"),
             "reused_validation_from_candidate": best_candidate.get("reused_validation_from_candidate"),
             "score": best_candidate["score"],
             "summary": best_candidate["summary"],
@@ -7199,6 +7358,57 @@ EXPERIMENT_CONFIGS = [
         }
     },
     {
+        "label": "matd3_cross_agent_ref_closed_loop_team_head_tail_selector",
+        "name": "MATD3 Cross-Agent Reference - Closed-Loop Team Head/Tail Selector",
+        "name_en": "Cross-Agent Ref - Closed-Loop Team Head/Tail Selector",
+        "description": "Mechanism ablation: behavior-action teacher with a team-discovery head/tail selector, augmented by delayed closed-loop feedback from normal training rollouts.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES": "100",
+            "CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS": "1",
+            "CROSS_AGENT_REFERENCE_UPDATE_INTERVAL": "4",
+            "CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT": "1",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS": "legacy",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH": "auto",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "closed_loop_team_head_tail",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW": "100",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA": "0.02",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES": "200",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES": "50",
+            "CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT": "0.15",
+            "CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE": "0",
+            "CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES": "64",
+        }
+    },
+    {
         "label": "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
         "name": "MATD3 Cross-Agent Reference - R2S Head/Tail Split Teacher Selector",
         "name_en": "Cross-Agent Ref - R2S Head/Tail Split Teacher Selector",
@@ -8733,6 +8943,9 @@ def _apply_runtime_env_overrides(env: Dict[str, str], args) -> Dict[str, str]:
         env["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"] = "1" if _to_bool(
             os.environ["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"]
         ) else "0"
+    for override_key in sorted(REWARD_SHAPING_OVERRIDE_ENV_KEYS | SELECTOR_TARGET_OVERRIDE_ENV_KEYS):
+        if override_key in os.environ:
+            env[override_key] = str(os.environ[override_key])
     return env
 
 
@@ -8896,6 +9109,7 @@ def _resolve_experiment_manifest(
         "CROSS_AGENT_REFERENCE_UPDATE_INTERVAL",
         "CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT",
         "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED",
+        "CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH",
         "CROSS_AGENT_REFERENCE_SELECTOR_MODE",
         "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA",
         "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU",
@@ -8910,8 +9124,11 @@ def _resolve_experiment_manifest(
         "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE",
         "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES",
         "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES",
+        "CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT",
+        "CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE",
+        "CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES",
     )
-    for key in training_env_exec_keys:
+    for key in tuple(dict.fromkeys(training_env_exec_keys + tuple(sorted(REWARD_SHAPING_OVERRIDE_ENV_KEYS)))):
         if key in env:
             manifest_exec_env[key] = env[key]
         else:

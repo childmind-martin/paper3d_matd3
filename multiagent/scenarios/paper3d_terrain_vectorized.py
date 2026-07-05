@@ -129,9 +129,13 @@ class Scenario(BaseWeightedScenario):
                 )
                 # 与训练侧保持兼容：reward_calculator 作为统一访问入口
                 self.reward_calculator = self.arw
-                print("[ARW] (vectorized) Adaptive Reward Weighting enabled")
+                suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+                if not suppress_reward_output:
+                    print("[ARW] (vectorized) Adaptive Reward Weighting enabled")
             except Exception as _e:
-                print(f"[ARW] (vectorized) init failed: {_e}")
+                suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+                if not suppress_reward_output:
+                    print(f"[ARW] (vectorized) init failed: {_e}")
                 self.arw = None
         
         # 批量处理缓存

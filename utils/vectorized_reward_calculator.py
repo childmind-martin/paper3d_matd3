@@ -147,6 +147,15 @@ class VectorizedRewardCalculator:
             except (TypeError, ValueError):
                 return float(default)
 
+        def _kw_env_float(key, env_name, default):
+            return _finite_or(kwargs.get(key, os.getenv(env_name, default)), default)
+
+        def _kw_env_bool(key, env_name, default):
+            raw = kwargs.get(key, os.getenv(env_name, '1' if default else '0'))
+            if isinstance(raw, (bool, np.bool_)):
+                return bool(raw)
+            return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
         max_reward = _finite_or(max_reward, 800.0)
         min_reward = _finite_or(min_reward, -800.0)
         success_reward_value = _finite_or(success_reward_value, 150.0)
@@ -285,26 +294,33 @@ class VectorizedRewardCalculator:
                 float(os.getenv('STATIONARY_NEAR_GOAL_MAX_PENALTY', '16.0'))
             )
             self.terminal_failure_penalty_base = np.float32(
-                float(os.getenv('TERMINAL_FAILURE_PENALTY_BASE', '30.0'))
+                _kw_env_float('terminal_failure_penalty_base', 'TERMINAL_FAILURE_PENALTY_BASE', 30.0)
             )
             self.terminal_failure_penalty_per_meter = np.float32(
-                float(os.getenv('TERMINAL_FAILURE_PENALTY_PER_METER', '120.0'))
+                _kw_env_float('terminal_failure_penalty_per_meter', 'TERMINAL_FAILURE_PENALTY_PER_METER', 120.0)
             )
             self.terminal_failure_penalty_max = np.float32(
-                float(os.getenv('TERMINAL_FAILURE_PENALTY_MAX', '180.0'))
+                _kw_env_float('terminal_failure_penalty_max', 'TERMINAL_FAILURE_PENALTY_MAX', 180.0)
             )
             goal_ring_schedule = os.getenv(
                 'GOAL_RING_REWARD_SCHEDULE',
                 '18:20,10:35,6:55,3.5:80'
             )
             self.goal_ring_radii, self.goal_ring_bonus_values = self._parse_goal_ring_schedule(goal_ring_schedule)
-            self.team_gated_goal_reward = (
-                str(os.getenv('TEAM_GATED_GOAL_REWARD', '1')).lower()
-                in ('1', 'true', 'yes', 'on')
+            self.goal_ring_individual_scale = np.float32(
+                max(_kw_env_float('goal_ring_individual_scale', 'GOAL_RING_INDIVIDUAL_SCALE', 0.25), 0.0)
             )
-            self.team_gated_goal_reward_require_safe = (
-                str(os.getenv('TEAM_GATED_GOAL_REWARD_REQUIRE_SAFE', '1')).lower()
-                in ('1', 'true', 'yes', 'on')
+            self.goal_ring_team_gated = _kw_env_bool(
+                'goal_ring_team_gated', 'GOAL_RING_TEAM_GATED', False
+            )
+            self.goal_ring_require_agent_safe = _kw_env_bool(
+                'goal_ring_require_agent_safe', 'GOAL_RING_REQUIRE_AGENT_SAFE', True
+            )
+            self.team_gated_goal_reward = _kw_env_bool(
+                'team_gated_goal_reward', 'TEAM_GATED_GOAL_REWARD', True
+            )
+            self.team_gated_goal_reward_require_safe = _kw_env_bool(
+                'team_gated_goal_reward_require_safe', 'TEAM_GATED_GOAL_REWARD_REQUIRE_SAFE', True
             )
         except Exception:
             self.penetration_alpha = np.float32(0.5)
@@ -338,6 +354,9 @@ class VectorizedRewardCalculator:
             self.goal_ring_radii, self.goal_ring_bonus_values = self._parse_goal_ring_schedule(
                 '18:20,10:35,6:55,3.5:80'
             )
+            self.goal_ring_individual_scale = np.float32(0.25)
+            self.goal_ring_team_gated = False
+            self.goal_ring_require_agent_safe = True
             self.team_gated_goal_reward = True
             self.team_gated_goal_reward_require_safe = True
         
@@ -389,6 +408,29 @@ class VectorizedRewardCalculator:
 
         # progress 合并：将 distance(状态锚点) 与 approach(步进结果) 融合成单一主通道
         self.progress_merge_enabled = True
+        self.progress_distance_state_scale = np.float32(
+            max(_kw_env_float('progress_distance_state_scale', 'PROGRESS_DISTANCE_STATE_SCALE', 0.0), 0.0)
+        )
+        self.progress_reward_scale = np.float32(
+            max(_kw_env_float('progress_reward_scale', 'PROGRESS_REWARD_SCALE', 1.0), 0.0)
+        )
+        self.team_progress_bottleneck_only = _kw_env_bool(
+            'team_progress_bottleneck_only', 'TEAM_PROGRESS_BOTTLENECK_ONLY', False
+        )
+        self.team_progress_non_bottleneck_scale = np.float32(
+            np.clip(
+                _kw_env_float(
+                    'team_progress_non_bottleneck_scale',
+                    'TEAM_PROGRESS_NON_BOTTLENECK_SCALE',
+                    1.0,
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        self.team_progress_bottleneck_eps = np.float32(
+            max(_kw_env_float('team_progress_bottleneck_eps', 'TEAM_PROGRESS_BOTTLENECK_EPS', 1.0), 0.0)
+        )
 
         # 可选弱正则：energy(7)
         try:
@@ -408,61 +450,85 @@ class VectorizedRewardCalculator:
 
         # terminal 奖励/惩罚（仅 episode end 生效）
         try:
-            import os as _os
-            self.team_success_bonus = np.float32(float(_os.getenv('TEAM_SUCCESS_BONUS', '3000.0')))
+            self.team_success_bonus = np.float32(
+                _kw_env_float('team_success_bonus', 'TEAM_SUCCESS_BONUS', 3000.0)
+            )
         except Exception:
             self.team_success_bonus = np.float32(3000.0)
         try:
-            import os as _os
-            self.unsafe_arrival_penalty = np.float32(float(_os.getenv('UNSAFE_ARRIVAL_PENALTY', '1200.0')))
+            self.unsafe_arrival_penalty = np.float32(
+                _kw_env_float('unsafe_arrival_penalty', 'UNSAFE_ARRIVAL_PENALTY', 1200.0)
+            )
         except Exception:
             self.unsafe_arrival_penalty = np.float32(1200.0)
+        self.non_success_terminal_guard_enabled = _kw_env_bool(
+            'non_success_terminal_guard_enabled', 'NON_SUCCESS_TERMINAL_GUARD_ENABLED', True
+        )
+        self.non_success_terminal_penalty_base = np.float32(
+            max(_kw_env_float('non_success_terminal_penalty_base', 'NON_SUCCESS_TERMINAL_PENALTY_BASE', 250.0), 0.0)
+        )
+        self.non_success_terminal_penalty_per_meter = np.float32(
+            max(_kw_env_float('non_success_terminal_penalty_per_meter', 'NON_SUCCESS_TERMINAL_PENALTY_PER_METER', 900.0), 0.0)
+        )
+        self.non_success_terminal_penalty_max = np.float32(
+            max(_kw_env_float('non_success_terminal_penalty_max', 'NON_SUCCESS_TERMINAL_PENALTY_MAX', 1200.0), 0.0)
+        )
 
         # success-only 质量奖励（仅 team_success=True 时给）
         try:
-            import os as _os
-            self.clearance_quality_bonus_weight = np.float32(float(_os.getenv('CLEARANCE_QUALITY_BONUS_WEIGHT', '800.0')))
+            self.clearance_quality_bonus_weight = np.float32(
+                _kw_env_float('clearance_quality_bonus_weight', 'CLEARANCE_QUALITY_BONUS_WEIGHT', 800.0)
+            )
         except Exception:
             self.clearance_quality_bonus_weight = np.float32(800.0)
         try:
-            import os as _os
-            self.efficiency_bonus_weight = np.float32(float(_os.getenv('EFFICIENCY_BONUS_WEIGHT', '800.0')))
+            self.efficiency_bonus_weight = np.float32(
+                _kw_env_float('efficiency_bonus_weight', 'EFFICIENCY_BONUS_WEIGHT', 800.0)
+            )
         except Exception:
             self.efficiency_bonus_weight = np.float32(800.0)
 
         # === Team-sync dense reward ===
         try:
-            import os as _os
-            self.team_sync_enabled = _os.getenv('TEAM_SYNC_REWARD_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on')
+            self.team_sync_enabled = _kw_env_bool('team_sync_enabled', 'TEAM_SYNC_REWARD_ENABLED', True)
         except Exception:
             self.team_sync_enabled = True
         try:
-            import os as _os
-            self.team_goal_occupancy_scale = np.float32(float(_os.getenv('TEAM_GOAL_OCCUPANCY_SCALE', '1.0')))
+            self.team_goal_occupancy_scale = np.float32(
+                _kw_env_float('team_goal_occupancy_scale', 'TEAM_GOAL_OCCUPANCY_SCALE', 1.0)
+            )
         except Exception:
             self.team_goal_occupancy_scale = np.float32(1.0)
         try:
-            import os as _os
-            self.team_bottleneck_progress_scale = np.float32(float(_os.getenv('TEAM_BOTTLENECK_PROGRESS_SCALE', '4.0')))
+            self.team_bottleneck_progress_scale = np.float32(
+                _kw_env_float('team_bottleneck_progress_scale', 'TEAM_BOTTLENECK_PROGRESS_SCALE', 4.0)
+            )
         except Exception:
             self.team_bottleneck_progress_scale = np.float32(4.0)
         try:
-            import os as _os
-            self.team_waiting_scale = np.float32(float(_os.getenv('TEAM_WAITING_SCALE', '0.6')))
+            self.team_waiting_scale = np.float32(
+                _kw_env_float('team_waiting_scale', 'TEAM_WAITING_SCALE', 0.6)
+            )
         except Exception:
             self.team_waiting_scale = np.float32(0.6)
         try:
-            import os as _os
             self.team_waiting_speed_threshold = np.float32(
-                float(_os.getenv('TEAM_WAITING_SPEED_THRESHOLD', str(kwargs.get('hover_speed_threshold', 1.0))))
+                _kw_env_float('team_waiting_speed_threshold', 'TEAM_WAITING_SPEED_THRESHOLD', kwargs.get('hover_speed_threshold', 1.0))
             )
         except Exception:
             self.team_waiting_speed_threshold = np.float32(kwargs.get('hover_speed_threshold', 1.0))
         try:
-            import os as _os
-            self.team_bottleneck_delta_clip = np.float32(float(_os.getenv('TEAM_BOTTLENECK_DELTA_CLIP', '1.0')))
+            self.team_bottleneck_delta_clip = np.float32(
+                _kw_env_float('team_bottleneck_delta_clip', 'TEAM_BOTTLENECK_DELTA_CLIP', 1.0)
+            )
         except Exception:
             self.team_bottleneck_delta_clip = np.float32(1.0)
+        self.clearance_dense_positive_scale = np.float32(
+            max(_kw_env_float('clearance_dense_positive_scale', 'CLEARANCE_DENSE_POSITIVE_SCALE', 0.0), 0.0)
+        )
+        self.height_dense_positive_scale = np.float32(
+            max(_kw_env_float('height_dense_positive_scale', 'HEIGHT_DENSE_POSITIVE_SCALE', 0.0), 0.0)
+        )
         
         # 奖励多样性检测
         self.reward_history = []
@@ -716,11 +782,17 @@ class VectorizedRewardCalculator:
                 if ring_state[idx]:
                     continue
                 radius_value = float(radius)
-                bonus_value = float(bonus)
-                if bool(getattr(self, 'team_gated_goal_reward', True)):
+                bonus_value = float(bonus) * max(float(getattr(self, 'goal_ring_individual_scale', 0.25)), 0.0)
+                if bonus_value <= 0.0:
+                    continue
+
+                if bool(getattr(self, 'goal_ring_team_gated', False)):
                     if self._goal_reward_team_gate(radius_value, scenario=scenario, world=world):
                         rewards += bonus_value
                         ring_state[idx] = True
+                    continue
+
+                if bool(getattr(self, 'goal_ring_require_agent_safe', True)) and not self._agent_safe_so_far(agent):
                     continue
 
                 ring_mask = distances <= radius_value
@@ -756,12 +828,15 @@ class VectorizedRewardCalculator:
         if approach_weight is None:
             approach_weight = float(self.reward_weights[6]) if len(self.reward_weights) > 6 else 1.0
 
-        total_weight = abs(float(distance_weight)) + abs(float(approach_weight))
+        distance_state_scale = max(float(getattr(self, 'progress_distance_state_scale', 0.0)), 0.0)
+        effective_distance_weight = float(distance_weight) * distance_state_scale
+
+        total_weight = abs(float(effective_distance_weight)) + abs(float(approach_weight))
         if total_weight < 1e-6:
             return np.zeros_like(distance_reward, dtype=np.float32)
 
         merged = (
-            float(distance_weight) * distance_reward +
+            float(effective_distance_weight) * distance_reward +
             float(approach_weight) * approach_reward
         ) / total_weight
         return merged.astype(np.float32)
@@ -992,6 +1067,49 @@ class VectorizedRewardCalculator:
 
                 raw_penalty = base_penalty + per_meter * remaining_ratio
                 penalties[idx] = -min(max_penalty, raw_penalty)
+        except Exception:
+            return np.zeros(num_positions, dtype=np.float32)
+        return penalties
+
+    def _terminal_non_success_guard_batch(
+        self,
+        positions: np.ndarray,
+        goal_positions: np.ndarray,
+        valid_goal_mask: np.ndarray,
+        start_positions: np.ndarray,
+        world: Any,
+    ) -> np.ndarray:
+        """团队未成功时，对全队施加按瓶颈剩余距离确定的终局 guard。"""
+        num_positions = positions.shape[0]
+        penalties = np.zeros(num_positions, dtype=np.float32)
+        try:
+            if not bool(getattr(self, 'non_success_terminal_guard_enabled', True)):
+                return penalties
+            if not self._is_episode_finished(world):
+                return penalties
+            if bool(getattr(world, '_episode_success', False)):
+                return penalties
+
+            base_penalty = max(float(getattr(self, 'non_success_terminal_penalty_base', 250.0)), 0.0)
+            per_meter = max(float(getattr(self, 'non_success_terminal_penalty_per_meter', 900.0)), 0.0)
+            max_penalty = max(float(getattr(self, 'non_success_terminal_penalty_max', 1200.0)), 0.0)
+            if max_penalty <= 0.0 or (base_penalty <= 0.0 and per_meter <= 0.0):
+                return penalties
+
+            valid_mask = np.asarray(valid_goal_mask, dtype=bool)
+            if valid_mask.shape[0] != num_positions or not np.any(valid_mask):
+                return penalties
+
+            success_thr = float(self.success_distance_threshold)
+            current_dist = np.linalg.norm(positions[valid_mask] - goal_positions[valid_mask], axis=-1)
+            initial_dist = np.linalg.norm(start_positions[valid_mask] - goal_positions[valid_mask], axis=-1)
+            denom = np.maximum(np.maximum(initial_dist, success_thr), 1e-6)
+            remaining_ratio = np.clip(np.maximum(current_dist - success_thr, 0.0) / denom, 0.0, 1.0)
+            bottleneck_ratio = float(np.max(remaining_ratio)) if remaining_ratio.size > 0 else 0.0
+
+            raw_penalty = base_penalty + per_meter * bottleneck_ratio
+            guard_penalty = -min(max_penalty, raw_penalty)
+            penalties[valid_mask] = np.float32(guard_penalty)
         except Exception:
             return np.zeros(num_positions, dtype=np.float32)
         return penalties
@@ -1629,6 +1747,13 @@ class VectorizedRewardCalculator:
         except Exception:
             pass
 
+        positive_trend_mask = trend_reward > 0.0
+        if np.any(positive_trend_mask):
+            trend_reward[positive_trend_mask] *= max(
+                float(getattr(self, 'clearance_dense_positive_scale', 0.0)),
+                0.0,
+            )
+
         warning_ratio = np.clip((safe_distance - d_min_current) / warning_span, 0.0, 1.0)
         warning_penalty = -penalty_weight * warning_ratio
         trend_active_mask = d_min_current >= collision_threshold
@@ -2154,11 +2279,13 @@ class VectorizedRewardCalculator:
             terminal_success_diag = np.zeros_like(total_rewards, dtype=np.float32)
             terminal_quality_diag = np.zeros_like(total_rewards, dtype=np.float32)
             terminal_unsafe_arrival_diag = np.zeros_like(total_rewards, dtype=np.float32)
+            terminal_non_success_guard_diag = np.zeros_like(total_rewards, dtype=np.float32)
 
             # === 终局项：episode end 单独结算（不参与逐步累积竞争） ===
             # - team_success_bonus（团队成功主导项）
             # - unsafe_arrival_penalty（全员到达但非安全成功）
             # - terminal_failure_penalty（从未进入成功圈的终局惩罚）
+            # - non_success_terminal_guard（团队未成功时的全队排序 guard）
             # - success-only quality bonuses（仅 team_success=True：clearance/efficiency）
             try:
                 for b, world in enumerate(world_batch):
@@ -2186,6 +2313,21 @@ class VectorizedRewardCalculator:
 
                     team_success = bool(getattr(world, '_episode_success', False))
                     all_reached = bool(getattr(world, '_episode_all_reached', False))
+
+                    if not team_success:
+                        try:
+                            valid_goal_mask = np.isfinite(arrays['goals'][b]).all(axis=1)
+                            guard_penalties = self._terminal_non_success_guard_batch(
+                                arrays['positions'][b],
+                                arrays['goals'][b],
+                                valid_goal_mask,
+                                arrays['start_positions'][b],
+                                world,
+                            ).astype(np.float32)
+                            total_rewards[b] = total_rewards[b] + guard_penalties
+                            terminal_non_success_guard_diag[b] = terminal_non_success_guard_diag[b] + guard_penalties
+                        except Exception:
+                            pass
 
                     if team_success:
                         # 2) 团队成功终局奖励：平均分配
@@ -2279,7 +2421,9 @@ class VectorizedRewardCalculator:
             # 首回合打印关键裁剪与权重配置
             if not self._printed_once:
                 try:
-                    print(f"[VecRew] min/max clip: [{float(self.min_reward):.1f},{float(self.max_reward):.1f}] weights[height,collision,exploration]={self.reward_weights[8]:.2f},{self.reward_weights[10]:.2f},{self.reward_weights[1]:.2f}")
+                    suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+                    if not suppress_reward_output:
+                        print(f"[VecRew] min/max clip: [{float(self.min_reward):.1f},{float(self.max_reward):.1f}] weights[height,collision,exploration]={self.reward_weights[8]:.2f},{self.reward_weights[10]:.2f},{self.reward_weights[1]:.2f}")
                 except Exception:
                     pass
                 self._printed_once = True
@@ -2323,10 +2467,39 @@ class VectorizedRewardCalculator:
                     'terminal_success': terminal_success_diag.astype(np.float32, copy=True),
                     'terminal_quality': terminal_quality_diag.astype(np.float32, copy=True),
                     'terminal_unsafe_arrival': terminal_unsafe_arrival_diag.astype(np.float32, copy=True),
+                    'terminal_non_success_guard': terminal_non_success_guard_diag.astype(np.float32, copy=True),
                     'total_before_clip': total_before_clip,
                     'total_after_clip': np.asarray(clipped_rewards, dtype=np.float32).copy(),
                     'clip_delta': (np.asarray(clipped_rewards, dtype=np.float32) - total_before_clip),
                     'restructured_reward_enabled': bool(getattr(self, 'restructured_reward_enabled', False)),
+                    'progress_distance_state_scale': float(
+                        getattr(self, 'progress_distance_state_scale', np.float32(0.0))
+                    ),
+                    'progress_reward_scale': float(getattr(self, 'progress_reward_scale', np.float32(1.0))),
+                    'team_progress_bottleneck_only': bool(getattr(self, 'team_progress_bottleneck_only', False)),
+                    'team_progress_non_bottleneck_scale': float(
+                        getattr(self, 'team_progress_non_bottleneck_scale', np.float32(1.0))
+                    ),
+                    'team_progress_bottleneck_eps': float(
+                        getattr(self, 'team_progress_bottleneck_eps', np.float32(1.0))
+                    ),
+                    'team_goal_occupancy_scale': float(getattr(self, 'team_goal_occupancy_scale', np.float32(1.0))),
+                    'team_bottleneck_progress_scale': float(
+                        getattr(self, 'team_bottleneck_progress_scale', np.float32(4.0))
+                    ),
+                    'team_waiting_scale': float(getattr(self, 'team_waiting_scale', np.float32(0.6))),
+                    'goal_ring_individual_scale': float(
+                        getattr(self, 'goal_ring_individual_scale', np.float32(0.25))
+                    ),
+                    'clearance_dense_positive_scale': float(
+                        getattr(self, 'clearance_dense_positive_scale', np.float32(0.0))
+                    ),
+                    'height_dense_positive_scale': float(
+                        getattr(self, 'height_dense_positive_scale', np.float32(0.0))
+                    ),
+                    'non_success_terminal_guard_enabled': bool(
+                        getattr(self, 'non_success_terminal_guard_enabled', True)
+                    ),
                     'active_indices': [int(i) for i in diagnostic_active_indices],
                 }
             except Exception:
@@ -2525,6 +2698,38 @@ class VectorizedRewardCalculator:
                         distance_weight=float(self.reward_weights[0]) if len(self.reward_weights) > 0 else 1.0,
                         approach_weight=float(self.reward_weights[6]) if len(self.reward_weights) > 6 else 1.0,
                     )
+                    progress_scale = float(getattr(self, 'progress_reward_scale', np.float32(1.0)))
+                    if progress_scale != 1.0:
+                        progress_scale = np.float32(max(progress_scale, 0.0))
+                        merged_progress = np.where(
+                            merged_progress > 0.0,
+                            merged_progress * progress_scale,
+                            merged_progress,
+                        ).astype(np.float32)
+                    if bool(getattr(self, 'team_progress_bottleneck_only', False)) and merged_progress.size > 1:
+                        finite_current_dist = np.where(
+                            np.isfinite(current_dist),
+                            current_dist,
+                            -np.inf,
+                        ).astype(np.float32)
+                        if np.any(np.isfinite(finite_current_dist)):
+                            bottleneck_dist = np.max(finite_current_dist)
+                            bottleneck_eps = np.float32(
+                                max(float(getattr(self, 'team_progress_bottleneck_eps', np.float32(1.0))), 0.0)
+                            )
+                            bottleneck_mask = finite_current_dist >= (bottleneck_dist - bottleneck_eps)
+                            non_bottleneck_scale = np.float32(
+                                np.clip(
+                                    float(getattr(self, 'team_progress_non_bottleneck_scale', np.float32(1.0))),
+                                    0.0,
+                                    1.0,
+                                )
+                            )
+                            merged_progress = np.where(
+                                (merged_progress > 0.0) & (~bottleneck_mask),
+                                merged_progress * non_bottleneck_scale,
+                                merged_progress,
+                            ).astype(np.float32)
                     rewards_batch[valid_goal_mask, 0] = merged_progress
 
                 # legacy approach 通道保留占位，但默认主路径不再单独计分
@@ -2706,14 +2911,23 @@ class VectorizedRewardCalculator:
                     if np.any(above_range):
                         height_reward[above_range] = -(height_diff[above_range] - ideal_max) * 0.5
 
+                    positive_height_mask = height_reward > 0.0
+                    if np.any(positive_height_mask):
+                        height_reward[positive_height_mask] *= max(
+                            float(getattr(self, 'height_dense_positive_scale', 0.0)),
+                            0.0,
+                        )
+
                     if not self._printed_once:
                         try:
-                            print(
-                                f"[VecRew] HEIGHT on: {self.height_reward_enabled} "
-                                f"ideal=[{ideal_min:.2f},{ideal_max:.2f}] "
-                                f"clip=[{float(self.min_reward):.1f},{float(self.max_reward):.1f}] "
-                                f"strict_expl={self.expl_reward_strict}"
-                            )
+                            suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+                            if not suppress_reward_output:
+                                print(
+                                    f"[VecRew] HEIGHT on: {self.height_reward_enabled} "
+                                    f"ideal=[{ideal_min:.2f},{ideal_max:.2f}] "
+                                    f"clip=[{float(self.min_reward):.1f},{float(self.max_reward):.1f}] "
+                                    f"strict_expl={self.expl_reward_strict}"
+                                )
                         except Exception:
                             pass
 
@@ -3454,16 +3668,25 @@ class VectorizedRewardCalculator:
             # 原因：低高度惩罚系数1.5，高高度惩罚系数0.1，导致网络倾向于向下飞
             if np.any(above_range):
                 rewards[above_range] = -(height_diff[above_range] - ideal_max) * 0.5
+
+            positive_height_mask = rewards > 0.0
+            if np.any(positive_height_mask):
+                rewards[positive_height_mask] *= max(
+                    float(getattr(self, 'height_dense_positive_scale', 0.0)),
+                    0.0,
+                )
             
             # 首回合调试打印：确认配置与场景一致
             if not self._printed_once:
                 try:
-                    print(
-                        f"[VecRew] HEIGHT on: {self.height_reward_enabled} "
-                        f"ideal=[{ideal_min:.2f},{ideal_max:.2f}] "
-                        f"clip=[{float(self.min_reward):.1f},{float(self.max_reward):.1f}] "
-                        f"strict_expl={self.expl_reward_strict}"
-                    )
+                    suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+                    if not suppress_reward_output:
+                        print(
+                            f"[VecRew] HEIGHT on: {self.height_reward_enabled} "
+                            f"ideal=[{ideal_min:.2f},{ideal_max:.2f}] "
+                            f"clip=[{float(self.min_reward):.1f},{float(self.max_reward):.1f}] "
+                            f"strict_expl={self.expl_reward_strict}"
+                        )
                 except Exception:
                     pass
         except Exception:
@@ -5977,6 +6200,13 @@ class VectorizedRewardCalculator:
                             trend_reward[positive_mask] *= float(self.clearance_near_goal_positive_factor)
             except Exception:
                 pass
+
+            positive_trend_mask = trend_reward > 0.0
+            if np.any(positive_trend_mask):
+                trend_reward[positive_trend_mask] *= max(
+                    float(getattr(self, 'clearance_dense_positive_scale', 0.0)),
+                    0.0,
+                )
 
             warning_ratio = np.clip((safe_distance - d_min_current) / warning_span, 0.0, 1.0)
             warning_penalty = -penalty_weight * warning_ratio

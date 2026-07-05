@@ -8,13 +8,14 @@ RUN_TAG="${RUN_TAG:-level3_dual_semantics_eval10x30}"
 EVAL_EPISODES="${EVAL_EPISODES:-30}"
 TRAIN_EPISODES="${TRAIN_EPISODES:-1000}"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
+SELECTION_MAX_PARALLEL="${SELECTION_MAX_PARALLEL:-1}"
 TRAIN_SEEDS=(${TRAIN_SEEDS:-101 202 936487})
 EVAL_SEEDS=(${EVAL_SEEDS:-30088 30188 30288 30388 30488 30588 30688 30788 30888 30988})
 LABELS=(${LABELS_OVERRIDE:-matd3_full_dual_semantic matd3_collapsed_replay matd3_no_corrected_target_reconstruction})
 MODEL_VARIANT="${MODEL_VARIANT:-best_by_team_sr}"
 SELECTION_PROTOCOL="${SELECTION_PROTOCOL:-fixed}"
-SELECTION_VALIDATION_SEEDS=(${SELECTION_VALIDATION_SEEDS:-41088 41188 41288})
-SELECTION_VALIDATION_EPISODES="${SELECTION_VALIDATION_EPISODES:-10}"
+SELECTION_VALIDATION_SEEDS=(${SELECTION_VALIDATION_SEEDS:-41088 41188 41288 41388 41488})
+SELECTION_VALIDATION_EPISODES="${SELECTION_VALIDATION_EPISODES:-20}"
 SELECTION_VALIDATION_CANDIDATES="${SELECTION_VALIDATION_CANDIDATES:-best_by_team_sr,best,checkpoint,final,latest_ep}"
 STRICT_SUMMARY="${STRICT_SUMMARY:-1}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
@@ -22,6 +23,15 @@ FORCE_RERUN="${FORCE_RERUN:-0}"
 EVAL_FR_MODE="${EVAL_FR_MODE:-checkpoint}"
 FORCE_EVAL_ACTION_FORCE_RATIO_VALUE="${FORCE_EVAL_ACTION_FORCE_RATIO_VALUE:-0.50}"
 SUMMARY_FILENAME_TAG="${SUMMARY_FILENAME_TAG:-model_fr}"
+EVAL_EPISODE_PARALLELISM="${EVAL_EPISODE_PARALLELISM:-1}"
+EVAL_ENV_STEP_THREADS="${EVAL_ENV_STEP_THREADS:-1}"
+SELECTION_EVAL_EPISODE_PARALLELISM="${SELECTION_EVAL_EPISODE_PARALLELISM:-3}"
+SELECTION_EVAL_ENV_STEP_THREADS="${SELECTION_EVAL_ENV_STEP_THREADS:-$SELECTION_EVAL_EPISODE_PARALLELISM}"
+EVAL_DEBUG_ACTION_STEPS="${EVAL_DEBUG_ACTION_STEPS:-0}"
+FAST_ARTIFACTS="${FAST_ARTIFACTS:-1}"
+EVAL_LIGHT_MODE="${EVAL_LIGHT_MODE:-1}"
+SUPPRESS_TERRAIN_OUTPUT="${SUPPRESS_TERRAIN_OUTPUT:-1}"
+SUPPRESS_REWARD_CONFIG_OUTPUT="${SUPPRESS_REWARD_CONFIG_OUTPUT:-1}"
 PYTHON_BIN="${PYTHON_BIN:-${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-/home/tang/miniconda3/envs/maddpg_env/bin/python3}}}"
 CONDA_SH="${CONDA_SH:-/home/tang/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-maddpg_env}"
@@ -239,6 +249,10 @@ try:
     model_root = model_dir.resolve()
 except Exception:
     raise SystemExit(1)
+if fr_mode in {"checkpoint", "checkpoint_fr", "model", "model_fr", "corresponding", "corresponding_fr"}:
+    selected_leaf = selected_path.name.strip().lower()
+    if selected_leaf.startswith("ep") and selected_leaf[2:].isdigit():
+        fr_source_ok = fr_source_ok and fr_source == "指定回合"
 
 selection_ok = True
 if selection_protocol == "fixed":
@@ -411,19 +425,121 @@ prepare_specs() {
 
 load_selection_result() {
   local result_path="$1"
-  "$PYTHON_BIN" - "$result_path" <<'PY'
+  local base_spec="$2"
+  "$PYTHON_BIN" - "$result_path" "$base_spec" "$MODEL_VARIANT" "$SELECTION_VALIDATION_EPISODES" "${SELECTION_VALIDATION_SEEDS[*]}" "$SELECTION_VALIDATION_CANDIDATES" "$EVAL_FR_MODE" "$REWARD_VERSION" "$REWARD_TERMINAL_ORDER_FIX" "$AGENT_SIZE" <<'PY'
+import hashlib
 import json
 import sys
 from pathlib import Path
 
+SCORE_SCHEMA_VERSION = 2
+VOLATILE_SPEC_HASH_KEYS = {"spec_path"}
+ALLOWED_CANDIDATES = {"auto", "final", "best", "best_by_team_sr", "latest_ep", "checkpoint"}
+
+def stable_json_hash(payload):
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+def spec_for_hash(spec):
+    if not isinstance(spec, dict):
+        return {}
+    return {k: v for k, v in spec.items() if k not in VOLATILE_SPEC_HASH_KEYS}
+
+def normalize_candidates(raw_value):
+    tokens = [
+        token.strip().lower()
+        for token in str(raw_value or "").replace(";", ",").split(",")
+    ]
+    ordered = []
+    for token in tokens:
+        is_explicit_ep = token.startswith("ep") and token[2:].isdigit()
+        if not token or (token not in ALLOWED_CANDIDATES and not is_explicit_ep) or token in ordered:
+            continue
+        ordered.append(token)
+    if not ordered:
+        ordered = ["best_by_team_sr", "best", "checkpoint", "final", "latest_ep"]
+    return ordered
+
+def parse_seeds(raw_value):
+    seeds = []
+    for token in str(raw_value or "").replace(",", " ").split():
+        try:
+            seed = int(token)
+        except Exception:
+            continue
+        if seed not in seeds:
+            seeds.append(seed)
+    return seeds
+
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 path = Path(sys.argv[1])
+base_spec = Path(sys.argv[2]).resolve()
+expected_model_variant = str(sys.argv[3]).strip().lower() or "best_by_team_sr"
+expected_validation_episodes = int(sys.argv[4])
+expected_validation_seeds = parse_seeds(sys.argv[5])
+expected_candidates = normalize_candidates(sys.argv[6])
+if expected_model_variant != "auto" and expected_model_variant not in expected_candidates:
+    expected_candidates = [expected_model_variant, *expected_candidates]
+expected_eval_fr_mode = str(sys.argv[7]).strip().lower() or "checkpoint"
+expected_reward_version = str(sys.argv[8]).strip() or "v1"
+expected_terminal_order_fix = to_bool(sys.argv[9]) if str(sys.argv[9]).strip() else True
+expected_agent_size = str(sys.argv[10]).strip() or "0.5"
 if not path.exists():
     raise SystemExit(1)
 data = json.loads(path.read_text(encoding="utf-8"))
+if int(data.get("schema_version", 0) or 0) != 2:
+    raise SystemExit(1)
 selection = data.get("model_selection", {})
+if not isinstance(selection, dict):
+    raise SystemExit(1)
+if int(selection.get("selection_score_schema_version", 0) or 0) != SCORE_SCHEMA_VERSION:
+    raise SystemExit(1)
+context = selection.get("selection_context", {})
+if not isinstance(context, dict):
+    context = data.get("selection_context", {}) if isinstance(data.get("selection_context"), dict) else {}
+if int(context.get("selection_score_schema_version", 0) or 0) != SCORE_SCHEMA_VERSION:
+    raise SystemExit(1)
+if not base_spec.exists():
+    raise SystemExit(1)
+base_spec_payload = json.loads(base_spec.read_text(encoding="utf-8"))
+expected_spec_hash = stable_json_hash(spec_for_hash(base_spec_payload))
+if str(context.get("official_spec_sha1", "") or "") != expected_spec_hash:
+    raise SystemExit(1)
+if str(context.get("official_spec_path", "") or "") and Path(str(context["official_spec_path"])).resolve() != base_spec:
+    raise SystemExit(1)
+if str(context.get("requested_model_variant", "") or "").strip().lower() != expected_model_variant:
+    raise SystemExit(1)
+if int(context.get("validation_episodes", 0) or 0) != expected_validation_episodes:
+    raise SystemExit(1)
+if [int(v) for v in context.get("validation_seeds", [])] != expected_validation_seeds:
+    raise SystemExit(1)
+if [str(v) for v in context.get("validation_candidates", [])] != expected_candidates:
+    raise SystemExit(1)
+if str(context.get("eval_fr_mode", "") or "").strip().lower() != expected_eval_fr_mode:
+    raise SystemExit(1)
+if str(context.get("reward_version", "") or "").strip() != expected_reward_version:
+    raise SystemExit(1)
+if bool(context.get("reward_terminal_order_fix", False)) != expected_terminal_order_fix:
+    raise SystemExit(1)
+try:
+    if abs(float(context.get("agent_size")) - float(expected_agent_size)) > 1e-6:
+        raise SystemExit(1)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(1)
 model_path = str(selection.get("selected_model_path", "") or "").strip()
 summary_path = str(selection.get("validation_selection_summary_path", "") or "").strip()
 if not model_path or not Path(model_path).exists():
+    raise SystemExit(1)
+if not summary_path or not Path(summary_path).exists():
+    raise SystemExit(1)
+summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+if int(summary.get("selection_score_schema_version", 0) or 0) != SCORE_SCHEMA_VERSION:
     raise SystemExit(1)
 print(model_path)
 print(summary_path)
@@ -434,41 +550,52 @@ select_shared_checkpoint() {
   local label="$1"
   local train_seed="$2"
   local model_dir="$3"
+  run_shared_selection_job "$label" "$train_seed" "$model_dir"
+  load_shared_selection_into_arrays "$label" "$train_seed"
+}
+
+run_shared_selection_job() {
+  local label="$1"
+  local train_seed="$2"
+  local model_dir="$3"
   local selection_dir
   local selection_result
   local selection_log
   local selection_base_spec
   local force_args=()
-  local selected_model_path
-  local selection_summary_path
-  local key="${label}|${train_seed}"
 
   selection_dir="$(selection_dir_for "$label" "$train_seed")"
   selection_result="$selection_dir/selection_result.json"
   selection_log="$RUN_LOG_ROOT/${label}_trainseed${train_seed}_shared_selection.log"
   mkdir -p "$selection_dir"
+  selection_base_spec="$(resolve_base_spec)"
+  if [ -z "$selection_base_spec" ] || [ ! -f "$selection_base_spec" ]; then
+    echo "[shared-selection-error] BASE_SPEC not found for $label trainseed${train_seed}" >&2
+    return 1
+  fi
 
-  if ! truthy "$FORCE_RERUN" && load_selection_result "$selection_result" >/tmp/level3_shared_selection_result.$$ 2>/dev/null; then
-    selected_model_path="$(sed -n '1p' /tmp/level3_shared_selection_result.$$)"
-    selection_summary_path="$(sed -n '2p' /tmp/level3_shared_selection_result.$$)"
-    rm -f /tmp/level3_shared_selection_result.$$
-    SHARED_SELECTED_MODEL_PATHS["$key"]="$selected_model_path"
-    SHARED_SELECTION_SUMMARIES["$key"]="$selection_summary_path"
-    echo "[shared-selection] reuse $label trainseed${train_seed}: $selected_model_path"
+  if ! truthy "$FORCE_RERUN" && load_selection_result "$selection_result" "$selection_base_spec" >/dev/null 2>/dev/null; then
+    echo "[shared-selection] reuse valid selection_result for $label trainseed${train_seed}"
     return 0
   fi
-  rm -f /tmp/level3_shared_selection_result.$$ 2>/dev/null || true
 
   if truthy "$FORCE_RERUN"; then
     force_args+=(--force-rerun)
   fi
-  selection_base_spec="$(resolve_base_spec)"
   echo "[shared-selection] selecting checkpoint for $label trainseed${train_seed}"
   echo "[shared-selection] validation seeds: ${SELECTION_VALIDATION_SEEDS[*]} | episodes/seed=$SELECTION_VALIDATION_EPISODES"
   (
     REWARD_VERSION="$REWARD_VERSION" \
     REWARD_TERMINAL_ORDER_FIX="$REWARD_TERMINAL_ORDER_FIX" \
     AGENT_SIZE="$AGENT_SIZE" \
+    EVAL_FR_MODE="$EVAL_FR_MODE" \
+    EVAL_EPISODE_PARALLELISM="$SELECTION_EVAL_EPISODE_PARALLELISM" \
+    EVAL_ENV_STEP_THREADS="$SELECTION_EVAL_ENV_STEP_THREADS" \
+    EVAL_DEBUG_ACTION_STEPS="$EVAL_DEBUG_ACTION_STEPS" \
+    FAST_ARTIFACTS="$FAST_ARTIFACTS" \
+    EVAL_LIGHT_MODE="$EVAL_LIGHT_MODE" \
+    SUPPRESS_TERRAIN_OUTPUT="$SUPPRESS_TERRAIN_OUTPUT" \
+    SUPPRESS_REWARD_CONFIG_OUTPUT="$SUPPRESS_REWARD_CONFIG_OUTPUT" \
     OFFICIAL_EVAL_QUIET=1 \
     QUIET_OUTPUT=1 \
     TQDM_DISABLE=1 \
@@ -488,9 +615,41 @@ select_shared_checkpoint() {
       "${force_args[@]}"
   ) 2>&1 | sed -u "s/^/[shared-selection ${label} trainseed${train_seed}] /" | tee "$selection_log"
 
-  mapfile -t _selection_lines < <(load_selection_result "$selection_result")
-  selected_model_path="${_selection_lines[0]:-}"
-  selection_summary_path="${_selection_lines[1]:-}"
+  load_selection_result "$selection_result" "$selection_base_spec" >/dev/null
+}
+
+load_shared_selection_into_arrays() {
+  local label="$1"
+  local train_seed="$2"
+  local selection_dir
+  local selection_result
+  local selection_base_spec
+  local selected_model_path
+  local selection_summary_path
+  local key="${label}|${train_seed}"
+  local tmp_file
+  local status=0
+
+  selection_dir="$(selection_dir_for "$label" "$train_seed")"
+  selection_result="$selection_dir/selection_result.json"
+  selection_base_spec="$(resolve_base_spec)"
+  if [ -z "$selection_base_spec" ] || [ ! -f "$selection_base_spec" ]; then
+    echo "[shared-selection-error] BASE_SPEC not found for $label trainseed${train_seed}" >&2
+    return 1
+  fi
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/level3_shared_selection_result.XXXXXX")"
+  if ! load_selection_result "$selection_result" "$selection_base_spec" >"$tmp_file"; then
+    status=1
+  fi
+  selected_model_path="$(sed -n '1p' "$tmp_file" 2>/dev/null || true)"
+  selection_summary_path="$(sed -n '2p' "$tmp_file" 2>/dev/null || true)"
+  rm -f "$tmp_file"
+
+  if [ "$status" -ne 0 ]; then
+    echo "[shared-selection-error] invalid selection_result for $label trainseed${train_seed}: $selection_result" >&2
+    return 1
+  fi
   if [ -z "$selected_model_path" ]; then
     echo "[shared-selection-error] selected checkpoint missing for $label trainseed${train_seed}" >&2
     return 1
@@ -504,10 +663,46 @@ run_shared_selection_all() {
   local label
   local train_seed
   local model_dir
+  local selection_failed=0
+  if [ "$SELECTION_MAX_PARALLEL" -le 1 ]; then
+    for label in "${LABELS[@]}"; do
+      for train_seed in "${TRAIN_SEEDS[@]}"; do
+        model_dir="$(latest_completed_model_dir "$label" "$train_seed")"
+        select_shared_checkpoint "$label" "$train_seed" "$model_dir"
+      done
+    done
+    return 0
+  fi
+
+  echo "[shared-selection] launching shared selection with max_parallel=$SELECTION_MAX_PARALLEL"
   for label in "${LABELS[@]}"; do
     for train_seed in "${TRAIN_SEEDS[@]}"; do
       model_dir="$(latest_completed_model_dir "$label" "$train_seed")"
-      select_shared_checkpoint "$label" "$train_seed" "$model_dir"
+      while [ "$(active_job_count)" -ge "$SELECTION_MAX_PARALLEL" ]; do
+        if ! wait -n; then
+          selection_failed=1
+        fi
+      done
+      (
+        run_shared_selection_job "$label" "$train_seed" "$model_dir"
+      ) &
+    done
+  done
+
+  while [ "$(active_job_count)" -gt 0 ]; do
+    if ! wait -n; then
+      selection_failed=1
+    fi
+  done
+
+  if [ "$selection_failed" -ne 0 ]; then
+    echo "[shared-selection-error] at least one shared selection job failed." >&2
+    return 1
+  fi
+
+  for label in "${LABELS[@]}"; do
+    for train_seed in "${TRAIN_SEEDS[@]}"; do
+      load_shared_selection_into_arrays "$label" "$train_seed"
     done
   done
 }
@@ -578,6 +773,14 @@ run_eval_job() {
       REWARD_VERSION="$REWARD_VERSION" \
       REWARD_TERMINAL_ORDER_FIX="$REWARD_TERMINAL_ORDER_FIX" \
       AGENT_SIZE="$AGENT_SIZE" \
+      EVAL_FR_MODE="$EVAL_FR_MODE" \
+      EVAL_EPISODE_PARALLELISM="$EVAL_EPISODE_PARALLELISM" \
+      EVAL_ENV_STEP_THREADS="$EVAL_ENV_STEP_THREADS" \
+      EVAL_DEBUG_ACTION_STEPS="$EVAL_DEBUG_ACTION_STEPS" \
+      FAST_ARTIFACTS="$FAST_ARTIFACTS" \
+      EVAL_LIGHT_MODE="$EVAL_LIGHT_MODE" \
+      SUPPRESS_TERRAIN_OUTPUT="$SUPPRESS_TERRAIN_OUTPUT" \
+      SUPPRESS_REWARD_CONFIG_OUTPUT="$SUPPRESS_REWARD_CONFIG_OUTPUT" \
       OFFICIAL_EVAL_QUIET=1 \
       QUIET_OUTPUT=1 \
       TQDM_DISABLE=1 \
@@ -609,6 +812,7 @@ preflight_checks() {
   is_positive_int "$EVAL_EPISODES" || { echo "[preflight-error] EVAL_EPISODES must be positive: $EVAL_EPISODES" >&2; errors=$((errors + 1)); }
   is_positive_int "$MAX_PARALLEL" || { echo "[preflight-error] MAX_PARALLEL must be positive: $MAX_PARALLEL" >&2; errors=$((errors + 1)); }
   if use_shared_selection; then
+    is_positive_int "$SELECTION_MAX_PARALLEL" || { echo "[preflight-error] SELECTION_MAX_PARALLEL must be positive: $SELECTION_MAX_PARALLEL" >&2; errors=$((errors + 1)); }
     is_positive_int "$SELECTION_VALIDATION_EPISODES" || { echo "[preflight-error] SELECTION_VALIDATION_EPISODES must be positive: $SELECTION_VALIDATION_EPISODES" >&2; errors=$((errors + 1)); }
     if [ "${#SELECTION_VALIDATION_SEEDS[@]}" -eq 0 ]; then
       echo "[preflight-error] SELECTION_VALIDATION_SEEDS must not be empty for shared selection" >&2
@@ -651,6 +855,8 @@ preflight_checks() {
   fi
   echo "[preflight] ok: Level3 specs and completed models are available."
   echo "[preflight] FR mode: $EVAL_FR_MODE"
+  echo "[preflight] official eval speed: episode_parallelism=$EVAL_EPISODE_PARALLELISM | env_step_threads=$EVAL_ENV_STEP_THREADS | fast_artifacts=$FAST_ARTIFACTS | light_mode=$EVAL_LIGHT_MODE | debug_action_steps=$EVAL_DEBUG_ACTION_STEPS"
+  echo "[preflight] selection eval speed: max_parallel=$SELECTION_MAX_PARALLEL | episode_parallelism=$SELECTION_EVAL_EPISODE_PARALLELISM | env_step_threads=$SELECTION_EVAL_ENV_STEP_THREADS"
   echo "[preflight] selection protocol: $SELECTION_PROTOCOL | model variant: $MODEL_VARIANT"
   if use_shared_selection; then
     echo "[preflight] shared validation seeds: ${SELECTION_VALIDATION_SEEDS[*]} | episodes/seed=$SELECTION_VALIDATION_EPISODES | candidates=$SELECTION_VALIDATION_CANDIDATES"

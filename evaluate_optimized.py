@@ -568,8 +568,6 @@ def _export_and_launch_gazebo_live_world(scenario, world, args, episode_idx, qui
         "export XDG_RUNTIME_DIR=/tmp/runtime-$USER; "
         "mkdir -p \"$XDG_RUNTIME_DIR\"; "
         "chmod 700 \"$XDG_RUNTIME_DIR\"; "
-        "export GZ_IP=${GZ_IP:-127.0.0.1}; "
-        "export IGN_IP=${IGN_IP:-127.0.0.1}; "
         "source /opt/ros/jazzy/setup.bash; "
         f"export HOME={shlex.quote(home_dir)}; "
         f"export GZ_SIM_RESOURCE_PATH={shlex.quote(str(model_parent_dir))}:$GZ_SIM_RESOURCE_PATH; "
@@ -969,6 +967,13 @@ def _env_int(name, default):
     except Exception:
         return int(default)
     return value if value > 0 else int(default)
+
+
+def _env_int_or_default(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
 
 
 def _env_float(name, default):
@@ -1652,6 +1657,24 @@ def _capture_agent_velocities(agents):
     return velocities
 
 
+def _apply_agent_velocity_frame(agents, velocities):
+    try:
+        arr = np.asarray(velocities, dtype=np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+    except Exception:
+        return False
+    for idx, agent in enumerate(list(agents)[: arr.shape[0]]):
+        state = getattr(agent, "state", None)
+        if state is None or arr.shape[1] < 3:
+            continue
+        vel = arr[idx, :3]
+        if not np.all(np.isfinite(vel)):
+            continue
+        state.p_vel = vel.astype(np.float64, copy=True)
+    return True
+
+
 def _positions_from_gazebo_state_data(data, agent_count):
     if not isinstance(data, dict):
         return None
@@ -1678,6 +1701,531 @@ def _vec_frames_to_lists(values):
         else:
             out.append(np.asarray(value, dtype=np.float64).reshape(-1).tolist())
     return out
+
+
+def _json_safe_eval_value(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, np.generic):
+        return _json_safe_eval_value(value.item())
+    if isinstance(value, np.ndarray):
+        return _json_safe_eval_value(value.tolist())
+    if isinstance(value, dict):
+        return {str(k): _json_safe_eval_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_eval_value(v) for v in value]
+    try:
+        return float(value) if np.isfinite(value) else None
+    except Exception:
+        return str(value)
+
+
+def _array_row_to_list(values, idx, limit=None):
+    try:
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if idx >= arr.shape[0]:
+            return None
+        row = arr[idx]
+        if limit is not None:
+            row = row[: int(limit)]
+        return _json_safe_eval_value(row)
+    except Exception:
+        return None
+
+
+def _norm3_or_none(values):
+    try:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)[:3]
+        if arr.size < 3 or not np.all(np.isfinite(arr)):
+            return None
+        return float(np.linalg.norm(arr))
+    except Exception:
+        return None
+
+
+def _gazebo_contact_pair_class(pair):
+    if not isinstance(pair, dict):
+        return "invalid"
+    collision1 = str(pair.get("collision1", "") or "")
+    collision2 = str(pair.get("collision2", "") or "")
+    text = f"{collision1} {collision2}".lower()
+    if not collision1 and not collision2:
+        return "topic_marker_only"
+    has_agent_envelope = "python_collision_envelope_collision" in text
+    if not has_agent_envelope:
+        return "unrelated_collision_pair"
+    if "obstacle" in text:
+        return "agent_vs_obstacle"
+    if "terrain" in text or "matd3_terrain" in text:
+        return "agent_vs_terrain"
+    if text.count("dynamic_agent") >= 2:
+        return "agent_vs_agent"
+    return "other_agent_envelope_contact"
+
+
+def _gazebo_contact_pair_is_real(pair):
+    return _gazebo_contact_pair_class(pair) in (
+        "agent_vs_obstacle",
+        "agent_vs_terrain",
+        "agent_vs_agent",
+    )
+
+
+def _gazebo_contact_pair_agent_index(pair, fallback_prefix=None):
+    if not isinstance(pair, dict):
+        return None
+    texts = [
+        str(pair.get("agent", "") or ""),
+        str(pair.get("collision1", "") or ""),
+        str(pair.get("collision2", "") or ""),
+        str(pair.get("topic", "") or ""),
+    ]
+    patterns = []
+    if fallback_prefix:
+        patterns.append(re.escape(str(fallback_prefix)) + r"(\d+)")
+    patterns.extend([r"dynamic_agent[^:\s/]*_(\d+)", r"agent[_-]?(\d+)"])
+    for text in texts:
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return int(match.group(1))
+                except Exception:
+                    continue
+    return None
+
+
+def _compact_gazebo_contact_pair(pair, agent_prefix=None):
+    if not isinstance(pair, dict):
+        return {}
+    out = {
+        "topic": pair.get("topic"),
+        "agent": pair.get("agent"),
+        "agent_id": _gazebo_contact_pair_agent_index(pair, fallback_prefix=agent_prefix),
+        "collision1": pair.get("collision1"),
+        "collision2": pair.get("collision2"),
+        "contacts": pair.get("contacts"),
+        "class": _gazebo_contact_pair_class(pair),
+    }
+    return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
+def _real_gazebo_contact_pairs(contact_pairs, agent_prefix=None):
+    real_pairs = []
+    for pair in contact_pairs or []:
+        if _gazebo_contact_pair_is_real(pair):
+            real_pairs.append(_compact_gazebo_contact_pair(pair, agent_prefix=agent_prefix))
+    return real_pairs
+
+
+def _mark_gazebo_contact_collision_on_agent(agent, contact_classes, step_count=None):
+    try:
+        agent._episode_has_collision = True
+        agent._had_penetration_or_collision = True
+    except Exception:
+        pass
+    if not hasattr(agent, "debug_info") or not isinstance(getattr(agent, "debug_info", None), dict):
+        try:
+            agent.debug_info = {}
+        except Exception:
+            pass
+    debug = getattr(agent, "debug_info", {}) if isinstance(getattr(agent, "debug_info", None), dict) else {}
+    classes = set(str(v) for v in (contact_classes or []) if v)
+    if "agent_vs_terrain" in classes:
+        try:
+            agent._had_terrain_contact_or_penetration = True
+        except Exception:
+            pass
+    if "agent_vs_obstacle" in classes:
+        try:
+            agent._had_obstacle_collision = True
+        except Exception:
+            pass
+    try:
+        debug["gazebo_contact_collision_count"] = int(debug.get("gazebo_contact_collision_count", 0) or 0) + 1
+        debug["total_penetration_count"] = int(debug.get("total_penetration_count", 0) or 0) + 1
+        if "agent_vs_terrain" in classes:
+            debug["terrain_penetration_count"] = int(debug.get("terrain_penetration_count", 0) or 0) + 1
+        if "agent_vs_obstacle" in classes:
+            debug["obstacle_collision_count"] = int(debug.get("obstacle_collision_count", 0) or 0) + 1
+        if "agent_vs_agent" in classes:
+            debug["agent_agent_contact_count"] = int(debug.get("agent_agent_contact_count", 0) or 0) + 1
+        if step_count is not None and debug.get("first_gazebo_contact_step") is None:
+            debug["first_gazebo_contact_step"] = int(step_count)
+    except Exception:
+        pass
+    try:
+        if not hasattr(agent, "current_episode_collision_count"):
+            agent.current_episode_collision_count = 0
+        agent.current_episode_collision_count = int(agent.current_episode_collision_count) + 1
+    except Exception:
+        pass
+
+
+def _apf_step_debug_frame(
+    step_count,
+    raw_actions,
+    original_corrected,
+    original_pf,
+    gazebo_result,
+    comparison_records,
+    cmd_vel,
+    gazebo_pose,
+    nominal_cmd_vel=None,
+    safety_filter_records=None,
+):
+    comp_by_agent = {}
+    for record in comparison_records or []:
+        try:
+            comp_by_agent[int(record.get("agent_id"))] = record
+        except Exception:
+            continue
+    safety_by_agent = {}
+    for record in safety_filter_records or []:
+        try:
+            safety_by_agent[int(record.get("agent_id"))] = record
+        except Exception:
+            continue
+    count = 0
+    try:
+        count = max(count, int(np.asarray(raw_actions).shape[0]))
+    except Exception:
+        pass
+    if gazebo_result is not None:
+        try:
+            count = max(count, int(gazebo_result.raw_actions.shape[0]))
+        except Exception:
+            pass
+        try:
+            count = max(count, len(gazebo_result.debug))
+        except Exception:
+            pass
+    frame = {
+        "step": int(step_count),
+        "raw_actions": _copy_action_frame(raw_actions),
+        "python_apf_outputs": [],
+        "gazebo_apf_outputs": [],
+        "nominal_cmd_vel": _vec_frames_to_lists(nominal_cmd_vel),
+        "cmd_vel": _vec_frames_to_lists(cmd_vel),
+        "gazebo_pose": _vec_frames_to_lists(gazebo_pose),
+        "agents": [],
+    }
+    for idx in range(count):
+        debug = {}
+        if gazebo_result is not None and idx < len(getattr(gazebo_result, "debug", [])):
+            debug = gazebo_result.debug[idx] or {}
+        nearest = debug.get("nearest_obstacle") or {}
+        original_corr = _array_row_to_list(original_corrected, idx)
+        original_pf_vec = _array_row_to_list(original_pf, idx, limit=3)
+        gazebo_corr = debug.get("corrected_action")
+        gazebo_pf_vec = debug.get("pf_force_action")
+        comp = comp_by_agent.get(idx, {})
+        safety = safety_by_agent.get(idx, {})
+        py_out = {
+            "agent_id": idx,
+            "corrected_action": original_corr,
+            "pf_vector": original_pf_vec,
+            "pf_norm": _norm3_or_none(original_pf_vec),
+        }
+        gz_out = {
+            "agent_id": idx,
+            "corrected_action": _json_safe_eval_value(gazebo_corr),
+            "corrected_acceleration": _json_safe_eval_value(debug.get("corrected_acceleration")),
+            "pf_vector": _json_safe_eval_value(gazebo_pf_vec),
+            "pf_norm": _norm3_or_none(gazebo_pf_vec),
+            "cmd_vel": _json_safe_eval_value(debug.get("cmd_vel")),
+            "nearest_obstacle": _json_safe_eval_value(nearest),
+            "terrain_clearance": _json_safe_eval_value(debug.get("terrain_clearance")),
+        }
+        agent_row = {
+            "agent_id": idx,
+            "raw_action": _array_row_to_list(raw_actions, idx),
+            "python_apf": py_out,
+            "gazebo_apf": gz_out,
+            "comparison": _json_safe_eval_value(comp),
+            "nearest_obstacle_id": nearest.get("name"),
+            "surface_distance": nearest.get("surface_distance"),
+            "nearest_obstacle_clearance": nearest.get("clearance"),
+            "terrain_clearance": debug.get("terrain_clearance"),
+            "nominal_cmd_vel": _array_row_to_list(nominal_cmd_vel, idx, limit=3),
+            "cmd_vel": _array_row_to_list(cmd_vel, idx, limit=3),
+            "gazebo_pose": _array_row_to_list(gazebo_pose, idx, limit=3),
+            "safety_filter": _json_safe_eval_value(safety),
+        }
+        frame["python_apf_outputs"].append(py_out)
+        frame["gazebo_apf_outputs"].append(gz_out)
+        frame["agents"].append(_json_safe_eval_value(agent_row))
+    return _json_safe_eval_value(frame)
+
+
+def _filter_contact_debug_window(records, start_step, end_step, agent_id=None, obstacle_name=None):
+    out = []
+    for frame in records or []:
+        try:
+            step = int(frame.get("step"))
+        except Exception:
+            continue
+        if step < int(start_step) or step > int(end_step):
+            continue
+        agents = []
+        for agent in frame.get("agents", []) or []:
+            try:
+                current_agent_id = int(agent.get("agent_id"))
+            except Exception:
+                current_agent_id = None
+            if agent_id is not None and current_agent_id != int(agent_id):
+                continue
+            nearest = agent.get("nearest_obstacle_id")
+            if obstacle_name and nearest != obstacle_name:
+                continue
+            agents.append(agent)
+        if agents:
+            row = dict(frame)
+            row["agents"] = agents
+            out.append(row)
+    return out
+
+
+def _surface_distance_trace(debug_window, agent_id=None, obstacle_name=None):
+    trace = []
+    for frame in debug_window or []:
+        step = frame.get("step")
+        for agent in frame.get("agents", []) or []:
+            if agent_id is not None and agent.get("agent_id") != agent_id:
+                continue
+            if obstacle_name and agent.get("nearest_obstacle_id") != obstacle_name:
+                continue
+            trace.append(
+                {
+                    "step": step,
+                    "agent_id": agent.get("agent_id"),
+                    "nearest_obstacle_id": agent.get("nearest_obstacle_id"),
+                    "surface_distance": agent.get("surface_distance"),
+                    "nearest_obstacle_clearance": agent.get("nearest_obstacle_clearance"),
+                    "terrain_clearance": agent.get("terrain_clearance"),
+                }
+            )
+    return trace
+
+
+def _write_contact_debug_window_artifacts(
+    output_dir,
+    episode_idx,
+    debug_window,
+    first_contact_step=None,
+    first_contact_pair=None,
+    agent_id=None,
+    obstacle_name=None,
+):
+    if not output_dir or not debug_window:
+        return {}
+    try:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return {}
+
+    safe_obstacle = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(obstacle_name or "obstacle"))
+    safe_agent = "all" if agent_id is None else str(agent_id)
+    stem = f"hard_contact_debug_ep{int(episode_idx):03d}_agent{safe_agent}_{safe_obstacle}"
+    payload = {
+        "episode": int(episode_idx),
+        "agent_id": agent_id,
+        "obstacle_name": obstacle_name,
+        "first_contact_step": int(first_contact_step) if first_contact_step is not None else None,
+        "first_contact_pair": first_contact_pair,
+        "window": debug_window,
+    }
+    paths = {}
+    try:
+        json_path = out_dir / f"{stem}.json"
+        json_path.write_text(json.dumps(_json_safe_eval_value(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        paths["json"] = str(json_path)
+    except Exception:
+        pass
+
+    rows = []
+    for frame in debug_window or []:
+        for agent in frame.get("agents", []) or []:
+            py = agent.get("python_apf", {}) or {}
+            gz = agent.get("gazebo_apf", {}) or {}
+            comp = agent.get("comparison", {}) or {}
+            py_pf = py.get("pf_vector") or []
+            gz_pf = gz.get("pf_vector") or []
+            py_corr = py.get("corrected_action") or []
+            gz_corr = gz.get("corrected_action") or []
+            nominal_cmd = agent.get("nominal_cmd_vel") or []
+            cmd = agent.get("cmd_vel") or []
+            pose = agent.get("gazebo_pose") or []
+            safety = agent.get("safety_filter") or {}
+            rows.append(
+                {
+                    "step": frame.get("step"),
+                    "agent_id": agent.get("agent_id"),
+                    "nearest_obstacle_id": agent.get("nearest_obstacle_id"),
+                    "surface_distance": agent.get("surface_distance"),
+                    "terrain_clearance": agent.get("terrain_clearance"),
+                    "python_corr_ax": py_corr[0] if len(py_corr) > 0 else "",
+                    "python_corr_ay": py_corr[1] if len(py_corr) > 1 else "",
+                    "python_corr_az": py_corr[2] if len(py_corr) > 2 else "",
+                    "gazebo_corr_ax": gz_corr[0] if len(gz_corr) > 0 else "",
+                    "gazebo_corr_ay": gz_corr[1] if len(gz_corr) > 1 else "",
+                    "gazebo_corr_az": gz_corr[2] if len(gz_corr) > 2 else "",
+                    "python_pf_x": py_pf[0] if len(py_pf) > 0 else "",
+                    "python_pf_y": py_pf[1] if len(py_pf) > 1 else "",
+                    "python_pf_z": py_pf[2] if len(py_pf) > 2 else "",
+                    "python_pf_norm": py.get("pf_norm"),
+                    "gazebo_pf_x": gz_pf[0] if len(gz_pf) > 0 else "",
+                    "gazebo_pf_y": gz_pf[1] if len(gz_pf) > 1 else "",
+                    "gazebo_pf_z": gz_pf[2] if len(gz_pf) > 2 else "",
+                    "gazebo_pf_norm": gz.get("pf_norm"),
+                    "corrected_action_error": comp.get("corrected_action_error"),
+                    "pf_force_error": comp.get("pf_force_error"),
+                    "direction_cosine_similarity": comp.get("direction_cosine_similarity"),
+                    "difference_reason": comp.get("difference_reason"),
+                    "filter_mode": safety.get("mode"),
+                    "filter_active": safety.get("filter_active"),
+                    "filter_trigger_reason": safety.get("filter_trigger_reason"),
+                    "inward_velocity_before_filter": safety.get("inward_velocity_before_filter"),
+                    "inward_velocity_after_filter": safety.get("inward_velocity_after_filter"),
+                    "relative_inward_velocity_before_filter": safety.get("relative_inward_velocity_before_filter"),
+                    "relative_inward_velocity_after_filter": safety.get("relative_inward_velocity_after_filter"),
+                    "current_relative_inward_velocity": safety.get("current_relative_inward_velocity"),
+                    "closing_inward_velocity_for_stopping": safety.get("closing_inward_velocity_for_stopping"),
+                    "outward_speed_applied": safety.get("outward_speed_applied"),
+                    "cmd_delta_norm": safety.get("cmd_delta_norm"),
+                    "goal_distance": safety.get("goal_distance"),
+                    "goal_projection_before_filter": safety.get("goal_projection_before_filter"),
+                    "goal_projection_after_filter": safety.get("goal_projection_after_filter"),
+                    "tangential_velocity_before_filter": safety.get("tangential_velocity_before_filter"),
+                    "tangential_velocity_after_filter": safety.get("tangential_velocity_after_filter"),
+                    "tangential_velocity_kept_ratio": safety.get("tangential_velocity_kept_ratio"),
+                    "outward_velocity_added": safety.get("outward_velocity_added"),
+                    "filter_invasiveness": safety.get("filter_invasiveness"),
+                    "boundary_dwell_steps": safety.get("boundary_dwell_steps"),
+                    "line_to_goal_blocked": safety.get("line_to_goal_blocked"),
+                    "nearest_agent_distance": safety.get("nearest_agent_distance"),
+                    "formation_error": safety.get("formation_error"),
+                    "avoidance_state": safety.get("avoidance_state"),
+                    "halfspace_projection_delta_norm": safety.get("halfspace_projection_delta_norm"),
+                    "tangent_recovery_applied": safety.get("tangent_recovery_applied"),
+                    "goal_projection_recovery_applied": safety.get("goal_projection_recovery_applied"),
+                    "nominal_cmd_vx": nominal_cmd[0] if len(nominal_cmd) > 0 else "",
+                    "nominal_cmd_vy": nominal_cmd[1] if len(nominal_cmd) > 1 else "",
+                    "nominal_cmd_vz": nominal_cmd[2] if len(nominal_cmd) > 2 else "",
+                    "cmd_vx": cmd[0] if len(cmd) > 0 else "",
+                    "cmd_vy": cmd[1] if len(cmd) > 1 else "",
+                    "cmd_vz": cmd[2] if len(cmd) > 2 else "",
+                    "pose_x": pose[0] if len(pose) > 0 else "",
+                    "pose_y": pose[1] if len(pose) > 1 else "",
+                    "pose_z": pose[2] if len(pose) > 2 else "",
+                }
+            )
+    try:
+        if rows:
+            csv_path = out_dir / f"{stem}.csv"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+            paths["csv"] = str(csv_path)
+    except Exception:
+        pass
+
+    try:
+        if rows:
+            steps = np.asarray([float(r["step"]) for r in rows], dtype=np.float64)
+            surface = np.asarray(
+                [float(r["surface_distance"]) if r["surface_distance"] not in (None, "") else np.nan for r in rows],
+                dtype=np.float64,
+            )
+            py_norm = np.asarray(
+                [float(r["python_pf_norm"]) if r["python_pf_norm"] not in (None, "") else np.nan for r in rows],
+                dtype=np.float64,
+            )
+            gz_norm = np.asarray(
+                [float(r["gazebo_pf_norm"]) if r["gazebo_pf_norm"] not in (None, "") else np.nan for r in rows],
+                dtype=np.float64,
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            ax = axes[0]
+            ax.plot(steps, surface, label="surface_distance", color="tab:red")
+            ax.axhline(0.0, color="black", linewidth=1.0, linestyle="--")
+            if first_contact_step is not None:
+                ax.axvline(float(first_contact_step), color="tab:orange", linewidth=1.2, label="first_contact")
+            ax.set_xlabel("step")
+            ax.set_ylabel("distance")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+
+            ax = axes[1]
+            poses = np.asarray(
+                [
+                    [r["pose_x"], r["pose_y"]]
+                    for r in rows
+                    if r["pose_x"] not in (None, "") and r["pose_y"] not in (None, "")
+                ],
+                dtype=np.float64,
+            )
+            if poses.size:
+                ax.plot(poses[:, 0], poses[:, 1], color="black", linewidth=1.0, label="gazebo pose")
+                ax.scatter([poses[0, 0]], [poses[0, 1]], color="green", s=25, label="window start")
+                ax.scatter([poses[-1, 0]], [poses[-1, 1]], color="red", s=25, label="window end")
+            first_nearest = None
+            for frame in debug_window:
+                agents = frame.get("agents", []) or []
+                if agents:
+                    first_nearest = (agents[0].get("gazebo_apf", {}) or {}).get("nearest_obstacle")
+                    if first_nearest:
+                        break
+            if isinstance(first_nearest, dict) and first_nearest.get("center") is not None:
+                center = np.asarray(first_nearest.get("center"), dtype=np.float64).reshape(-1)
+                radius = float(first_nearest.get("radius", 0.0) or 0.0)
+                if center.size >= 2:
+                    ax.add_patch(plt.Circle((center[0], center[1]), radius, fill=False, color="tab:red", linewidth=1.2))
+                    ax.scatter([center[0]], [center[1]], color="tab:red", s=20, label=first_nearest.get("name", "obstacle"))
+            if poses.size:
+                stride = max(1, len(rows) // 12)
+                for r in rows[::stride]:
+                    try:
+                        x = float(r["pose_x"])
+                        y = float(r["pose_y"])
+                        pfx = float(r["python_pf_x"])
+                        pfy = float(r["python_pf_y"])
+                        gfx = float(r["gazebo_pf_x"])
+                        gfy = float(r["gazebo_pf_y"])
+                        ax.arrow(x, y, pfx * 3.0, pfy * 3.0, color="tab:blue", width=0.05, alpha=0.6)
+                        ax.arrow(x, y, gfx * 3.0, gfy * 3.0, color="tab:orange", width=0.05, alpha=0.6)
+                    except Exception:
+                        continue
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.set_title("blue=python PF, orange=gazebo PF")
+            ax.axis("equal")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+
+            fig.suptitle(f"Hard contact debug ep={episode_idx}, agent={agent_id}, obstacle={obstacle_name}")
+            fig.tight_layout()
+            plot_path = out_dir / f"{stem}.png"
+            fig.savefig(plot_path, dpi=150)
+            plt.close(fig)
+            paths["plot"] = str(plot_path)
+            paths["pf_norm_series"] = {
+                "step": steps.astype(float).tolist(),
+                "python_pf_norm": py_norm.astype(float).tolist(),
+                "gazebo_pf_norm": gz_norm.astype(float).tolist(),
+            }
+    except Exception:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+    return _json_safe_eval_value(paths)
 
 
 def _extract_agent_goal_positions(world, scenario):
@@ -3376,6 +3924,46 @@ class ModelEvaluator:
         training_quadrotor_attitude_response_time = None
         training_quadrotor_psi_cmd = None
         training_use_quadrotor_dynamics = None
+
+        def _coerce_float_list(values):
+            if not isinstance(values, list):
+                return None
+            coerced = []
+            try:
+                for item in values:
+                    coerced.append(float(item))
+            except Exception:
+                return None
+            return coerced if coerced else None
+
+        def _load_checkpoint_episode_force_ratios():
+            candidates = [
+                Path(model_path) / "checkpoint_state.json",
+                Path(model_base_dir) / "checkpoint_state.json",
+                Path(model_base_dir) / "checkpoint" / "checkpoint_state.json",
+                Path(model_base_dir) / "best_by_team_sr" / "checkpoint_state.json",
+            ]
+            seen = set()
+            for candidate in candidates:
+                try:
+                    resolved = candidate.resolve()
+                except Exception:
+                    resolved = candidate
+                if resolved in seen or not candidate.exists():
+                    continue
+                seen.add(resolved)
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        state = json.load(f)
+                except Exception:
+                    continue
+                ratios = _coerce_float_list(state.get('episode_force_ratios') if isinstance(state, dict) else None)
+                if ratios is not None:
+                    print(f"✅ 从检查点状态读取逐回合FR序列: {candidate} (n={len(ratios)})")
+                    return ratios
+            return None
+
+        checkpoint_episode_force_ratios = _load_checkpoint_episode_force_ratios()
         for log_dir in potential_log_dirs:
             # 查找results.json（可能在子目录中）
             results_files = []
@@ -3390,18 +3978,18 @@ class ModelEvaluator:
                     with open(results_file, 'r', encoding='utf-8') as f:
                         results = json.load(f)
                     
-                    if isinstance(results.get('episode_force_ratios'), list):
-                        try:
-                            episode_force_ratios = [float(v) for v in results['episode_force_ratios']]
-                        except Exception:
-                            episode_force_ratios = None
+                    results_episode_force_ratios = _coerce_float_list(results.get('episode_force_ratios'))
+                    if results_episode_force_ratios is not None:
+                        episode_force_ratios = results_episode_force_ratios
+                    elif episode_force_ratios is None and checkpoint_episode_force_ratios is not None:
+                        episode_force_ratios = checkpoint_episode_force_ratios
 
                     # 关键：FR 必须与实际评估的权重变体一致。
                     # - final -> 最后回合 FR
                     # - best_by_team_sr -> Team SR 最佳回合 FR
                     # - best_by_strict_success -> 严格成功最佳回合 FR
                     # - best -> reward 最佳回合 FR
-                    # - epXXX/latest_ep -> 对应回合 FR（找不到则回退到最后回合 FR）
+                    # - epXXX/latest_ep -> 对应回合 FR；找不到逐回合 FR 时拒绝评估，不能回退到最终回合 FR
                     if model_leaf_dir == 'best_by_team_sr' and 'best_team_sr_force_ratio' in results:
                         selected_force_ratio = float(results['best_team_sr_force_ratio'])
                         if 'best_team_sr_episode' in results:
@@ -3465,10 +4053,11 @@ class ModelEvaluator:
                             selected_force_ratio_episode = ep_idx + 1
                             selected_force_ratio_label = '指定回合'
                             print(f"✅ 从训练配置读取第 {selected_force_ratio_episode} 回合的FR值: {selected_force_ratio}")
-                        elif 'last_episode_force_ratio' in results:
-                            selected_force_ratio = float(results['last_episode_force_ratio'])
-                            selected_force_ratio_label = '最终回合(回退)'
-                            print(f"⚠️  未找到 {model_leaf_dir} 对应FR，回退到最终回合FR: {selected_force_ratio}")
+                        else:
+                            print(
+                                f"⚠️  未找到 {model_leaf_dir} 对应逐回合FR，"
+                                f"拒绝回退到最终回合FR以避免评估错配"
+                            )
                     
                     # 读取训练时的特征标志
                     if 'args' in results and isinstance(results['args'], dict):
@@ -5010,7 +5599,7 @@ class ModelEvaluator:
                                 state,
                                 actions=actions_np,
                                 raw_actions=raw_actions_np,
-                                step=step,
+                                step=step + 1,
                                 pf_forces=pf_forces_np,
                             )
                         except Exception as step_e:
@@ -5286,10 +5875,25 @@ class ModelEvaluator:
         gazebo_live_authoritative_feedback_updates = 0
         gazebo_live_authoritative_feedback_errors = 0
         gazebo_contact_detected = False
+        gazebo_contact_raw_flag_count = 0
+        gazebo_contact_false_positive_count = 0
         gazebo_contact_step = None
+        gazebo_first_contact_step = None
+        gazebo_first_contact_pair = None
+        gazebo_first_contact_position = None
+        gazebo_first_contact_agent_id = None
         gazebo_contact_count = 0
         gazebo_contact_agent_indices = []
         gazebo_contact_pairs = []
+        gazebo_real_contact_pairs = []
+        gazebo_contact_pair_class_counts = {}
+        gazebo_contact_debug_records = []
+        gazebo_contact_debug_tail = deque(maxlen=20)
+        gazebo_contact_debug_window_start = _env_int_or_default("GAZEBO_LIVE_CONTACT_DEBUG_WINDOW_START", 380)
+        gazebo_contact_debug_post_steps = max(0, _env_int_or_default("GAZEBO_LIVE_CONTACT_DEBUG_POST_STEPS", 5))
+        gazebo_contact_debug_agent_id = _env_int_or_default("GAZEBO_LIVE_CONTACT_DEBUG_AGENT_ID", 2)
+        gazebo_contact_debug_obstacle = os.getenv("GAZEBO_LIVE_CONTACT_DEBUG_OBSTACLE", "obstacle_1")
+        gazebo_first_contact_pending_snapshot = False
         validation_trace_tail = deque(maxlen=20)
         gazebo_live_client_stats = {
             "semantic_mode": gazebo_live_semantic_mode,
@@ -5327,6 +5931,13 @@ class ModelEvaluator:
         gazebo_apf_validator = None
         gazebo_apf_metrics = None
         gazebo_apf_error = None
+        gazebo_velocity_filter = None
+        gazebo_velocity_filter_mode = "off"
+        gazebo_velocity_filter_enabled = False
+        gazebo_velocity_filter_error = None
+        gazebo_velocity_filter_records = []
+        gazebo_velocity_filter_summary = None
+        gazebo_velocity_filter_artifacts = {}
         if gazebo_apf_enabled:
             try:
                 from gazebo_apf import GazeboAPFCalculator
@@ -5368,6 +5979,29 @@ class ModelEvaluator:
                 gazebo_apf_enabled = False
                 if not quiet_output:
                     print(f"⚠️ Gazebo APF backend init failed; fallback to python_original: {gazebo_apf_error}")
+        if gazebo_apf_enabled:
+            try:
+                from gazebo_velocity_safety_filter import GazeboObstacleVelocitySafetyFilter
+
+                gazebo_velocity_filter = GazeboObstacleVelocitySafetyFilter.from_env()
+                gazebo_velocity_filter_mode = gazebo_velocity_filter.config.mode
+                gazebo_velocity_filter_enabled = bool(gazebo_velocity_filter.config.enabled)
+                monitor_enabled = _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_MONITOR", True)
+                if not gazebo_velocity_filter_enabled and not monitor_enabled:
+                    gazebo_velocity_filter = None
+                if not quiet_output and gazebo_velocity_filter is not None:
+                    print(
+                        "✅ Gazebo obstacle velocity safety filter/monitor: "
+                        f"mode={gazebo_velocity_filter_mode}, "
+                        f"enabled={gazebo_velocity_filter_enabled}, "
+                        f"margin={gazebo_velocity_filter.config.safety_margin}, "
+                        f"stopping_margin={gazebo_velocity_filter.config.stopping_margin}"
+                    )
+            except Exception as filter_err:
+                gazebo_velocity_filter_error = str(filter_err)
+                if _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_REQUIRED", gazebo_apf_enabled):
+                    raise
+                gazebo_velocity_filter = None
         if _env_flag("GAZEBO_LIVE_SYNC", False):
             try:
                 from gazebo_live_pose_client import make_live_pose_client_from_env
@@ -5502,6 +6136,9 @@ class ModelEvaluator:
             gazebo_apf_base_obs = None
             gazebo_apf_result = None
             gazebo_apf_comparison_records = []
+            original_corrected_head_np = None
+            original_corrected_full_np = None
+            original_pf_forces_np = None
             if gazebo_apf_enabled and gazebo_apf_provider is not None:
                 try:
                     if gazebo_live_client is not None:
@@ -5606,6 +6243,18 @@ class ModelEvaluator:
                     original_pf_forces_np = pf_forces_tf.numpy()
                 except Exception:
                     original_pf_forces_np = None
+                try:
+                    original_corrected_head_np = corrected_head_tf.numpy()
+                    if raw_actions.shape[1] > 3:
+                        original_corrected_full_np = np.concatenate(
+                            [original_corrected_head_np, raw_actions[:, 3:]],
+                            axis=1,
+                        )
+                    else:
+                        original_corrected_full_np = original_corrected_head_np
+                except Exception:
+                    original_corrected_head_np = None
+                    original_corrected_full_np = None
 
                 if (
                     gazebo_apf_enabled
@@ -5623,15 +6272,11 @@ class ModelEvaluator:
                         actions = gazebo_apf_result.corrected_actions
                         pf_forces = gazebo_apf_result.pf_forces
 
-                        if gazebo_apf_validator is not None and original_pf_forces_np is not None:
-                            original_corrected_head_np = corrected_head_tf.numpy()
-                            if raw_actions.shape[1] > 3:
-                                original_corrected_full_np = np.concatenate(
-                                    [original_corrected_head_np, raw_actions[:, 3:]],
-                                    axis=1,
-                                )
-                            else:
-                                original_corrected_full_np = original_corrected_head_np
+                        if (
+                            gazebo_apf_validator is not None
+                            and original_pf_forces_np is not None
+                            and original_corrected_full_np is not None
+                        ):
                             comparison = gazebo_apf_validator.compare(
                                 original_corrected_actions=original_corrected_full_np,
                                 original_pf_forces=original_pf_forces_np,
@@ -5711,6 +6356,37 @@ class ModelEvaluator:
                         f"      Agent {i}: {actions[i][:3]} (原始动作: {raw_actions[i][:3] if 'raw_actions' in locals() else 'N/A'})",
                         file=tqdm_file
                     )
+
+            semantic_filter_context = {}
+            if gazebo_apf_enabled and gazebo_apf_calculator is not None and gazebo_apf_state is not None:
+                try:
+                    raw_actor_accel_np = gazebo_apf_calculator._normalized_action_to_acceleration(
+                        np.asarray(raw_actions, dtype=np.float64)[:, :3],
+                        gazebo_apf_state,
+                    )
+                    shadow_raw_cmd_vel_np = gazebo_apf_calculator._acceleration_to_cmd_vel(
+                        raw_actor_accel_np,
+                        gazebo_apf_state,
+                    )
+                    corrected_accel_np = (
+                        np.asarray(gazebo_apf_result.corrected_accelerations, dtype=np.float64)
+                        if gazebo_apf_result is not None
+                        else gazebo_apf_calculator._normalized_action_to_acceleration(
+                            np.asarray(actions, dtype=np.float64)[:, :3],
+                            gazebo_apf_state,
+                        )
+                    )
+                    semantic_filter_context = {
+                        "raw_actions": raw_actions,
+                        "corrected_actions": actions,
+                        "raw_actor_accel": raw_actor_accel_np,
+                        "corrected_accel": corrected_accel_np,
+                        "shadow_raw_cmd_vel": shadow_raw_cmd_vel_np,
+                    }
+                except Exception as semantic_context_err:
+                    gazebo_velocity_filter_error = str(semantic_context_err)
+                    if _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_REQUIRED", False):
+                        raise
                 
             authoritative_reward_snapshot = (
                 _snapshot_gazebo_live_reward_state(self.env)
@@ -5732,8 +6408,56 @@ class ModelEvaluator:
             step_count += 1
             gazebo_state_feedback_applied = False
             validation_python_pose = _capture_agent_positions(self.env.agents) if validation_active else []
-            validation_cmd_vel = _capture_agent_velocities(self.env.agents) if validation_active else []
+            validation_nominal_cmd_vel = _capture_agent_velocities(self.env.agents)
+            validation_cmd_vel = validation_nominal_cmd_vel
             validation_gazebo_pose = None
+            gazebo_velocity_filter_step_records = []
+            if gazebo_velocity_filter is not None:
+                try:
+                    can_filter_velocity = (
+                        gazebo_live_control_mode == "velocity"
+                        and not gazebo_live_python_authoritative
+                        and gazebo_apf_state is not None
+                    )
+                    if can_filter_velocity:
+                        if not isinstance(semantic_filter_context, dict):
+                            semantic_filter_context = {}
+                        semantic_filter_context = dict(semantic_filter_context)
+                        semantic_filter_context.update({
+                            "step": int(step_count),
+                            "episode_length": int(episode_length),
+                            "simulation_dt": float(simulation_dt),
+                        })
+                        filter_result = gazebo_velocity_filter.apply(
+                            gazebo_apf_state,
+                            validation_nominal_cmd_vel,
+                            diagnostics_context=semantic_filter_context,
+                        )
+                        gazebo_velocity_filter_step_records = []
+                        for record in filter_result.records:
+                            if not isinstance(record, dict):
+                                continue
+                            item = dict(record)
+                            item["episode"] = int(episode_idx)
+                            item["step"] = int(step_count)
+                            item["hard_contact_seen_before_step"] = bool(gazebo_first_contact_step is not None)
+                            gazebo_velocity_filter_step_records.append(_json_safe_eval_value(item))
+                        gazebo_velocity_filter_records.extend(gazebo_velocity_filter_step_records)
+                        if gazebo_velocity_filter_enabled:
+                            _apply_agent_velocity_frame(self.env.agents, filter_result.final_cmd_vel)
+                        validation_cmd_vel = _capture_agent_velocities(self.env.agents)
+                    elif gazebo_velocity_filter_enabled:
+                        gazebo_velocity_filter_error = (
+                            "obstacle velocity safety filter requires Gazebo-authoritative velocity control "
+                            "and a Gazebo APF state"
+                        )
+                        if _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_REQUIRED", True):
+                            raise RuntimeError(gazebo_velocity_filter_error)
+                except Exception as filter_step_err:
+                    gazebo_velocity_filter_error = str(filter_step_err)
+                    if _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_REQUIRED", gazebo_velocity_filter_enabled):
+                        raise
+                    validation_cmd_vel = validation_nominal_cmd_vel
 
             if gazebo_live_client is not None and (step_count % gazebo_live_sync_every == 0):
                 try:
@@ -5812,56 +6536,96 @@ class ModelEvaluator:
             if gazebo_live_client is not None:
                 try:
                     if gazebo_live_client.contact_detected():
-                        gazebo_contact_detected = True
-                        gazebo_contact_count += 1
-                        if gazebo_contact_step is None:
-                            gazebo_contact_step = int(step_count)
-                        contact_agents = gazebo_live_client.contact_agent_indices()
+                        gazebo_contact_raw_flag_count += 1
+                        contact_pairs = []
                         try:
                             contact_pairs = gazebo_live_client.contact_pairs()
-                            if contact_pairs:
-                                gazebo_contact_pairs.extend(contact_pairs)
                         except Exception:
-                            pass
-                        if not contact_agents:
-                            contact_agents = list(range(len(getattr(self.env, "agents", []) or [])))
-                        gazebo_contact_agent_indices = sorted(set(gazebo_contact_agent_indices).union(contact_agents))
-                        if gazebo_live_contact_marks_collision:
-                            for contact_agent_idx in contact_agents:
-                                try:
-                                    agent = self.env.agents[contact_agent_idx]
-                                except Exception:
+                            contact_pairs = []
+                        for pair in contact_pairs or []:
+                            pair_class = _gazebo_contact_pair_class(pair)
+                            gazebo_contact_pair_class_counts[pair_class] = int(
+                                gazebo_contact_pair_class_counts.get(pair_class, 0) or 0
+                            ) + 1
+                        real_pairs = _real_gazebo_contact_pairs(
+                            contact_pairs,
+                            agent_prefix=getattr(gazebo_live_client, "agent_prefix", None),
+                        )
+                        if not real_pairs:
+                            gazebo_contact_false_positive_count += 1
+                            try:
+                                gazebo_live_client.clear_contact_flag()
+                            except Exception:
+                                pass
+                        else:
+                            gazebo_contact_detected = True
+                            gazebo_contact_count += 1
+                            gazebo_contact_pairs.extend(real_pairs)
+                            gazebo_real_contact_pairs.extend(real_pairs)
+                            contact_agents = sorted(
+                                {
+                                    int(pair["agent_id"])
+                                    for pair in real_pairs
+                                    if pair.get("agent_id") is not None
+                                }
+                            )
+                            if not contact_agents:
+                                contact_agents = gazebo_live_client.contact_agent_indices()
+                            if not contact_agents:
+                                contact_agents = list(range(len(getattr(self.env, "agents", []) or [])))
+                            gazebo_contact_agent_indices = sorted(set(gazebo_contact_agent_indices).union(contact_agents))
+                            if gazebo_contact_step is None:
+                                gazebo_contact_step = int(step_count)
+                                gazebo_first_contact_step = int(step_count)
+                                gazebo_first_contact_pair = real_pairs[0] if real_pairs else None
+                                gazebo_first_contact_agent_id = int(contact_agents[0]) if contact_agents else None
+                                gazebo_first_contact_pending_snapshot = True
+
+                            classes_by_agent = {}
+                            for pair in real_pairs:
+                                agent_idx = pair.get("agent_id")
+                                if agent_idx is None:
                                     continue
                                 try:
-                                    agent._episode_has_collision = True
-                                    agent._had_obstacle_collision = True
-                                    agent._had_penetration_or_collision = True
+                                    classes_by_agent.setdefault(int(agent_idx), set()).add(str(pair.get("class") or ""))
                                 except Exception:
-                                    pass
-                                try:
-                                    if not hasattr(agent, "debug_info") or not isinstance(agent.debug_info, dict):
-                                        agent.debug_info = {}
-                                    old_count = int(agent.debug_info.get("gazebo_contact_collision_count", 0) or 0)
-                                    agent.debug_info["gazebo_contact_collision_count"] = old_count + 1
-                                    total_old = int(agent.debug_info.get("total_penetration_count", 0) or 0)
-                                    agent.debug_info["total_penetration_count"] = total_old + 1
-                                    if not hasattr(agent, "current_episode_collision_count"):
-                                        agent.current_episode_collision_count = 0
-                                    agent.current_episode_collision_count = int(agent.current_episode_collision_count) + 1
-                                except Exception:
-                                    pass
+                                    continue
+                            if gazebo_live_contact_marks_collision:
+                                for contact_agent_idx in contact_agents:
+                                    try:
+                                        agent = self.env.agents[contact_agent_idx]
+                                    except Exception:
+                                        continue
+                                    _mark_gazebo_contact_collision_on_agent(
+                                        agent,
+                                        classes_by_agent.get(int(contact_agent_idx), []),
+                                        step_count=step_count,
+                                    )
                             if gazebo_live_contact_terminates and len(done_n) > 0:
                                 for done_idx in range(len(done_n)):
                                     done_n[done_idx] = True
-                        try:
-                            gazebo_live_client.clear_contact_flag()
-                        except Exception:
-                            pass
-                        if not quiet_output:
-                            tqdm.write(
-                                f"⚠️ Gazebo contact detected at step {step_count}: agents={gazebo_contact_agent_indices}",
-                                file=tqdm_file,
-                            )
+                                try:
+                                    if hasattr(self.env, "world"):
+                                        self.env.world._episode_done_reason = "gazebo_hard_contact"
+                                except Exception:
+                                    pass
+                            try:
+                                if hasattr(self.env, "_sync_world_team_success_snapshot"):
+                                    self.env._sync_world_team_success_snapshot()
+                                if gazebo_live_contact_terminates and hasattr(self.env, "world"):
+                                    self.env.world._episode_done_reason = "gazebo_hard_contact"
+                            except Exception:
+                                pass
+                            try:
+                                gazebo_live_client.clear_contact_flag()
+                            except Exception:
+                                pass
+                            if not quiet_output:
+                                tqdm.write(
+                                    f"⚠️ Gazebo hard contact at step {step_count}: "
+                                    f"agents={contact_agents}, pair={gazebo_first_contact_pair}",
+                                    file=tqdm_file,
+                                )
                 except Exception as contact_err:
                     gazebo_live_sync_error = str(contact_err)
                     if _env_flag("GAZEBO_LIVE_REQUIRED", False):
@@ -5875,6 +6639,11 @@ class ModelEvaluator:
                     )
                     if gazebo_contact_detected and gazebo_live_contact_terminates and len(done_n) > 0:
                         done_n = [True] * len(done_n)
+                        try:
+                            if hasattr(self.env, "world"):
+                                self.env.world._episode_done_reason = "gazebo_hard_contact"
+                        except Exception:
+                            pass
                     gazebo_live_authoritative_feedback_updates += 1
                 except Exception as authoritative_err:
                     gazebo_live_authoritative_feedback_errors += 1
@@ -5907,6 +6676,17 @@ class ModelEvaluator:
 
             current_positions = _capture_agent_positions(self.env.agents)
             current_feedback_velocities = _capture_agent_velocities(self.env.agents)
+            if gazebo_first_contact_pending_snapshot:
+                try:
+                    idx = gazebo_first_contact_agent_id
+                    if idx is not None and 0 <= int(idx) < len(current_positions):
+                        pos = current_positions[int(idx)]
+                        gazebo_first_contact_position = (
+                            pos.astype(float).tolist() if pos is not None else None
+                        )
+                except Exception:
+                    gazebo_first_contact_position = None
+                gazebo_first_contact_pending_snapshot = False
             if validation_active:
                 try:
                     from gazebo_live_validation import capture_pose_metrics
@@ -5922,15 +6702,46 @@ class ModelEvaluator:
                         "step": int(step_count),
                         "actions": _copy_action_frame(actions),
                         "raw_actions": _copy_action_frame(raw_actions),
+                        "nominal_cmd_vel": _vec_frames_to_lists(validation_nominal_cmd_vel),
                         "cmd_vel": _vec_frames_to_lists(validation_cmd_vel),
                         "feedback_vel": _vec_frames_to_lists(current_feedback_velocities),
                         "python_pose": _vec_frames_to_lists(validation_python_pose),
                         "gazebo_pose": _vec_frames_to_lists(
                             validation_gazebo_pose if validation_gazebo_pose is not None else current_positions
                         ),
+                        "safety_filter": _json_safe_eval_value(gazebo_velocity_filter_step_records),
                         "metrics": validation_metrics,
                     }
                 )
+            if gazebo_apf_enabled:
+                try:
+                    debug_pose = validation_gazebo_pose if validation_gazebo_pose is not None else current_positions
+                    debug_frame = _apf_step_debug_frame(
+                        step_count=step_count,
+                        raw_actions=raw_actions,
+                        original_corrected=original_corrected_full_np,
+                        original_pf=original_pf_forces_np,
+                        gazebo_result=gazebo_apf_result,
+                        comparison_records=gazebo_apf_comparison_records,
+                        cmd_vel=validation_cmd_vel,
+                        gazebo_pose=debug_pose,
+                        nominal_cmd_vel=validation_nominal_cmd_vel,
+                        safety_filter_records=gazebo_velocity_filter_step_records,
+                    )
+                    gazebo_contact_debug_tail.append(debug_frame)
+                    debug_window_end = (
+                        gazebo_first_contact_step + gazebo_contact_debug_post_steps
+                        if gazebo_first_contact_step is not None
+                        else None
+                    )
+                    if int(step_count) >= int(gazebo_contact_debug_window_start) and (
+                        debug_window_end is None or int(step_count) <= int(debug_window_end)
+                    ):
+                        gazebo_contact_debug_records.append(debug_frame)
+                except Exception as debug_frame_err:
+                    gazebo_apf_error = str(debug_frame_err)
+                    if _env_flag("GAZEBO_APF_REQUIRED", True):
+                        raise
             if gazebo_apf_enabled and gazebo_apf_validator is not None and gazebo_apf_result is not None and gazebo_apf_state is not None:
                 try:
                     gazebo_apf_validator.record_live_step(
@@ -5939,8 +6750,10 @@ class ModelEvaluator:
                         episode=episode_idx,
                         step=step_count,
                         comparison_records=gazebo_apf_comparison_records,
+                        nominal_cmd_vel=validation_nominal_cmd_vel,
                         sent_cmd_vel=validation_cmd_vel,
                         feedback_velocities=current_feedback_velocities,
+                        safety_filter_records=gazebo_velocity_filter_step_records,
                     )
                 except Exception as live_metric_err:
                     gazebo_apf_error = str(live_metric_err)
@@ -6049,7 +6862,7 @@ class ModelEvaluator:
 
         if gazebo_apf_validator is not None:
             try:
-                gazebo_apf_metrics = gazebo_apf_validator.finalize()
+                gazebo_apf_metrics = gazebo_apf_validator.finalize(first_contact_step=gazebo_first_contact_step)
             except Exception as apf_finalize_err:
                 gazebo_apf_error = str(apf_finalize_err)
                 if _env_flag("GAZEBO_APF_REQUIRED", True):
@@ -6389,6 +7202,8 @@ class ModelEvaluator:
         )
         if world_snapshot is not None and world_snapshot.get('done_reason'):
             episode_done_reason = world_snapshot['done_reason']
+        if gazebo_first_contact_step is not None and gazebo_live_contact_terminates:
+            episode_done_reason = "gazebo_hard_contact"
         
         if not quiet_output:
             print(f"✅ 回合 {episode_idx + 1} 完成:")
@@ -6435,6 +7250,89 @@ class ModelEvaluator:
         gazebo_live_state_feedback_update_ratio = float(
             gazebo_live_state_feedback_updates / max(gazebo_live_cmd_vel_publish_count, 1)
         )
+        gazebo_contact_debug_window_end_requested = (
+            int(gazebo_first_contact_step) + int(gazebo_contact_debug_post_steps)
+            if gazebo_first_contact_step is not None
+            else int(step_count) + int(gazebo_contact_debug_post_steps)
+        )
+        gazebo_contact_debug_window = _filter_contact_debug_window(
+            gazebo_contact_debug_records,
+            gazebo_contact_debug_window_start,
+            gazebo_contact_debug_window_end_requested,
+            agent_id=gazebo_contact_debug_agent_id,
+            obstacle_name=gazebo_contact_debug_obstacle,
+        )
+        pre_contact_debug_window = [
+            frame for frame in gazebo_contact_debug_window
+            if gazebo_first_contact_step is None or int(frame.get("step", 0) or 0) <= int(gazebo_first_contact_step)
+        ]
+        pre_contact_surface_distance_trace = _surface_distance_trace(
+            pre_contact_debug_window,
+            agent_id=gazebo_contact_debug_agent_id,
+            obstacle_name=gazebo_contact_debug_obstacle,
+        )
+        gazebo_contact_debug_window_end_available = None
+        if gazebo_contact_debug_window:
+            try:
+                gazebo_contact_debug_window_end_available = max(
+                    int(frame.get("step", 0) or 0) for frame in gazebo_contact_debug_window
+                )
+            except Exception:
+                gazebo_contact_debug_window_end_available = None
+        gazebo_contact_debug_tail_list = list(gazebo_contact_debug_tail)
+        last_20_raw_actions = [frame.get("raw_actions", []) for frame in gazebo_contact_debug_tail_list]
+        last_20_python_apf_outputs = [
+            frame.get("python_apf_outputs", []) for frame in gazebo_contact_debug_tail_list
+        ]
+        last_20_gazebo_apf_outputs = [
+            frame.get("gazebo_apf_outputs", []) for frame in gazebo_contact_debug_tail_list
+        ]
+        last_20_nominal_cmd_vel = [frame.get("nominal_cmd_vel", []) for frame in gazebo_contact_debug_tail_list]
+        last_20_cmd_vel = [frame.get("cmd_vel", []) for frame in gazebo_contact_debug_tail_list]
+        last_20_gazebo_pose = [frame.get("gazebo_pose", []) for frame in gazebo_contact_debug_tail_list]
+        last_20_safety_filter_outputs = [
+            [agent.get("safety_filter", {}) for agent in frame.get("agents", [])]
+            for frame in gazebo_contact_debug_tail_list
+        ]
+        gazebo_contact_debug_artifacts = {}
+        if gazebo_apf_validator is not None and gazebo_contact_debug_window:
+            gazebo_contact_debug_artifacts = _write_contact_debug_window_artifacts(
+                output_dir=gazebo_apf_validator.output_dir,
+                episode_idx=episode_idx,
+                debug_window=gazebo_contact_debug_window,
+                first_contact_step=gazebo_first_contact_step,
+                first_contact_pair=gazebo_first_contact_pair,
+                agent_id=gazebo_contact_debug_agent_id,
+                obstacle_name=gazebo_contact_debug_obstacle,
+            )
+        if gazebo_velocity_filter_records:
+            try:
+                from gazebo_velocity_safety_filter import (
+                    summarize_velocity_filter_records,
+                    write_velocity_filter_debug_artifacts,
+                )
+
+                gazebo_velocity_filter_summary = summarize_velocity_filter_records(gazebo_velocity_filter_records)
+                velocity_filter_output_dir = (
+                    gazebo_apf_validator.output_dir
+                    if gazebo_apf_validator is not None
+                    else getattr(self.args, "gazebo_apf_output_dir", "results/gazebo_apf_validation")
+                )
+                gazebo_velocity_filter_artifacts = write_velocity_filter_debug_artifacts(
+                    output_dir=velocity_filter_output_dir,
+                    episode_idx=episode_idx,
+                    records=gazebo_velocity_filter_records,
+                    first_contact_step=gazebo_first_contact_step,
+                    hard_contact=bool(gazebo_first_contact_step is not None),
+                    agent_id=gazebo_contact_debug_agent_id,
+                    obstacle_name=gazebo_contact_debug_obstacle,
+                    window_start=gazebo_contact_debug_window_start,
+                    window_end=gazebo_contact_debug_window_end_requested,
+                )
+            except Exception as filter_artifact_err:
+                gazebo_velocity_filter_error = str(filter_artifact_err)
+                if _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_REQUIRED", False):
+                    raise
 
         episode_data = {
             'episode': episode_idx,
@@ -6458,6 +7356,19 @@ class ModelEvaluator:
             'gazebo_apf_enabled': bool(gazebo_apf_enabled),
             'gazebo_apf_error': gazebo_apf_error,
             'gazebo_apf_metrics': gazebo_apf_metrics,
+            'gazebo_apf_adapter_metrics': (
+                gazebo_apf_metrics.get('adapter_metrics')
+                if isinstance(gazebo_apf_metrics, dict)
+                else None
+            ),
+            'gazebo_obstacle_velocity_filter_mode': gazebo_velocity_filter_mode,
+            'gazebo_obstacle_velocity_filter_enabled': bool(gazebo_velocity_filter_enabled),
+            'gazebo_obstacle_velocity_filter_error': gazebo_velocity_filter_error,
+            'gazebo_obstacle_velocity_filter_summary': gazebo_velocity_filter_summary,
+            'gazebo_obstacle_velocity_filter_artifacts': gazebo_velocity_filter_artifacts,
+            'gazebo_obstacle_velocity_filter_records_tail': _json_safe_eval_value(
+                gazebo_velocity_filter_records[-60:]
+            ),
             'gazebo_apf_validation_dir': (
                 str(gazebo_apf_validator.output_dir)
                 if gazebo_apf_validator is not None
@@ -6537,9 +7448,39 @@ class ModelEvaluator:
             'gazebo_live_feedback_update_ratio': gazebo_live_feedback_update_ratio,
             'gazebo_contact_detected': bool(gazebo_contact_detected),
             'gazebo_contact_count': int(gazebo_contact_count),
+            'gazebo_contact_raw_flag_count': int(gazebo_contact_raw_flag_count),
+            'gazebo_contact_false_positive_count': int(gazebo_contact_false_positive_count),
             'gazebo_contact_step': int(gazebo_contact_step) if gazebo_contact_step is not None else None,
+            'gazebo_first_contact_step': int(gazebo_first_contact_step) if gazebo_first_contact_step is not None else None,
+            'first_contact_step': int(gazebo_first_contact_step) if gazebo_first_contact_step is not None else None,
+            'first_contact_pair': gazebo_first_contact_pair,
+            'first_contact_position': gazebo_first_contact_position,
+            'first_contact_agent_id': (
+                int(gazebo_first_contact_agent_id) if gazebo_first_contact_agent_id is not None else None
+            ),
             'gazebo_contact_agent_indices': [int(v) for v in gazebo_contact_agent_indices],
             'gazebo_contact_pairs': gazebo_contact_pairs,
+            'gazebo_real_contact_pairs': gazebo_real_contact_pairs,
+            'gazebo_contact_pair_class_counts': gazebo_contact_pair_class_counts,
+            'pre_contact_surface_distance_trace': pre_contact_surface_distance_trace,
+            'last_20_raw_actions': last_20_raw_actions,
+            'last_20_python_apf_outputs': last_20_python_apf_outputs,
+            'last_20_gazebo_apf_outputs': last_20_gazebo_apf_outputs,
+            'last_20_nominal_cmd_vel': last_20_nominal_cmd_vel,
+            'last_20_cmd_vel': last_20_cmd_vel,
+            'last_20_safety_filter_outputs': last_20_safety_filter_outputs,
+            'last_20_gazebo_pose': last_20_gazebo_pose,
+            'gazebo_contact_debug_window': gazebo_contact_debug_window,
+            'gazebo_contact_debug_window_start': int(gazebo_contact_debug_window_start),
+            'gazebo_contact_debug_window_end_requested': int(gazebo_contact_debug_window_end_requested),
+            'gazebo_contact_debug_window_end_available': (
+                int(gazebo_contact_debug_window_end_available)
+                if gazebo_contact_debug_window_end_available is not None
+                else None
+            ),
+            'gazebo_contact_debug_agent_id': int(gazebo_contact_debug_agent_id),
+            'gazebo_contact_debug_obstacle': gazebo_contact_debug_obstacle,
+            'gazebo_contact_debug_artifacts': gazebo_contact_debug_artifacts,
             'gazebo_live_scene_check': gazebo_live_scene_check,
             'python_scene_signature': (
                 python_scene_signature_record.get('python_scene_signature')
@@ -6597,6 +7538,41 @@ class ModelEvaluator:
             'episode_done_reason': episode_done_reason,
             'vis_context': vis_context,
         }
+        if gazebo_velocity_filter_records:
+            try:
+                from gazebo_velocity_safety_filter import write_progress_diagnostics_artifacts
+
+                progress_output_dir = (
+                    gazebo_apf_validator.output_dir
+                    if gazebo_apf_validator is not None
+                    else getattr(self.args, "gazebo_apf_output_dir", "results/gazebo_apf_validation")
+                )
+                gazebo_progress_artifacts = write_progress_diagnostics_artifacts(
+                    output_dir=progress_output_dir,
+                    episode_idx=episode_idx,
+                    records=gazebo_velocity_filter_records,
+                    episode_data=episode_data,
+                )
+                episode_data['gazebo_progress_diagnostics_artifacts'] = gazebo_progress_artifacts
+                episode_data['gazebo_progress_failure_summary'] = (
+                    gazebo_progress_artifacts.get('episode_progress_summary')
+                    if isinstance(gazebo_progress_artifacts, dict)
+                    else None
+                )
+                episode_data['gazebo_progress_diagnostics_csv'] = (
+                    gazebo_progress_artifacts.get('gazebo_progress_diagnostics_csv')
+                    if isinstance(gazebo_progress_artifacts, dict)
+                    else None
+                )
+                episode_data['progress_failure_summary_json'] = (
+                    gazebo_progress_artifacts.get('progress_failure_summary_json')
+                    if isinstance(gazebo_progress_artifacts, dict)
+                    else None
+                )
+            except Exception as progress_artifact_err:
+                episode_data['gazebo_progress_diagnostics_error'] = str(progress_artifact_err)
+                if _env_flag("GAZEBO_LIVE_OBSTACLE_SAFETY_REQUIRED", False):
+                    raise
         if validation_active:
             try:
                 from gazebo_live_validation import build_sync_health_record
@@ -8096,6 +9072,23 @@ class ModelEvaluator:
                     'diagnostic_metrics': ep.get('diagnostic_metrics', {}),
                     'terminal_success_bonus_applied': ep.get('terminal_success_bonus_applied', False),
                     'episode_done_reason': ep.get('episode_done_reason', None),
+                    'apf_backend': ep.get('apf_backend', 'python_original'),
+                    'gazebo_apf_enabled': ep.get('gazebo_apf_enabled', False),
+                    'gazebo_apf_error': ep.get('gazebo_apf_error', None),
+                    'gazebo_apf_metrics': ep.get('gazebo_apf_metrics', None),
+                    'gazebo_apf_adapter_metrics': ep.get('gazebo_apf_adapter_metrics', None),
+                    'gazebo_obstacle_velocity_filter_mode': ep.get('gazebo_obstacle_velocity_filter_mode', 'off'),
+                    'gazebo_obstacle_velocity_filter_enabled': ep.get('gazebo_obstacle_velocity_filter_enabled', False),
+                    'gazebo_obstacle_velocity_filter_error': ep.get('gazebo_obstacle_velocity_filter_error', None),
+                    'gazebo_obstacle_velocity_filter_summary': ep.get('gazebo_obstacle_velocity_filter_summary', None),
+                    'gazebo_obstacle_velocity_filter_artifacts': ep.get('gazebo_obstacle_velocity_filter_artifacts', {}),
+                    'gazebo_obstacle_velocity_filter_records_tail': ep.get('gazebo_obstacle_velocity_filter_records_tail', []),
+                    'gazebo_progress_diagnostics_artifacts': ep.get('gazebo_progress_diagnostics_artifacts', {}),
+                    'gazebo_progress_failure_summary': ep.get('gazebo_progress_failure_summary', None),
+                    'gazebo_progress_diagnostics_csv': ep.get('gazebo_progress_diagnostics_csv', None),
+                    'progress_failure_summary_json': ep.get('progress_failure_summary_json', None),
+                    'gazebo_progress_diagnostics_error': ep.get('gazebo_progress_diagnostics_error', None),
+                    'gazebo_apf_validation_dir': ep.get('gazebo_apf_validation_dir', None),
                     'gazebo_live_sync_active': ep.get('gazebo_live_sync_active', False),
                     'gazebo_live_sync_error': ep.get('gazebo_live_sync_error', None),
                     'gazebo_live_launch_error': ep.get('gazebo_live_launch_error', None),
@@ -8144,9 +9137,33 @@ class ModelEvaluator:
                     'gazebo_live_feedback_update_ratio': ep.get('gazebo_live_feedback_update_ratio', 0.0),
                     'gazebo_contact_detected': ep.get('gazebo_contact_detected', False),
                     'gazebo_contact_count': ep.get('gazebo_contact_count', 0),
+                    'gazebo_contact_raw_flag_count': ep.get('gazebo_contact_raw_flag_count', 0),
+                    'gazebo_contact_false_positive_count': ep.get('gazebo_contact_false_positive_count', 0),
                     'gazebo_contact_step': ep.get('gazebo_contact_step', None),
+                    'gazebo_first_contact_step': ep.get('gazebo_first_contact_step', None),
+                    'first_contact_step': ep.get('first_contact_step', None),
+                    'first_contact_pair': ep.get('first_contact_pair', None),
+                    'first_contact_position': ep.get('first_contact_position', None),
+                    'first_contact_agent_id': ep.get('first_contact_agent_id', None),
                     'gazebo_contact_agent_indices': ep.get('gazebo_contact_agent_indices', []),
                     'gazebo_contact_pairs': ep.get('gazebo_contact_pairs', []),
+                    'gazebo_real_contact_pairs': ep.get('gazebo_real_contact_pairs', []),
+                    'gazebo_contact_pair_class_counts': ep.get('gazebo_contact_pair_class_counts', {}),
+                    'pre_contact_surface_distance_trace': ep.get('pre_contact_surface_distance_trace', []),
+                    'last_20_raw_actions': ep.get('last_20_raw_actions', []),
+                    'last_20_python_apf_outputs': ep.get('last_20_python_apf_outputs', []),
+                    'last_20_gazebo_apf_outputs': ep.get('last_20_gazebo_apf_outputs', []),
+                    'last_20_nominal_cmd_vel': ep.get('last_20_nominal_cmd_vel', []),
+                    'last_20_cmd_vel': ep.get('last_20_cmd_vel', []),
+                    'last_20_safety_filter_outputs': ep.get('last_20_safety_filter_outputs', []),
+                    'last_20_gazebo_pose': ep.get('last_20_gazebo_pose', []),
+                    'gazebo_contact_debug_window': ep.get('gazebo_contact_debug_window', []),
+                    'gazebo_contact_debug_window_start': ep.get('gazebo_contact_debug_window_start', None),
+                    'gazebo_contact_debug_window_end_requested': ep.get('gazebo_contact_debug_window_end_requested', None),
+                    'gazebo_contact_debug_window_end_available': ep.get('gazebo_contact_debug_window_end_available', None),
+                    'gazebo_contact_debug_agent_id': ep.get('gazebo_contact_debug_agent_id', None),
+                    'gazebo_contact_debug_obstacle': ep.get('gazebo_contact_debug_obstacle', None),
+                    'gazebo_contact_debug_artifacts': ep.get('gazebo_contact_debug_artifacts', {}),
                     'gazebo_live_scene_check': ep.get('gazebo_live_scene_check', None),
                     'gazebo_live_sync_health': ep.get('gazebo_live_sync_health', None),
                     'python_scene_signature': ep.get('python_scene_signature', None),

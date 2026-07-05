@@ -26,6 +26,30 @@ DEFAULT_VALIDATION_CANDIDATES = (
     "latest_ep",
 )
 SELECTION_PROTOCOL_CHOICES = ("fixed", "matched_validation")
+SELECTION_RESULT_SCHEMA_VERSION = 2
+SELECTION_SCORE_SCHEMA_VERSION = 2
+SELECTION_GUARDED_MIN_COLLISION_FREE = 0.05
+SELECTION_GUARDED_COLLISION_COUNT_WEIGHT = 5.0
+SELECTION_SCORE_FIELDS = (
+    "team_success_rate",
+    "partial_success_mean",
+    "partial_success_max",
+    "partial_success_min",
+    "guarded_goal_progress_score",
+    "collision_free_rate",
+    "neg_avg_collision_count",
+    "neg_avg_team_final_goal_distance",
+    "neg_avg_team_total_path_length",
+)
+CHECKPOINT_FR_MODES = {
+    "checkpoint",
+    "checkpoint_fr",
+    "model",
+    "model_fr",
+    "corresponding",
+    "corresponding_fr",
+}
+VOLATILE_SPEC_HASH_KEYS = {"spec_path"}
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -64,12 +88,86 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return data
 
 
+def _stable_json_hash(payload: Any) -> str:
+    blob = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _spec_for_hash(spec: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(spec, dict):
+        return {}
+    return {
+        key: value
+        for key, value in spec.items()
+        if key not in VOLATILE_SPEC_HASH_KEYS
+    }
+
+
+def _selection_score_schema() -> Dict[str, Any]:
+    return {
+        "version": int(SELECTION_SCORE_SCHEMA_VERSION),
+        "fields": list(SELECTION_SCORE_FIELDS),
+        "guarded_goal_progress": {
+            "min_collision_free_rate": float(SELECTION_GUARDED_MIN_COLLISION_FREE),
+            "collision_count_weight": float(SELECTION_GUARDED_COLLISION_COUNT_WEIGHT),
+        },
+        "ordering": "lexicographic_desc",
+    }
+
+
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if value is None:
         return False
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _terminal_order_fix_from_env() -> bool:
+    terminal_order_raw = os.getenv("REWARD_TERMINAL_ORDER_FIX", os.getenv("reward_terminal_order_fix", ""))
+    if str(terminal_order_raw).strip() == "":
+        return True
+    return _to_bool(terminal_order_raw)
+
+
+def _current_eval_fr_mode() -> str:
+    return str(os.getenv("EVAL_FR_MODE", "checkpoint") or "checkpoint").strip().lower()
+
+
+def _is_ep_variant_name(name: str) -> bool:
+    value = str(name or "").strip().lower()
+    return value.startswith("ep") and value[2:].isdigit()
+
+
+def _build_selection_context(
+    *,
+    official_spec: Dict[str, Any],
+    official_spec_path: Path,
+    requested_variant: str,
+    validation_episodes: int,
+    validation_seeds: Sequence[int],
+    validation_candidates: Sequence[str],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": int(SELECTION_RESULT_SCHEMA_VERSION),
+        "selection_score_schema_version": int(SELECTION_SCORE_SCHEMA_VERSION),
+        "requested_model_variant": str(requested_variant),
+        "validation_episodes": int(validation_episodes),
+        "validation_seeds": [int(seed) for seed in validation_seeds],
+        "validation_candidates": [str(candidate) for candidate in validation_candidates],
+        "official_spec_path": str(Path(official_spec_path).resolve()),
+        "official_spec_sha1": _stable_json_hash(_spec_for_hash(official_spec)),
+        "eval_fr_mode": _current_eval_fr_mode(),
+        "reward_version": str(os.getenv("REWARD_VERSION", os.getenv("reward_version", "v1")) or "v1").strip(),
+        "reward_terminal_order_fix": bool(_terminal_order_fix_from_env()),
+        "agent_size": str(os.getenv("AGENT_SIZE", str(official_spec.get("agent_size", "0.5"))) or "0.5"),
+    }
 
 
 def _normalize_candidates(raw_value: str) -> List[str]:
@@ -480,30 +578,50 @@ def _partial_success_scores(summary: Dict[str, Any]) -> Tuple[float, float, floa
     )
 
 
-def _score_summary(summary: Dict[str, Any]) -> Tuple[float, float, float, float, float, float, float, float]:
-    def _metric(key: str, *, fallback: float, invert: bool = False) -> float:
-        value = _safe_float(summary.get(key))
-        if value is None:
-            return fallback
-        value = float(value)
-        return -value if invert else value
+def _selection_metric(summary: Dict[str, Any], key: str, *, fallback: float) -> float:
+    value = _safe_float(summary.get(key))
+    if value is None:
+        return fallback
+    return float(value)
 
+
+def _guarded_goal_progress_score(summary: Dict[str, Any]) -> float:
+    distance = max(0.0, _selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12))
+    collision_count = max(0.0, _selection_metric(summary, "avg_collision_count", fallback=1e12))
+    collision_free = max(0.0, min(1.0, _selection_metric(summary, "collision_free_rate", fallback=0.0)))
+
+    # Compare goal progress only after discounting unsafe trajectories. This keeps a close,
+    # moderately-colliding checkpoint competitive while rejecting collision-heavy shortcuts.
+    guarded_distance = (
+        distance / max(collision_free, SELECTION_GUARDED_MIN_COLLISION_FREE)
+        + collision_count * SELECTION_GUARDED_COLLISION_COUNT_WEIGHT
+    )
+    return -guarded_distance
+
+
+def _score_summary(summary: Dict[str, Any]) -> Tuple[float, ...]:
     partial_mean, partial_max, partial_min = _partial_success_scores(summary)
+    collision_free = _selection_metric(summary, "collision_free_rate", fallback=-1.0)
+    collision_count = _selection_metric(summary, "avg_collision_count", fallback=1e12)
+    distance = _selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12)
+    path_length = _selection_metric(summary, "avg_team_total_path_length", fallback=1e12)
     return (
-        _metric("team_success_rate", fallback=-1.0),
+        _selection_metric(summary, "team_success_rate", fallback=-1.0),
         partial_mean,
         partial_max,
         partial_min,
-        _metric("avg_team_final_goal_distance", fallback=-1e12, invert=True),
-        _metric("collision_free_rate", fallback=-1.0),
-        _metric("avg_collision_count", fallback=-1e12, invert=True),
-        _metric("avg_team_total_path_length", fallback=-1e12, invert=True),
+        _guarded_goal_progress_score(summary),
+        collision_free,
+        -collision_count,
+        -distance,
+        -path_length,
     )
 
 
 def _build_eval_env(base_env: Dict[str, str], spec: Dict[str, Any], *, quiet_output: str, python_bin: str) -> Dict[str, str]:
     env = dict(base_env)
     artifact_policy = spec.get("artifact_policy", {}) if isinstance(spec.get("artifact_policy"), dict) else {}
+    light_mode = _to_bool(artifact_policy.get("light_mode", env.get("EVAL_LIGHT_MODE", False)))
     env["EVAL_PYTHON_BIN"] = python_bin
     env["MODEL_VARIANT"] = "auto"
     if _to_bool(env.get("OFFICIAL_EVAL_LOAD_CRITIC", "0")):
@@ -547,6 +665,17 @@ def _build_eval_env(base_env: Dict[str, str], spec: Dict[str, Any], *, quiet_out
     env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = ""
     env["QUIET_OUTPUT"] = str(quiet_output)
     env["TQDM_DISABLE"] = "1"
+    env["EVAL_LIGHT_MODE"] = "1" if light_mode else "0"
+    if light_mode:
+        env["FAST_ARTIFACTS"] = "1"
+        env.setdefault("SUPPRESS_TERRAIN_OUTPUT", "1")
+        env.setdefault("SUPPRESS_REWARD_CONFIG_OUTPUT", "1")
+    env["EVAL_DEBUG_ACTION_STEPS"] = str(
+        artifact_policy.get(
+            "debug_action_steps",
+            env.get("EVAL_DEBUG_ACTION_STEPS", "0" if light_mode else "3"),
+        )
+    )
     env["SAVE_INTERACTIVE_TRAJ"] = "1" if _to_bool(artifact_policy.get("save_interactive_html", True)) else "0"
     env["SAVE_EVAL_ALL_EPISODES"] = "1" if _to_bool(artifact_policy.get("save_all_episodes", False)) else "0"
     env["SAVE_BEST_TRAJ"] = "1" if _to_bool(artifact_policy.get("save_best_reward_html", True)) else "0"
@@ -608,6 +737,62 @@ def _run_command_with_live_output(
         raise RuntimeError(f"{prefix}命令失败，退出码={returncode} | 日志: {log_path}")
 
 
+def _checkpoint_fr_source_errors(results: Dict[str, Any], model_path: Path) -> List[str]:
+    if _current_eval_fr_mode() not in CHECKPOINT_FR_MODES:
+        return []
+    setup = results.get("evaluation_setup", {}) if isinstance(results, dict) else {}
+    if not isinstance(setup, dict):
+        setup = {}
+    fr_source = str(setup.get("action_force_ratio_source", "") or "").strip()
+    errors: List[str] = []
+    if not fr_source:
+        errors.append("缺少 action_force_ratio_source")
+    elif fr_source == "forced_override":
+        errors.append("checkpoint FR 模式下不允许 forced_override")
+    model_leaf = Path(model_path).name
+    if _is_ep_variant_name(model_leaf) and fr_source != "指定回合":
+        errors.append(f"{model_leaf} 必须使用指定回合 FR，当前 source={fr_source or '<empty>'}")
+    return errors
+
+
+def _existing_eval_reuse_errors(
+    *,
+    results: Dict[str, Any],
+    spec_path: Path,
+    expected_spec: Dict[str, Any],
+    model_path: Path,
+) -> List[str]:
+    errors: List[str] = []
+    if not spec_path.exists():
+        errors.append(f"缺少旧 post_eval_spec.json: {spec_path}")
+    else:
+        try:
+            previous_spec = _load_json(spec_path)
+            if _stable_json_hash(_spec_for_hash(previous_spec)) != _stable_json_hash(_spec_for_hash(expected_spec)):
+                errors.append("post_eval_spec 与当前请求不一致")
+        except Exception as exc:
+            errors.append(f"旧 post_eval_spec 无法读取: {exc}")
+
+    summary = results.get("summary", {}) if isinstance(results.get("summary"), dict) else {}
+    try:
+        actual_episodes = int(summary.get("episodes", results.get("episodes")) or 0)
+    except Exception:
+        actual_episodes = 0
+    expected_episodes = int(expected_spec.get("episodes", 0) or 0)
+    if actual_episodes != expected_episodes:
+        errors.append(f"episodes 不一致: got={actual_episodes} expected={expected_episodes}")
+
+    errors.extend(_checkpoint_fr_source_errors(results, model_path))
+
+    selection = results.get("model_selection", {}) if isinstance(results.get("model_selection"), dict) else {}
+    recorded_signature = str(selection.get("selected_model_signature", "") or "").strip()
+    if recorded_signature:
+        current_signature = _compute_model_signature(model_path) or ""
+        if not current_signature or current_signature != recorded_signature:
+            errors.append("model_selection.selected_model_signature 与当前模型不一致")
+    return errors
+
+
 def _execute_eval_run(
     *,
     model_path: Path,
@@ -622,23 +807,40 @@ def _execute_eval_run(
         shutil.rmtree(eval_dir)
     eval_dir.mkdir(parents=True, exist_ok=True)
     spec_path = eval_dir / "post_eval_spec.json"
-    _save_json(spec_path, spec)
     results_path = eval_dir / "evaluation_results.json"
     log_path = eval_dir / "post_eval.log"
     if not force_rerun and results_path.exists():
         try:
             results = _load_json(results_path)
-            summary = results.get("summary", {}) if isinstance(results.get("summary"), dict) else {}
-            print(f"{banner_prefix}复用已有评估结果: {results_path}")
-            return {
-                "results_path": str(results_path),
-                "log_path": str(log_path),
-                "spec_path": str(spec_path),
-                "summary": summary,
-                "results": results,
-            }
+            reuse_errors = _existing_eval_reuse_errors(
+                results=results,
+                spec_path=spec_path,
+                expected_spec=spec,
+                model_path=model_path,
+            )
+            if reuse_errors:
+                print(
+                    f"{banner_prefix}已有评估结果与当前请求不一致，将重新评估: "
+                    f"{'; '.join(reuse_errors)}"
+                )
+            else:
+                summary = results.get("summary", {}) if isinstance(results.get("summary"), dict) else {}
+                print(f"{banner_prefix}复用已有评估结果: {results_path}")
+                return {
+                    "results_path": str(results_path),
+                    "log_path": str(log_path),
+                    "spec_path": str(spec_path),
+                    "summary": summary,
+                    "results": results,
+                }
         except Exception:
             print(f"{banner_prefix}已有评估结果无法读取，将重新评估: {results_path}")
+    _save_json(spec_path, spec)
+    if not force_rerun and results_path.exists():
+        try:
+            results_path.unlink()
+        except Exception:
+            pass
     env = _build_eval_env(os.environ.copy(), spec, quiet_output=quiet_output, python_bin=python_bin)
     cmd = [
         "/bin/bash",
@@ -688,7 +890,31 @@ def _execute_eval_run(
     }
 
 
-def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path, quiet_output: str, python_bin: str) -> Dict[str, Any]:
+def _candidate_eval_cache_key(candidate: Dict[str, Any], signature: Optional[str]) -> Optional[str]:
+    if not signature:
+        return None
+    try:
+        model_path = str(Path(candidate["model_path"]).resolve())
+    except Exception:
+        model_path = str(candidate.get("model_path", ""))
+    return "|".join(
+        (
+            str(signature),
+            str(candidate.get("candidate_alias", "")),
+            str(candidate.get("resolved_variant", "")),
+            model_path,
+        )
+    )
+
+
+def _select_candidate(
+    args,
+    official_spec: Dict[str, Any],
+    official_spec_path: Path,
+    experiment_root: Path,
+    quiet_output: str,
+    python_bin: str,
+) -> Dict[str, Any]:
     requested_variant = str(args.model_variant or DEFAULT_MODEL_VARIANT).strip().lower()
     protocol = str(args.selection_protocol or DEFAULT_SELECTION_PROTOCOL).strip().lower()
     output_dir = Path(args.output_dir).resolve()
@@ -700,21 +926,34 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
         summary_path = str(getattr(args, "preselected_selection_summary", "") or "").strip()
         candidate_alias = "preselected"
         resolved_variant = selected_path.name
+        selection_context: Dict[str, Any] = {}
         if summary_path and Path(summary_path).exists():
             try:
                 selection_summary = _load_json(Path(summary_path))
+                schema_version = int(selection_summary.get("selection_score_schema_version", 0) or 0)
+                if schema_version != int(SELECTION_SCORE_SCHEMA_VERSION):
+                    raise RuntimeError(
+                        f"预选 checkpoint 的 selection_summary schema 过期: "
+                        f"got={schema_version} expected={SELECTION_SCORE_SCHEMA_VERSION}"
+                    )
+                selection_context = (
+                    selection_summary.get("selection_context", {})
+                    if isinstance(selection_summary.get("selection_context"), dict)
+                    else {}
+                )
                 selected = selection_summary.get("selected", {})
                 if isinstance(selected, dict):
                     candidate_alias = str(selected.get("candidate_alias") or candidate_alias)
                     resolved_variant = str(selected.get("resolved_variant") or resolved_variant)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(f"预选 selection_summary 无法复用: {summary_path} | {exc}") from exc
         return {
             "selection_protocol": "shared_matched_validation",
             "candidate_alias": candidate_alias,
             "resolved_variant": resolved_variant,
             "model_path": selected_path,
             "validation_selection_summary_path": summary_path,
+            "selection_context": selection_context,
         }
 
     if protocol != "matched_validation":
@@ -745,6 +984,14 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
     candidate_aliases = _normalize_candidates(args.validation_candidates)
     if requested_variant != "auto" and requested_variant not in candidate_aliases:
         candidate_aliases = [requested_variant, *candidate_aliases]
+    selection_context = _build_selection_context(
+        official_spec=official_spec,
+        official_spec_path=official_spec_path,
+        requested_variant=requested_variant,
+        validation_episodes=int(args.validation_episodes),
+        validation_seeds=validation_seeds,
+        validation_candidates=candidate_aliases,
+    )
 
     candidates: List[Dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -778,11 +1025,12 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
 
     scored_candidates: List[Dict[str, Any]] = []
     failed_candidates: List[Dict[str, Any]] = []
-    cached_by_signature: Dict[str, Dict[str, Any]] = {}
+    cached_by_eval_identity: Dict[str, Dict[str, Any]] = {}
     for order_idx, candidate in enumerate(candidates):
         signature = _compute_model_signature(Path(candidate["model_path"]))
-        if signature and signature in cached_by_signature:
-            cached = cached_by_signature[signature]
+        cache_key = _candidate_eval_cache_key(candidate, signature)
+        if cache_key and cache_key in cached_by_eval_identity:
+            cached = cached_by_eval_identity[cache_key]
             scored_candidates.append(
                 {
                     **candidate,
@@ -791,6 +1039,7 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
                     "score": list(cached["score"]),
                     "validation_runs": list(cached["validation_runs"]),
                     "model_signature": signature,
+                    "candidate_eval_cache_key": cache_key,
                     "reused_validation_from_candidate": cached["candidate_alias"],
                 }
             )
@@ -833,6 +1082,7 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
                     **candidate,
                     "order": order_idx,
                     "model_signature": signature,
+                    "candidate_eval_cache_key": cache_key,
                     "failure_reason": str(exc),
                     "eval_dir": str(candidate_eval_dir),
                 }
@@ -848,10 +1098,11 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
             "score": list(score),
             "validation_runs": validation_runs,
             "model_signature": signature,
+            "candidate_eval_cache_key": cache_key,
         }
         scored_candidates.append(scored_entry)
-        if signature:
-            cached_by_signature[signature] = {
+        if cache_key:
+            cached_by_eval_identity[cache_key] = {
                 "candidate_alias": candidate["candidate_alias"],
                 "summary": aggregate_summary,
                 "score": list(score),
@@ -864,7 +1115,11 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
 
     best_candidate = max(scored_candidates, key=lambda item: (tuple(item["score"]), -int(item["order"])))
     selection_summary = {
+        "schema_version": int(SELECTION_RESULT_SCHEMA_VERSION),
         "selection_protocol": "matched_validation",
+        "selection_score_schema_version": int(SELECTION_SCORE_SCHEMA_VERSION),
+        "selection_score_schema": _selection_score_schema(),
+        "selection_context": selection_context,
         "requested_model_variant": requested_variant,
         "validation_episodes": int(args.validation_episodes),
         "validation_seeds": [int(seed) for seed in validation_seeds],
@@ -877,6 +1132,7 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
             "resolved_variant": best_candidate["resolved_variant"],
             "model_path": str(best_candidate["model_path"]),
             "model_signature": best_candidate.get("model_signature"),
+            "candidate_eval_cache_key": best_candidate.get("candidate_eval_cache_key"),
             "score": best_candidate["score"],
             "summary": best_candidate["summary"],
             "validation_runs": best_candidate.get("validation_runs", []),
@@ -891,6 +1147,7 @@ def _select_candidate(args, official_spec: Dict[str, Any], experiment_root: Path
         "resolved_variant": best_candidate["resolved_variant"],
         "model_path": Path(best_candidate["model_path"]),
         "validation_selection_summary_path": str(selection_summary_path),
+        "selection_context": selection_context,
     }
 
 
@@ -912,8 +1169,17 @@ def _inject_selection_metadata(results_path: Path, payload: Dict[str, Any]) -> N
 
 
 def _selection_metadata(selection: Dict[str, Any], requested_variant: str, selected_model_path: Path) -> Dict[str, Any]:
+    selection_context = (
+        selection.get("selection_context", {})
+        if isinstance(selection.get("selection_context"), dict)
+        else {}
+    )
     return {
+        "schema_version": int(SELECTION_RESULT_SCHEMA_VERSION),
         "selection_protocol": str(selection["selection_protocol"]),
+        "selection_score_schema_version": int(SELECTION_SCORE_SCHEMA_VERSION),
+        "selection_score_schema": _selection_score_schema(),
+        "selection_context": selection_context,
         "requested_model_variant": str(requested_variant),
         "selected_model_candidate": str(selection["candidate_alias"]),
         "selected_model_variant": str(selection["resolved_variant"]),
@@ -987,6 +1253,7 @@ def main() -> int:
     selection = _select_candidate(
         args=args,
         official_spec=official_spec,
+        official_spec_path=official_spec_path,
         experiment_root=experiment_root,
         quiet_output=str(args.quiet_output),
         python_bin=str(args.python_bin),
@@ -1016,9 +1283,14 @@ def main() -> int:
     if args.selection_only:
         output_dir.mkdir(parents=True, exist_ok=True)
         selection_result = {
+            "schema_version": int(SELECTION_RESULT_SCHEMA_VERSION),
             "selection_only": True,
             "experiment_root": str(experiment_root),
             "official_spec": str(official_spec_path),
+            "official_spec_sha1": _stable_json_hash(_spec_for_hash(official_spec)),
+            "selection_score_schema_version": int(SELECTION_SCORE_SCHEMA_VERSION),
+            "selection_score_schema": _selection_score_schema(),
+            "selection_context": selection_metadata.get("selection_context", {}),
             "model_selection": selection_metadata,
         }
         _save_json(output_dir / "selection_result.json", selection_result)

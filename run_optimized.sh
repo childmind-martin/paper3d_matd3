@@ -739,9 +739,32 @@ export STATIONARY_NEAR_GOAL_THRESHOLD=${STATIONARY_NEAR_GOAL_THRESHOLD:-0.02}   
 export STATIONARY_NEAR_GOAL_MIN_PENALTY=${STATIONARY_NEAR_GOAL_MIN_PENALTY:-6.0}    # 近目标外圈停滞基础惩罚
 export STATIONARY_NEAR_GOAL_MAX_PENALTY=${STATIONARY_NEAR_GOAL_MAX_PENALTY:-16.0}   # 紧贴成功圈但未进入时的最大停滞惩罚
 export GOAL_RING_REWARD_SCHEDULE=${GOAL_RING_REWARD_SCHEDULE:-18:20,10:35,6:55,3.5:80}       # 一次性阶段奖励：首次进入若干目标半径时给小额bonus
-export TERMINAL_FAILURE_PENALTY_BASE=${TERMINAL_FAILURE_PENALTY_BASE:-30.0}          # 回合结束仍未到达目标时的基础失败惩罚
-export TERMINAL_FAILURE_PENALTY_PER_METER=${TERMINAL_FAILURE_PENALTY_PER_METER:-120.0}  # 实际按“剩余距离比例”追加惩罚
-export TERMINAL_FAILURE_PENALTY_MAX=${TERMINAL_FAILURE_PENALTY_MAX:-180.0}           # 失败惩罚上限，避免早期训练被终局负值淹没
+export GOAL_RING_INDIVIDUAL_SCALE=${GOAL_RING_INDIVIDUAL_SCALE:-0.25}               # 恢复个体goal-ring引导，但只给小额一次性阶段奖励
+export GOAL_RING_TEAM_GATED=${GOAL_RING_TEAM_GATED:-0}                              # 不要求全队同时进ring，避免早期完全无目标引导
+export GOAL_RING_REQUIRE_AGENT_SAFE=${GOAL_RING_REQUIRE_AGENT_SAFE:-1}              # 发生碰撞的agent不给ring阶段奖励
+export PROGRESS_DISTANCE_STATE_SCALE=${PROGRESS_DISTANCE_STATE_SCALE:-0.0}          # 关闭每步distance状态正奖励，只保留真实推进
+export PROGRESS_REWARD_SCALE=${PROGRESS_REWARD_SCALE:-0.25}                         # 团队严格奖励：压低长失败轨迹累计progress
+export TEAM_PROGRESS_BOTTLENECK_ONLY=${TEAM_PROGRESS_BOTTLENECK_ONLY:-1}            # 仅瓶颈agent保留主要正向progress
+export TEAM_PROGRESS_NON_BOTTLENECK_SCALE=${TEAM_PROGRESS_NON_BOTTLENECK_SCALE:-0.20}  # 非瓶颈agent正progress保留比例
+export TEAM_PROGRESS_BOTTLENECK_EPS=${TEAM_PROGRESS_BOTTLENECK_EPS:-1.0}            # 与最大剩余距离相差1m内视为瓶颈
+export TEAM_GOAL_OCCUPANCY_SCALE=${TEAM_GOAL_OCCUPANCY_SCALE:-0.0}                  # 关闭“几个人到达”dense正奖励，避免partial success刷分
+export TEAM_BOTTLENECK_PROGRESS_SCALE=${TEAM_BOTTLENECK_PROGRESS_SCALE:-5.0}        # 只保留瓶颈剩余距离改善的弱dense团队信号
+export TEAM_WAITING_SCALE=${TEAM_WAITING_SCALE:-0.0}                                # 关闭等待奖励，避免先到者等待也刷分
+export TEAM_BOTTLENECK_DELTA_CLIP=${TEAM_BOTTLENECK_DELTA_CLIP:-1.0}                # 单步瓶颈改善裁剪
+export TEAM_SYNC_REWARD_ENABLED=${TEAM_SYNC_REWARD_ENABLED:-1}
+export TEAM_SUCCESS_BONUS=${TEAM_SUCCESS_BONUS:-6000.0}                             # 团队安全成功终局奖励总额，按agent均分
+export UNSAFE_ARRIVAL_PENALTY=${UNSAFE_ARRIVAL_PENALTY:-4500.0}                     # 全员到达但不安全时的终局惩罚总额
+export NON_SUCCESS_TERMINAL_GUARD_ENABLED=${NON_SUCCESS_TERMINAL_GUARD_ENABLED:-1}  # 团队未成功时加全队终局排序guard
+export NON_SUCCESS_TERMINAL_PENALTY_BASE=${NON_SUCCESS_TERMINAL_PENALTY_BASE:-250.0}
+export NON_SUCCESS_TERMINAL_PENALTY_PER_METER=${NON_SUCCESS_TERMINAL_PENALTY_PER_METER:-900.0}
+export NON_SUCCESS_TERMINAL_PENALTY_MAX=${NON_SUCCESS_TERMINAL_PENALTY_MAX:-1200.0}
+export TERMINAL_FAILURE_PENALTY_BASE=${TERMINAL_FAILURE_PENALTY_BASE:-80.0}          # 回合结束仍未到达目标时的基础失败惩罚
+export TERMINAL_FAILURE_PENALTY_PER_METER=${TERMINAL_FAILURE_PENALTY_PER_METER:-1400.0}  # 实际按“剩余距离比例”追加惩罚
+export TERMINAL_FAILURE_PENALTY_MAX=${TERMINAL_FAILURE_PENALTY_MAX:-1200.0}          # 失败惩罚上限，使未完成回合不再靠dense progress转正
+export CLEARANCE_DENSE_POSITIVE_SCALE=${CLEARANCE_DENSE_POSITIVE_SCALE:-0.0}         # dense安全项默认只罚不奖，成功质量另算
+export HEIGHT_DENSE_POSITIVE_SCALE=${HEIGHT_DENSE_POSITIVE_SCALE:-0.0}               # dense高度项默认只罚不奖，避免舒适高度刷分
+export CLEARANCE_QUALITY_BONUS_WEIGHT=${CLEARANCE_QUALITY_BONUS_WEIGHT:-800.0}
+export EFFICIENCY_BONUS_WEIGHT=${EFFICIENCY_BONUS_WEIGHT:-800.0}
                                                                      # 建议：训练初期用0，中后期用1避免探索奖励盖过负向信号
 
 # === 向量化优化参数 ===
@@ -970,7 +993,7 @@ if _truthy "${SEMI_RANDOM_TERRAIN:-0}"; then
         export SUCCESS_REWARD_VALUE=2600.0
     fi
     if [ "$TEAM_SUCCESS_BONUS_WAS_SET" -eq 0 ]; then
-        export TEAM_SUCCESS_BONUS=4500.0
+        export TEAM_SUCCESS_BONUS=6000.0
     fi
 fi
 export MAX_FORCE_MAGNITUDE=${MAX_FORCE_MAGNITUDE:-80.0}               # 🚨 关键修复：大幅提高（28.5→80），避免强斥力被过早裁剪（k_rep*factor可达3000+）
@@ -1032,7 +1055,7 @@ export SAVE_EPISODE_TRAJ=${SAVE_EPISODE_TRAJ:-0}    # 保存每个完成回合�
 export SAVE_INTERACTIVE_TRAJ=${SAVE_INTERACTIVE_TRAJ:-1}    # 是否保存可交互HTML轨迹图（需要plotly）
 export SAVE_INTERACTIVE_TRAJ_INDEPENDENT=${SAVE_INTERACTIVE_TRAJ_INDEPENDENT:-0}  # 默认不独立生成每回合交互图
 
-# 批量消融/纯性能测试模式：保留训练语义，关闭重型训练期产物与心跳日志。
+# 批量消融/纯性能测试模式：保留训练语义，默认关闭重型训练期产物与心跳日志。
 if _truthy "${FAST_ARTIFACTS:-0}"; then
     export ENABLE_ACTOR_OUTPUT_COLLECTION=0
     export SAVE_BEST_TRAJ=0
@@ -1040,7 +1063,7 @@ if _truthy "${FAST_ARTIFACTS:-0}"; then
     export SAVE_INTERACTIVE_TRAJ=0
     export SAVE_INTERACTIVE_TRAJ_INDEPENDENT=0
     export SAVE_PRERANDOM_BEST=0
-    export HEARTBEAT_ENABLE=0
+    export HEARTBEAT_ENABLE=${HEARTBEAT_ENABLE:-0}
 fi
 
 # 早停策略（防误判）
@@ -1411,12 +1434,14 @@ if [ "$ALGORITHM" = "matd3" ]; then
         --cross-agent-reference-head-weight "${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}"
         --cross-agent-reference-tail-weight "${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}"
         --cross-agent-reference-use-clean-label "${CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL:-true}"
+        --cross-agent-reference-target-semantics "${CROSS_AGENT_REFERENCE_TARGET_SEMANTICS:-legacy}"
         --cross-agent-reference-exclude-random "${CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM:-true}"
         --cross-agent-reference-quality-gate "${CROSS_AGENT_REFERENCE_QUALITY_GATE:-true}"
         --cross-agent-reference-gate-mode "${CROSS_AGENT_REFERENCE_GATE_MODE:-progress}"
         --cross-agent-reference-update-interval "${CROSS_AGENT_REFERENCE_UPDATE_INTERVAL:-1}"
         --cross-agent-reference-pairs-per-agent "${CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT:-0}"
         --cross-agent-reference-selector-enabled "${CROSS_AGENT_REFERENCE_SELECTOR_ENABLED:-false}"
+        --cross-agent-reference-selector-train-in-graph "${CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH:-auto}"
         --cross-agent-reference-selector-mode "${CROSS_AGENT_REFERENCE_SELECTOR_MODE:-hard}"
         --cross-agent-reference-selector-alpha "${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}"
         --cross-agent-reference-selector-q-tau "${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}"
@@ -1431,6 +1456,17 @@ if [ "$ALGORITHM" = "matd3" ]; then
         --cross-agent-reference-selector-success-stable-min-rate "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE:-0.05}"
         --cross-agent-reference-selector-success-stable-min-episodes "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES:-200}"
         --cross-agent-reference-selector-success-ramp-episodes "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES:-50}"
+        --cross-agent-reference-closed-loop-feedback-weight "${CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT:-0.15}"
+        --cross-agent-reference-closed-loop-use-q-advantage "${CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE:-0}"
+        --cross-agent-reference-team-target-two-plus "${CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS:-0.30}"
+        --cross-agent-reference-team-target-single-near "${CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR:-0.25}"
+        --cross-agent-reference-team-target-single-safe "${CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE:-0.20}"
+        --cross-agent-reference-team-target-safe-near "${CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR:-0.15}"
+        --cross-agent-reference-team-target-progress "${CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS:-0.05}"
+        --cross-agent-reference-feedback-two-plus-weight "${CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT:-0.20}"
+        --cross-agent-reference-feedback-any-weight "${CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT:-0.05}"
+        --cross-agent-reference-feedback-progress-weight "${CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT:-0.05}"
+        --cross-agent-reference-closed-loop-max-pending-updates "${CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES:-64}"
     )
 fi
 if [ "$ALGORITHM" = "maddpg" ]; then
@@ -1546,6 +1582,32 @@ if [ "$USE_WEIGHTED_REWARD" = "1" ] || [ "${USE_WEIGHTED_REWARD,,}" = "true" ]; 
         --collision-distance-threshold "$COLLISION_DISTANCE_THRESHOLD"
         --global-reward-mode "$GLOBAL_REWARD_MODE"
         --shaping-gamma "$SHAPING_GAMMA"
+        --goal-ring-individual-scale "$GOAL_RING_INDIVIDUAL_SCALE"
+        --goal-ring-team-gated "$GOAL_RING_TEAM_GATED"
+        --goal-ring-require-agent-safe "$GOAL_RING_REQUIRE_AGENT_SAFE"
+        --progress-distance-state-scale "$PROGRESS_DISTANCE_STATE_SCALE"
+        --progress-reward-scale "$PROGRESS_REWARD_SCALE"
+        --team-progress-bottleneck-only "$TEAM_PROGRESS_BOTTLENECK_ONLY"
+        --team-progress-non-bottleneck-scale "$TEAM_PROGRESS_NON_BOTTLENECK_SCALE"
+        --team-progress-bottleneck-eps "$TEAM_PROGRESS_BOTTLENECK_EPS"
+        --team-success-bonus "$TEAM_SUCCESS_BONUS"
+        --unsafe-arrival-penalty "$UNSAFE_ARRIVAL_PENALTY"
+        --non-success-terminal-guard-enabled "$NON_SUCCESS_TERMINAL_GUARD_ENABLED"
+        --non-success-terminal-penalty-base "$NON_SUCCESS_TERMINAL_PENALTY_BASE"
+        --non-success-terminal-penalty-per-meter "$NON_SUCCESS_TERMINAL_PENALTY_PER_METER"
+        --non-success-terminal-penalty-max "$NON_SUCCESS_TERMINAL_PENALTY_MAX"
+        --terminal-failure-penalty-base "$TERMINAL_FAILURE_PENALTY_BASE"
+        --terminal-failure-penalty-per-meter "$TERMINAL_FAILURE_PENALTY_PER_METER"
+        --terminal-failure-penalty-max "$TERMINAL_FAILURE_PENALTY_MAX"
+        --team-sync-reward-enabled "$TEAM_SYNC_REWARD_ENABLED"
+        --team-goal-occupancy-scale "$TEAM_GOAL_OCCUPANCY_SCALE"
+        --team-bottleneck-progress-scale "$TEAM_BOTTLENECK_PROGRESS_SCALE"
+        --team-waiting-scale "$TEAM_WAITING_SCALE"
+        --team-bottleneck-delta-clip "$TEAM_BOTTLENECK_DELTA_CLIP"
+        --clearance-quality-bonus-weight "$CLEARANCE_QUALITY_BONUS_WEIGHT"
+        --efficiency-bonus-weight "$EFFICIENCY_BONUS_WEIGHT"
+        --clearance-dense-positive-scale "$CLEARANCE_DENSE_POSITIVE_SCALE"
+        --height-dense-positive-scale "$HEIGHT_DENSE_POSITIVE_SCALE"
     )
 else
     echo "[奖励模式] 原始（original）"

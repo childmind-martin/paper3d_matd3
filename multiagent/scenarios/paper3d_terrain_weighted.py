@@ -145,6 +145,7 @@ class Scenario(BaseTerrainScenario):
         # 高度奖励可配置开关与范围（支持kwargs与环境变量）
         try:
             import os
+            suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
             _env_enabled = os.getenv('HEIGHT_REWARD_ENABLED', '1')
             self.height_reward_enabled = kwargs.get('height_reward_enabled', _env_enabled not in ('0', 'false', 'False'))
             self.height_ideal_min = float(kwargs.get('height_ideal_min', os.getenv('HEIGHT_IDEAL_MIN', '2.0')))
@@ -154,13 +155,20 @@ class Scenario(BaseTerrainScenario):
                 self.height_ideal_min, self.height_ideal_max = self.height_ideal_max, self.height_ideal_min
             
             # 调试输出：高度奖励配置
-            print(f"[高度奖励配置] enabled={self.height_reward_enabled} | weight={self.reward_weights['height']} | ideal_range=[{self.height_ideal_min:.1f},{self.height_ideal_max:.1f}]")
+            if not suppress_reward_output:
+                print(f"[高度奖励配置] enabled={self.height_reward_enabled} | weight={self.reward_weights['height']} | ideal_range=[{self.height_ideal_min:.1f},{self.height_ideal_max:.1f}]")
         except Exception:
             # 兜底到默认范围
             self.height_reward_enabled = True
             self.height_ideal_min = 2.0
             self.height_ideal_max = 5.0
-            print(f"[高度奖励配置] 使用默认值: enabled={self.height_reward_enabled} | ideal_range=[{self.height_ideal_min:.1f},{self.height_ideal_max:.1f}]")
+            try:
+                import os
+                suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                suppress_reward_output = False
+            if not suppress_reward_output:
+                print(f"[高度奖励配置] 使用默认值: enabled={self.height_reward_enabled} | ideal_range=[{self.height_ideal_min:.1f},{self.height_ideal_max:.1f}]")
         
         # 初始化ARW模块
         self.arw = None
@@ -180,9 +188,21 @@ class Scenario(BaseTerrainScenario):
                 self.reward_calculator = self.arw
             except Exception:
                 pass
-            print(f"[ARW] Adaptive Reward Weighting enabled with config: {arw_config}")
+            try:
+                import os
+                suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                suppress_reward_output = False
+            if not suppress_reward_output:
+                print(f"[ARW] Adaptive Reward Weighting enabled with config: {arw_config}")
         else:
-            print("[ARW] Adaptive Reward Weighting disabled")
+            try:
+                import os
+                suppress_reward_output = os.getenv('SUPPRESS_REWARD_CONFIG_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+            except Exception:
+                suppress_reward_output = False
+            if not suppress_reward_output:
+                print("[ARW] Adaptive Reward Weighting disabled")
 
     @staticmethod
     def _normalize_reward_profile_name(raw_profile):

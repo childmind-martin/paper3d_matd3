@@ -400,7 +400,8 @@ class Scenario(BaseScenario):
             import os
             value = float(os.getenv('START_ALTITUDE_OFFSET', '7.0'))
             # 🔧 临时调试：输出读取到的值
-            if not hasattr(self, '_altitude_offset_logged'):
+            suppress_output = os.getenv('SUPPRESS_TERRAIN_OUTPUT', '0').lower() in ('1', 'true', 'yes', 'on')
+            if not suppress_output and not hasattr(self, '_altitude_offset_logged'):
                 print(f"[调试] _get_start_altitude_offset() 返回: {value}")
                 self._altitude_offset_logged = True
             return value
