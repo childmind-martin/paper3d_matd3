@@ -56,6 +56,53 @@ import csv
 import hashlib
 from dataclasses import dataclass
 from collections import defaultdict, deque
+from experiment_runtime_config import (
+    add_runtime_environment_arguments,
+    apply_runtime_environment,
+    resolve_runtime_environment,
+)
+from cross_agent_reference_selector import (
+    ACTIVE_SELECTOR_MODES,
+    ADVANTAGE_SELECTOR_MODES,
+    HEAD_TAIL_SELECTOR_MODES,
+    MODE_ADAPTIVE_TWIN_HEAD_TAIL,
+    MODE_HARD,
+    MODE_SHARED_TWIN_HEAD_TAIL,
+    SELECTOR_FEATURE_SCHEMA_VERSION,
+    SELECTOR_STATE_SCHEMA_VERSION,
+    TRAINABLE_SELECTOR_MODES,
+    binary_cross_entropy_per_sample,
+    build_eligible_mask,
+    build_shared_selector_features,
+    next_ema_scale,
+    reduce_reference_loss_fixed_denominator,
+    selector_state_errors,
+    selector_state_payload,
+    suppress_only_multiplier,
+    twin_consensus_target,
+)
+from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
+
+
+TRAINING_ENVIRONMENT_SCHEMA_VERSION = 2
+CHECKPOINT_STATE_SCHEMA_VERSION = 2
+CHECKPOINT_RESUME_CONFIG_SCHEMA_VERSION = 1
+DEFAULT_NOISE_RESTART_INTERVAL = 25
+
+
+# These options control where/how often artifacts are written, but do not alter
+# the learned policy or the environment transition sequence.  Everything else
+# present in the resolved argparse namespace is treated as resume-immutable.
+_CHECKPOINT_MUTABLE_OPERATION_ARGUMENTS = frozenset({
+    "checkpoint",
+    "exp_name",
+    "mem_debug",
+    "profiling",
+    "resume",
+    "save_interval",
+    "save_model",
+    "train_episodes",
+})
 
 
 def _make_json_safe(value):
@@ -76,6 +123,656 @@ def _make_json_safe(value):
     if isinstance(value, (list, tuple, set)):
         return [_make_json_safe(v) for v in value]
     return str(value)
+
+
+def _record_training_device_info(args, device_info):
+    """Attach the device detected by ``train`` without changing its return API."""
+    if not isinstance(device_info, dict):
+        raise TypeError("training_device_info 必须是字典")
+    required_fields = (
+        "python",
+        "cuda_visible_devices",
+        "physical_gpus",
+        "logical_gpus",
+        "configure_gpu",
+        "require_gpu",
+    )
+    missing = [key for key in required_fields if key not in device_info]
+    if missing:
+        raise RuntimeError(
+            "training_device_info 缺少字段: " + ", ".join(missing)
+        )
+    normalized = dict(_make_json_safe(device_info))
+    try:
+        normalized["physical_gpus"] = int(normalized["physical_gpus"])
+        normalized["logical_gpus"] = int(normalized["logical_gpus"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("training_device_info 的 GPU 数量无效") from exc
+    if normalized["physical_gpus"] < 0 or normalized["logical_gpus"] < 0:
+        raise RuntimeError("training_device_info 的 GPU 数量不能为负数")
+    if not isinstance(normalized["require_gpu"], bool):
+        raise RuntimeError("training_device_info.require_gpu 必须是布尔值")
+    if normalized["require_gpu"] and (
+        normalized["physical_gpus"] < 1 or normalized["logical_gpus"] < 1
+    ):
+        raise RuntimeError(
+            "正式 GPU 训练没有记录物理和逻辑 GPU，禁止生成完成结果"
+        )
+    args._training_device_info = normalized
+    return dict(normalized)
+
+
+def _require_recorded_training_device_info(args):
+    """Return the device captured inside ``train``; never re-detect it afterward."""
+    device_info = getattr(args, "_training_device_info", None)
+    if not isinstance(device_info, dict):
+        raise RuntimeError(
+            "train() 没有传出本次训练的 training_device_info；"
+            "禁止在训练结束后重新探测设备并冒充训练证据"
+        )
+    return _record_training_device_info(args, device_info)
+
+
+def _validate_training_observation_batch(
+    observations,
+    *,
+    expected_envs,
+    expected_agents,
+    expected_obs_dim,
+    context,
+):
+    """Fail before Actor execution if an environment axis was lost or altered."""
+    expected_shape = (
+        int(expected_envs),
+        int(expected_agents),
+        int(expected_obs_dim),
+    )
+    actual_shape = tuple(np.shape(observations))
+    if actual_shape != expected_shape:
+        raise RuntimeError(
+            f"{context} 观察批次形状错误: expected={expected_shape}, "
+            f"actual={actual_shape}。训练禁止丢弃或广播并行环境轴。"
+        )
+    return observations
+
+
+def _resolve_noise_restart_interval():
+    """Return the one authoritative OU-state restart interval."""
+    return int(os.getenv('NOISE_RESTART_INTERVAL', str(DEFAULT_NOISE_RESTART_INTERVAL)))
+
+
+def _checkpoint_file_sha256(path):
+    """Return a content signature for an input file used by training."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _capture_checkpoint_resume_config(args):
+    """Capture the resolved, scientifically relevant continuation contract."""
+    arguments = {}
+    for key, value in sorted(vars(args).items()):
+        if key.startswith("_") or key in _CHECKPOINT_MUTABLE_OPERATION_ARGUMENTS:
+            continue
+        if key in ("training_environment_config", "training_hyperparameters_config"):
+            continue
+        arguments[str(key)] = _make_json_safe(value)
+
+    input_artifacts = {}
+    # Path spelling is not scientific state.  For an active fixed-position
+    # input, compare the canonical path plus content hash; otherwise omit the
+    # unused parser default entirely.
+    arguments.pop("positions_file", None)
+    if bool(getattr(args, "use_fixed_positions", False)):
+        positions_file = getattr(args, "positions_file", None)
+        if not positions_file:
+            raise ValueError("固定位置训练缺少 positions_file，不能生成续训契约")
+        resolved_positions = os.path.realpath(os.path.abspath(str(positions_file)))
+        if not os.path.isfile(resolved_positions):
+            raise FileNotFoundError(
+                f"固定位置训练文件不存在，不能生成续训契约: {resolved_positions}"
+            )
+        input_artifacts["positions_file"] = {
+            "path": resolved_positions,
+            "sha256": _checkpoint_file_sha256(resolved_positions),
+        }
+        arguments["positions_file"] = resolved_positions
+
+    return {
+        "schema_version": CHECKPOINT_RESUME_CONFIG_SCHEMA_VERSION,
+        "arguments": arguments,
+        "training_environment": _make_json_safe(
+            getattr(args, "training_environment_config", {}) or {}
+        ),
+        "training_hyperparameters": _make_json_safe(
+            getattr(args, "training_hyperparameters_config", {}) or {}
+        ),
+        "input_artifacts": input_artifacts,
+    }
+
+
+def _checkpoint_config_differences(saved, current, path="resume_config"):
+    """Return precise paths whose saved and current resume contracts differ."""
+    differences = []
+    if isinstance(saved, dict) and isinstance(current, dict):
+        saved_keys = set(saved)
+        current_keys = set(current)
+        for key in sorted(saved_keys | current_keys):
+            child_path = f"{path}.{key}"
+            if key not in saved:
+                differences.append(f"{child_path}: checkpoint=<missing>, current={current[key]!r}")
+            elif key not in current:
+                differences.append(f"{child_path}: checkpoint={saved[key]!r}, current=<missing>")
+            else:
+                differences.extend(
+                    _checkpoint_config_differences(saved[key], current[key], child_path)
+                )
+        return differences
+    if isinstance(saved, list) and isinstance(current, list):
+        if len(saved) != len(current):
+            return [
+                f"{path}: checkpoint length={len(saved)}, current length={len(current)}"
+            ]
+        for index, (saved_item, current_item) in enumerate(zip(saved, current)):
+            differences.extend(
+                _checkpoint_config_differences(
+                    saved_item,
+                    current_item,
+                    f"{path}[{index}]",
+                )
+            )
+        return differences
+    if saved != current or type(saved) is not type(current):
+        differences.append(f"{path}: checkpoint={saved!r}, current={current!r}")
+    return differences
+
+
+_CHECKPOINT_PER_EPISODE_FIELDS = (
+    "episode_rewards",
+    "episode_force_ratios",
+    "noise_scale_var_history",
+    "actual_noise_std_history",
+    "success_flags",
+    "agent_success_flags",
+    "team_success_flags",
+)
+
+
+def _resolve_checkpoint_completed_episodes(checkpoint_state):
+    """Validate per-episode histories and return an unambiguous completed count.
+
+    Historical ``best_by_team_sr`` states stored the zero-based loop index while
+    all per-episode arrays already contained that completed episode.  That exact
+    legacy shape is accepted and normalized; arbitrary length disagreement is
+    rejected instead of taking the maximum and silently skipping work.
+    """
+    if not isinstance(checkpoint_state, dict):
+        raise ValueError("checkpoint state must be a mapping")
+    try:
+        schema_version = int(checkpoint_state.get("checkpoint_state_schema_version", 0))
+    except Exception as exc:
+        raise ValueError("checkpoint_state_schema_version is invalid") from exc
+    if schema_version < 0 or schema_version > CHECKPOINT_STATE_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported checkpoint state schema {schema_version}; "
+            f"current={CHECKPOINT_STATE_SCHEMA_VERSION}"
+        )
+    try:
+        declared_episode = int(checkpoint_state.get("episode", 0))
+    except Exception as exc:
+        raise ValueError("checkpoint episode is invalid") from exc
+    if declared_episode < 0:
+        raise ValueError("checkpoint episode must be non-negative")
+
+    lengths = {}
+    for field in _CHECKPOINT_PER_EPISODE_FIELDS:
+        if schema_version >= 2 and field not in checkpoint_state:
+            raise ValueError(f"checkpoint schema {schema_version} missing {field}")
+        sequence = checkpoint_state.get(field, [])
+        if sequence is None:
+            sequence = []
+        if not isinstance(sequence, list):
+            raise ValueError(f"checkpoint {field} must be a list")
+        lengths[field] = len(sequence)
+
+    if schema_version >= 2:
+        mismatched = {
+            field: length for field, length in lengths.items()
+            if length != declared_episode
+        }
+        if mismatched:
+            raise ValueError(
+                "checkpoint per-episode history length mismatch: "
+                f"episode={declared_episode}, lengths={mismatched}"
+            )
+        return declared_episode, False
+
+    # Every legacy state currently present in the repository has one of two
+    # forms: normal checkpoint/epN (length == episode), or the known best-model
+    # off-by-one form (all non-empty histories have length == episode + 1).
+    nonempty_lengths = {length for length in lengths.values() if length > 0}
+    if not nonempty_lengths:
+        return declared_episode, False
+    if nonempty_lengths == {declared_episode}:
+        return declared_episode, False
+    if nonempty_lengths == {declared_episode + 1}:
+        return declared_episode + 1, True
+    raise ValueError(
+        "legacy checkpoint per-episode histories are inconsistent: "
+        f"episode={declared_episode}, lengths={lengths}"
+    )
+
+
+def _validate_checkpoint_resume_contract(checkpoint_state, current_config):
+    """Reject stateful resume when its environment/algorithm contract changed."""
+    schema_version = int(checkpoint_state.get("checkpoint_state_schema_version", 0))
+    if schema_version >= 2:
+        saved_config = checkpoint_state.get("resume_config")
+        if not isinstance(saved_config, dict):
+            raise ValueError("checkpoint schema >=2 missing resume_config")
+        differences = _checkpoint_config_differences(saved_config, current_config)
+        if differences:
+            preview = "; ".join(differences[:20])
+            if len(differences) > 20:
+                preview += f"; ... and {len(differences) - 20} more"
+            raise ValueError(f"checkpoint resume configuration mismatch: {preview}")
+        return
+
+    # Legacy checkpoints do not contain a complete continuation contract.  The
+    # obstacle observation block keeps the same 81-D shape across semantics, so
+    # strict weight loading alone cannot detect this especially dangerous drift.
+    current_environment = current_config.get("training_environment", {})
+    legacy_fields = (
+        "obstacle_observation_mode",
+        "obstacle_risk_velocity_forward_weight",
+        "obstacle_risk_goal_along_weight",
+    )
+    for field in legacy_fields:
+        if field not in checkpoint_state:
+            continue
+        saved_value = checkpoint_state[field]
+        current_value = current_environment.get(field)
+        if field == "obstacle_observation_mode":
+            saved_value = normalize_obstacle_observation_mode(saved_value)
+            current_value = normalize_obstacle_observation_mode(current_value)
+            matches = saved_value == current_value
+        else:
+            saved_value = float(saved_value)
+            current_value = float(current_value)
+            matches = bool(np.isclose(saved_value, current_value, rtol=0.0, atol=1e-12))
+        if not matches:
+            raise ValueError(
+                f"legacy checkpoint {field} mismatch: "
+                f"checkpoint={saved_value!r}, current={current_value!r}"
+            )
+
+
+class ClippedExponentialDecaySchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Exponential schedule with a hard lower bound and mutable runtime anchor.
+
+    ``initial_value_var`` is a resource variable so an already traced
+    ``tf.function`` observes adaptive changes.  ``set_base_value`` keeps the
+    original step origin (learning-rate use); ``set_anchor`` also resets the
+    step origin (behavior-noise restart/adaptation use).
+    """
+
+    def __init__(self, initial_value, decay_steps, decay_rate, min_value, staircase=True, name=None):
+        self.initial_value = float(initial_value)
+        self.decay_steps = max(1, int(decay_steps))
+        self.decay_rate = float(decay_rate)
+        self.min_value = float(min_value)
+        self.staircase = bool(staircase)
+        self.name = str(name or "clipped_exponential_decay")
+        self.initial_value_var = tf.Variable(
+            self.initial_value,
+            trainable=False,
+            dtype=tf.float32,
+            name=f"{self.name}_anchor_value",
+        )
+        # Existing adaptive-LR code and Keras conventions use this attribute.
+        self.initial_learning_rate = self.initial_value_var
+        self.anchor_step_var = tf.Variable(
+            0,
+            trainable=False,
+            dtype=tf.int64,
+            name=f"{self.name}_anchor_step",
+        )
+
+    def __call__(self, step):
+        step = tf.maximum(
+            tf.cast(step, tf.float32) - tf.cast(self.anchor_step_var, tf.float32),
+            tf.constant(0.0, dtype=tf.float32),
+        )
+        decay_steps = tf.cast(self.decay_steps, tf.float32)
+        p = tf.math.floor(step / decay_steps) if self.staircase else step / decay_steps
+        decayed = (
+            tf.cast(self.initial_value_var, tf.float32)
+            * tf.pow(tf.cast(self.decay_rate, tf.float32), p)
+        )
+        return tf.maximum(decayed, tf.cast(self.min_value, tf.float32))
+
+    def set_base_value(self, value):
+        value = tf.maximum(tf.cast(value, tf.float32), tf.cast(self.min_value, tf.float32))
+        self.initial_value_var.assign(value)
+
+    def set_anchor(self, value, step):
+        self.set_base_value(value)
+        self.anchor_step_var.assign(tf.cast(step, tf.int64))
+
+    def export_runtime_state(self):
+        return {
+            "anchor_value": float(self.initial_value_var.numpy()),
+            "anchor_step": int(self.anchor_step_var.numpy()),
+        }
+
+    def restore_runtime_state(self, state):
+        if not isinstance(state, dict):
+            raise ValueError("schedule runtime state must be a mapping")
+        self.set_anchor(state["anchor_value"], state["anchor_step"])
+
+    def get_config(self):
+        return {
+            "initial_value": self.initial_value,
+            "decay_steps": self.decay_steps,
+            "decay_rate": self.decay_rate,
+            "min_value": self.min_value,
+            "staircase": self.staircase,
+            "name": self.name,
+        }
+
+
+def _coerce_optional_bool(value, fallback=None):
+    if value is None:
+        return fallback
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_noise_scale_schedule(args, fallback_decay_steps, fallback_staircase):
+    """Build the explicit OU-noise std schedule used by behavior actions."""
+    noise_decay_enabled = bool(_coerce_optional_bool(getattr(args, "noise_decay_enabled", True), True))
+    initial_noise_scale = float(getattr(args, "noise_scale", 0.35))
+    min_noise_scale = float(getattr(args, "noise_min", 0.05))
+    noise_decay_rate = float(getattr(args, "noise_decay", 0.9995))
+    for label, value in (
+        ("noise_scale", initial_noise_scale),
+        ("noise_min", min_noise_scale),
+        ("noise_decay", noise_decay_rate),
+    ):
+        if not np.isfinite(value):
+            raise ValueError(f"{label} must be finite, got {value!r}")
+    if initial_noise_scale < 0.0:
+        raise ValueError(f"noise_scale must be >= 0, got {initial_noise_scale}")
+    if min_noise_scale < 0.0:
+        raise ValueError(f"noise_min must be >= 0, got {min_noise_scale}")
+    if not (0.0 < noise_decay_rate <= 1.0):
+        raise ValueError(f"noise_decay must be in (0, 1], got {noise_decay_rate}")
+
+    # ``NOISE_SCALE=0`` is the documented way to disable behavior noise.  A
+    # positive configured lower bound must not silently turn it back on.
+    noise_disabled = initial_noise_scale == 0.0
+    effective_min_noise_scale = 0.0 if noise_disabled else min_noise_scale
+    effective_initial_noise_scale = (
+        0.0 if noise_disabled else max(initial_noise_scale, effective_min_noise_scale)
+    )
+
+    raw_noise_decay_steps = getattr(args, "noise_decay_steps", None)
+    if raw_noise_decay_steps is None:
+        noise_decay_steps = int(fallback_decay_steps)
+    else:
+        try:
+            noise_decay_steps = int(raw_noise_decay_steps)
+        except Exception:
+            noise_decay_steps = int(fallback_decay_steps)
+        if noise_decay_steps <= 0:
+            noise_decay_steps = int(fallback_decay_steps)
+
+    noise_staircase = _coerce_optional_bool(
+        getattr(args, "noise_staircase", None),
+        bool(fallback_staircase),
+    )
+
+    config = {
+        "enabled": noise_decay_enabled,
+        "initial_noise_scale": initial_noise_scale,
+        "min_noise_scale": min_noise_scale,
+        "effective_initial_noise_scale": effective_initial_noise_scale,
+        "effective_min_noise_scale": effective_min_noise_scale,
+        "disabled_by_zero_scale": noise_disabled,
+        "decay_steps": max(1, int(noise_decay_steps)),
+        "decay_rate": noise_decay_rate,
+        "staircase": bool(noise_staircase),
+    }
+
+    if not noise_decay_enabled:
+        return None, config
+
+    return (
+        ClippedExponentialDecaySchedule(
+            initial_value=effective_initial_noise_scale,
+            decay_steps=config["decay_steps"],
+            decay_rate=noise_decay_rate,
+            min_value=effective_min_noise_scale,
+            staircase=bool(noise_staircase),
+            name="behavior_noise",
+        ),
+        config,
+    )
+
+
+def _initial_behavior_noise_values(args):
+    """Return validated (effective_initial, effective_min, disabled) values."""
+    initial = float(getattr(args, "noise_scale", 0.3))
+    minimum = float(getattr(args, "noise_min", 0.0))
+    if not np.isfinite(initial) or initial < 0.0:
+        raise ValueError(f"noise_scale must be finite and >= 0, got {initial!r}")
+    if not np.isfinite(minimum) or minimum < 0.0:
+        raise ValueError(f"noise_min must be finite and >= 0, got {minimum!r}")
+    disabled = initial == 0.0
+    effective_min = 0.0 if disabled else minimum
+    effective_initial = 0.0 if disabled else max(initial, effective_min)
+    return effective_initial, effective_min, disabled
+
+
+def _assign_behavior_noise_scale(controller, requested_value, *, reanchor_schedule=True, reset_state=False):
+    """Update every runtime OU-noise consumer from one authoritative value."""
+    requested_value = float(requested_value)
+    if not np.isfinite(requested_value):
+        raise ValueError(f"runtime behavior noise must be finite, got {requested_value!r}")
+    minimum = float(controller.noise_min_var.numpy())
+    effective = 0.0 if bool(getattr(controller, "noise_disabled", False)) else max(requested_value, minimum)
+
+    schedule = getattr(controller, "noise_scale_schedule", None)
+    if schedule is not None and reanchor_schedule:
+        step = getattr(controller, "total_steps_var", 0)
+        schedule.set_anchor(effective, step)
+
+    controller.noise_scale_var.assign(tf.cast(effective, tf.float32))
+    if hasattr(controller, "current_ou_noise_std_var"):
+        controller.current_ou_noise_std_var.assign(tf.cast(effective, tf.float32))
+
+    vectorized = getattr(controller, "vectorized_ou_noise", None)
+    if vectorized is not None:
+        vectorized.set_std_dev(effective)
+        if reset_state:
+            vectorized.reset()
+    for row in list(getattr(controller, "ou_noises", None) or []):
+        noises = row if isinstance(row, (list, tuple)) else [row]
+        for noise in noises:
+            if hasattr(noise, "set_std_dev"):
+                noise.set_std_dev(effective)
+            if reset_state and hasattr(noise, "reset"):
+                noise.reset()
+    return effective
+
+
+def _capture_behavior_noise_runtime_state(controller):
+    schedule = getattr(controller, "noise_scale_schedule", None)
+    return {
+        "runtime_scale": float(controller.noise_scale_var.numpy()),
+        "actual_scale": float(controller.current_ou_noise_std_var.numpy()),
+        "disabled": bool(getattr(controller, "noise_disabled", False)),
+        "schedule": schedule.export_runtime_state() if schedule is not None else None,
+    }
+
+
+def _restore_behavior_noise_runtime_state(controller, state):
+    if not isinstance(state, dict):
+        raise ValueError("behavior-noise runtime state must be a mapping")
+    expected_disabled = bool(getattr(controller, "noise_disabled", False))
+    if bool(state.get("disabled", expected_disabled)) != expected_disabled:
+        raise ValueError("checkpoint behavior-noise disabled state does not match current configuration")
+    schedule = getattr(controller, "noise_scale_schedule", None)
+    schedule_state = state.get("schedule")
+    if schedule is not None and schedule_state is not None:
+        schedule.restore_runtime_state(schedule_state)
+    return _assign_behavior_noise_scale(
+        controller,
+        state.get("runtime_scale", state.get("actual_scale", 0.0)),
+        reanchor_schedule=False,
+        reset_state=True,
+    )
+
+
+def _adaptive_behavior_noise_update(controller, default_cap):
+    """Apply one global adaptive OU-noise adjustment (not once per agent)."""
+    current = float(controller.noise_scale_var.numpy())
+    if bool(getattr(controller, "noise_disabled", False)):
+        _assign_behavior_noise_scale(controller, 0.0, reanchor_schedule=True)
+        return current, 0.0, 0.0, 0.0, 0.0
+    minimum = float(controller.noise_min_var.numpy())
+    boost = float(controller.adaptive_learning.get("noise_boost_factor", 1.5))
+    try:
+        env_cap = float(os.getenv("ADAPTIVE_NOISE_MAX", str(default_cap)))
+    except Exception:
+        env_cap = float(default_cap)
+    hard_cap = max(minimum, float(min(controller.adaptive_learning.get("max_noise_scale", 2.0), env_cap)))
+    target = max(minimum, current * 0.7) if current >= hard_cap * 0.95 else min(hard_cap, current * boost)
+    try:
+        beta = float(os.getenv("ADAPTIVE_NOISE_SMOOTH", "0.3"))
+    except Exception:
+        beta = 0.3
+    beta = max(0.0, min(1.0, beta))
+    updated = min(hard_cap, max(minimum, current + beta * (target - current)))
+    updated = _assign_behavior_noise_scale(controller, updated, reanchor_schedule=True)
+    return current, updated, target, hard_cap, beta
+
+
+def _base_optimizer(optimizer):
+    return getattr(optimizer, "inner_optimizer", getattr(optimizer, "_optimizer", optimizer))
+
+
+def _capture_learning_rate_runtime_state(controller):
+    """Capture LR bases and schedule progress without serializing Adam slots."""
+    agent_states = []
+    for agent in controller.agents:
+        state = {}
+        for role in ("actor", "critic"):
+            lr_var = agent.get(f"{role}_lr_var")
+            if lr_var is not None:
+                state[f"{role}_lr"] = float(lr_var.numpy())
+            schedule = agent.get(f"{role}_lr_schedule")
+            if schedule is not None and hasattr(schedule, "export_runtime_state"):
+                state[f"{role}_schedule"] = schedule.export_runtime_state()
+                optimizer_keys = (
+                    ("actor_optimizer",)
+                    if role == "actor"
+                    else ("critic_optimizer", "critic1_optimizer", "critic2_optimizer")
+                )
+                iteration_values = []
+                for optimizer_key in optimizer_keys:
+                    optimizer = agent.get(optimizer_key)
+                    if optimizer is None:
+                        continue
+                    iterations = getattr(_base_optimizer(optimizer), "iterations", None)
+                    if iterations is not None:
+                        iteration_values.append(int(iterations.numpy()))
+                if iteration_values:
+                    if any(value != iteration_values[0] for value in iteration_values[1:]):
+                        raise ValueError(f"{role} optimizer iteration counters are inconsistent")
+                    state[f"{role}_schedule_iteration"] = iteration_values[0]
+        agent_states.append(state)
+    return agent_states
+
+
+def _restore_learning_rate_runtime_state(controller, agent_states):
+    """Restore LR schedule progress while intentionally rewarming Adam state."""
+    if not isinstance(agent_states, list) or len(agent_states) != len(controller.agents):
+        raise ValueError(
+            "checkpoint learning-rate state agent count does not match current controller"
+        )
+    for index, (agent, state) in enumerate(zip(controller.agents, agent_states)):
+        if not isinstance(state, dict):
+            raise ValueError(f"checkpoint learning-rate state for agent {index} is invalid")
+        for role in ("actor", "critic"):
+            value = state.get(f"{role}_lr")
+            if value is None:
+                continue
+            value = float(value)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"checkpoint {role} learning rate for agent {index} is invalid")
+            lr_var = agent.get(f"{role}_lr_var")
+            if lr_var is not None:
+                lr_var.assign(tf.cast(value, tf.float32))
+            agent[f"{role}_lr"] = value
+            schedule = agent.get(f"{role}_lr_schedule")
+            schedule_state = state.get(f"{role}_schedule")
+            if schedule is not None:
+                if schedule_state is not None and hasattr(schedule, "restore_runtime_state"):
+                    restored_schedule_state = dict(schedule_state)
+                    saved_iteration = state.get(f"{role}_schedule_iteration")
+                    if saved_iteration is not None:
+                        saved_iteration = int(saved_iteration)
+                        saved_anchor = int(restored_schedule_state.get("anchor_step", 0))
+                        elapsed_schedule_steps = max(0, saved_iteration - saved_anchor)
+                        optimizer_keys = (
+                            ("actor_optimizer",)
+                            if role == "actor"
+                            else ("critic_optimizer", "critic1_optimizer", "critic2_optimizer")
+                        )
+                        current_iterations = []
+                        for optimizer_key in optimizer_keys:
+                            optimizer = agent.get(optimizer_key)
+                            if optimizer is None:
+                                continue
+                            iterations = getattr(_base_optimizer(optimizer), "iterations", None)
+                            if iterations is not None:
+                                current_iterations.append(int(iterations.numpy()))
+                        if current_iterations:
+                            if any(item != current_iterations[0] for item in current_iterations[1:]):
+                                raise ValueError(
+                                    f"current {role} optimizer iteration counters are inconsistent"
+                                )
+                            restored_schedule_state["anchor_step"] = (
+                                current_iterations[0] - elapsed_schedule_steps
+                            )
+                    schedule.restore_runtime_state(restored_schedule_state)
+                    restored_base = float(schedule.initial_value_var.numpy())
+                    if not np.isclose(restored_base, value, rtol=1e-6, atol=1e-12):
+                        raise ValueError(
+                            f"checkpoint {role} schedule/base mismatch for agent {index}"
+                        )
+                elif hasattr(schedule, "set_base_value"):
+                    schedule.set_base_value(value)
+            else:
+                optimizer_keys = (
+                    ("actor_optimizer",)
+                    if role == "actor"
+                    else ("critic_optimizer", "critic1_optimizer", "critic2_optimizer")
+                )
+                for optimizer_key in optimizer_keys:
+                    optimizer = agent.get(optimizer_key)
+                    if optimizer is None:
+                        continue
+                    base_optimizer = _base_optimizer(optimizer)
+                    lr_attr = getattr(base_optimizer, "learning_rate", None)
+                    if hasattr(lr_attr, "assign"):
+                        lr_attr.assign(tf.cast(value, tf.float32))
+                    else:
+                        setattr(base_optimizer, "learning_rate", value)
 
 
 def _save_vis_context_snapshot_artifacts(output_dir, prefix, vis_context):
@@ -115,6 +812,7 @@ def _save_vis_context_snapshot_artifacts(output_dir, prefix, vis_context):
 
 def _apply_runtime_env_overrides_from_args(args):
     """将隐藏的运行时参数显式回写到环境变量，确保训练执行与结果记录一致。"""
+    apply_runtime_environment(args)
     runtime_pairs = (
         ("simulation_dt", "SIMULATION_DT"),
         ("z_action_bias", "Z_ACTION_BIAS"),
@@ -128,6 +826,33 @@ def _apply_runtime_env_overrides_from_args(args):
             value = None
         if value is None:
             continue
+        os.environ[env_name] = str(value)
+
+    obstacle_mode = normalize_obstacle_observation_mode(
+        getattr(args, "obstacle_observation_mode", os.getenv("OBSTACLE_OBSERVATION_MODE", "nearest_surface"))
+    )
+    args.obstacle_observation_mode = obstacle_mode
+    os.environ["OBSTACLE_OBSERVATION_MODE"] = obstacle_mode
+    os.environ["OBSTACLE_OBS_MODE"] = obstacle_mode
+    for attr_name, env_name, legacy_env_name, default_value in (
+        (
+            "obstacle_risk_velocity_forward_weight",
+            "OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT",
+            "OBSTACLE_OBS_VEL_FORWARD_WEIGHT",
+            4.0,
+        ),
+        (
+            "obstacle_risk_goal_along_weight",
+            "OBSTACLE_RISK_GOAL_ALONG_WEIGHT",
+            "OBSTACLE_OBS_GOAL_ALONG_WEIGHT",
+            3.0,
+        ),
+    ):
+        value = getattr(args, attr_name, None)
+        if value is None:
+            value = os.getenv(env_name, os.getenv(legacy_env_name, str(default_value)))
+        value = float(value)
+        setattr(args, attr_name, value)
         os.environ[env_name] = str(value)
 
 
@@ -373,6 +1098,247 @@ class ReplayBuffer:
         return
 
 # === 并行环境执行模块 ===
+EPISODE_AUDIT_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def _episode_audit_float(value, default=None):
+    """将环境审计值规范为有限 float；无有效值时返回 default。"""
+    try:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+        if array.size <= 0:
+            return default
+        finite = array[np.isfinite(array)]
+        if finite.size <= 0:
+            return default
+        return float(finite[-1])
+    except Exception:
+        return default
+
+
+def _episode_audit_nonnegative_int(value):
+    parsed = _episode_audit_float(value, default=0.0)
+    if parsed is None:
+        return 0
+    return max(0, int(parsed))
+
+
+def _build_episode_audit_snapshot(env):
+    """构造可经 multiprocessing Pipe 传输的权威回合末快照。
+
+    成功语义只读取 MultiAgentEnv 在每步末同步到 world 的
+    ``_episode_*`` 字段；碰撞和终点距离来自同一批 policy agents。
+    缺少权威字段时立即失败，禁止在并行训练中静默生成全零标签。
+    """
+    base_env = getattr(env, "env", None)
+    if base_env is None:
+        base_env = env
+    world = getattr(base_env, "world", None)
+    if world is None:
+        raise RuntimeError("episode audit snapshot: environment has no world")
+
+    policy_agents = list(getattr(base_env, "agents", []) or [])
+    if not policy_agents:
+        policy_agents = list(getattr(world, "policy_agents", []) or [])
+    if not policy_agents:
+        raise RuntimeError("episode audit snapshot: no policy agents")
+    agent_count = len(policy_agents)
+
+    def _strict_binary_flags(field_name):
+        raw = getattr(world, field_name, None)
+        if not isinstance(raw, (list, tuple, np.ndarray)):
+            raise RuntimeError(
+                f"episode audit snapshot: world.{field_name} is missing"
+            )
+        values = np.asarray(raw).reshape(-1)
+        if int(values.size) != agent_count:
+            raise RuntimeError(
+                f"episode audit snapshot: world.{field_name} has "
+                f"{int(values.size)} values, expected {agent_count}"
+            )
+        flags = []
+        for index, value in enumerate(values):
+            parsed = _episode_audit_float(value, default=None)
+            if parsed is None or parsed not in (0.0, 1.0):
+                raise RuntimeError(
+                    f"episode audit snapshot: world.{field_name}[{index}]="
+                    f"{value!r} is not binary"
+                )
+            flags.append(int(parsed))
+        return flags
+
+    reach_flags = _strict_binary_flags("_episode_agent_reach_flags")
+    safe_flags = _strict_binary_flags("_episode_agent_safe_flags")
+    success_flags = _strict_binary_flags("_episode_agent_success_flags")
+    expected_success = [
+        int(bool(reach) and bool(safe))
+        for reach, safe in zip(reach_flags, safe_flags)
+    ]
+    if success_flags != expected_success:
+        raise RuntimeError(
+            "episode audit snapshot: success flags do not equal reach AND safe"
+        )
+    team_success = int(bool(success_flags) and all(success_flags))
+    recorded_team_success = _episode_audit_float(
+        getattr(world, "_episode_team_success_flag", None),
+        default=None,
+    )
+    if recorded_team_success is None or recorded_team_success not in (0.0, 1.0):
+        raise RuntimeError(
+            "episode audit snapshot: world._episode_team_success_flag is invalid"
+        )
+    if int(recorded_team_success) != team_success:
+        raise RuntimeError(
+            "episode audit snapshot: team flag disagrees with agent success flags"
+        )
+
+    collision_counts = []
+    terrain_collision_counts = []
+    obstacle_collision_counts = []
+    min_distances = []
+    goal_distances = []
+    scenario = getattr(base_env, "scenario", None)
+    for index, agent in enumerate(policy_agents):
+        debug_info = (
+            agent.debug_info
+            if isinstance(getattr(agent, "debug_info", None), dict)
+            else {}
+        )
+        collision_counts.append(
+            _episode_audit_nonnegative_int(
+                debug_info.get("total_penetration_count", 0)
+            )
+        )
+        terrain_collision_counts.append(
+            _episode_audit_nonnegative_int(
+                debug_info.get("terrain_penetration_count", 0)
+            )
+        )
+        obstacle_collision_counts.append(
+            _episode_audit_nonnegative_int(
+                debug_info.get("obstacle_collision_count", 0)
+            )
+        )
+        min_distance = _episode_audit_float(
+            debug_info.get(
+                "d_min_current",
+                getattr(agent, "last_min_distance", None),
+            ),
+            default=None,
+        )
+        min_distances.append(min_distance)
+
+        goal_pos = None
+        goal_entity = getattr(agent, "goal_a", None)
+        if goal_entity is not None:
+            goal_pos = getattr(getattr(goal_entity, "state", None), "p_pos", None)
+        if goal_pos is None and scenario is not None:
+            goal_pos = getattr(scenario, "goal_pos", None)
+        position = getattr(getattr(agent, "state", None), "p_pos", None)
+        if goal_pos is None or position is None:
+            raise RuntimeError(
+                f"episode audit snapshot: agent[{index}] position/goal is missing"
+            )
+        try:
+            distance = float(
+                np.linalg.norm(
+                    np.asarray(position, dtype=np.float64)
+                    - np.asarray(goal_pos, dtype=np.float64)
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"episode audit snapshot: agent[{index}] goal distance failed"
+            ) from exc
+        if not np.isfinite(distance):
+            raise RuntimeError(
+                f"episode audit snapshot: agent[{index}] goal distance is non-finite"
+            )
+        goal_distances.append(distance)
+
+    try:
+        env_id = int(getattr(world, "env_id", 0))
+    except Exception:
+        env_id = 0
+    return {
+        "schema_version": EPISODE_AUDIT_SNAPSHOT_SCHEMA_VERSION,
+        "env_id": env_id,
+        "agent_count": agent_count,
+        "agent_reach_flags": reach_flags,
+        "agent_safe_flags": safe_flags,
+        "agent_success_flags": success_flags,
+        "team_success": team_success,
+        "all_reached": int(bool(reach_flags) and all(reach_flags)),
+        "success_threshold": _episode_audit_float(
+            getattr(world, "_episode_success_thr_snapshot", None),
+            default=None,
+        ),
+        "agent_goal_distances": goal_distances,
+        "agent_collision_counts": collision_counts,
+        "agent_terrain_collision_counts": terrain_collision_counts,
+        "agent_obstacle_collision_counts": obstacle_collision_counts,
+        "agent_min_distances": min_distances,
+        "done_reason": getattr(world, "_episode_done_reason", None),
+    }
+
+
+def _validate_episode_audit_snapshots(snapshots, expected_envs, expected_agents):
+    """验证 IPC 回合快照数量、顺序及关键维度并返回规范化列表。"""
+    if not isinstance(snapshots, (list, tuple)):
+        raise RuntimeError(
+            f"episode audit snapshots must be a list, got {type(snapshots).__name__}"
+        )
+    if len(snapshots) != int(expected_envs):
+        raise RuntimeError(
+            f"episode audit snapshot count={len(snapshots)}, "
+            f"expected={int(expected_envs)}"
+        )
+    normalized = []
+    for env_index, snapshot in enumerate(snapshots):
+        if not isinstance(snapshot, dict):
+            raise RuntimeError(
+                f"episode audit Env{env_index}: invalid payload "
+                f"{type(snapshot).__name__}"
+            )
+        if snapshot.get("error"):
+            raise RuntimeError(
+                f"episode audit Env{env_index}: worker error: "
+                f"{snapshot.get('error')}"
+            )
+        if int(snapshot.get("schema_version", 0) or 0) != (
+            EPISODE_AUDIT_SNAPSHOT_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                f"episode audit Env{env_index}: schema mismatch"
+            )
+        if int(snapshot.get("env_id", -1)) != env_index:
+            raise RuntimeError(
+                f"episode audit Env{env_index}: env_id="
+                f"{snapshot.get('env_id')!r}"
+            )
+        if int(snapshot.get("agent_count", 0) or 0) != int(expected_agents):
+            raise RuntimeError(
+                f"episode audit Env{env_index}: agent_count="
+                f"{snapshot.get('agent_count')!r}, expected={int(expected_agents)}"
+            )
+        for field_name in (
+            "agent_reach_flags",
+            "agent_safe_flags",
+            "agent_success_flags",
+            "agent_goal_distances",
+            "agent_collision_counts",
+            "agent_terrain_collision_counts",
+            "agent_obstacle_collision_counts",
+            "agent_min_distances",
+        ):
+            values = snapshot.get(field_name)
+            if not isinstance(values, list) or len(values) != int(expected_agents):
+                raise RuntimeError(
+                    f"episode audit Env{env_index}: {field_name} length is invalid"
+                )
+        normalized.append(snapshot)
+    return normalized
+
+
 def _worker(remote, parent_remote, env_fn):
     """多进程worker函数，用于在单独的进程中运行环境。
 
@@ -438,8 +1404,11 @@ def _worker(remote, parent_remote, env_fn):
                 base_seed = (int(_time.time() * 1000000) + int(_os.getpid())) % 2147483647
 
         env_id = getattr(getattr(env, 'world', None), 'env_id', 0)
-        pid = int(_os.getpid())
-        derived_seed = int(base_seed) + int(env_id) * 100003 + (pid % 1000003)
+        # 正式消融要求同一 train seed / env_id 在不同算法进程中得到完全
+        # 相同的环境随机流。PID 会随启动顺序变化，不能进入派生种子。
+        derived_seed = (
+            int(base_seed) + int(env_id) * 100003
+        ) % 2147483647
 
         # 设置全局与库级随机源
         _py_random.seed(derived_seed)
@@ -601,6 +1570,32 @@ def _worker(remote, parent_remote, env_fn):
                         detail = detail.copy()
                         detail['env_outer'] = float(detail.get('env_outer', 0.0)) + (time.perf_counter() - _worker_outer_t0)
                         info_n['_timing'] = detail
+                # 向主进程返回每个 agent 当前安全距离。该轻量字段用于
+                # 多环境训练的完整回合 D_min 统计，不暴露子进程对象。
+                try:
+                    info_rows = info_n.get("n", []) if isinstance(info_n, dict) else []
+                    policy_agents = list(getattr(env, "agents", []) or [])
+                    for agent_index, agent in enumerate(policy_agents):
+                        if agent_index >= len(info_rows):
+                            break
+                        if not isinstance(info_rows[agent_index], dict):
+                            info_rows[agent_index] = {}
+                        debug_info = (
+                            agent.debug_info
+                            if isinstance(getattr(agent, "debug_info", None), dict)
+                            else {}
+                        )
+                        info_rows[agent_index][
+                            "episode_audit_d_min_current"
+                        ] = _episode_audit_float(
+                            debug_info.get(
+                                "d_min_current",
+                                getattr(agent, "last_min_distance", None),
+                            ),
+                            default=None,
+                        )
+                except Exception:
+                    pass
                 remote.send((next_obs_n, rew_n, done_n, info_n))
             elif cmd == 'reset':
                 # 无论 _needs_reset 与否，收到重置指令都执行真实 reset，避免跨回合状态泄漏
@@ -1160,6 +2155,20 @@ def _worker(remote, parent_remote, env_fn):
                 except Exception:
                     remote.send({})
 
+            elif cmd == 'get_episode_audit_snapshot':
+                try:
+                    remote.send(_build_episode_audit_snapshot(env))
+                except Exception as snapshot_exc:
+                    remote.send({
+                        "schema_version": EPISODE_AUDIT_SNAPSHOT_SCHEMA_VERSION,
+                        "env_id": int(
+                            getattr(getattr(env, "world", None), "env_id", -1)
+                        ),
+                        "error": (
+                            f"{type(snapshot_exc).__name__}: {snapshot_exc}"
+                        ),
+                    })
+
             elif cmd == 'close':
                 env.close()
                 remote.close()
@@ -1188,7 +2197,30 @@ class ParallelEnv:
             # 使用 cloudpickle 序列化 env_fn
             process = mp.Process(target=_worker, args=(work_remote, remote, env_fn))
             process.daemon = True  # 设置为守护进程，主进程退出时自动终止
-            process.start()
+            # multiprocessing 使用 spawn。子解释器会在进入 _worker 之前先
+            # 重新导入本模块；因此只在 _worker 内设置 CUDA_VISIBLE_DEVICES
+            # 已经太晚。start() 创建子进程时临时隐藏 GPU，使子环境从首次
+            # import TensorFlow 起就是 CPU-only；start 返回后立即恢复父进程
+            # 环境，主训练网络继续使用原 GPU 配置。
+            worker_spawn_overrides = {
+                "CUDA_VISIBLE_DEVICES": "",
+                "TF_FORCE_GPU_ALLOW_GROWTH": "false",
+                "TF_GPU_ALLOCATOR": "",
+                "TF_CPP_MIN_LOG_LEVEL": "3",
+            }
+            previous_spawn_env = {
+                key: os.environ.get(key)
+                for key in worker_spawn_overrides
+            }
+            try:
+                os.environ.update(worker_spawn_overrides)
+                process.start()
+            finally:
+                for key, previous_value in previous_spawn_env.items():
+                    if previous_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = previous_value
             self.processes.append(process)
             work_remote.close()
 
@@ -1293,6 +2325,12 @@ class ParallelEnv:
             return self.remotes[env_idx].recv()
         except Exception:
             return {}
+
+    def get_episode_audit_snapshots(self):
+        """一次并发获取所有子环境的权威回合末审计快照。"""
+        for remote in self.remotes:
+            remote.send(('get_episode_audit_snapshot', None))
+        return [remote.recv() for remote in self.remotes]
 
     def prime_resume_env_sequence_state(self, completed_episodes: int):
         """在首次 reset 前对齐各子环境的续训场景序列状态。"""
@@ -1447,6 +2485,9 @@ class SingleEnvWrapper:
                     scenario._obstacle_reset_count = int(completed_episodes)
                 except Exception:
                     pass
+
+    def get_episode_audit_snapshots(self):
+        return [_build_episode_audit_snapshot(self.env)]
 
     def get_vis_bundle(self, env_idx: int = 0):
         """一次性拉取地形/尺寸/中央目标/各自目标/seed，避免跨调用漂移。"""
@@ -4522,28 +5563,39 @@ def build_continuous_action_network(input_shape, action_dim=7, hidden_units=(256
     return model
 
 
-CROSS_AGENT_REFERENCE_SELECTOR_MODES = (
-    'hard',
+CROSS_AGENT_REFERENCE_LEGACY_SELECTOR_MODES = (
     'soft_advantage',
     'selector_mix',
     'reward_to_success_priority',
     'reward_to_success_head_tail',
     'closed_loop_team_head_tail',
 )
-CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES = (
+CROSS_AGENT_REFERENCE_SELECTOR_MODES = (
+    *ACTIVE_SELECTOR_MODES,
+    *CROSS_AGENT_REFERENCE_LEGACY_SELECTOR_MODES,
+)
+CROSS_AGENT_REFERENCE_LEGACY_TRAINABLE_MODES = (
     'selector_mix',
     'reward_to_success_priority',
     'reward_to_success_head_tail',
     'closed_loop_team_head_tail',
+)
+CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES = (
+    *TRAINABLE_SELECTOR_MODES,
+    *CROSS_AGENT_REFERENCE_LEGACY_TRAINABLE_MODES,
 )
 CROSS_AGENT_REFERENCE_R2S_SELECTOR_MODES = (
     'reward_to_success_priority',
     'reward_to_success_head_tail',
     'closed_loop_team_head_tail',
 )
-CROSS_AGENT_REFERENCE_HEAD_TAIL_SELECTOR_MODES = (
+CROSS_AGENT_REFERENCE_LEGACY_HEAD_TAIL_SELECTOR_MODES = (
     'reward_to_success_head_tail',
     'closed_loop_team_head_tail',
+)
+CROSS_AGENT_REFERENCE_HEAD_TAIL_SELECTOR_MODES = (
+    *HEAD_TAIL_SELECTOR_MODES,
+    *CROSS_AGENT_REFERENCE_LEGACY_HEAD_TAIL_SELECTOR_MODES,
 )
 
 
@@ -4564,7 +5616,13 @@ def _cross_agent_reference_selector_output_dim(selector_mode):
     return 2 if mode in CROSS_AGENT_REFERENCE_HEAD_TAIL_SELECTOR_MODES else 1
 
 
-def build_cross_agent_reference_selector(input_dim, hidden_units=(128, 64), init_logit=-2.0, output_dim=1):
+def build_cross_agent_reference_selector(
+    input_dim,
+    hidden_units=(128, 64),
+    init_logit=0.0,
+    output_dim=1,
+    zero_output_kernel=False,
+):
     """Predict whether a cross-agent reference sample should affect actor imitation."""
     selector_input = tf.keras.layers.Input(shape=(int(input_dim),), name='cross_ref_selector_input')
     x = tf.keras.layers.LayerNormalization(name='cross_ref_selector_input_ln')(selector_input)
@@ -4580,7 +5638,14 @@ def build_cross_agent_reference_selector(input_dim, hidden_units=(128, 64), init
     logits = tf.keras.layers.Dense(
         max(1, int(output_dim)),
         activation=None,
-        kernel_initializer=tf.keras.initializers.RandomUniform(minval=-0.003, maxval=0.003),
+        kernel_initializer=(
+            tf.keras.initializers.Zeros()
+            if bool(zero_output_kernel)
+            else tf.keras.initializers.RandomUniform(
+                minval=-0.003,
+                maxval=0.003,
+            )
+        ),
         bias_initializer=tf.keras.initializers.Constant(float(init_logit)),
         name='cross_ref_selector_logit',
     )(x)
@@ -5001,6 +6066,9 @@ def load_scenario_module(scenario_name, args=None):
                     'per_env_terrain',
                     'per_episode_terrain',
                     'map_size',
+                    'obstacle_observation_mode',
+                    'obstacle_risk_velocity_forward_weight',
+                    'obstacle_risk_goal_along_weight',
                 ):
                     value = getattr(args, key, None)
                     if value is not None:
@@ -5195,6 +6263,10 @@ def try_apply_scenario_params(scenario, world, args, tqdm_file=None):
         'collision_distance_threshold', 'collision_penalty_value',
         # 与 MultiAgentEnv.step 到达判定、训练日志同源
         'success_distance_threshold',
+        # 障碍物 observation 语义必须与训练/评估一致；维度仍保持15维。
+        'obstacle_observation_mode',
+        'obstacle_risk_velocity_forward_weight',
+        'obstacle_risk_goal_along_weight',
     ]
 
     applied = {}
@@ -5305,6 +6377,36 @@ def make_env_init(rank: int, args_dict: dict):
                 dynamic_obstacles = os.getenv('USE_DYNAMIC_OBSTACLES', '1').lower() in ('1','true','yes','on')
             scenario.use_dynamic_obstacles = bool(dynamic_obstacles)
             setattr(args, 'use_dynamic_obstacles', bool(scenario.use_dynamic_obstacles))
+            obstacle_observation_mode = getattr(args, 'obstacle_observation_mode', None)
+            if obstacle_observation_mode is None:
+                obstacle_observation_mode = os.getenv(
+                    'OBSTACLE_OBSERVATION_MODE',
+                    os.getenv('OBSTACLE_OBS_MODE', 'nearest_surface'),
+                )
+            obstacle_observation_mode = normalize_obstacle_observation_mode(obstacle_observation_mode)
+            scenario.obstacle_observation_mode = str(obstacle_observation_mode)
+            setattr(args, 'obstacle_observation_mode', scenario.obstacle_observation_mode)
+            for arg_name, env_name, default_value in (
+                (
+                    'obstacle_risk_velocity_forward_weight',
+                    'OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT',
+                    4.0,
+                ),
+                (
+                    'obstacle_risk_goal_along_weight',
+                    'OBSTACLE_RISK_GOAL_ALONG_WEIGHT',
+                    3.0,
+                ),
+            ):
+                value = getattr(args, arg_name, None)
+                if value is None:
+                    value = os.getenv(env_name, str(default_value))
+                try:
+                    value = float(value)
+                except Exception:
+                    value = float(default_value)
+                setattr(scenario, arg_name, value)
+                setattr(args, arg_name, value)
             hold_mode = str(
                 getattr(args, 'semi_random_hold_mode', None)
                 if getattr(args, 'semi_random_hold_mode', None) is not None
@@ -5813,7 +6915,8 @@ class OptimizedMADDPG:
 
         # 🔧 性能优化：向量化OU噪声生成
         # 🔧 XLA修复：使用tf.Variable存储噪声参数，避免自适应调整时触发XLA重新编译
-        initial_noise_scale = max(float(getattr(self.args, 'noise_scale', 0.3)), float(getattr(self.args, 'noise_min', 0.0)))
+        initial_noise_scale, effective_noise_min, self.noise_disabled = _initial_behavior_noise_values(self.args)
+        self.initial_behavior_noise_scale = float(initial_noise_scale)
         self.noise_scale_var = tf.Variable(
             initial_noise_scale,
             trainable=False,
@@ -5822,10 +6925,16 @@ class OptimizedMADDPG:
         )
         # 🔧 XLA修复：将noise_min也存储为Variable，避免在tf.function中访问Python属性
         self.noise_min_var = tf.Variable(
-            float(getattr(self.args, 'noise_min', 0.0)),
+            effective_noise_min,
             trainable=False,
             dtype=tf.float32,
             name='maddpg_noise_min_var'
+        )
+        self.current_ou_noise_std_var = tf.Variable(
+            initial_noise_scale,
+            trainable=False,
+            dtype=tf.float32,
+            name='maddpg_current_ou_noise_std_var'
         )
         # 🚨 关键修复：创建total_steps的Variable，用于噪声衰减调度器（在@tf.function中安全使用）
         self.total_steps_var = tf.Variable(
@@ -5923,7 +7032,7 @@ class OptimizedMADDPG:
             for env_idx in range(max(1, num_envs)):
                 row = []
                 for agent_idx in range(self.n_agents):
-                    std = max(float(self.args.noise_scale), float(self.args.noise_min))
+                    std = initial_noise_scale
                     seed = (base_seed + 9973 * env_idx + 101 * agent_idx) % 2147483647
                     row.append(OUNoise(size=total_action_dims[agent_idx], std_dev=std, decay=float(self.args.noise_decay), seed=seed))
                 self.ou_noises.append(row)
@@ -6037,74 +7146,42 @@ class OptimizedMADDPG:
         # 噪声状态总结：统一使用 OU 噪声
         print(f"\n{'='*80}")
         print(f"[噪声机制] OU噪声模式")
-        print(f"  - 噪声强度: scale={self.args.noise_scale}, min={self.args.noise_min}, decay={self.args.noise_decay}")
-        print(f"  - 所有{self.n_agents}个智能体将使用OU噪声进行探索")
+        if self.noise_disabled:
+            print(f"  - 已禁用: NOISE_SCALE=0（配置的 NOISE_MIN={self.args.noise_min} 不会重新启用噪声）")
+        else:
+            print(f"  - 噪声强度: scale={self.args.noise_scale}, min={self.args.noise_min}, decay={self.args.noise_decay}")
+            print(f"  - 所有{self.n_agents}个智能体将使用OU噪声进行探索")
         print(f"{'='*80}\n")
 
     def _init_optimizers(self):
         """初始化优化器（支持学习率衰减）"""
         # 🔥 创建学习率调度器（如果启用）
         lr_decay_enabled = getattr(self.args, 'lr_decay_enabled', True)
+        decay_steps = getattr(self.args, 'lr_decay_steps', 8000)
+        decay_rate = getattr(self.args, 'lr_decay_rate', 0.96)
+        staircase = getattr(self.args, 'lr_staircase', True)
 
         if lr_decay_enabled:
-            decay_steps = getattr(self.args, 'lr_decay_steps', 8000)
-            decay_rate = getattr(self.args, 'lr_decay_rate', 0.96)
-            staircase = getattr(self.args, 'lr_staircase', True)
             min_actor_lr = getattr(self.args, 'lr_min_actor', 5e-5)
             min_critic_lr = getattr(self.args, 'lr_min_critic', 8e-5)
 
-            # 创建自定义学习率调度器（带下限保护）
-            class ClippedExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
-                def __init__(self, initial_learning_rate, decay_steps, decay_rate, min_lr, staircase=True):
-                    self.initial_learning_rate = initial_learning_rate
-                    self.decay_steps = decay_steps
-                    self.decay_rate = decay_rate
-                    self.min_lr = min_lr
-                    self.staircase = staircase
-
-                def __call__(self, step):
-                    # 指数衰减公式
-                    # 确保所有计算都在float32精度下进行，避免类型不匹配
-                    step = tf.cast(step, tf.float32)
-                    decay_steps = tf.cast(self.decay_steps, tf.float32)
-
-                    if self.staircase:
-                        p = tf.math.floor(step / decay_steps)
-                    else:
-                        p = step / decay_steps
-
-                    # 确保所有参数都是float32类型
-                    initial_lr = tf.cast(self.initial_learning_rate, tf.float32)
-                    decay_rate = tf.cast(self.decay_rate, tf.float32)
-                    min_lr = tf.cast(self.min_lr, tf.float32)
-
-                    decayed_lr = initial_lr * tf.pow(decay_rate, p)
-                    # 限制在最小学习率之上
-                    return tf.maximum(decayed_lr, min_lr)
-
-                def get_config(self):
-                    return {
-                        'initial_learning_rate': self.initial_learning_rate,
-                        'decay_steps': self.decay_steps,
-                        'decay_rate': self.decay_rate,
-                        'min_lr': self.min_lr,
-                        'staircase': self.staircase
-                    }
-
-            actor_lr_schedule = ClippedExponentialDecay(
-                initial_learning_rate=self.args.learning_rate_actor,
+            # 使用资源变量作为初始值；自适应调整后，已追踪的训练图会立即读取新值。
+            actor_lr_schedule = ClippedExponentialDecaySchedule(
+                initial_value=self.args.learning_rate_actor,
                 decay_steps=decay_steps,
                 decay_rate=decay_rate,
-                min_lr=min_actor_lr,
-                staircase=staircase
+                min_value=min_actor_lr,
+                staircase=staircase,
+                name="maddpg_actor_lr",
             )
 
-            critic_lr_schedule = ClippedExponentialDecay(
-                initial_learning_rate=self.args.learning_rate_critic,
+            critic_lr_schedule = ClippedExponentialDecaySchedule(
+                initial_value=self.args.learning_rate_critic,
                 decay_steps=decay_steps,
                 decay_rate=decay_rate,
-                min_lr=min_critic_lr,
-                staircase=staircase
+                min_value=min_critic_lr,
+                staircase=staircase,
+                name="maddpg_critic_lr",
             )
 
             print(f"[学习率衰减] 已启用")
@@ -6112,27 +7189,26 @@ class OptimizedMADDPG:
             print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
             print(f"  - 最小学习率: Actor={min_actor_lr:.6f}, Critic={min_critic_lr:.6f}")
 
-            # 🚨 关键修复：创建噪声衰减调度器（与学习率衰减使用相同的机制）
-            initial_noise_scale = float(getattr(self.args, 'noise_scale', 0.35))
-            min_noise_scale = float(getattr(self.args, 'noise_min', 0.05))
-
-            self.noise_scale_schedule = ClippedExponentialDecay(
-                initial_learning_rate=initial_noise_scale,
-                decay_steps=decay_steps,  # 与学习率衰减使用相同的decay_steps
-                decay_rate=decay_rate,    # 与学习率衰减使用相同的decay_rate
-                min_lr=min_noise_scale,
-                staircase=staircase       # 与学习率衰减使用相同的staircase
-            )
-            print(f"[噪声衰减] 已启用（与学习率衰减同步）")
-            print(f"  - 初始噪声: {initial_noise_scale:.4f}, 最小噪声: {min_noise_scale:.4f}")
-            print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
         else:
             # 固定学习率
             actor_lr_schedule = self.args.learning_rate_actor
             critic_lr_schedule = self.args.learning_rate_critic
             print(f"[学习率] 固定学习率: Actor={self.args.learning_rate_actor:.6f}, Critic={self.args.learning_rate_critic:.6f}")
-            # 固定噪声（不使用调度器）
-            self.noise_scale_schedule = None
+
+        self.noise_scale_schedule, self.noise_schedule_config = _build_noise_scale_schedule(
+            self.args,
+            fallback_decay_steps=decay_steps,
+            fallback_staircase=staircase,
+        )
+        cfg = self.noise_schedule_config
+        if cfg['disabled_by_zero_scale']:
+            print("[噪声衰减] 行为噪声已禁用：有效初始值和最小值均为 0")
+        elif self.noise_scale_schedule is not None:
+            print(f"[噪声衰减] 已启用（独立于学习率）")
+            print(f"  - 初始噪声: {cfg['initial_noise_scale']:.4f}, 最小噪声: {cfg['min_noise_scale']:.4f}")
+            print(f"  - 衰减参数: 每{cfg['decay_steps']}步衰减{(1-cfg['decay_rate'])*100:.3f}% ({'阶梯式' if cfg['staircase'] else '平滑'})")
+        else:
+            print(f"[噪声衰减] 已关闭：使用固定/自适应OU噪声变量")
 
         for i, agent in enumerate(self.agents):
             # 🔧 核心修复：强制优化器使用FP32，避免bf16/fp16下的数值不稳定
@@ -6531,64 +7607,14 @@ class OptimizedMADDPG:
                 # 固定学习率模式：直接修改优化器学习率
                 _safe_set_lr(agent['critic_optimizer'], agent['critic_lr_var'])
 
-            # 🔧 XLA修复：从Variable读取当前噪声
-            current_noise = float(self.noise_scale_var.numpy())
-            boost = float(self.adaptive_learning.get('noise_boost_factor', 1.5))
-            # 🔧 修复：降低噪声上限（0.6 → 0.3），减少噪声干扰
-            # 硬上限：取配置max_noise_scale与环境变量ADAPTIVE_NOISE_MAX（默认0.3）的较小值
-            try:
-                env_cap = float(os.getenv('ADAPTIVE_NOISE_MAX', '0.3'))
-            except Exception:
-                env_cap = 0.3
-            hard_cap = float(min(self.adaptive_learning.get('max_noise_scale', 2.0), env_cap))
-
-            # 🚨 关键修复：添加噪声循环机制，防止噪声卡在上限
-            # 问题：如果噪声已经达到上限，继续调整会导致噪声不变，无法跳出局部最优
-            # 解决方案：当噪声达到上限时，降低噪声，形成循环
-            noise_min_val = float(self.noise_min_var.numpy())
-            if current_noise >= hard_cap * 0.95:  # 接近上限时
-                # 降低噪声，形成循环
-                target_noise = max(noise_min_val, current_noise * 0.7)  # 降低到70%
-            else:
-                # 正常增加噪声
-                target_noise = min(hard_cap, current_noise * boost)
-
-            # 平滑更新：new = cur + beta*(target-cur)
-            try:
-                beta = float(os.getenv('ADAPTIVE_NOISE_SMOOTH', '0.3'))
-            except Exception:
-                beta = 0.3
-            beta = max(0.0, min(1.0, beta))
-            new_noise = current_noise + beta * (target_noise - current_noise)
-            # 再次确保在合法范围（使用Variable的值）
-            new_noise = float(min(hard_cap, max(new_noise, noise_min_val)))
-
-            # 🔧 XLA修复：使用Variable.assign更新，不会触发重新编译
-            self.noise_scale_var.assign(tf.cast(new_noise, tf.float32))
-
-            # 同步更新Python属性（保持兼容性）
-            self.args.noise_scale = new_noise
-
             print(f"智能体{i}: Actor LR {current_actor_lr:.6f}->{new_actor_lr:.6f}, "
-                  f"Critic LR {current_critic_lr:.6f}->{new_critic_lr:.6f}, "
-                  f"噪声 {current_noise:.4f}->{new_noise:.4f} (target={target_noise:.4f}, cap={hard_cap:.2f}, beta={beta:.2f})")
+                  f"Critic LR {current_critic_lr:.6f}->{new_critic_lr:.6f}")
 
-        # 🚨 XLA修复：安全地更新向量化OU噪声std_dev
-        # 解决方案：使用tf.constant包装，确保值是tensor常量，不是Python变量
-        # 这样XLA编译的代码可以正确处理内存地址
-        if hasattr(self, 'vectorized_ou_noise') and self.vectorized_ou_noise is not None:
-            try:
-                # 🔧 XLA安全做法：将new_noise转为tf.constant再assign
-                # 这样XLA可以正确追踪内存地址变化
-                updated_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                # 🚨 关键：使用tf.constant包装，避免Python变量导致的内存地址问题
-                updated_std_const = tf.constant(float(updated_std.numpy()), dtype=tf.float32)
-                self.vectorized_ou_noise._std_dev.assign(updated_std_const)
-            except Exception as e:
-                # 如果更新失败，记录但不影响训练
-                quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')
-                if not quiet_output:
-                    print(f"⚠️  更新向量化OU噪声std_dev失败: {e}")
+        current_noise, new_noise, target_noise, hard_cap, beta = _adaptive_behavior_noise_update(self, 0.3)
+        print(
+            f"全局OU噪声 {current_noise:.4f}->{new_noise:.4f} "
+            f"(target={target_noise:.4f}, cap={hard_cap:.2f}, beta={beta:.2f})"
+        )
 
         # 维持 XLA Global 的固定状态（不在此处尝试切换或延迟切换）
 
@@ -6645,13 +7671,12 @@ class OptimizedMADDPG:
         # 🔧 修改3：在势场修正后的动作上添加OU噪声（只加在前3维）
         if add_noise:
             i = int(agent_idx)
-            # 🚨 关键修复：使用噪声衰减调度器（与学习率衰减一致）
+            # 使用独立OU噪声衰减调度器
             if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
                 # 使用调度器计算当前噪声强度（基于total_steps_var）
                 # 注意：在非@tf.function环境中，可以直接使用numpy()转换
                 current_step = tf.cast(self.total_steps_var, tf.float32)
                 current_std_tensor = self.noise_scale_schedule(current_step)
-                current_std_tensor = tf.maximum(current_std_tensor, self.noise_min_var)
                 # 安全转换：在非图模式下使用numpy()，在图模式下使用tf.identity
                 try:
                     current_std = float(current_std_tensor.numpy())
@@ -6659,11 +7684,11 @@ class OptimizedMADDPG:
                     # 如果无法转换为numpy（可能在图模式下），使用tf.identity然后转换
                     current_std = float(tf.keras.backend.get_value(current_std_tensor))
             else:
-                # 回退：如果没有调度器，使用简单的指数衰减（向后兼容）
-                current_std = max(float(self.args.noise_scale), float(self.args.noise_min))
-                current_std = current_std * (self.args.noise_decay ** self.training_stats['total_steps'])
-                current_std = max(current_std, float(self.args.noise_min))
+                current_std = float(self.noise_scale_var.numpy())
 
+            if hasattr(self, 'current_ou_noise_std_var'):
+                self.current_ou_noise_std_var.assign(tf.cast(current_std, tf.float32))
+            self.noise_scale_var.assign(tf.cast(current_std, tf.float32))
             self.ou_noises[i].set_std_dev(current_std)
             ou = self.ou_noises[i]()  # 返回7维
             ou_head = ou[:3]  # 只取前3维
@@ -6888,18 +7913,29 @@ class OptimizedMADDPG:
         # 但要确保assign的值来自tf.constant或其他tensor，不要来自Python变量
         if add_noise:
             if self.use_vectorized_ou:
-                # 🚨 关键修复：使用噪声衰减调度器（与学习率衰减一致）
-                if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
-                    # 使用调度器计算当前噪声强度（基于total_steps_var）
-                    current_step = tf.cast(self.total_steps_var, tf.float32)
-                    current_std = self.noise_scale_schedule(current_step)
-                    current_std = tf.maximum(current_std, self.noise_min_var)
-                    # 使用generate_noise_with_std，传入计算出的std（XLA友好）
-                    ou_tensor = self.vectorized_ou_noise.generate_noise_with_std(current_std)
-                else:
-                    # 回退：如果没有调度器，使用Variable存储的噪声强度（向后兼容）
-                    current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                    ou_tensor = self.vectorized_ou_noise.generate_noise()
+                env_axis_assertion = tf.debugging.assert_equal(
+                    num_envs,
+                    tf.cast(self.vectorized_ou_noise.batch_size, tf.int32),
+                    message=(
+                        "MADDPG action batch must match the fixed OU-noise "
+                        "environment batch"
+                    ),
+                )
+                with tf.control_dependencies([env_axis_assertion]):
+                    # 使用独立OU噪声衰减调度器
+                    if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
+                        # 使用调度器计算当前噪声强度（基于total_steps_var）
+                        current_step = tf.cast(self.total_steps_var, tf.float32)
+                        current_std = self.noise_scale_schedule(current_step)
+                        self.current_ou_noise_std_var.assign(tf.cast(current_std, tf.float32))
+                        self.noise_scale_var.assign(tf.cast(current_std, tf.float32))
+                        # 使用generate_noise_with_std，传入计算出的std（XLA友好）
+                        ou_tensor = self.vectorized_ou_noise.generate_noise_with_std(current_std)
+                    else:
+                        # 回退：如果没有调度器，使用Variable存储的噪声强度（向后兼容）
+                        current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
+                        self.current_ou_noise_std_var.assign(tf.cast(current_std, tf.float32))
+                        ou_tensor = self.vectorized_ou_noise.generate_noise()
                 ou_tensor_head = ou_tensor[:, :, :3]
             else:
                 ou_tensor_head = tf.zeros([num_envs, self.n_agents, 3], dtype=tf.float32)
@@ -10009,7 +11045,7 @@ class OptimizedMADDPG:
             agent['actor'].save_weights(os.path.join(path, f'actor_{i}.weights.h5'))
             agent['critic'].save_weights(os.path.join(path, f'critic_{i}.weights.h5'))
 
-    def load_models(self, path):
+    def load_models(self, path, strict=False):
         """加载模型。
 
         旧实现用“层名里是否包含 concatenate”来猜 Critic 架构，但当前实际层名是
@@ -10021,16 +11057,21 @@ class OptimizedMADDPG:
         print(f"\n{'='*80}")
         print(f"[模型加载] 检查模型路径: {path}")
 
-        # 打印当前Critic结构提示信息（仅提示，不再作为是否跳过加载的依据）
-        sample_critic = self.agents[0]['critic']
-        layer_names = [str(layer.name).lower() for layer in sample_critic.layers]
-        if any(name in layer_names for name in ("shared_base_fusion", "concat_all_agent_head_features", "concat_all_agent_tail_features")):
-            print(f"[模型加载] ✅ 当前Critic结构: 双Q/PF分离式Critic")
-        elif "state_action_fusion" in layer_names:
-            print(f"[模型加载] ✅ 当前Critic结构: 标准MADDPG单Q Critic")
+        # 打印当前Critic结构提示信息（仅提示，不再作为是否跳过加载的依据）。
+        # 轻量评估实例本来就不构建 Critic，不能访问不存在的字典项。
+        if self.eval_actor_only:
+            print("[模型加载] 评估轻量模式：严格加载Actor，跳过Critic/Target")
         else:
-            print(f"[模型加载] ⚠️  当前Critic结构: 未识别（将直接尝试加载权重）")
+            sample_critic = self.agents[0]['critic']
+            layer_names = [str(layer.name).lower() for layer in sample_critic.layers]
+            if any(name in layer_names for name in ("shared_base_fusion", "concat_all_agent_head_features", "concat_all_agent_tail_features")):
+                print(f"[模型加载] ✅ 当前Critic结构: 双Q/PF分离式Critic")
+            elif "state_action_fusion" in layer_names:
+                print(f"[模型加载] ✅ 当前Critic结构: 标准MADDPG单Q Critic")
+            else:
+                print(f"[模型加载] ⚠️  当前Critic结构: 未识别（将直接尝试加载权重）")
 
+        load_errors = []
         for i, agent in enumerate(self.agents):
             actor_path = os.path.join(path, f'actor_{i}.weights.h5')
             critic_path = os.path.join(path, f'critic_{i}.weights.h5')
@@ -10038,10 +11079,17 @@ class OptimizedMADDPG:
             if os.path.exists(actor_path):
                 try:
                     agent['actor'].load_weights(actor_path)
-                    agent['target_actor'].set_weights(agent['actor'].get_weights())
+                    if 'target_actor' in agent:
+                        agent['target_actor'].set_weights(agent['actor'].get_weights())
                     print(f"[模型加载] ✅ Agent{i} Actor加载成功")
                 except Exception as e:
                     print(f"[模型加载] ❌ Agent{i} Actor加载失败: {e}")
+                    load_errors.append(f"agent{i} actor: {e}")
+            else:
+                load_errors.append(f"agent{i} actor missing: {actor_path}")
+
+            if self.eval_actor_only:
+                continue
 
             if os.path.exists(critic_path):
                 try:
@@ -10051,10 +11099,15 @@ class OptimizedMADDPG:
                 except Exception as e:
                     print(f"[模型加载] ❌ Agent{i} Critic加载失败: {e}")
                     print(f"[模型加载] 💡 将使用随机初始化的Critic网络")
+                    load_errors.append(f"agent{i} critic: {e}")
             else:
                 print(f"[模型加载] ⚠️  Agent{i} Critic权重文件不存在: {critic_path}")
+                load_errors.append(f"agent{i} critic missing: {critic_path}")
 
         print(f"{'='*80}\n")
+        if strict and load_errors:
+            raise RuntimeError("; ".join(load_errors))
+        return not load_errors
 
 
 class OptimizedMATD3:
@@ -10211,12 +11264,40 @@ class OptimizedMATD3:
             getattr(self.args, 'cross_agent_reference_selector_enabled', False)
         )
         self.cross_agent_reference_selector_mode_cached = str(
-            getattr(self.args, 'cross_agent_reference_selector_mode', 'hard') or 'hard'
+            getattr(self.args, 'cross_agent_reference_selector_mode', MODE_HARD) or MODE_HARD
         ).strip().lower()
         if self.cross_agent_reference_selector_mode_cached not in CROSS_AGENT_REFERENCE_SELECTOR_MODES:
-            self.cross_agent_reference_selector_mode_cached = 'hard'
-        if self.cross_agent_reference_selector_enabled and self.cross_agent_reference_selector_mode_cached == 'hard':
-            self.cross_agent_reference_selector_mode_cached = 'selector_mix'
+            raise ValueError(
+                "Unsupported cross-agent reference selector mode: "
+                f"{self.cross_agent_reference_selector_mode_cached!r}"
+            )
+        if (
+            self.cross_agent_reference_selector_mode_cached in CROSS_AGENT_REFERENCE_LEGACY_SELECTOR_MODES
+            and not self.eval_actor_only
+        ):
+            raise ValueError(
+                "Legacy selector mode has been retired from training: "
+                f"{self.cross_agent_reference_selector_mode_cached}. "
+                "Use hard, adaptive_twin_advantage_head_tail, or "
+                "shared_twin_advantage_head_tail."
+            )
+        if (
+            self.cross_agent_reference_selector_mode_cached == MODE_SHARED_TWIN_HEAD_TAIL
+            and not self.cross_agent_reference_selector_enabled
+        ):
+            raise ValueError(
+                "shared_twin_advantage_head_tail requires "
+                "cross_agent_reference_selector_enabled=true"
+            )
+        if (
+            self.cross_agent_reference_selector_mode_cached != MODE_SHARED_TWIN_HEAD_TAIL
+            and self.cross_agent_reference_selector_enabled
+            and not self.eval_actor_only
+        ):
+            raise ValueError(
+                "A trainable selector is only supported by "
+                "shared_twin_advantage_head_tail"
+            )
         self.cross_agent_reference_selector_lr_cached = float(
             getattr(self.args, 'cross_agent_reference_selector_lr', 1e-4)
         )
@@ -10224,8 +11305,11 @@ class OptimizedMATD3:
             parse_hidden_units(getattr(self.args, 'cross_agent_reference_selector_hidden', None)) or (128, 64)
         )
         self.cross_agent_reference_selector_init_logit_cached = float(
-            getattr(self.args, 'cross_agent_reference_selector_init_logit', -2.0)
+            getattr(self.args, 'cross_agent_reference_selector_init_logit', 0.0)
         )
+        self.reference_selector_shared = None
+        self.reference_selector_shared_optimizer = None
+        self.cross_agent_reference_selector_input_dim = None
 
         # 初始化网络
         self.agents = []
@@ -10351,7 +11435,8 @@ class OptimizedMATD3:
         self._stagnation_prev = False
 
         # 🔧 XLA修复：使用tf.Variable存储噪声参数，避免自适应调整时触发XLA重新编译
-        initial_noise_scale = max(float(getattr(self.args, 'noise_scale', 0.3)), float(getattr(self.args, 'noise_min', 0.0)))
+        initial_noise_scale, effective_noise_min, self.noise_disabled = _initial_behavior_noise_values(self.args)
+        self.initial_behavior_noise_scale = float(initial_noise_scale)
         self.noise_scale_var = tf.Variable(
             initial_noise_scale,
             trainable=False,
@@ -10360,10 +11445,16 @@ class OptimizedMATD3:
         )
         # 🔧 XLA修复：将noise_min也存储为Variable，避免在tf.function中访问Python属性
         self.noise_min_var = tf.Variable(
-            float(getattr(self.args, 'noise_min', 0.0)),
+            effective_noise_min,
             trainable=False,
             dtype=tf.float32,
             name='matd3_noise_min_var'
+        )
+        self.current_ou_noise_std_var = tf.Variable(
+            initial_noise_scale,
+            trainable=False,
+            dtype=tf.float32,
+            name='matd3_current_ou_noise_std_var'
         )
         # 🚨 关键修复：创建total_steps的Variable，用于噪声衰减调度器（在@tf.function中安全使用）
         self.total_steps_var = tf.Variable(
@@ -10429,20 +11520,20 @@ class OptimizedMATD3:
             getattr(self.args, 'cross_agent_reference_selector_enabled', False)
         )
         self.cross_agent_reference_selector_mode_cached = str(
-            getattr(self.args, 'cross_agent_reference_selector_mode', 'hard') or 'hard'
+            getattr(self.args, 'cross_agent_reference_selector_mode', MODE_HARD) or MODE_HARD
         ).strip().lower()
         if self.cross_agent_reference_selector_mode_cached not in CROSS_AGENT_REFERENCE_SELECTOR_MODES:
-            self.cross_agent_reference_selector_mode_cached = 'hard'
-        if self.cross_agent_reference_selector_enabled and self.cross_agent_reference_selector_mode_cached == 'hard':
-            self.cross_agent_reference_selector_mode_cached = 'selector_mix'
+            raise ValueError(
+                "Unsupported cross-agent reference selector mode: "
+                f"{self.cross_agent_reference_selector_mode_cached!r}"
+            )
         selector_train_in_graph_arg = getattr(
             self.args,
             'cross_agent_reference_selector_train_in_graph',
             None,
         )
         self.cross_agent_reference_selector_train_in_graph_cached = (
-            self.cross_agent_reference_selector_mode_cached != 'closed_loop_team_head_tail'
-            if selector_train_in_graph_arg is None else bool(selector_train_in_graph_arg)
+            True if selector_train_in_graph_arg is None else bool(selector_train_in_graph_arg)
         )
         self.cross_agent_reference_selector_alpha_cached = float(
             getattr(self.args, 'cross_agent_reference_selector_alpha', 0.7)
@@ -10461,10 +11552,212 @@ class OptimizedMATD3:
             parse_hidden_units(getattr(self.args, 'cross_agent_reference_selector_hidden', None)) or (128, 64)
         )
         self.cross_agent_reference_selector_init_logit_cached = float(
-            getattr(self.args, 'cross_agent_reference_selector_init_logit', -2.0)
+            getattr(self.args, 'cross_agent_reference_selector_init_logit', 0.0)
         )
         self.cross_agent_reference_selector_adv_clip_cached = float(
             getattr(self.args, 'cross_agent_reference_selector_adv_clip', 5.0)
+        )
+        # Preserve the requested values until validation.  Silent clipping here
+        # would turn an invalid scientific configuration into a different valid
+        # experiment while the manifest still records the invalid request.
+        self.cross_agent_reference_advantage_ema_decay_cached = float(
+            getattr(
+                self.args,
+                'cross_agent_reference_advantage_ema_decay',
+                0.99,
+            )
+        )
+        self.cross_agent_reference_advantage_epsilon_cached = float(
+            getattr(
+                self.args,
+                'cross_agent_reference_advantage_epsilon',
+                1e-6,
+            )
+        )
+        self.cross_agent_reference_advantage_initial_scale_cached = float(
+            getattr(
+                self.args,
+                'cross_agent_reference_advantage_initial_scale',
+                1.0,
+            )
+        )
+        if (
+            self.cross_agent_reference_selector_mode_cached
+            in ADVANTAGE_SELECTOR_MODES
+            and not self.eval_actor_only
+        ):
+            adaptive_configuration_errors = []
+            if not self.cross_agent_reference_enabled:
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_enabled must be true"
+                )
+            if not self.use_dual_q:
+                adaptive_configuration_errors.append(
+                    "matd3_use_dual_q must be true"
+                )
+            if not self.use_separated_gradient:
+                adaptive_configuration_errors.append(
+                    "matd3_use_separated_gradient must be true"
+                )
+            if self.use_hybrid_actor_objective:
+                adaptive_configuration_errors.append(
+                    "matd3_use_hybrid_actor_objective must be false"
+                )
+            if self.action_semantics_mode != 'dual':
+                adaptive_configuration_errors.append(
+                    "matd3_action_semantics_mode must be dual"
+                )
+            if not self.reconstruct_corrected_target:
+                adaptive_configuration_errors.append(
+                    "matd3_reconstruct_corrected_target must be true"
+                )
+            if (
+                self.cross_agent_reference_target_semantics_cached
+                != 'split_raw_head_corrected_tail'
+            ):
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_target_semantics must be "
+                    "split_raw_head_corrected_tail"
+                )
+            if self.cross_agent_reference_use_clean_label:
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_use_clean_label must be false so the "
+                    "split raw-head/corrected-tail teacher is constructed"
+                )
+            if not self.cross_agent_reference_quality_gate:
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_quality_gate must be true"
+                )
+            if self.cross_agent_reference_gate_mode_cached != 'agent_quality':
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_gate_mode must be agent_quality"
+                )
+            if not self.cross_agent_reference_exclude_random:
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_exclude_random must be true"
+                )
+            if not (
+                0.0
+                <= self.cross_agent_reference_advantage_ema_decay_cached
+                < 1.0
+            ):
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_advantage_ema_decay must satisfy "
+                    "0 <= value < 1"
+                )
+            if (
+                not np.isfinite(
+                    self.cross_agent_reference_selector_adv_clip_cached
+                )
+                or self.cross_agent_reference_selector_adv_clip_cached <= 0.0
+            ):
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_selector_adv_clip must be finite and "
+                    "positive"
+                )
+            if any(int(action_dim) <= 3 for action_dim in self.action_dims):
+                adaptive_configuration_errors.append(
+                    "all action dimensions must be greater than 3 for separate "
+                    "head/tail supervision"
+                )
+            if not np.isfinite(
+                self.cross_agent_reference_advantage_ema_decay_cached
+            ):
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_advantage_ema_decay must be finite"
+                )
+            if not np.isfinite(
+                self.cross_agent_reference_advantage_epsilon_cached
+            ):
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_advantage_epsilon must be finite"
+                )
+            elif self.cross_agent_reference_advantage_epsilon_cached <= 0.0:
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_advantage_epsilon must be positive"
+                )
+            if not np.isfinite(
+                self.cross_agent_reference_advantage_initial_scale_cached
+            ):
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_advantage_initial_scale must be finite"
+                )
+            elif self.cross_agent_reference_advantage_initial_scale_cached <= 0.0:
+                adaptive_configuration_errors.append(
+                    "cross_agent_reference_advantage_initial_scale must be positive"
+                )
+            if (
+                self.cross_agent_reference_selector_mode_cached
+                == MODE_SHARED_TWIN_HEAD_TAIL
+            ):
+                if (
+                    self.cross_agent_reference_actor_start_episode
+                    != self.cross_agent_reference_start_episode
+                ):
+                    adaptive_configuration_errors.append(
+                        "the shared selector and actor reference loss must start "
+                        "in the same episode; selector pretraining is not supported"
+                    )
+                if (
+                    self.cross_agent_reference_actor_ramp_episodes_cached
+                    != 0
+                ):
+                    adaptive_configuration_errors.append(
+                        "cross_agent_reference_actor_ramp_episodes must be 0 for "
+                        "the shared selector protocol"
+                    )
+                if self.cross_agent_reference_actor_require_success:
+                    adaptive_configuration_errors.append(
+                        "cross_agent_reference_actor_require_success must be false"
+                    )
+                if not self.cross_agent_reference_selector_train_in_graph_cached:
+                    adaptive_configuration_errors.append(
+                        "cross_agent_reference_selector_train_in_graph must be true"
+                    )
+                if not np.isclose(
+                    self.cross_agent_reference_selector_init_logit_cached,
+                    0.0,
+                    rtol=0.0,
+                    atol=1e-12,
+                ):
+                    adaptive_configuration_errors.append(
+                        "cross_agent_reference_selector_init_logit must be 0 so "
+                        "the initial multiplier is exactly neutral"
+                    )
+            if adaptive_configuration_errors:
+                raise ValueError(
+                    "Invalid adaptive cross-agent reference configuration: "
+                    + "; ".join(adaptive_configuration_errors)
+                )
+        self.cross_agent_reference_head_advantage_ema = tf.Variable(
+            self.cross_agent_reference_advantage_initial_scale_cached,
+            trainable=False,
+            dtype=tf.float32,
+            name='cross_ref_head_advantage_ema',
+        )
+        self.cross_agent_reference_tail_advantage_ema = tf.Variable(
+            self.cross_agent_reference_advantage_initial_scale_cached,
+            trainable=False,
+            dtype=tf.float32,
+            name='cross_ref_tail_advantage_ema',
+        )
+        self.cross_agent_reference_head_ema_initialized = tf.Variable(
+            False,
+            trainable=False,
+            dtype=tf.bool,
+            name='cross_ref_head_ema_initialized',
+        )
+        self.cross_agent_reference_tail_ema_initialized = tf.Variable(
+            False,
+            trainable=False,
+            dtype=tf.bool,
+            name='cross_ref_tail_ema_initialized',
+        )
+        self.cross_agent_reference_selector_update_count = tf.Variable(
+            0,
+            trainable=False,
+            dtype=tf.int64,
+            name='cross_ref_selector_update_count',
         )
         self.cross_agent_reference_selector_reward_tau_cached = max(
             float(getattr(self.args, 'cross_agent_reference_selector_reward_tau', 500.0)),
@@ -10622,7 +11915,7 @@ class OptimizedMATD3:
             for env_idx in range(max(1, num_envs)):
                 row = []
                 for agent_idx in range(self.n_agents):
-                    std = max(float(self.args.noise_scale), float(self.args.noise_min))
+                    std = initial_noise_scale
                     # 🔧 修复：使用确定性的种子派生方式，确保不同环境/智能体的噪声可重复
                     seed = (base_seed + 9973 * env_idx + 101 * agent_idx) % 2147483647
                     row.append(OUNoise(size=total_action_dims[agent_idx],
@@ -10682,7 +11975,9 @@ class OptimizedMATD3:
                         except (ValueError, TypeError):
                             continue
                         if np.isfinite(v):
-                            vals.append(1.0 if v >= 0.5 else 0.0)
+                            # 单环境时仍为 0/1；多环境同步迭代时该值是
+                            # 该 agent 在所有完整环境轨迹上的成功率。
+                            vals.append(float(np.clip(v, 0.0, 1.0)))
                 if vals:
                     rates[agent_idx] = float(np.mean(vals))
 
@@ -11319,7 +12614,13 @@ class OptimizedMATD3:
         }
 
     def _compute_cross_ref_actor_weight(self):
-        """Delay actor imitation while allowing selector pretraining."""
+        """Return the actor reference-loss phase weight.
+
+        The active shared-selector protocol requires this start episode to be
+        identical to the selector start episode, so it cannot pretrain the
+        selector separately.  The generic ramp remains for historical
+        actor-only compatibility.
+        """
         try:
             if not bool(getattr(self, 'cross_agent_reference_enabled', False)):
                 return 0.0
@@ -11414,7 +12715,8 @@ class OptimizedMATD3:
 
             if (
                 bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
-                and str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard')) in CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES
+                and str(getattr(self, 'cross_agent_reference_selector_mode_cached', MODE_HARD))
+                in CROSS_AGENT_REFERENCE_LEGACY_TRAINABLE_MODES
             ):
                 selector_mode = str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard'))
                 selector_scalar_dim = _cross_agent_reference_selector_scalar_dim(selector_mode)
@@ -11485,70 +12787,84 @@ class OptimizedMATD3:
 
             self.agents.append(agent)
 
+        if (
+            not self.eval_actor_only
+            and bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
+            and str(getattr(self, 'cross_agent_reference_selector_mode_cached', MODE_HARD))
+            == MODE_SHARED_TWIN_HEAD_TAIL
+        ):
+            if not self.obs_shapes or len(set(int(value) for value in self.obs_shapes)) != 1:
+                raise ValueError(
+                    "The shared cross-agent selector requires identical observation "
+                    f"dimensions, got={self.obs_shapes!r}"
+                )
+            if not self.action_dims or len(set(int(value) for value in self.action_dims)) != 1:
+                raise ValueError(
+                    "The shared cross-agent selector requires identical action "
+                    f"dimensions, got={self.action_dims!r}"
+                )
+            shared_obs_dim = int(self.obs_shapes[0])
+            shared_action_dim = int(self.action_dims[0])
+            if shared_action_dim < 3:
+                raise ValueError(
+                    "The shared head/tail selector requires action_dim >= 3, "
+                    f"got={shared_action_dim}"
+                )
+            # Full current observation + teacher/learner/delta action + FR.
+            # PF is included only when it is an actual actor input.
+            selector_input_dim = shared_obs_dim + shared_action_dim * 3 + 1
+            if self.use_pf_feature_flag:
+                selector_input_dim += int(self.pf_feature_dim)
+            self.cross_agent_reference_selector_input_dim = int(selector_input_dim)
+            self.reference_selector_shared = build_cross_agent_reference_selector(
+                input_dim=self.cross_agent_reference_selector_input_dim,
+                hidden_units=getattr(
+                    self,
+                    'cross_agent_reference_selector_hidden_cached',
+                    (128, 64),
+                ),
+                init_logit=getattr(
+                    self,
+                    'cross_agent_reference_selector_init_logit_cached',
+                    0.0,
+                ),
+                output_dim=2,
+                zero_output_kernel=True,
+            )
+            print(
+                "[MATD3网络] Shared adaptive-twin selector 已启用 "
+                f"(input_dim={self.cross_agent_reference_selector_input_dim}, "
+                "output_dim=2, shared_across_agents=true)"
+            )
+
     def _init_optimizers(self):
         """初始化优化器（支持学习率衰减）"""
         # 🔥 创建学习率调度器（如果启用）
         lr_decay_enabled = getattr(self.args, 'lr_decay_enabled', True)
+        decay_steps = getattr(self.args, 'lr_decay_steps', 8000)
+        decay_rate = getattr(self.args, 'lr_decay_rate', 0.96)
+        staircase = getattr(self.args, 'lr_staircase', True)
 
         if lr_decay_enabled:
-            decay_steps = getattr(self.args, 'lr_decay_steps', 8000)
-            decay_rate = getattr(self.args, 'lr_decay_rate', 0.96)
-            staircase = getattr(self.args, 'lr_staircase', True)
             min_actor_lr = getattr(self.args, 'lr_min_actor', 5e-5)
             min_critic_lr = getattr(self.args, 'lr_min_critic', 8e-5)
 
-            # 创建自定义学习率调度器（带下限保护）
-            class ClippedExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
-                def __init__(self, initial_learning_rate, decay_steps, decay_rate, min_lr, staircase=True):
-                    self.initial_learning_rate = initial_learning_rate
-                    self.decay_steps = decay_steps
-                    self.decay_rate = decay_rate
-                    self.min_lr = min_lr
-                    self.staircase = staircase
-
-                def __call__(self, step):
-                    # 指数衰减公式
-                    # 确保所有计算都在float32精度下进行，避免类型不匹配
-                    step = tf.cast(step, tf.float32)
-                    decay_steps = tf.cast(self.decay_steps, tf.float32)
-
-                    if self.staircase:
-                        p = tf.math.floor(step / decay_steps)
-                    else:
-                        p = step / decay_steps
-
-                    # 确保所有参数都是float32类型
-                    initial_lr = tf.cast(self.initial_learning_rate, tf.float32)
-                    decay_rate = tf.cast(self.decay_rate, tf.float32)
-                    min_lr = tf.cast(self.min_lr, tf.float32)
-
-                    decayed_lr = initial_lr * tf.pow(decay_rate, p)
-                    # 限制在最小学习率之上
-                    return tf.maximum(decayed_lr, min_lr)
-
-                def get_config(self):
-                    return {
-                        'initial_learning_rate': self.initial_learning_rate,
-                        'decay_steps': self.decay_steps,
-                        'decay_rate': self.decay_rate,
-                        'min_lr': self.min_lr,
-                        'staircase': self.staircase
-                    }
-
-            actor_lr_schedule = ClippedExponentialDecay(
-                initial_learning_rate=getattr(self.args, 'learning_rate_actor', 0.0005),
+            actor_lr_schedule = ClippedExponentialDecaySchedule(
+                initial_value=getattr(self.args, 'learning_rate_actor', 0.0005),
                 decay_steps=decay_steps,
                 decay_rate=decay_rate,
-                min_lr=min_actor_lr,
-                staircase=staircase
+                min_value=min_actor_lr,
+                staircase=staircase,
+                name="matd3_actor_lr",
             )
 
-            critic_lr_schedule = ClippedExponentialDecay(
-                initial_learning_rate=getattr(self.args, 'learning_rate_critic', 0.001),
+            critic_lr_schedule = ClippedExponentialDecaySchedule(
+                initial_value=getattr(self.args, 'learning_rate_critic', 0.001),
                 decay_steps=decay_steps,
                 decay_rate=decay_rate,
-                min_lr=min_critic_lr,
-                staircase=staircase
+                min_value=min_critic_lr,
+                staircase=staircase,
+                name="matd3_critic_lr",
             )
 
             print(f"[MATD3 学习率衰减] 已启用")
@@ -11556,27 +12872,26 @@ class OptimizedMATD3:
             print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
             print(f"  - 最小学习率: Actor={min_actor_lr:.6f}, Critic={min_critic_lr:.6f}")
 
-            # 🚨 关键修复：创建噪声衰减调度器（与学习率衰减使用相同的机制）
-            initial_noise_scale = float(getattr(self.args, 'noise_scale', 0.35))
-            min_noise_scale = float(getattr(self.args, 'noise_min', 0.05))
-
-            self.noise_scale_schedule = ClippedExponentialDecay(
-                initial_learning_rate=initial_noise_scale,
-                decay_steps=decay_steps,  # 与学习率衰减使用相同的decay_steps
-                decay_rate=decay_rate,    # 与学习率衰减使用相同的decay_rate
-                min_lr=min_noise_scale,
-                staircase=staircase       # 与学习率衰减使用相同的staircase
-            )
-            print(f"[MATD3 噪声衰减] 已启用（与学习率衰减同步）")
-            print(f"  - 初始噪声: {initial_noise_scale:.4f}, 最小噪声: {min_noise_scale:.4f}")
-            print(f"  - 衰减参数: 每{decay_steps}步衰减{(1-decay_rate)*100:.1f}% ({'阶梯式' if staircase else '平滑'})")
         else:
             # 固定学习率
             actor_lr_schedule = getattr(self.args, 'learning_rate_actor', 0.0005)
             critic_lr_schedule = getattr(self.args, 'learning_rate_critic', 0.001)
             print(f"[MATD3 学习率] 固定学习率: Actor={actor_lr_schedule:.6f}, Critic={critic_lr_schedule:.6f}")
-            # 固定噪声（不使用调度器）
-            self.noise_scale_schedule = None
+
+        self.noise_scale_schedule, self.noise_schedule_config = _build_noise_scale_schedule(
+            self.args,
+            fallback_decay_steps=decay_steps,
+            fallback_staircase=staircase,
+        )
+        cfg = self.noise_schedule_config
+        if cfg['disabled_by_zero_scale']:
+            print("[MATD3 噪声衰减] 行为噪声已禁用：有效初始值和最小值均为 0")
+        elif self.noise_scale_schedule is not None:
+            print(f"[MATD3 噪声衰减] 已启用（独立于学习率）")
+            print(f"  - 初始噪声: {cfg['initial_noise_scale']:.4f}, 最小噪声: {cfg['min_noise_scale']:.4f}")
+            print(f"  - 衰减参数: 每{cfg['decay_steps']}步衰减{(1-cfg['decay_rate'])*100:.3f}% ({'阶梯式' if cfg['staircase'] else '平滑'})")
+        else:
+            print(f"[MATD3 噪声衰减] 已关闭：使用固定/自适应OU噪声变量")
 
         for i in range(self.n_agents):
             agent = self.agents[i]
@@ -11660,6 +12975,23 @@ class OptimizedMATD3:
                 dtype=tf.float32,
                 name=f'matd3_critic_lr_var_{i}'
             )
+
+        if self.reference_selector_shared is not None:
+            self.reference_selector_shared_optimizer = tf.keras.optimizers.Adam(
+                learning_rate=float(
+                    getattr(self, 'cross_agent_reference_selector_lr_cached', 1e-4)
+                ),
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-8,
+            )
+            try:
+                if hasattr(self.reference_selector_shared_optimizer, 'build'):
+                    self.reference_selector_shared_optimizer.build(
+                        self.reference_selector_shared.trainable_variables
+                    )
+            except Exception:
+                pass
 
     def _initialize_optimizers(self):
         """初始化优化器状态（防止tf.function首次执行时创建变量）。"""
@@ -11809,6 +13141,40 @@ class OptimizedMATD3:
             except Exception as e:
                 print(f"[MATD3] 智能体{i}优化器预热失败: {e}")
 
+        if (
+            self.reference_selector_shared is not None
+            and self.reference_selector_shared_optimizer is not None
+        ):
+            try:
+                selector_input_dim = int(self.cross_agent_reference_selector_input_dim)
+                with tf.GradientTape() as selector_tape:
+                    selector_dummy = tf.zeros(
+                        [batch_size, selector_input_dim],
+                        dtype=tf.float32,
+                    )
+                    selector_score = self.reference_selector_shared(
+                        selector_dummy,
+                        training=True,
+                    )
+                    selector_dummy_loss = tf.reduce_mean(selector_score)
+                selector_vars = self.reference_selector_shared.trainable_variables
+                selector_grads = selector_tape.gradient(
+                    selector_dummy_loss,
+                    selector_vars,
+                )
+                selector_pairs = [
+                    (tf.zeros_like(grad), variable)
+                    for grad, variable in zip(selector_grads, selector_vars)
+                    if grad is not None
+                ]
+                if selector_pairs:
+                    self.reference_selector_shared_optimizer.apply_gradients(
+                        selector_pairs
+                    )
+                print("[MATD3] 共享 selector 优化器预热完成")
+            except Exception as exc:
+                raise RuntimeError("共享 selector 优化器预热失败") from exc
+
         print("[MATD3] 优化器预热完成")
 
     def select_action(self, obs, agent_idx, training=True):
@@ -11922,13 +13288,12 @@ class OptimizedMATD3:
         if training:
             env_idx = 0  # 默认使用第一个环境
             if env_idx < len(self.ou_noises) and agent_idx < len(self.ou_noises[env_idx]):
-                # 🚨 关键修复：使用噪声衰减调度器（与学习率衰减一致）
+                # 使用独立OU噪声衰减调度器
                 if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
                     # 使用调度器计算当前噪声强度（基于total_steps_var）
                     # 注意：在非@tf.function环境中，可以直接使用numpy()转换
                     current_step = tf.cast(self.total_steps_var, tf.float32)
                     current_std_tensor = self.noise_scale_schedule(current_step)
-                    current_std_tensor = tf.maximum(current_std_tensor, self.noise_min_var)
                     # 安全转换：在非图模式下使用numpy()，在图模式下使用tf.keras.backend.get_value
                     try:
                         current_std = float(current_std_tensor.numpy())
@@ -11936,11 +13301,11 @@ class OptimizedMATD3:
                         # 如果无法转换为numpy（可能在图模式下），使用tf.keras.backend.get_value
                         current_std = float(tf.keras.backend.get_value(current_std_tensor))
                 else:
-                    # 回退：如果没有调度器，使用简单的指数衰减（向后兼容）
-                    current_std = max(float(self.args.noise_scale), float(self.args.noise_min))
-                    current_std = current_std * (self.args.noise_decay ** self.training_stats['total_steps'])
-                    current_std = max(current_std, float(self.args.noise_min))
+                    current_std = float(self.noise_scale_var.numpy())
 
+                if hasattr(self, 'current_ou_noise_std_var'):
+                    self.current_ou_noise_std_var.assign(tf.cast(current_std, tf.float32))
+                self.noise_scale_var.assign(tf.cast(current_std, tf.float32))
                 self.ou_noises[env_idx][agent_idx].set_std_dev(current_std)
                 ou = self.ou_noises[env_idx][agent_idx]()  # 形状(7,)
                 ou_head = ou[:3]
@@ -12114,18 +13479,29 @@ class OptimizedMATD3:
         # 回放区存原始探索动作，环境执行 PF 修正后的动作。
         if add_noise:
             if self.use_vectorized_ou:
-                # 🚨 关键修复：使用噪声衰减调度器计算当前噪声强度（与学习率衰减一致）
-                if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
-                    # 使用调度器计算当前噪声强度（基于total_steps_var）
-                    current_step = tf.cast(self.total_steps_var, tf.float32)
-                    current_std = self.noise_scale_schedule(current_step)
-                    current_std = tf.maximum(current_std, self.noise_min_var)
-                    # 使用generate_noise_with_std，传入计算出的std（XLA友好）
-                    ou_tensor = self.vectorized_ou_noise.generate_noise_with_std(current_std)
-                else:
-                    # 回退：如果没有调度器，使用Variable存储的噪声强度（向后兼容）
-                    current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                    ou_tensor = self.vectorized_ou_noise.generate_noise()
+                env_axis_assertion = tf.debugging.assert_equal(
+                    num_envs,
+                    tf.cast(self.vectorized_ou_noise.batch_size, tf.int32),
+                    message=(
+                        "MATD3 action batch must match the fixed OU-noise "
+                        "environment batch"
+                    ),
+                )
+                with tf.control_dependencies([env_axis_assertion]):
+                    # 使用独立OU噪声衰减调度器计算当前噪声强度
+                    if hasattr(self, 'noise_scale_schedule') and self.noise_scale_schedule is not None:
+                        # 使用调度器计算当前噪声强度（基于total_steps_var）
+                        current_step = tf.cast(self.total_steps_var, tf.float32)
+                        current_std = self.noise_scale_schedule(current_step)
+                        self.current_ou_noise_std_var.assign(tf.cast(current_std, tf.float32))
+                        self.noise_scale_var.assign(tf.cast(current_std, tf.float32))
+                        # 使用generate_noise_with_std，传入计算出的std（XLA友好）
+                        ou_tensor = self.vectorized_ou_noise.generate_noise_with_std(current_std)
+                    else:
+                        # 回退：如果没有调度器，使用Variable存储的噪声强度（向后兼容）
+                        current_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
+                        self.current_ou_noise_std_var.assign(tf.cast(current_std, tf.float32))
+                        ou_tensor = self.vectorized_ou_noise.generate_noise()
                 ou_tensor_head = ou_tensor[:, :, :3]
             else:
                 ou_tensor_head = tf.zeros([num_envs, self.n_agents, 3], dtype=tf.float32)
@@ -12778,10 +14154,6 @@ class OptimizedMATD3:
             * cross_agent_reference_interval
             // math.gcd(cross_agent_reference_actor_stride, cross_agent_reference_interval)
         )
-        cross_agent_reference_pair_slot = int(
-            (int(getattr(self, 'total_it', 0)) // max(1, cross_agent_reference_common_stride))
-            % cross_agent_reference_pair_pool
-        )
         cross_agent_reference_active_bool = bool(
             getattr(self, 'cross_agent_reference_enabled', False)
             and int(getattr(self, '_current_episode_idx', 0)) >= int(getattr(self, 'cross_agent_reference_start_episode', 0))
@@ -12796,6 +14168,21 @@ class OptimizedMATD3:
         cross_agent_reference_active_graph_bool = bool(
             cross_agent_reference_active_bool and not cross_agent_reference_eager_aux_bool
         )
+        # pair_slot is a Python control-flow argument of the compiled update
+        # graph.  Rotating it while cross-reference is disabled (or while all/no
+        # peers are used) creates needless giant graph variants and was the
+        # direct cause of repeated retracing in the real training smoke.
+        cross_agent_reference_pair_rotation_enabled = bool(
+            cross_agent_reference_active_graph_bool
+            and 0 < cross_agent_reference_pairs_per_agent < cross_agent_reference_pair_pool
+        )
+        if cross_agent_reference_pair_rotation_enabled:
+            cross_agent_reference_pair_slot = int(
+                (int(getattr(self, 'total_it', 0)) // max(1, cross_agent_reference_common_stride))
+                % cross_agent_reference_pair_pool
+            )
+        else:
+            cross_agent_reference_pair_slot = 0
         cross_agent_reference_selector_success_weight = self._compute_cross_ref_selector_success_weight()
         cross_agent_reference_selector_success_weight_tensor = tf.constant(
             float(np.clip(cross_agent_reference_selector_success_weight, 0.0, 1.0)),
@@ -13004,6 +14391,19 @@ class OptimizedMATD3:
                 if q_np.size >= 44:
                     cross_diag.update({
                         'cross_ref_actor_weight': float(q_np[43]),
+                    })
+                if q_np.size >= 54:
+                    cross_diag.update({
+                        'cross_ref_head_twin_agreement_ratio': float(q_np[44]),
+                        'cross_ref_tail_twin_agreement_ratio': float(q_np[45]),
+                        'cross_ref_head_multiplier': float(q_np[46]),
+                        'cross_ref_tail_multiplier': float(q_np[47]),
+                        'cross_ref_head_suppressed_ratio': float(q_np[48]),
+                        'cross_ref_tail_suppressed_ratio': float(q_np[49]),
+                        'cross_ref_head_advantage_ema': float(q_np[50]),
+                        'cross_ref_tail_advantage_ema': float(q_np[51]),
+                        'cross_ref_selector_gradient_norm': float(q_np[52]),
+                        'cross_ref_selector_update_count': float(q_np[53]),
                     })
             if str(getattr(self, 'cross_agent_reference_selector_mode_cached', 'hard')) in (
                 'reward_to_success_priority',
@@ -13627,56 +15027,14 @@ class OptimizedMATD3:
             _safe_set_lr(agent['critic1_optimizer'], agent['critic_lr_var'])
             _safe_set_lr(agent['critic2_optimizer'], agent['critic_lr_var'])
 
-            # 🔧 XLA修复：从Variable读取当前噪声
-            current_noise = float(self.noise_scale_var.numpy())
-            boost = float(self.adaptive_learning.get('noise_boost_factor', 1.5))
-            try:
-                env_cap = float(os.getenv('ADAPTIVE_NOISE_MAX', '0.6'))
-            except Exception:
-                env_cap = 0.6
-            hard_cap = float(min(self.adaptive_learning.get('max_noise_scale', 2.0), env_cap))
-
-            # 🚨 关键修复：添加噪声循环机制，防止噪声卡在上限（MATD3版本）
-            # 问题：如果噪声已经达到上限，继续调整会导致噪声不变，无法跳出局部最优
-            # 解决方案：当噪声达到上限时，降低噪声，形成循环
-            noise_min_val = float(self.noise_min_var.numpy())
-            if current_noise >= hard_cap * 0.95:  # 接近上限时
-                # 降低噪声，形成循环
-                target_noise = max(noise_min_val, current_noise * 0.7)  # 降低到70%
-            else:
-                # 正常增加噪声
-                target_noise = min(hard_cap, current_noise * boost)
-
-            try:
-                beta = float(os.getenv('ADAPTIVE_NOISE_SMOOTH', '0.3'))
-            except Exception:
-                beta = 0.3
-            beta = max(0.0, min(1.0, beta))
-            new_noise = current_noise + beta * (target_noise - current_noise)
-            # 再次确保在合法范围（使用Variable的值）
-            new_noise = float(min(hard_cap, max(new_noise, noise_min_val)))
-
-            # 🔧 XLA修复：使用Variable.assign更新，不会触发重新编译
-            self.noise_scale_var.assign(tf.cast(new_noise, tf.float32))
-
-            # 同步更新Python属性（保持兼容性）
-            self.args.noise_scale = new_noise
-
             print(f"智能体{i}: Actor LR {current_actor_lr:.6f} -> {new_actor_lr:.6f}, "
-                  f"Critic LR {current_critic_lr:.6f} -> {new_critic_lr:.6f}, "
-                  f"Noise {current_noise:.4f} -> {new_noise:.4f} (target={target_noise:.4f}, cap={hard_cap:.2f}, beta={beta:.2f})")
+                  f"Critic LR {current_critic_lr:.6f} -> {new_critic_lr:.6f}")
 
-        # 🚨 XLA修复：安全地更新向量化OU噪声std_dev（MATD3版本）
-        if hasattr(self, 'vectorized_ou_noise') and self.vectorized_ou_noise is not None:
-            try:
-                updated_std = tf.maximum(self.noise_scale_var, self.noise_min_var)
-                # 🚨 XLA安全做法：使用tf.constant包装
-                updated_std_const = tf.constant(float(updated_std.numpy()), dtype=tf.float32)
-                self.vectorized_ou_noise._std_dev.assign(updated_std_const)
-            except Exception as e:
-                quiet_output = os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')
-                if not quiet_output:
-                    print(f"⚠️  更新向量化OU噪声std_dev失败: {e}")
+        current_noise, new_noise, target_noise, hard_cap, beta = _adaptive_behavior_noise_update(self, 0.6)
+        print(
+            f"全局OU噪声 {current_noise:.4f}->{new_noise:.4f} "
+            f"(target={target_noise:.4f}, cap={hard_cap:.2f}, beta={beta:.2f})"
+        )
 
         # 维持 XLA Global 的固定状态（不在此处尝试切换或延迟切换）
 
@@ -14847,6 +16205,14 @@ class OptimizedMATD3:
             cross_ref_selector_head_target_sum = tf.constant(0.0, dtype=tf.float32)
             cross_ref_selector_tail_target_sum = tf.constant(0.0, dtype=tf.float32)
             cross_ref_selector_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_head_agreement_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_tail_agreement_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_head_multiplier_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_tail_multiplier_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_head_suppressed_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_tail_suppressed_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_adaptive_diag_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_grad_norm = tf.constant(0.0, dtype=tf.float32)
             cross_ref_active_float = tf.cast(bool(cross_agent_reference_active), tf.float32)
             actor_has_shared_pf_context = len(self.obs_shapes) > 0 and len(set(self.obs_shapes)) <= 1
             actor_uniform_action_dims = len(self.action_dims) > 0 and len(set(self.action_dims)) <= 1 and self.action_dims[0] >= 3
@@ -14864,13 +16230,20 @@ class OptimizedMATD3:
             cross_ref_r2s_mode = cross_ref_selector_mode in CROSS_AGENT_REFERENCE_R2S_SELECTOR_MODES
             cross_ref_closed_loop_team_selector = cross_ref_selector_mode == 'closed_loop_team_head_tail'
             cross_ref_head_tail_selector = cross_ref_selector_mode in CROSS_AGENT_REFERENCE_HEAD_TAIL_SELECTOR_MODES
+            cross_ref_adaptive_twin = cross_ref_selector_mode in ADVANTAGE_SELECTOR_MODES
+            cross_ref_shared_selector = (
+                cross_ref_selector_mode == MODE_SHARED_TWIN_HEAD_TAIL
+            )
             cross_ref_uses_advantage = bool(
                 cross_ref_supported
-                and cross_ref_selector_mode in (
-                    'soft_advantage',
-                    'selector_mix',
-                    'reward_to_success_priority',
-                    'reward_to_success_head_tail',
+                and (
+                    cross_ref_adaptive_twin
+                    or cross_ref_selector_mode in (
+                        'soft_advantage',
+                        'selector_mix',
+                        'reward_to_success_priority',
+                        'reward_to_success_head_tail',
+                    )
                 )
             )
             if cross_ref_closed_loop_team_selector:
@@ -14878,12 +16251,23 @@ class OptimizedMATD3:
                     cross_ref_supported
                     and getattr(self, 'cross_agent_reference_closed_loop_use_q_advantage_cached', False)
                 )
-            cross_ref_uses_selector = bool(
-                cross_ref_supported
-                and cross_ref_selector_mode in CROSS_AGENT_REFERENCE_SELECTOR_TRAINABLE_MODES
-                and bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
-                and all('reference_selector' in self.agents[_idx] for _idx in range(self.n_agents))
-            )
+            if cross_ref_shared_selector:
+                cross_ref_uses_selector = bool(
+                    cross_ref_supported
+                    and bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
+                    and self.reference_selector_shared is not None
+                )
+            else:
+                cross_ref_uses_selector = bool(
+                    cross_ref_supported
+                    and cross_ref_selector_mode
+                    in CROSS_AGENT_REFERENCE_LEGACY_TRAINABLE_MODES
+                    and bool(getattr(self, 'cross_agent_reference_selector_enabled', False))
+                    and all(
+                        'reference_selector' in self.agents[_idx]
+                        for _idx in range(self.n_agents)
+                    )
+                )
             cross_ref_train_selector_in_graph = bool(
                 cross_ref_uses_selector
                 and bool(getattr(self, 'cross_agent_reference_selector_train_in_graph_cached', True))
@@ -14921,11 +16305,19 @@ class OptimizedMATD3:
             with tf.GradientTape(persistent=True) as tape_a:
                 total_actor_loss = tf.constant(0.0, dtype=tf.float32)
                 total_selector_loss = tf.constant(0.0, dtype=tf.float32)
+                shared_selector_loss_numerator = tf.constant(0.0, dtype=tf.float32)
+                shared_selector_loss_denominator = tf.constant(0.0, dtype=tf.float32)
+                adaptive_head_consensus_parts = []
+                adaptive_tail_consensus_parts = []
+                adaptive_head_valid_parts = []
+                adaptive_tail_valid_parts = []
                 actor_losses = []
                 current_force_ratio_actor = fr_batch_safe
-                actor_use_pf = self.use_tf_potential_field_cached and tf.reduce_any(
-                    tf.greater(current_force_ratio_actor, 0.0)
-                )
+                # This function is traced with autograph disabled, so graph
+                # tensors must never control Python branches.  The PF feature
+                # switch is static; when a sampled FR is zero the correction
+                # formula itself exactly reduces to the raw action.
+                actor_use_pf = bool(self.use_tf_potential_field_cached)
                 actor_agent_fairness_weights = []
                 actor_agents_list = []
                 actor_action_dims = []
@@ -15033,7 +16425,13 @@ class OptimizedMATD3:
                     actor_arc_eff_list.append(arc_eff)
 
                 actor_corrected_head_batch = None
-                if dual_q_mode and actor_has_shared_pf_context and actor_uniform_action_dims and len(actor_action_for_tail_list) == self.n_agents:
+                if (
+                    dual_q_mode
+                    and actor_use_pf
+                    and actor_has_shared_pf_context
+                    and actor_uniform_action_dims
+                    and len(actor_action_for_tail_list) == self.n_agents
+                ):
                     shared_act_dim = int(self.action_dims[0])
                     flat_actor_actions_for_tail = tf.reshape(
                         tf.stack(actor_action_for_tail_list, axis=0),
@@ -15253,6 +16651,12 @@ class OptimizedMATD3:
                     cross_ref_selector_tail_score_i = tf.constant(0.0, dtype=tf.float32)
                     cross_ref_selector_head_target_i = tf.constant(0.0, dtype=tf.float32)
                     cross_ref_selector_tail_target_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_head_agreement_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_tail_agreement_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_head_multiplier_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_tail_multiplier_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_head_suppressed_i = tf.constant(0.0, dtype=tf.float32)
+                    cross_ref_tail_suppressed_i = tf.constant(0.0, dtype=tf.float32)
                     if cross_ref_supported:
                         ref_losses_i = []
                         ref_valid_ratios_i = []
@@ -15267,6 +16671,12 @@ class OptimizedMATD3:
                         ref_selector_y_mix_i = []
                         ref_selector_adv_i = []
                         ref_selector_adv_pos_i = []
+                        ref_head_agreement_i = []
+                        ref_tail_agreement_i = []
+                        ref_head_multiplier_i = []
+                        ref_tail_multiplier_i = []
+                        ref_head_suppressed_i = []
+                        ref_tail_suppressed_i = []
                         ref_goal_idx = int(getattr(self, 'cross_agent_reference_goal_distance_index', 59))
                         ref_head_weight = tf.cast(getattr(self, 'cross_agent_reference_head_weight_cached', 1.0), tf.float32)
                         ref_tail_weight = tf.cast(getattr(self, 'cross_agent_reference_tail_weight_cached', 0.3), tf.float32)
@@ -15397,11 +16807,43 @@ class OptimizedMATD3:
                             if bool(getattr(self, 'cross_agent_reference_exclude_random', True)):
                                 ref_base_valid = ref_base_valid * (tf.cast(1.0, tf.float32) - ref_random)
                             ref_hindsight = tf.cast(ref_quality_bool, tf.float32)
+                            if cross_ref_adaptive_twin:
+                                ref_eligible = build_eligible_mask(
+                                    finite=ref_finite_bool,
+                                    label_valid=ref_label_valid_bool,
+                                    safe=ref_safe_bool,
+                                    success=ref_success_bool,
+                                    reach=ref_reach_bool,
+                                    trajectory_progress=ref_traj_progress_bool,
+                                    near_goal=ref_traj_near_bool,
+                                    random_mask=ref_random,
+                                    exclude_random=bool(
+                                        getattr(
+                                            self,
+                                            'cross_agent_reference_exclude_random',
+                                            True,
+                                        )
+                                    ),
+                                )
+                            else:
+                                ref_eligible = ref_base_valid * ref_hindsight
 
                             ref_q_ref = tf.zeros_like(ref_sample_loss)
                             ref_q_cur = tf.zeros_like(ref_sample_loss)
                             ref_advantage = tf.zeros_like(ref_sample_loss)
                             ref_y_q = tf.fill(tf.shape(ref_sample_loss), tf.cast(0.5, tf.float32))
+                            ref_head_target = tf.fill(
+                                tf.shape(ref_sample_loss),
+                                tf.cast(0.5, tf.float32),
+                            )
+                            ref_tail_target = tf.fill(
+                                tf.shape(ref_sample_loss),
+                                tf.cast(0.5, tf.float32),
+                            )
+                            ref_head_agreement = tf.zeros_like(ref_sample_loss)
+                            ref_tail_agreement = tf.zeros_like(ref_sample_loss)
+                            ref_head_consensus = tf.zeros_like(ref_sample_loss)
+                            ref_tail_consensus = tf.zeros_like(ref_sample_loss)
                             if cross_ref_uses_advantage:
                                 source_agent = self.agents[ref_j]
                                 ref_target_q_action = tf.stop_gradient(ref_target)
@@ -15461,6 +16903,16 @@ class OptimizedMATD3:
                                 ref_raw_inputs, ref_corrected_inputs = _build_ref_candidate_inputs(ref_target_q_action)
                                 cur_raw_inputs, cur_corrected_inputs = _build_ref_candidate_inputs(ref_pred_q_action)
                                 if dual_q_mode:
+                                    advantage_critic_1 = (
+                                        source_agent['target_critic1']
+                                        if cross_ref_adaptive_twin
+                                        else source_agent['critic1']
+                                    )
+                                    advantage_critic_2 = (
+                                        source_agent['target_critic2']
+                                        if cross_ref_adaptive_twin
+                                        else source_agent['critic2']
+                                    )
                                     (
                                         ref_q1_head_1,
                                         _,
@@ -15471,7 +16923,7 @@ class OptimizedMATD3:
                                         _,
                                         cur_q1_tail_1,
                                     ) = self._forward_twin_critic_quad(
-                                        source_agent['critic1'],
+                                        advantage_critic_1,
                                         ref_raw_inputs,
                                         ref_corrected_inputs,
                                         cur_raw_inputs,
@@ -15488,22 +16940,139 @@ class OptimizedMATD3:
                                         _,
                                         cur_q1_tail_2,
                                     ) = self._forward_twin_critic_quad(
-                                        source_agent['critic2'],
+                                        advantage_critic_2,
                                         ref_raw_inputs,
                                         ref_corrected_inputs,
                                         cur_raw_inputs,
                                         cur_corrected_inputs,
                                         training=False,
                                     )
-                                    ref_q_ref = tf.squeeze(
-                                        tf.minimum(ref_q1_head_1 + ref_q1_tail_1, ref_q1_head_2 + ref_q1_tail_2),
-                                        axis=1,
-                                    )
-                                    ref_q_cur = tf.squeeze(
-                                        tf.minimum(cur_q1_head_1 + cur_q1_tail_1, cur_q1_head_2 + cur_q1_tail_2),
-                                        axis=1,
-                                    )
+                                    if cross_ref_adaptive_twin:
+                                        head_advantage_1 = tf.squeeze(
+                                            ref_q1_head_1 - cur_q1_head_1,
+                                            axis=1,
+                                        )
+                                        head_advantage_2 = tf.squeeze(
+                                            ref_q1_head_2 - cur_q1_head_2,
+                                            axis=1,
+                                        )
+                                        tail_advantage_1 = tf.squeeze(
+                                            ref_q1_tail_1 - cur_q1_tail_1,
+                                            axis=1,
+                                        )
+                                        tail_advantage_2 = tf.squeeze(
+                                            ref_q1_tail_2 - cur_q1_tail_2,
+                                            axis=1,
+                                        )
+                                        ref_head_target, ref_head_agreement, ref_head_consensus = (
+                                            twin_consensus_target(
+                                                head_advantage_1,
+                                                head_advantage_2,
+                                                self.cross_agent_reference_head_advantage_ema,
+                                                clip=getattr(
+                                                    self,
+                                                    'cross_agent_reference_selector_adv_clip_cached',
+                                                    5.0,
+                                                ),
+                                                epsilon=getattr(
+                                                    self,
+                                                    'cross_agent_reference_advantage_epsilon_cached',
+                                                    1e-6,
+                                                ),
+                                            )
+                                        )
+                                        ref_tail_target, ref_tail_agreement, ref_tail_consensus = (
+                                            twin_consensus_target(
+                                                tail_advantage_1,
+                                                tail_advantage_2,
+                                                self.cross_agent_reference_tail_advantage_ema,
+                                                clip=getattr(
+                                                    self,
+                                                    'cross_agent_reference_selector_adv_clip_cached',
+                                                    5.0,
+                                                ),
+                                                epsilon=getattr(
+                                                    self,
+                                                    'cross_agent_reference_advantage_epsilon_cached',
+                                                    1e-6,
+                                                ),
+                                            )
+                                        )
+                                        adaptive_head_consensus_parts.append(
+                                            ref_head_consensus
+                                        )
+                                        adaptive_tail_consensus_parts.append(
+                                            ref_tail_consensus
+                                        )
+                                        adaptive_head_valid_parts.append(
+                                            ref_eligible * ref_head_agreement
+                                        )
+                                        adaptive_tail_valid_parts.append(
+                                            ref_eligible * ref_tail_agreement
+                                        )
+                                        # Critic total-Q semantics are Q_head + Q_tail.
+                                        # Keep the diagnostic advantage/Q values on that
+                                        # exact scale; the head/tail selector targets
+                                        # below remain their separate dimensionless
+                                        # sigmoid targets.
+                                        ref_advantage = tf.stop_gradient(
+                                            ref_head_consensus
+                                            + ref_tail_consensus
+                                        )
+                                        ref_y_q = tf.stop_gradient(
+                                            tf.cast(0.5, tf.float32)
+                                            * (ref_head_target + ref_tail_target)
+                                        )
+                                        ref_q_ref = tf.stop_gradient(
+                                            tf.cast(0.5, tf.float32)
+                                            * (
+                                                tf.squeeze(
+                                                    ref_q1_head_1
+                                                    + ref_q1_head_2,
+                                                    axis=1,
+                                                )
+                                                + tf.squeeze(
+                                                    ref_q1_tail_1
+                                                    + ref_q1_tail_2,
+                                                    axis=1,
+                                                )
+                                            )
+                                        )
+                                        ref_q_cur = tf.stop_gradient(
+                                            tf.cast(0.5, tf.float32)
+                                            * (
+                                                tf.squeeze(
+                                                    cur_q1_head_1
+                                                    + cur_q1_head_2,
+                                                    axis=1,
+                                                )
+                                                + tf.squeeze(
+                                                    cur_q1_tail_1
+                                                    + cur_q1_tail_2,
+                                                    axis=1,
+                                                )
+                                            )
+                                        )
+                                    else:
+                                        ref_q_ref = tf.squeeze(
+                                            tf.minimum(
+                                                ref_q1_head_1 + ref_q1_tail_1,
+                                                ref_q1_head_2 + ref_q1_tail_2,
+                                            ),
+                                            axis=1,
+                                        )
+                                        ref_q_cur = tf.squeeze(
+                                            tf.minimum(
+                                                cur_q1_head_1 + cur_q1_tail_1,
+                                                cur_q1_head_2 + cur_q1_tail_2,
+                                            ),
+                                            axis=1,
+                                        )
                                 else:
+                                    if cross_ref_adaptive_twin:
+                                        raise ValueError(
+                                            "adaptive twin reference modes require dual-q critics"
+                                        )
                                     ref_q_out_1 = tf.cast(source_agent['critic1'](ref_corrected_inputs, training=False), tf.float32)
                                     ref_q_out_2 = tf.cast(source_agent['critic2'](ref_corrected_inputs, training=False), tf.float32)
                                     cur_q_out_1 = tf.cast(source_agent['critic1'](cur_corrected_inputs, training=False), tf.float32)
@@ -15514,18 +17083,38 @@ class OptimizedMATD3:
                                 ref_q_cur = tf.stop_gradient(tf.where(tf.math.is_finite(ref_q_cur), ref_q_cur, tf.zeros_like(ref_q_cur)))
                                 ref_q_ref = tf.clip_by_value(ref_q_ref, -q_clip, q_clip)
                                 ref_q_cur = tf.clip_by_value(ref_q_cur, -q_clip, q_clip)
-                                ref_advantage = tf.stop_gradient(ref_q_ref - ref_q_cur)
-                                adv_tau = tf.cast(getattr(self, 'cross_agent_reference_selector_q_tau_cached', 500.0), tf.float32)
-                                adv_clip = tf.cast(getattr(self, 'cross_agent_reference_selector_adv_clip_cached', 5.0), tf.float32)
-                                ref_advantage_scaled = tf.clip_by_value(ref_advantage / tf.maximum(adv_tau, tf.cast(1e-6, tf.float32)), -adv_clip, adv_clip)
-                                ref_y_q = tf.stop_gradient(tf.sigmoid(ref_advantage_scaled))
+                                if not cross_ref_adaptive_twin:
+                                    ref_advantage = tf.stop_gradient(ref_q_ref - ref_q_cur)
+                                    adv_tau = tf.cast(getattr(self, 'cross_agent_reference_selector_q_tau_cached', 500.0), tf.float32)
+                                    adv_clip = tf.cast(getattr(self, 'cross_agent_reference_selector_adv_clip_cached', 5.0), tf.float32)
+                                    ref_advantage_scaled = tf.clip_by_value(ref_advantage / tf.maximum(adv_tau, tf.cast(1e-6, tf.float32)), -adv_clip, adv_clip)
+                                    ref_y_q = tf.stop_gradient(tf.sigmoid(ref_advantage_scaled))
+                                else:
+                                    ref_advantage_scaled = ref_advantage / tf.maximum(
+                                        (
+                                            self.cross_agent_reference_head_advantage_ema
+                                            + self.cross_agent_reference_tail_advantage_ema
+                                        ),
+                                        tf.cast(
+                                            getattr(
+                                                self,
+                                                'cross_agent_reference_advantage_epsilon_cached',
+                                                1e-6,
+                                            ),
+                                            tf.float32,
+                                        ),
+                                    )
                             else:
                                 ref_advantage_scaled = tf.zeros_like(ref_sample_loss)
-                            selector_alpha = tf.cast(getattr(self, 'cross_agent_reference_selector_alpha_cached', 0.7), tf.float32)
-                            ref_y_mix = tf.stop_gradient(
-                                tf.clip_by_value(selector_alpha * ref_hindsight + (tf.cast(1.0, tf.float32) - selector_alpha) * ref_y_q, 0.0, 1.0)
-                            )
-                            ref_selector_target = ref_y_mix
+                            if cross_ref_adaptive_twin:
+                                ref_y_mix = ref_y_q
+                                ref_selector_target = ref_y_q
+                            else:
+                                selector_alpha = tf.cast(getattr(self, 'cross_agent_reference_selector_alpha_cached', 0.7), tf.float32)
+                                ref_y_mix = tf.stop_gradient(
+                                    tf.clip_by_value(selector_alpha * ref_hindsight + (tf.cast(1.0, tf.float32) - selector_alpha) * ref_y_q, 0.0, 1.0)
+                                )
+                                ref_selector_target = ref_y_mix
                             team_success_count_norm = tf.zeros_like(ref_sample_loss)
                             team_reach_count_norm = tf.zeros_like(ref_sample_loss)
                             team_safe_count_norm = tf.zeros_like(ref_sample_loss)
@@ -15749,7 +17338,326 @@ class OptimizedMATD3:
                                         )
                                     )
 
-                            if cross_ref_selector_mode == 'soft_advantage':
+                            if (
+                                cross_ref_adaptive_twin
+                                and not cross_ref_shared_selector
+                            ):
+                                selector_target_head = tf.stop_gradient(
+                                    ref_head_target
+                                )
+                                selector_target_tail = tf.stop_gradient(
+                                    ref_tail_target
+                                )
+                                head_multiplier = suppress_only_multiplier(
+                                    selector_target_head,
+                                    ref_head_agreement,
+                                )
+                                tail_multiplier = suppress_only_multiplier(
+                                    selector_target_tail,
+                                    ref_tail_agreement,
+                                )
+                                ref_loss_j, ref_valid_sum = (
+                                    reduce_reference_loss_fixed_denominator(
+                                        ref_head_loss,
+                                        ref_tail_loss,
+                                        ref_eligible,
+                                        head_multiplier,
+                                        tail_multiplier,
+                                        head_weight=ref_head_weight,
+                                        tail_weight=ref_tail_weight,
+                                    )
+                                )
+                                ref_weight = ref_eligible
+                                selector_base_sum = tf.maximum(
+                                    ref_valid_sum,
+                                    tf.cast(1.0, tf.float32),
+                                )
+                                ref_selector_head_targets_i.append(
+                                    tf.reduce_sum(
+                                        selector_target_head * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_tail_targets_i.append(
+                                    tf.reduce_sum(
+                                        selector_target_tail * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_scores_i.append(
+                                    tf.reduce_sum(
+                                        tf.cast(0.5, tf.float32)
+                                        * (
+                                            selector_target_head
+                                            + selector_target_tail
+                                        )
+                                        * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_head_scores_i.append(
+                                    tf.reduce_sum(
+                                        selector_target_head * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_tail_scores_i.append(
+                                    tf.reduce_sum(
+                                        selector_target_tail * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_head_agreement_i.append(
+                                    tf.reduce_sum(
+                                        ref_head_agreement * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_tail_agreement_i.append(
+                                    tf.reduce_sum(
+                                        ref_tail_agreement * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_head_multiplier_i.append(
+                                    tf.reduce_sum(
+                                        head_multiplier * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_tail_multiplier_i.append(
+                                    tf.reduce_sum(
+                                        tail_multiplier * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_head_suppressed_i.append(
+                                    tf.reduce_sum(
+                                        tf.cast(
+                                            head_multiplier
+                                            < tf.cast(1.0 - 1e-6, tf.float32),
+                                            tf.float32,
+                                        )
+                                        * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_tail_suppressed_i.append(
+                                    tf.reduce_sum(
+                                        tf.cast(
+                                            tail_multiplier
+                                            < tf.cast(1.0 - 1e-6, tf.float32),
+                                            tf.float32,
+                                        )
+                                        * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                            elif cross_ref_shared_selector:
+                                selector_pf_feature = (
+                                    ref_pf_force
+                                    if self.use_pf_feature_flag
+                                    else None
+                                )
+                                selector_features = build_shared_selector_features(
+                                    reference_observation=ref_obs,
+                                    teacher_action=ref_target,
+                                    learner_action=ref_pred,
+                                    force_ratio=fr_batch_safe,
+                                    pf_feature=selector_pf_feature,
+                                )
+                                selector_output = tf.cast(
+                                    self.reference_selector_shared(
+                                        selector_features,
+                                        training=True,
+                                    ),
+                                    tf.float32,
+                                )
+                                selector_score_head = tf.clip_by_value(
+                                    tf.where(
+                                        tf.math.is_finite(selector_output[:, 0]),
+                                        selector_output[:, 0],
+                                        tf.fill(
+                                            tf.shape(selector_output[:, 0]),
+                                            tf.cast(0.5, tf.float32),
+                                        ),
+                                    ),
+                                    tf.cast(1e-5, tf.float32),
+                                    tf.cast(1.0 - 1e-5, tf.float32),
+                                )
+                                selector_score_tail = tf.clip_by_value(
+                                    tf.where(
+                                        tf.math.is_finite(selector_output[:, 1]),
+                                        selector_output[:, 1],
+                                        tf.fill(
+                                            tf.shape(selector_output[:, 1]),
+                                            tf.cast(0.5, tf.float32),
+                                        ),
+                                    ),
+                                    tf.cast(1e-5, tf.float32),
+                                    tf.cast(1.0 - 1e-5, tf.float32),
+                                )
+                                selector_target_head = tf.stop_gradient(
+                                    ref_head_target
+                                )
+                                selector_target_tail = tf.stop_gradient(
+                                    ref_tail_target
+                                )
+                                head_label_mask = (
+                                    ref_eligible * ref_head_agreement
+                                )
+                                tail_label_mask = (
+                                    ref_eligible * ref_tail_agreement
+                                )
+                                selector_head_bce = binary_cross_entropy_per_sample(
+                                    selector_target_head,
+                                    selector_score_head,
+                                )
+                                selector_tail_bce = binary_cross_entropy_per_sample(
+                                    selector_target_tail,
+                                    selector_score_tail,
+                                )
+                                selector_loss_numerator_j = (
+                                    tf.reduce_sum(
+                                        selector_head_bce * head_label_mask
+                                    )
+                                    + tf.reduce_sum(
+                                        selector_tail_bce * tail_label_mask
+                                    )
+                                )
+                                selector_loss_denominator_j = (
+                                    tf.reduce_sum(head_label_mask)
+                                    + tf.reduce_sum(tail_label_mask)
+                                )
+                                shared_selector_loss_numerator += (
+                                    selector_loss_numerator_j
+                                )
+                                shared_selector_loss_denominator += (
+                                    selector_loss_denominator_j
+                                )
+                                selector_loss_j = (
+                                    selector_loss_numerator_j
+                                    / tf.maximum(
+                                        selector_loss_denominator_j,
+                                        tf.cast(1.0, tf.float32),
+                                    )
+                                )
+                                selector_loss_j = tf.where(
+                                    tf.math.is_finite(selector_loss_j),
+                                    selector_loss_j,
+                                    tf.cast(0.0, tf.float32),
+                                )
+                                head_multiplier = suppress_only_multiplier(
+                                    selector_score_head
+                                )
+                                tail_multiplier = suppress_only_multiplier(
+                                    selector_score_tail
+                                )
+                                ref_loss_j, ref_valid_sum = (
+                                    reduce_reference_loss_fixed_denominator(
+                                        ref_head_loss,
+                                        ref_tail_loss,
+                                        ref_eligible,
+                                        head_multiplier,
+                                        tail_multiplier,
+                                        head_weight=ref_head_weight,
+                                        tail_weight=ref_tail_weight,
+                                    )
+                                )
+                                ref_weight = ref_eligible
+                                selector_base_sum = tf.maximum(
+                                    ref_valid_sum,
+                                    tf.cast(1.0, tf.float32),
+                                )
+                                ref_selector_losses_i.append(selector_loss_j)
+                                ref_selector_scores_i.append(
+                                    tf.reduce_sum(
+                                        tf.cast(0.5, tf.float32)
+                                        * (
+                                            selector_score_head
+                                            + selector_score_tail
+                                        )
+                                        * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_head_scores_i.append(
+                                    tf.reduce_sum(
+                                        selector_score_head * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_tail_scores_i.append(
+                                    tf.reduce_sum(
+                                        selector_score_tail * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_selector_head_targets_i.append(
+                                    tf.reduce_sum(
+                                        selector_target_head * head_label_mask
+                                    )
+                                    / tf.maximum(
+                                        tf.reduce_sum(head_label_mask),
+                                        tf.cast(1.0, tf.float32),
+                                    )
+                                )
+                                ref_selector_tail_targets_i.append(
+                                    tf.reduce_sum(
+                                        selector_target_tail * tail_label_mask
+                                    )
+                                    / tf.maximum(
+                                        tf.reduce_sum(tail_label_mask),
+                                        tf.cast(1.0, tf.float32),
+                                    )
+                                )
+                                ref_head_agreement_i.append(
+                                    tf.reduce_sum(
+                                        ref_head_agreement * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_tail_agreement_i.append(
+                                    tf.reduce_sum(
+                                        ref_tail_agreement * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_head_multiplier_i.append(
+                                    tf.reduce_sum(
+                                        head_multiplier * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_tail_multiplier_i.append(
+                                    tf.reduce_sum(
+                                        tail_multiplier * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_head_suppressed_i.append(
+                                    tf.reduce_sum(
+                                        tf.cast(
+                                            head_multiplier
+                                            < tf.cast(1.0 - 1e-6, tf.float32),
+                                            tf.float32,
+                                        )
+                                        * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                                ref_tail_suppressed_i.append(
+                                    tf.reduce_sum(
+                                        tf.cast(
+                                            tail_multiplier
+                                            < tf.cast(1.0 - 1e-6, tf.float32),
+                                            tf.float32,
+                                        )
+                                        * ref_eligible
+                                    )
+                                    / selector_base_sum
+                                )
+                            elif cross_ref_selector_mode == 'soft_advantage':
                                 ref_weight = ref_base_valid * ref_y_mix
                             elif cross_ref_uses_selector:
                                 q_norm = tf.maximum(tf.cast(q_clip, tf.float32), tf.cast(1.0, tf.float32))
@@ -15901,23 +17809,35 @@ class OptimizedMATD3:
                                 ref_selector_losses_i.append(selector_loss_j)
                             else:
                                 ref_weight = ref_base_valid * ref_hindsight
-                            if cross_ref_selector_mode == 'hard' and not bool(getattr(self, 'cross_agent_reference_quality_gate', True)):
-                                ref_weight = ref_base_valid
-                            ref_weight = tf.where(tf.math.is_finite(ref_weight), ref_weight, tf.zeros_like(ref_weight))
-                            ref_valid_sum = tf.reduce_sum(ref_weight)
-                            if cross_ref_head_tail_selector and cross_ref_uses_selector:
-                                ref_loss_j = tf.reduce_sum(ref_weighted_sample_loss) / tf.maximum(ref_valid_sum, tf.cast(1.0, tf.float32))
+                            if not cross_ref_adaptive_twin:
+                                if cross_ref_selector_mode == MODE_HARD and not bool(getattr(self, 'cross_agent_reference_quality_gate', True)):
+                                    ref_weight = ref_base_valid
+                                ref_weight = tf.where(tf.math.is_finite(ref_weight), ref_weight, tf.zeros_like(ref_weight))
+                                ref_valid_sum = tf.reduce_sum(ref_weight)
+                                if cross_ref_head_tail_selector and cross_ref_uses_selector:
+                                    ref_loss_j = tf.reduce_sum(ref_weighted_sample_loss) / tf.maximum(ref_valid_sum, tf.cast(1.0, tf.float32))
+                                else:
+                                    ref_loss_j = tf.reduce_sum(ref_sample_loss * ref_weight) / tf.maximum(ref_valid_sum, tf.cast(1.0, tf.float32))
                             else:
-                                ref_loss_j = tf.reduce_sum(ref_sample_loss * ref_weight) / tf.maximum(ref_valid_sum, tf.cast(1.0, tf.float32))
+                                ref_weight = tf.where(
+                                    tf.math.is_finite(ref_eligible),
+                                    ref_eligible,
+                                    tf.zeros_like(ref_eligible),
+                                )
                             ref_losses_i.append(ref_loss_j)
                             ref_valid_ratios_i.append(ref_valid_sum / ref_batch_size_float)
-                            ref_diag_sum = tf.maximum(tf.reduce_sum(ref_base_valid), tf.cast(1.0, tf.float32))
-                            ref_selector_y_hindsight_i.append(tf.reduce_sum(ref_hindsight * ref_base_valid) / ref_diag_sum)
-                            ref_selector_y_q_i.append(tf.reduce_sum(ref_y_q * ref_base_valid) / ref_diag_sum)
-                            ref_selector_y_mix_i.append(tf.reduce_sum(ref_selector_target * ref_base_valid) / ref_diag_sum)
-                            ref_selector_adv_i.append(tf.reduce_sum(ref_advantage * ref_base_valid) / ref_diag_sum)
+                            ref_diag_mask = (
+                                ref_eligible
+                                if cross_ref_adaptive_twin
+                                else ref_base_valid
+                            )
+                            ref_diag_sum = tf.maximum(tf.reduce_sum(ref_diag_mask), tf.cast(1.0, tf.float32))
+                            ref_selector_y_hindsight_i.append(tf.reduce_sum(ref_hindsight * ref_diag_mask) / ref_diag_sum)
+                            ref_selector_y_q_i.append(tf.reduce_sum(ref_y_q * ref_diag_mask) / ref_diag_sum)
+                            ref_selector_y_mix_i.append(tf.reduce_sum(ref_selector_target * ref_diag_mask) / ref_diag_sum)
+                            ref_selector_adv_i.append(tf.reduce_sum(ref_advantage * ref_diag_mask) / ref_diag_sum)
                             ref_selector_adv_pos_i.append(
-                                tf.reduce_sum(tf.cast(ref_advantage > tf.cast(0.0, tf.float32), tf.float32) * ref_base_valid) / ref_diag_sum
+                                tf.reduce_sum(tf.cast(ref_advantage > tf.cast(0.0, tf.float32), tf.float32) * ref_diag_mask) / ref_diag_sum
                             )
                         if len(ref_losses_i) > 0:
                             cross_ref_loss_i = tf.add_n(ref_losses_i) / tf.cast(len(ref_losses_i), tf.float32)
@@ -15946,6 +17866,13 @@ class OptimizedMATD3:
                                 cross_ref_selector_y_mix_i = tf.add_n(ref_selector_y_mix_i) / tf.cast(len(ref_selector_y_mix_i), tf.float32)
                                 cross_ref_selector_adv_i = tf.add_n(ref_selector_adv_i) / tf.cast(len(ref_selector_adv_i), tf.float32)
                                 cross_ref_selector_adv_pos_ratio_i = tf.add_n(ref_selector_adv_pos_i) / tf.cast(len(ref_selector_adv_pos_i), tf.float32)
+                            if len(ref_head_agreement_i) > 0:
+                                cross_ref_head_agreement_i = tf.add_n(ref_head_agreement_i) / tf.cast(len(ref_head_agreement_i), tf.float32)
+                                cross_ref_tail_agreement_i = tf.add_n(ref_tail_agreement_i) / tf.cast(len(ref_tail_agreement_i), tf.float32)
+                                cross_ref_head_multiplier_i = tf.add_n(ref_head_multiplier_i) / tf.cast(len(ref_head_multiplier_i), tf.float32)
+                                cross_ref_tail_multiplier_i = tf.add_n(ref_tail_multiplier_i) / tf.cast(len(ref_tail_multiplier_i), tf.float32)
+                                cross_ref_head_suppressed_i = tf.add_n(ref_head_suppressed_i) / tf.cast(len(ref_head_suppressed_i), tf.float32)
+                                cross_ref_tail_suppressed_i = tf.add_n(ref_tail_suppressed_i) / tf.cast(len(ref_tail_suppressed_i), tf.float32)
                         cross_ref_loss_sum += cross_ref_loss_i
                         cross_ref_valid_ratio_sum += cross_ref_valid_ratio_i
                         cross_ref_agent_count += tf.constant(1.0, dtype=tf.float32)
@@ -15961,6 +17888,14 @@ class OptimizedMATD3:
                         cross_ref_selector_head_target_sum += cross_ref_selector_head_target_i
                         cross_ref_selector_tail_target_sum += cross_ref_selector_tail_target_i
                         cross_ref_selector_agent_count += tf.constant(1.0, dtype=tf.float32)
+                        if cross_ref_adaptive_twin:
+                            cross_ref_head_agreement_sum += cross_ref_head_agreement_i
+                            cross_ref_tail_agreement_sum += cross_ref_tail_agreement_i
+                            cross_ref_head_multiplier_sum += cross_ref_head_multiplier_i
+                            cross_ref_tail_multiplier_sum += cross_ref_tail_multiplier_i
+                            cross_ref_head_suppressed_sum += cross_ref_head_suppressed_i
+                            cross_ref_tail_suppressed_sum += cross_ref_tail_suppressed_i
+                            cross_ref_adaptive_diag_count += tf.constant(1.0, dtype=tf.float32)
                     cross_ref_coef = (
                         tf.cast(getattr(self, 'cross_agent_reference_coef_cached', 0.03), tf.float32)
                         * cross_agent_reference_actor_weight
@@ -15982,6 +17917,15 @@ class OptimizedMATD3:
                     actor_action_reg_diag_list.append(action_reg)
                     actor_losses.append(actor_loss)
                     total_actor_loss += tf.cast(actor_loss, tf.float32)
+
+                if cross_ref_shared_selector:
+                    total_selector_loss = (
+                        shared_selector_loss_numerator
+                        / tf.maximum(
+                            shared_selector_loss_denominator,
+                            tf.cast(1.0, tf.float32),
+                        )
+                    )
 
             all_actor_vars = []
             per_agent_actor_slices = []
@@ -16057,7 +18001,48 @@ class OptimizedMATD3:
                 actor_diag_grad_applied_fraction_sum += applied_fraction
                 actor_diag_var_grad_abs_sum += grad_abs_mean
                 actor_diag_grad_agent_count += tf.constant(1.0, dtype=tf.float32)
-            if cross_ref_train_selector_in_graph:
+            if cross_ref_train_selector_in_graph and cross_ref_shared_selector:
+                selector_vars = self.reference_selector_shared.trainable_variables
+                selector_grads = tape_a.gradient(
+                    total_selector_loss,
+                    selector_vars,
+                )
+                selector_grad_var_pairs = [
+                    (gradient, variable)
+                    for gradient, variable in zip(selector_grads, selector_vars)
+                    if gradient is not None
+                ]
+                if selector_grad_var_pairs:
+                    selector_grad_abs_values = [
+                        tf.reduce_mean(
+                            tf.abs(
+                                tf.where(
+                                    tf.math.is_finite(gradient),
+                                    gradient,
+                                    tf.zeros_like(gradient),
+                                )
+                            )
+                        )
+                        for gradient, _ in selector_grad_var_pairs
+                    ]
+                    cross_ref_selector_grad_norm = (
+                        tf.add_n(selector_grad_abs_values)
+                        / tf.cast(
+                            len(selector_grad_abs_values),
+                            tf.float32,
+                        )
+                    )
+                    selector_pairs, _ = _build_safe_gradient_pairs(
+                        [gradient for gradient, _ in selector_grad_var_pairs],
+                        [variable for _, variable in selector_grad_var_pairs],
+                        self.c_grad_clip_norm,
+                        per_tensor_clip=1.0,
+                    )
+                    if selector_pairs:
+                        self.reference_selector_shared_optimizer.apply_gradients(
+                            selector_pairs
+                        )
+            elif cross_ref_train_selector_in_graph:
                 all_selector_vars = []
                 per_agent_selector_slices = []
                 selector_start = 0
@@ -16084,6 +18069,81 @@ class OptimizedMATD3:
                         )
                         if selector_pairs:
                             self.agents[i]['reference_selector_optimizer'].apply_gradients(selector_pairs)
+
+            if cross_ref_adaptive_twin and adaptive_head_consensus_parts:
+                head_consensus_all = tf.concat(
+                    adaptive_head_consensus_parts,
+                    axis=0,
+                )
+                tail_consensus_all = tf.concat(
+                    adaptive_tail_consensus_parts,
+                    axis=0,
+                )
+                head_valid_all = tf.concat(
+                    adaptive_head_valid_parts,
+                    axis=0,
+                )
+                tail_valid_all = tf.concat(
+                    adaptive_tail_valid_parts,
+                    axis=0,
+                )
+                next_head_scale, next_head_initialized, head_scale_count = (
+                    next_ema_scale(
+                        self.cross_agent_reference_head_advantage_ema,
+                        self.cross_agent_reference_head_ema_initialized,
+                        head_consensus_all,
+                        head_valid_all,
+                        decay=getattr(
+                            self,
+                            'cross_agent_reference_advantage_ema_decay_cached',
+                            0.99,
+                        ),
+                        epsilon=getattr(
+                            self,
+                            'cross_agent_reference_advantage_epsilon_cached',
+                            1e-6,
+                        ),
+                    )
+                )
+                next_tail_scale, next_tail_initialized, tail_scale_count = (
+                    next_ema_scale(
+                        self.cross_agent_reference_tail_advantage_ema,
+                        self.cross_agent_reference_tail_ema_initialized,
+                        tail_consensus_all,
+                        tail_valid_all,
+                        decay=getattr(
+                            self,
+                            'cross_agent_reference_advantage_ema_decay_cached',
+                            0.99,
+                        ),
+                        epsilon=getattr(
+                            self,
+                            'cross_agent_reference_advantage_epsilon_cached',
+                            1e-6,
+                        ),
+                    )
+                )
+                self.cross_agent_reference_head_advantage_ema.assign(
+                    next_head_scale
+                )
+                self.cross_agent_reference_tail_advantage_ema.assign(
+                    next_tail_scale
+                )
+                self.cross_agent_reference_head_ema_initialized.assign(
+                    next_head_initialized
+                )
+                self.cross_agent_reference_tail_ema_initialized.assign(
+                    next_tail_initialized
+                )
+                self.cross_agent_reference_selector_update_count.assign_add(
+                    tf.cast(
+                        tf.greater(
+                            head_scale_count + tail_scale_count,
+                            tf.cast(0.0, tf.float32),
+                        ),
+                        tf.int64,
+                    )
+                )
             del tape_a
             actor_losses_vec = tf.stack(actor_losses) if len(actor_losses) > 0 else tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
         else:
@@ -16115,6 +18175,14 @@ class OptimizedMATD3:
             cross_ref_selector_head_target_sum = tf.constant(0.0, dtype=tf.float32)
             cross_ref_selector_tail_target_sum = tf.constant(0.0, dtype=tf.float32)
             cross_ref_selector_agent_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_head_agreement_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_tail_agreement_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_head_multiplier_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_tail_multiplier_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_head_suppressed_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_tail_suppressed_sum = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_adaptive_diag_count = tf.constant(0.0, dtype=tf.float32)
+            cross_ref_selector_grad_norm = tf.constant(0.0, dtype=tf.float32)
             cross_ref_active_float = tf.cast(bool(cross_agent_reference_active), tf.float32)
             actor_losses_vec = tf.fill([self.n_agents], tf.cast(float('nan'), tf.float32))
 
@@ -16158,6 +18226,10 @@ class OptimizedMATD3:
         actor_diag_grad_agent_count_safe = tf.maximum(actor_diag_grad_agent_count, tf.cast(1.0, tf.float32))
         cross_ref_agent_count_safe = tf.maximum(cross_ref_agent_count, tf.cast(1.0, tf.float32))
         cross_ref_selector_agent_count_safe = tf.maximum(cross_ref_selector_agent_count, tf.cast(1.0, tf.float32))
+        cross_ref_adaptive_diag_count_safe = tf.maximum(
+            cross_ref_adaptive_diag_count,
+            tf.cast(1.0, tf.float32),
+        )
         matd3_q_diag_vec = tf.stack([
             current_q_mean,
             tf.sqrt(current_q_var),
@@ -16207,6 +18279,25 @@ class OptimizedMATD3:
             cross_ref_selector_head_target_sum / cross_ref_selector_agent_count_safe,
             cross_ref_selector_tail_target_sum / cross_ref_selector_agent_count_safe,
             cross_agent_reference_actor_weight * cross_ref_active_float,
+            cross_ref_head_agreement_sum / cross_ref_adaptive_diag_count_safe,
+            cross_ref_tail_agreement_sum / cross_ref_adaptive_diag_count_safe,
+            cross_ref_head_multiplier_sum / cross_ref_adaptive_diag_count_safe,
+            cross_ref_tail_multiplier_sum / cross_ref_adaptive_diag_count_safe,
+            cross_ref_head_suppressed_sum / cross_ref_adaptive_diag_count_safe,
+            cross_ref_tail_suppressed_sum / cross_ref_adaptive_diag_count_safe,
+            tf.cast(
+                self.cross_agent_reference_head_advantage_ema,
+                tf.float32,
+            ),
+            tf.cast(
+                self.cross_agent_reference_tail_advantage_ema,
+                tf.float32,
+            ),
+            cross_ref_selector_grad_norm,
+            tf.cast(
+                self.cross_agent_reference_selector_update_count,
+                tf.float32,
+            ),
         ])
         matd3_q_diag_vec = tf.where(
             tf.math.is_finite(matd3_q_diag_vec),
@@ -17565,7 +19656,7 @@ class OptimizedMATD3:
         return wa * Ia + wb * Ib + wc * Ic + wd * Id
 
     def save_models(self, path):
-        """🚨 标准MATD3：保存模型（包括两个独立的Twin Critic网络）"""
+        """保存完整 MATD3 模型及自适应 cross-reference 状态。"""
         os.makedirs(path, exist_ok=True)
 
         # 保存每个智能体的网络
@@ -17581,56 +19672,246 @@ class OptimizedMATD3:
             agent['target_critic1'].save_weights(os.path.join(path, f'target_critic1_{i}.weights.h5'))
             agent['target_critic2'].save_weights(os.path.join(path, f'target_critic2_{i}.weights.h5'))
 
+        selector_mode = str(
+            getattr(self, 'cross_agent_reference_selector_mode_cached', MODE_HARD)
+            or MODE_HARD
+        )
+        if self.reference_selector_shared is not None:
+            self.reference_selector_shared.save_weights(
+                os.path.join(path, 'reference_selector_shared.weights.h5')
+            )
+        if selector_mode in ADVANTAGE_SELECTOR_MODES:
+            selector_payload = selector_state_payload(
+                mode=selector_mode,
+                head_scale=float(
+                    self.cross_agent_reference_head_advantage_ema.numpy()
+                ),
+                tail_scale=float(
+                    self.cross_agent_reference_tail_advantage_ema.numpy()
+                ),
+                head_initialized=bool(
+                    self.cross_agent_reference_head_ema_initialized.numpy()
+                ),
+                tail_initialized=bool(
+                    self.cross_agent_reference_tail_ema_initialized.numpy()
+                ),
+                update_count=int(
+                    self.cross_agent_reference_selector_update_count.numpy()
+                ),
+                ema_decay=float(
+                    self.cross_agent_reference_advantage_ema_decay_cached
+                ),
+                epsilon=float(
+                    self.cross_agent_reference_advantage_epsilon_cached
+                ),
+                advantage_clip=float(
+                    self.cross_agent_reference_selector_adv_clip_cached
+                ),
+                input_dim=(
+                    self.cross_agent_reference_selector_input_dim
+                    if selector_mode == MODE_SHARED_TWIN_HEAD_TAIL
+                    else None
+                ),
+            )
+            selector_state_path = os.path.join(
+                path,
+                'cross_agent_reference_state.json',
+            )
+            selector_state_tmp_path = selector_state_path + '.tmp'
+            with open(
+                selector_state_tmp_path,
+                'w',
+                encoding='utf-8',
+            ) as selector_state_file:
+                json.dump(
+                    selector_payload,
+                    selector_state_file,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                selector_state_file.flush()
+                os.fsync(selector_state_file.fileno())
+            os.replace(selector_state_tmp_path, selector_state_path)
+
         print(f"[模型保存] ✅ 所有智能体网络保存成功")
 
-    def load_models(self, path):
+    def load_models(self, path, strict=False):
         """🚨 标准MATD3：加载模型（包括两个独立的Twin Critic网络）"""
 
-        # 加载每个智能体的网络
+        load_errors = []
         for i, agent in enumerate(self.agents):
+            actor_path = os.path.join(path, f'actor_{i}.weights.h5')
+            critic1_path = os.path.join(path, f'critic1_{i}.weights.h5')
+            critic2_path = os.path.join(path, f'critic2_{i}.weights.h5')
+            actor_loaded = False
+            critics_loaded = False
             try:
-                agent['actor'].load_weights(os.path.join(path, f'actor_{i}.weights.h5'))
-                # 🚨 标准MATD3：加载两个独立的Critic网络
-                agent['critic1'].load_weights(os.path.join(path, f'critic1_{i}.weights.h5'))
-                agent['critic2'].load_weights(os.path.join(path, f'critic2_{i}.weights.h5'))
-                # 加载目标网络（如果存在）
+                agent['actor'].load_weights(actor_path)
+                actor_loaded = True
+            except Exception as actor_exc:
+                load_errors.append(f"agent{i} actor: {actor_exc}")
+                print(f"[模型加载] ❌ Agent{i} Actor加载失败: {actor_exc}")
+
+            if self.eval_actor_only:
+                if actor_loaded:
+                    print(f"[模型加载] ✅ Agent{i} Actor加载成功（评估轻量模式）")
+                continue
+
+            try:
+                agent['critic1'].load_weights(critic1_path)
+                agent['critic2'].load_weights(critic2_path)
+                critics_loaded = True
+            except Exception as critic_exc:
+                old_critic_path = os.path.join(path, f'critic_{i}.weights.h5')
+                try:
+                    if not os.path.exists(old_critic_path):
+                        raise FileNotFoundError(old_critic_path)
+                    print(f"[模型加载] ⚠️  Agent{i} 使用旧格式critic权重初始化Twin Critic")
+                    agent['critic1'].load_weights(old_critic_path)
+                    agent['critic2'].load_weights(old_critic_path)
+                    critics_loaded = True
+                except Exception as legacy_exc:
+                    load_errors.append(f"agent{i} critics: {critic_exc}; legacy: {legacy_exc}")
+                    print(f"[模型加载] ❌ Agent{i} Critic加载失败: {critic_exc}; legacy={legacy_exc}")
+
+            if actor_loaded:
                 target_actor_path = os.path.join(path, f'target_actor_{i}.weights.h5')
-                target_critic1_path = os.path.join(path, f'target_critic1_{i}.weights.h5')
-                target_critic2_path = os.path.join(path, f'target_critic2_{i}.weights.h5')
                 if os.path.exists(target_actor_path):
-                    agent['target_actor'].load_weights(target_actor_path)
+                    try:
+                        agent['target_actor'].load_weights(target_actor_path)
+                    except Exception as target_actor_exc:
+                        agent['target_actor'].set_weights(agent['actor'].get_weights())
+                        if strict:
+                            load_errors.append(f"agent{i} target_actor: {target_actor_exc}")
                 else:
                     agent['target_actor'].set_weights(agent['actor'].get_weights())
+            if critics_loaded:
+                target_critic1_path = os.path.join(path, f'target_critic1_{i}.weights.h5')
+                target_critic2_path = os.path.join(path, f'target_critic2_{i}.weights.h5')
                 if os.path.exists(target_critic1_path):
-                    agent['target_critic1'].load_weights(target_critic1_path)
+                    try:
+                        agent['target_critic1'].load_weights(target_critic1_path)
+                    except Exception as target_critic1_exc:
+                        agent['target_critic1'].set_weights(agent['critic1'].get_weights())
+                        if strict:
+                            load_errors.append(f"agent{i} target_critic1: {target_critic1_exc}")
                 else:
                     agent['target_critic1'].set_weights(agent['critic1'].get_weights())
                 if os.path.exists(target_critic2_path):
-                    agent['target_critic2'].load_weights(target_critic2_path)
+                    try:
+                        agent['target_critic2'].load_weights(target_critic2_path)
+                    except Exception as target_critic2_exc:
+                        agent['target_critic2'].set_weights(agent['critic2'].get_weights())
+                        if strict:
+                            load_errors.append(f"agent{i} target_critic2: {target_critic2_exc}")
                 else:
                     agent['target_critic2'].set_weights(agent['critic2'].get_weights())
-                selector_path = os.path.join(path, f'reference_selector_{i}.weights.h5')
-                if 'reference_selector' in agent and os.path.exists(selector_path):
+
+            selector_path = os.path.join(path, f'reference_selector_{i}.weights.h5')
+            if 'reference_selector' in agent:
+                if os.path.exists(selector_path):
                     try:
                         agent['reference_selector'].load_weights(selector_path)
                     except Exception as selector_exc:
                         print(f"[模型加载] ⚠️  Agent{i} selector加载失败，保留随机初始化: {selector_exc}")
+                        load_errors.append(f"agent{i} selector: {selector_exc}")
+                elif strict:
+                    load_errors.append(f"agent{i} selector missing: {selector_path}")
+
+            if actor_loaded and critics_loaded:
                 print(f"[模型加载] ✅ Agent{i} 加载成功（标准MATD3 Twin Critic）")
-            except Exception as e:
-                print(f"[模型加载] ❌ Agent{i} 加载失败: {e}")
-                # 尝试兼容旧格式（如果存在旧格式的critic文件）
+
+        selector_mode = str(
+            getattr(self, 'cross_agent_reference_selector_mode_cached', MODE_HARD)
+            or MODE_HARD
+        )
+        if not self.eval_actor_only and selector_mode in ADVANTAGE_SELECTOR_MODES:
+            selector_state_path = os.path.join(
+                path,
+                'cross_agent_reference_state.json',
+            )
+            adaptive_load_errors = []
+            selector_payload = None
+            try:
+                with open(
+                    selector_state_path,
+                    'r',
+                    encoding='utf-8',
+                ) as selector_state_file:
+                    selector_payload = json.load(selector_state_file)
+            except Exception as state_exc:
+                adaptive_load_errors.append(
+                    f"selector state: {state_exc}"
+                )
+            if selector_payload is not None:
+                expected_input_dim = (
+                    int(self.cross_agent_reference_selector_input_dim)
+                    if selector_mode == MODE_SHARED_TWIN_HEAD_TAIL
+                    else None
+                )
+                adaptive_load_errors.extend(
+                    selector_state_errors(
+                        selector_payload,
+                        expected_mode=selector_mode,
+                        expected_input_dim=expected_input_dim,
+                    )
+                )
+                if (
+                    selector_mode == MODE_ADAPTIVE_TWIN_HEAD_TAIL
+                    and selector_payload.get('input_dim') is not None
+                ):
+                    adaptive_load_errors.append(
+                        "adaptive non-network selector state input_dim must be null"
+                    )
+            if (
+                selector_mode == MODE_SHARED_TWIN_HEAD_TAIL
+                and self.reference_selector_shared is None
+            ):
+                adaptive_load_errors.append(
+                    "shared selector network was not constructed"
+                )
+            if (
+                selector_mode == MODE_SHARED_TWIN_HEAD_TAIL
+                and self.reference_selector_shared is not None
+            ):
+                shared_selector_path = os.path.join(
+                    path,
+                    'reference_selector_shared.weights.h5',
+                )
                 try:
-                    old_critic_path = os.path.join(path, f'critic_{i}.weights.h5')
-                    if os.path.exists(old_critic_path):
-                        print(f"[模型加载] ⚠️  检测到旧格式critic文件，尝试加载到critic1...")
-                        agent['critic1'].load_weights(old_critic_path)
-                        agent['critic2'].load_weights(old_critic_path)  # 使用相同的权重初始化critic2
-                        agent['target_critic1'].set_weights(agent['critic1'].get_weights())
-                        agent['target_critic2'].set_weights(agent['critic2'].get_weights())
-                        print(f"[模型加载] ✅ Agent{i} 从旧格式加载成功")
-                except Exception as e2:
-                    print(f"[模型加载] ❌ Agent{i} 从旧格式加载也失败: {e2}")
-                    print(f"[模型加载] 💡 将使用随机初始化的网络")
+                    self.reference_selector_shared.load_weights(
+                        shared_selector_path
+                    )
+                except Exception as selector_exc:
+                    adaptive_load_errors.append(
+                        f"shared selector: {selector_exc}"
+                    )
+            if adaptive_load_errors:
+                load_errors.extend(adaptive_load_errors)
+                raise RuntimeError(
+                    "Adaptive cross-agent reference state load failed: "
+                    + "; ".join(adaptive_load_errors)
+                )
+            self.cross_agent_reference_head_advantage_ema.assign(
+                float(selector_payload['head_advantage_ema'])
+            )
+            self.cross_agent_reference_tail_advantage_ema.assign(
+                float(selector_payload['tail_advantage_ema'])
+            )
+            self.cross_agent_reference_head_ema_initialized.assign(
+                bool(selector_payload['head_ema_initialized'])
+            )
+            self.cross_agent_reference_tail_ema_initialized.assign(
+                bool(selector_payload['tail_ema_initialized'])
+            )
+            self.cross_agent_reference_selector_update_count.assign(
+                int(selector_payload['selector_update_count'])
+            )
+
+        if strict and load_errors:
+            raise RuntimeError("; ".join(load_errors))
+        return not load_errors
 
 
 def train(args):
@@ -18209,7 +20490,7 @@ def train(args):
             getattr(args, 'training_env_sequence_seed', terrain_base_seed),
         )
         config = {
-            'schema_version': 1,
+            'schema_version': TRAINING_ENVIRONMENT_SCHEMA_VERSION,
             'source': 'train_bootstrap',
             'use_fixed_positions': bool(getattr(args, 'use_fixed_positions', False)),
             'use_dynamic_obstacles': bool(getattr(args, 'use_dynamic_obstacles', False) or _env_bool('USE_DYNAMIC_OBSTACLES', False)),
@@ -18221,6 +20502,28 @@ def train(args):
             'training_env_sequence_seed': int(training_env_sequence_seed),
             'train_obstacle_sequence_mode': str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_MODE', str(getattr(args, 'train_obstacle_sequence_mode', 'legacy_linear') or 'legacy_linear'))),
             'train_obstacle_sequence_namespace': str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_NAMESPACE', str(getattr(args, 'train_obstacle_sequence_namespace', 'train_obstacle') or 'train_obstacle'))),
+            'obstacle_observation_mode': normalize_obstacle_observation_mode(
+                os.getenv(
+                    'OBSTACLE_OBSERVATION_MODE',
+                    os.getenv('OBSTACLE_OBS_MODE', getattr(args, 'obstacle_observation_mode', 'nearest_surface')),
+                )
+            ),
+            'obstacle_risk_velocity_forward_weight': _env_float(
+                'OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT',
+                _env_float(
+                    'OBSTACLE_OBS_VEL_FORWARD_WEIGHT',
+                    4.0 if getattr(args, 'obstacle_risk_velocity_forward_weight', None) is None
+                    else getattr(args, 'obstacle_risk_velocity_forward_weight'),
+                ),
+            ),
+            'obstacle_risk_goal_along_weight': _env_float(
+                'OBSTACLE_RISK_GOAL_ALONG_WEIGHT',
+                _env_float(
+                    'OBSTACLE_OBS_GOAL_ALONG_WEIGHT',
+                    3.0 if getattr(args, 'obstacle_risk_goal_along_weight', None) is None
+                    else getattr(args, 'obstacle_risk_goal_along_weight'),
+                ),
+            ),
             'peak_jitter_range': _env_float('PEAK_JITTER_RANGE', getattr(args, 'peak_jitter_range', 0.0) or 0.0),
             'peak_center_jitter_range': _env_float('PEAK_CENTER_JITTER_RANGE', getattr(args, 'peak_center_jitter_range', 0.0) or 0.0),
             'peak_height_jitter_ratio_min': _env_float('PEAK_HEIGHT_JITTER_RATIO_MIN', getattr(args, 'peak_height_jitter_ratio_min', 0.0) or 0.0),
@@ -18233,6 +20536,7 @@ def train(args):
             'semi_random_hold_min_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', getattr(args, 'semi_random_hold_min_episodes', 1) or 1),
             'semi_random_hold_max_episodes': _env_int('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', getattr(args, 'semi_random_hold_max_episodes', 1) or 1),
         }
+        config.update(resolve_runtime_environment(args))
         return config
 
     def _capture_training_hyperparameters_config():
@@ -18328,6 +20632,13 @@ def train(args):
             "per_age_decay": float(getattr(args, "per_age_decay", 0.0) or 0.0),
             "noise_scale": float(getattr(args, "noise_scale", 0.0) or 0.0),
             "noise_decay": float(getattr(args, "noise_decay", 0.0) or 0.0),
+            "noise_decay_enabled": bool(getattr(args, "noise_decay_enabled", True)),
+            "noise_decay_steps": (
+                int(getattr(args, "noise_decay_steps"))
+                if getattr(args, "noise_decay_steps", None) is not None
+                else None
+            ),
+            "noise_staircase": getattr(args, "noise_staircase", None),
             "noise_min": float(getattr(args, "noise_min", 0.0) or 0.0),
             "adaptive_patience": _env_int("ADAPTIVE_PATIENCE", 25),
             "adaptive_lr_decay": _env_float("ADAPTIVE_LR_DECAY", 0.98),
@@ -18342,7 +20653,10 @@ def train(args):
             "adaptive_plateau_slope_eps": _env_float("ADAPTIVE_PLATEAU_SLOPE_EPS", 0.002),
             "adaptive_noise_max": _env_float("ADAPTIVE_NOISE_MAX", 0.12),
             "adaptive_noise_smooth": _env_float("ADAPTIVE_NOISE_SMOOTH", 0.4),
-            "noise_restart_interval": _env_int("NOISE_RESTART_INTERVAL", 25),
+            "noise_restart_interval": _env_int(
+                "NOISE_RESTART_INTERVAL",
+                DEFAULT_NOISE_RESTART_INTERVAL,
+            ),
             "reward_scale": float(getattr(args, "reward_scale", 0.0) or 0.0),
             "goal_ring_individual_scale": _arg_float("goal_ring_individual_scale", 0.25),
             "goal_ring_team_gated": bool(getattr(args, "goal_ring_team_gated", False)),
@@ -18388,6 +20702,21 @@ def train(args):
             "cross_agent_reference_enabled": bool(getattr(args, "cross_agent_reference_enabled", False)),
             "cross_agent_reference_coef": float(getattr(args, "cross_agent_reference_coef", 0.0) or 0.0),
             "cross_agent_reference_start_episode": int(getattr(args, "cross_agent_reference_start_episode", 0) or 0),
+            "cross_agent_reference_actor_start_episode": int(
+                getattr(args, "cross_agent_reference_actor_start_episode", 0)
+                or 0
+            ),
+            "cross_agent_reference_actor_ramp_episodes": int(
+                getattr(args, "cross_agent_reference_actor_ramp_episodes", 0)
+                or 0
+            ),
+            "cross_agent_reference_actor_require_success": bool(
+                getattr(
+                    args,
+                    "cross_agent_reference_actor_require_success",
+                    False,
+                )
+            ),
             "cross_agent_reference_update_interval": int(getattr(args, "cross_agent_reference_update_interval", 1) or 1),
             "cross_agent_reference_pairs_per_agent": int(getattr(args, "cross_agent_reference_pairs_per_agent", 0) or 0),
             "cross_agent_reference_progress_threshold": float(getattr(args, "cross_agent_reference_progress_threshold", 0.0) or 0.0),
@@ -18404,35 +20733,39 @@ def train(args):
             "cross_agent_reference_selector_train_in_graph": (
                 bool(getattr(args, "cross_agent_reference_selector_train_in_graph"))
                 if getattr(args, "cross_agent_reference_selector_train_in_graph", None) is not None
-                else str(getattr(args, "cross_agent_reference_selector_mode", "hard") or "hard") != "closed_loop_team_head_tail"
+                else True
             ),
-            "cross_agent_reference_selector_alpha": _arg_float("cross_agent_reference_selector_alpha", 0.7),
-            "cross_agent_reference_selector_q_tau": _arg_float("cross_agent_reference_selector_q_tau", 500.0),
             "cross_agent_reference_selector_lr": _arg_float("cross_agent_reference_selector_lr", 1e-4),
             "cross_agent_reference_selector_hidden": str(getattr(args, "cross_agent_reference_selector_hidden", "128,64") or "128,64"),
-            "cross_agent_reference_selector_init_logit": _arg_float("cross_agent_reference_selector_init_logit", -2.0),
+            "cross_agent_reference_selector_init_logit": _arg_float("cross_agent_reference_selector_init_logit", 0.0),
             "cross_agent_reference_selector_adv_clip": _arg_float("cross_agent_reference_selector_adv_clip", 5.0),
-            "cross_agent_reference_selector_reward_tau": _arg_float("cross_agent_reference_selector_reward_tau", 500.0),
-            "cross_agent_reference_selector_reward_tiebreak": _arg_float("cross_agent_reference_selector_reward_tiebreak", 0.05),
-            "cross_agent_reference_selector_success_stable_window": int(getattr(args, "cross_agent_reference_selector_success_stable_window", 100) or 100),
-            "cross_agent_reference_selector_success_stable_delta": _arg_float("cross_agent_reference_selector_success_stable_delta", 0.02),
-            "cross_agent_reference_selector_success_stable_min_rate": _arg_float("cross_agent_reference_selector_success_stable_min_rate", 0.05),
-            "cross_agent_reference_selector_success_stable_min_episodes": int(getattr(args, "cross_agent_reference_selector_success_stable_min_episodes", 200) or 200),
-            "cross_agent_reference_selector_success_ramp_episodes": int(getattr(args, "cross_agent_reference_selector_success_ramp_episodes", 50) or 50),
-            "cross_agent_reference_closed_loop_feedback_weight": _arg_float("cross_agent_reference_closed_loop_feedback_weight", 0.15),
-            "cross_agent_reference_closed_loop_use_q_advantage": bool(getattr(args, "cross_agent_reference_closed_loop_use_q_advantage", False)),
-            "cross_agent_reference_team_target_two_plus": _arg_float("cross_agent_reference_team_target_two_plus", 0.30),
-            "cross_agent_reference_team_target_single_near": _arg_float("cross_agent_reference_team_target_single_near", 0.25),
-            "cross_agent_reference_team_target_single_safe": _arg_float("cross_agent_reference_team_target_single_safe", 0.20),
-            "cross_agent_reference_team_target_safe_near": _arg_float("cross_agent_reference_team_target_safe_near", 0.15),
-            "cross_agent_reference_team_target_progress": _arg_float("cross_agent_reference_team_target_progress", 0.05),
-            "cross_agent_reference_feedback_two_plus_weight": _arg_float("cross_agent_reference_feedback_two_plus_weight", 0.20),
-            "cross_agent_reference_feedback_any_weight": _arg_float("cross_agent_reference_feedback_any_weight", 0.05),
-            "cross_agent_reference_feedback_progress_weight": _arg_float("cross_agent_reference_feedback_progress_weight", 0.05),
+            "cross_agent_reference_advantage_ema_decay": _arg_float(
+                "cross_agent_reference_advantage_ema_decay",
+                0.99,
+            ),
+            "cross_agent_reference_advantage_epsilon": _arg_float(
+                "cross_agent_reference_advantage_epsilon",
+                1e-6,
+            ),
+            "cross_agent_reference_advantage_initial_scale": _arg_float(
+                "cross_agent_reference_advantage_initial_scale",
+                1.0,
+            ),
+            "cross_agent_reference_selector_state_schema_version": int(
+                SELECTOR_STATE_SCHEMA_VERSION
+            ),
+            "cross_agent_reference_selector_feature_schema_version": int(
+                SELECTOR_FEATURE_SCHEMA_VERSION
+            ),
+            "reward_version": str(
+                os.getenv("REWARD_VERSION", os.getenv("reward_version", "v1")) or "v1"
+            ).strip(),
+            "reward_terminal_order_fix": _env_bool("REWARD_TERMINAL_ORDER_FIX", True),
         }
 
     args.training_environment_config = _capture_training_environment_config()
     args.training_hyperparameters_config = _capture_training_hyperparameters_config()
+    args._checkpoint_resume_config = _capture_checkpoint_resume_config(args)
 
     # 运行目录：为每次训练创建独立的时间戳目录，避免与历史运行混淆
     try:
@@ -18479,6 +20812,53 @@ def train(args):
 
     # 配置GPU
     use_gpu = configure_gpu()
+    try:
+        training_physical_gpus = tf.config.list_physical_devices('GPU')
+    except Exception:
+        training_physical_gpus = []
+    try:
+        training_logical_gpus = tf.config.list_logical_devices('GPU')
+    except Exception:
+        training_logical_gpus = []
+    training_require_gpu = _env_flag_enabled(
+        'MATD3_REQUIRE_GPU',
+        default=False,
+    )
+    training_device_info = {
+        'python': sys.executable,
+        'cuda_visible_devices': os.getenv('CUDA_VISIBLE_DEVICES', '<unset>'),
+        'physical_gpus': len(training_physical_gpus),
+        'logical_gpus': len(training_logical_gpus),
+        'physical_gpu_names': [
+            getattr(gpu, 'name', str(gpu))
+            for gpu in training_physical_gpus
+        ],
+        'logical_gpu_names': [
+            getattr(gpu, 'name', str(gpu))
+            for gpu in training_logical_gpus
+        ],
+        'configure_gpu': 'ok' if use_gpu else 'fallback_cpu',
+        'require_gpu': bool(training_require_gpu),
+    }
+    training_device_info = _record_training_device_info(
+        args,
+        training_device_info,
+    )
+    print(
+        "[Train Device] "
+        f"python={sys.executable} | "
+        f"CUDA_VISIBLE_DEVICES={training_device_info['cuda_visible_devices']} | "
+        f"physical_gpus={len(training_physical_gpus)} | "
+        f"logical_gpus={len(training_logical_gpus)} | "
+        f"require_gpu={bool(training_require_gpu)}"
+    )
+    if training_require_gpu and (
+        not training_physical_gpus or not training_logical_gpus
+    ):
+        raise RuntimeError(
+            "MATD3_REQUIRE_GPU=1，但 TensorFlow 未检测到物理和逻辑 GPU；"
+            "已拒绝继续用 CPU 跑正式训练。"
+        )
 
     # XLA 全局JIT（不改变训练内容，仅切换后端执行方式）
     try:
@@ -18560,6 +20940,7 @@ def train(args):
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
             print(f"✅ 启用势场力特征: PF作为独立输入（类似FR），obs维度保持 {obs_shapes}，PF维度={args.pf_feature_dim}")
     action_dims = [7] * n_agents  # 7维动作空间
+    args.base_action_dims = list(action_dims)
     try:
         current_level = int(getattr(args, 'terrain_complexity_level', 1))
         if not quiet_output:
@@ -18856,7 +21237,14 @@ def train(args):
                             critic_lr_var.assign(tf.cast(new_critic_lr, tf.float32))
                         except Exception:
                             pass
-                    _safe_set_lr(agent['critic_optimizer'], critic_lr_var, new_critic_lr)
+                    critic_optimizer_keys = (
+                        ('critic_optimizer',)
+                        if 'critic_optimizer' in agent
+                        else ('critic1_optimizer', 'critic2_optimizer')
+                    )
+                    for optimizer_key in critic_optimizer_keys:
+                        if optimizer_key in agent:
+                            _safe_set_lr(agent[optimizer_key], critic_lr_var, new_critic_lr)
             curriculum_lr_reduced = True
             if not quiet_output:
                 tqdm.write(f"📉 学习率已降低到原来的 {curriculum_lr_factor*100:.0f}%（仅首次课程切换执行）", file=tqdm_file)
@@ -18870,7 +21258,13 @@ def train(args):
             if not curriculum_reset_optimizer:
                 return
             for agent in maddpg.agents:
-                for opt_key in ('actor_optimizer', 'critic_optimizer'):
+                for opt_key in (
+                    'actor_optimizer',
+                    'critic_optimizer',
+                    'critic1_optimizer',
+                    'critic2_optimizer',
+                    'reference_selector_optimizer',
+                ):
                     optimizer = agent.get(opt_key, None)
                     if optimizer is None:
                         continue
@@ -18918,6 +21312,7 @@ def train(args):
     episode_force_ratios = []  # 🔧 新增：记录每个回合的FR值
     # 🔧 新增：记录每个回合结束时的探索噪声强度（OU噪声标准差）
     noise_scale_var_history = []
+    actual_noise_std_history = []
     actor_losses_history = []  # 添加actor loss历史
     critic_losses_history = []  # 添加critic loss历史
     best_reward = -np.inf
@@ -18991,30 +21386,40 @@ def train(args):
     if checkpoint_path or resume_training:
         # 确定检查点路径
         if checkpoint_path:
-            checkpoint_dir = checkpoint_path
+            checkpoint_dir = os.path.realpath(os.path.abspath(str(checkpoint_path)))
+            if not os.path.isdir(checkpoint_dir):
+                raise FileNotFoundError(f"指定的检查点目录不存在: {checkpoint_dir}")
         elif resume_training:
-            # 自动查找最新的检查点
-            checkpoint_dir = os.path.join("models", args.exp_name, "checkpoint")
-            if not os.path.exists(checkpoint_dir):
-                # 尝试查找其他可能的检查点位置
-                final_dir = os.path.join("models", args.exp_name, "final")
-                if os.path.exists(final_dir):
-                    checkpoint_dir = final_dir
-                    print(f"⚠️  未找到checkpoint目录，使用final目录: {checkpoint_dir}")
-                else:
-                    print(f"⚠️  未找到检查点，将从episode 0开始训练")
-                    checkpoint_dir = None
-            else:
-                print(f"✅ 找到检查点目录: {checkpoint_dir}")
+            # --resume 表示恢复训练状态，不能退化成随机初始化或仅加载 final 权重。
+            checkpoint_dir = os.path.realpath(
+                os.path.abspath(os.path.join("models", args.exp_name, "checkpoint"))
+            )
+            if not os.path.isdir(checkpoint_dir):
+                raise FileNotFoundError(
+                    f"--resume 请求的检查点目录不存在: {checkpoint_dir}"
+                )
+            print(f"✅ 找到检查点目录: {checkpoint_dir}")
 
-        if checkpoint_dir and os.path.exists(checkpoint_dir):
+        if checkpoint_dir:
             # 加载检查点状态
             checkpoint_state_file = os.path.join(checkpoint_dir, "checkpoint_state.json")
             if os.path.exists(checkpoint_state_file):
                 try:
                     with open(checkpoint_state_file, 'r', encoding='utf-8') as f:
                         checkpoint_state = json.load(f)
-                    start_episode = checkpoint_state.get('episode', 0)
+                    resume_completed_episodes, legacy_best_off_by_one = (
+                        _resolve_checkpoint_completed_episodes(checkpoint_state)
+                    )
+                    _validate_checkpoint_resume_contract(
+                        checkpoint_state,
+                        args._checkpoint_resume_config,
+                    )
+                    start_episode = int(resume_completed_episodes)
+                    if legacy_best_off_by_one:
+                        print(
+                            "⚠️  识别到旧版 best_by_team_sr 的零基回合字段；"
+                            f"已用一致的历史长度规范化为 {start_episode} 个已完成回合"
+                        )
                     episode_rewards = checkpoint_state.get('episode_rewards', [])
                     episode_force_ratios = checkpoint_state.get('episode_force_ratios', [])
                     best_reward = checkpoint_state.get('best_reward', -np.inf)
@@ -19039,6 +21444,7 @@ def train(args):
                     actor_losses_history = checkpoint_state.get('actor_losses_history', [])
                     critic_losses_history = checkpoint_state.get('critic_losses_history', [])
                     noise_scale_var_history = checkpoint_state.get('noise_scale_var_history', [])
+                    actual_noise_std_history = checkpoint_state.get('actual_noise_std_history', [])
                     try:
                         maddpg.training_stats['best_reward'] = float(best_reward)
                         maddpg.training_stats['best_episode'] = int(best_episode)
@@ -19053,27 +21459,6 @@ def train(args):
                     maddpg._episode_agent_success_flags = list(restored_agent_success_flags)
                     maddpg._episode_team_success_flags = list(restored_team_success_flags)
                     total_success_count = int(sum(restored_team_success_flags)) if restored_team_success_flags else 0
-
-                    completed_episode_candidates = [int(start_episode)]
-                    for seq in (
-                        episode_rewards,
-                        episode_force_ratios,
-                        restored_team_success_flags,
-                        restored_success_flags,
-                    ):
-                        try:
-                            completed_episode_candidates.append(len(seq))
-                        except Exception:
-                            pass
-                    resume_completed_episodes = max(0, max(completed_episode_candidates))
-                    if resume_completed_episodes != int(start_episode):
-                        print(
-                            f"   - 续训对齐: 以已完成回合数 {resume_completed_episodes} 作为起始回合 "
-                            f"(checkpoint episode={start_episode})"
-                        )
-                        start_episode = int(resume_completed_episodes)
-                    else:
-                        resume_completed_episodes = int(start_episode)
                     if resume_completed_episodes > 0:
                         setattr(args, '_resume_fr_schedule_start_episode', int(resume_completed_episodes))
                         try:
@@ -19082,6 +21467,49 @@ def train(args):
                             )
                         except Exception:
                             pass
+                        try:
+                            loaded_total_steps = checkpoint_state.get('total_steps', None)
+                            if loaded_total_steps is None:
+                                loaded_total_steps = int(resume_completed_episodes) * int(getattr(args, 'episode_length', 0))
+                            loaded_total_steps = max(0, int(loaded_total_steps))
+                            maddpg.training_stats['total_steps'] = loaded_total_steps
+                            if hasattr(maddpg, 'total_steps_var'):
+                                maddpg.total_steps_var.assign(tf.cast(loaded_total_steps, tf.int64))
+                            noise_runtime_state = checkpoint_state.get('behavior_noise_runtime_state')
+                            if noise_runtime_state is not None:
+                                _restore_behavior_noise_runtime_state(maddpg, noise_runtime_state)
+                        except Exception as runtime_state_exc:
+                            raise RuntimeError("检查点运行期步数/噪声状态恢复失败") from runtime_state_exc
+
+                    adaptive_runtime_state = checkpoint_state.get('adaptive_learning_runtime_state')
+                    if isinstance(adaptive_runtime_state, dict):
+                        maddpg.adaptive_learning['consecutive_no_improve'] = int(
+                            adaptive_runtime_state.get('consecutive_no_improve', 0)
+                        )
+                        saved_reward_history = adaptive_runtime_state.get('reward_history')
+                        if isinstance(saved_reward_history, list):
+                            maddpg.adaptive_learning['reward_history'] = [
+                                float(value) for value in saved_reward_history[-1000:]
+                                if np.isfinite(float(value))
+                            ]
+                        saved_plateau_stats = adaptive_runtime_state.get('last_plateau_stats')
+                        if isinstance(saved_plateau_stats, dict):
+                            maddpg.adaptive_learning['last_plateau_stats'] = dict(saved_plateau_stats)
+                        saved_lr_state = adaptive_runtime_state.get('agent_learning_rate_runtime_state')
+                        if saved_lr_state is not None:
+                            _restore_learning_rate_runtime_state(maddpg, saved_lr_state)
+                        saved_total_it = adaptive_runtime_state.get('total_it')
+                        if saved_total_it is not None:
+                            saved_total_it = int(saved_total_it)
+                            if saved_total_it < 0:
+                                raise ValueError("checkpoint total_it must be non-negative")
+                            maddpg.total_it = saved_total_it
+                        saved_train_steps = adaptive_runtime_state.get('training_train_steps')
+                        if saved_train_steps is not None:
+                            saved_train_steps = int(saved_train_steps)
+                            if saved_train_steps < 0:
+                                raise ValueError("checkpoint training_train_steps must be non-negative")
+                            maddpg.training_stats['train_steps'] = saved_train_steps
 
                     print(f"✅ 成功加载检查点状态:")
                     print(f"   - 起始回合: {start_episode}")
@@ -19106,22 +21534,40 @@ def train(args):
                             print(f"   ⚠️  警告: 检查点显示已完成所有回合，将从episode {start_episode}继续")
                 except Exception as e:
                     print(f"❌ 加载检查点状态失败: {e}")
-                    print(f"   将从episode 0开始训练")
-                    start_episode = 0
-                    resume_completed_episodes = 0
+                    raise RuntimeError(
+                        f"检查点状态损坏或与当前配置不兼容: {checkpoint_state_file}"
+                    ) from e
+            elif resume_training:
+                raise FileNotFoundError(
+                    f"--resume 需要训练状态文件，但未找到: {checkpoint_state_file}"
+                )
+            else:
+                print(
+                    "⚠️  指定目录没有 checkpoint_state.json；"
+                    "本次只严格加载网络权重并从第0回合开始（显式 warm-start）"
+                )
 
             # 加载模型权重
             try:
                 model_path = checkpoint_dir
                 if os.path.exists(os.path.join(model_path, "actor_0.weights.h5")):
                     print(f"🔄 正在加载模型权重从: {model_path}")
-                    maddpg.load_models(model_path)
+                    maddpg.load_models(model_path, strict=True)
                     print(f"✅ 模型权重加载成功")
                 else:
-                    print(f"⚠️  检查点目录中未找到模型权重文件")
+                    raise FileNotFoundError(f"检查点目录中未找到 actor_0.weights.h5: {model_path}")
             except Exception as e:
                 print(f"❌ 加载模型权重失败: {e}")
-                print(f"   将使用随机初始化的模型")
+                raise RuntimeError(
+                    f"请求了检查点续训，但模型权重未完整加载: {checkpoint_dir}"
+                ) from e
+
+    # 正式批次默认只保留完整 algorithm×seed；模型候选仍可保存，但不写
+    # episode 级续训状态，也不维护滚动 checkpoint 副本。
+    save_training_resume_state = _env_flag_enabled(
+        "SAVE_TRAINING_RESUME_STATE",
+        default=True,
+    )
 
     # 🔧 新增：检查点保存函数
     def save_checkpoint(episode, checkpoint_name="checkpoint"):
@@ -19132,15 +21578,11 @@ def train(args):
         checkpoint_dir = os.path.join("models", args.exp_name, checkpoint_name)
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # 保存模型权重
-        try:
-            maddpg.save_models(checkpoint_dir)
-        except Exception as e:
-            print(f"⚠️  保存模型权重失败: {e}")
-
         # 保存训练状态
         checkpoint_state = {
-            'episode': episode,
+            'checkpoint_state_schema_version': CHECKPOINT_STATE_SCHEMA_VERSION,
+            'resume_config': _make_json_safe(args._checkpoint_resume_config),
+            'episode': int(episode),
             'episode_rewards': episode_rewards,
             'episode_force_ratios': episode_force_ratios,
             'best_reward': float(best_reward),
@@ -19158,19 +21600,69 @@ def train(args):
             'actor_losses_history': actor_losses_history,
             'critic_losses_history': critic_losses_history,
             'noise_scale_var_history': noise_scale_var_history,
+            'actual_noise_std_history': actual_noise_std_history,
+            'total_steps': int(getattr(maddpg, 'training_stats', {}).get('total_steps', 0)),
+            'behavior_noise_runtime_state': _capture_behavior_noise_runtime_state(maddpg),
+            'adaptive_learning_runtime_state': {
+                'consecutive_no_improve': int(maddpg.adaptive_learning.get('consecutive_no_improve', 0)),
+                'reward_history': [
+                    float(value) for value in maddpg.adaptive_learning.get('reward_history', [])[-1000:]
+                    if np.isfinite(float(value))
+                ],
+                'last_plateau_stats': _make_json_safe(
+                    maddpg.adaptive_learning.get('last_plateau_stats', {})
+                ),
+                'total_it': int(getattr(maddpg, 'total_it', 0)),
+                'training_train_steps': int(
+                    getattr(maddpg, 'training_stats', {}).get('train_steps', 0)
+                ),
+                'agent_learning_rate_runtime_state': _capture_learning_rate_runtime_state(maddpg),
+            },
             'train_episodes': int(args.train_episodes),
             'exp_name': args.exp_name,
+            'obstacle_observation_mode': normalize_obstacle_observation_mode(
+                getattr(args, 'obstacle_observation_mode', 'nearest_surface')
+            ),
+            'obstacle_risk_velocity_forward_weight': float(
+                4.0 if getattr(args, 'obstacle_risk_velocity_forward_weight', None) is None
+                else getattr(args, 'obstacle_risk_velocity_forward_weight')
+            ),
+            'obstacle_risk_goal_along_weight': float(
+                3.0 if getattr(args, 'obstacle_risk_goal_along_weight', None) is None
+                else getattr(args, 'obstacle_risk_goal_along_weight')
+            ),
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
 
+        # 在覆盖任何已有权重前验证状态内部一致性。这样调用方若错误地传入
+        # 零基 episode 或漏写某条历史，不会留下“新权重 + 旧状态”的目录。
+        _resolve_checkpoint_completed_episodes(checkpoint_state)
+        _validate_checkpoint_resume_contract(
+            checkpoint_state,
+            args._checkpoint_resume_config,
+        )
+
+        # 保存模型权重
+        try:
+            maddpg.save_models(checkpoint_dir)
+        except Exception as e:
+            raise RuntimeError(f"保存检查点模型权重失败: {checkpoint_dir}") from e
+
         checkpoint_state_file = os.path.join(checkpoint_dir, "checkpoint_state.json")
+        if not save_training_resume_state:
+            try:
+                if os.path.exists(checkpoint_state_file):
+                    os.unlink(checkpoint_state_file)
+            except Exception as e:
+                raise RuntimeError(f"清理已禁用的旧续训状态失败: {checkpoint_state_file}") from e
+            return
         try:
             with open(checkpoint_state_file, 'w', encoding='utf-8') as f:
                 json.dump(checkpoint_state, f, ensure_ascii=False, indent=2)
             if not quiet_output and episode % 50 == 0:  # 每50回合输出一次
-                print(f"💾 检查点已保存: {checkpoint_dir} (episode {episode+1})")
+                print(f"💾 检查点已保存: {checkpoint_dir} (已完成 {episode} 回合)")
         except Exception as e:
-            print(f"⚠️  保存检查点状态失败: {e}")
+            raise RuntimeError(f"保存检查点状态失败: {checkpoint_state_file}") from e
 
     # 配置进度显示输出与行为（支持环境变量控制）
     try:
@@ -19784,25 +22276,27 @@ def train(args):
         # 注意：障碍物生成由场景类的reset_world方法根据USE_DYNAMIC_OBSTACLES环境变量自动处理
 
         # 噪声重启机制：每N回合重启噪声，避免陷入局部解（N<=0 时关闭）
-        noise_restart_interval = int(os.getenv('NOISE_RESTART_INTERVAL', '200'))
+        # Keep the direct Python entry point identical to the recorded/wrapper
+        # default.  The previous fallback (200) disagreed with both
+        # training_hyperparameters and run_optimized.sh (25), so a run started
+        # without the wrapper could report a restart interval it did not use.
+        noise_restart_interval = _resolve_noise_restart_interval()
         if noise_restart_interval > 0 and episode > 0 and (episode % noise_restart_interval) == 0:
             if not quiet_output:
                 tqdm.write(f"🔄 噪声重启：第{episode+1}回合，重置探索噪声", file=tqdm_file)
 
-            # 正确的噪声重启方式：重置噪声参数
             try:
-                # 重置噪声尺度到初始值
-                original_noise_scale = float(os.getenv('NOISE_SCALE', '0.6'))
-                args.noise_scale = original_noise_scale
-
-                # 重置噪声衰减计数器（如果存在）
-                if hasattr(maddpg, '_noise_restart_count'):
-                    maddpg._noise_restart_count = 0
-                else:
-                    maddpg._noise_restart_count = 0
+                # 使用解析后的 CLI 初值，统一更新调度锚点、运行期变量和 OU 状态。
+                original_noise_scale = float(getattr(maddpg, 'initial_behavior_noise_scale', 0.0))
+                restored_noise_scale = _assign_behavior_noise_scale(
+                    maddpg,
+                    original_noise_scale,
+                    reanchor_schedule=True,
+                    reset_state=True,
+                )
 
                 if not quiet_output:
-                    tqdm.write(f"✅ 噪声重启成功：噪声尺度重置为 {original_noise_scale}", file=tqdm_file)
+                    tqdm.write(f"✅ 噪声重启成功：实际噪声尺度重置为 {restored_noise_scale}", file=tqdm_file)
 
             except Exception as e:
                 if not quiet_output:
@@ -19943,6 +22437,13 @@ def train(args):
             processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
         else:
             processed_obs = maddpg.obs_processor.batch_process_observations_parallel(obs_n)
+        _validate_training_observation_batch(
+            processed_obs,
+            expected_envs=env.num_envs,
+            expected_agents=n_agents,
+            expected_obs_dim=max(obs_shapes),
+            context=f"episode {episode + 1} reset",
+        )
 
         # 🔧 性能优化1：预先缓存方法判断，避免每步重复（提升2-3%）
         _use_vectorized_actions = hasattr(maddpg, 'batch_select_actions_vectorized')
@@ -19971,10 +22472,6 @@ def train(args):
         # 🚨 初始化episode级别的d_min收集列表（根据图片定义：D_min^(k) = min_{i ∈ I} min_{t ∈ [1,T]} d_i,t^min）
         # 每步收集所有智能体的d_min_current，确保数据完整性
         episode_d_min_all_timesteps = []  # 存储所有时间步的所有智能体的d_min_current
-        # 🔧 性能优化：在每个episode开始时初始化缓存，避免跨episode污染
-        # 注意：这些变量是episode级别的，每个episode都会重新初始化
-        _cached_env_structure = None
-        _cached_agents_list = None  # 🔧 性能优化：缓存agents列表，避免每步重复访问
         pending_single_transition = None
         episode_replay_refs_by_env = {}
         cross_ref_goal_distance_idx = int(getattr(maddpg, 'cross_agent_reference_goal_distance_index', 59))
@@ -20488,6 +22985,15 @@ def train(args):
                     next_obs_n, rew_n, done_n, info_n = env.step(actions_for_env)
             else:
                 next_obs_n, rew_n, done_n, info_n = env.step(actions_for_env)
+            # One behavior timestep has completed.  Update immediately so the
+            # next action (and any early-stop checkpoint) sees the true count.
+            if hasattr(maddpg, 'training_stats'):
+                maddpg.training_stats['total_steps'] = int(
+                    maddpg.training_stats.get('total_steps', 0)
+                ) + 1
+            if hasattr(maddpg, 'total_steps_var'):
+                maddpg.total_steps_var.assign_add(tf.constant(1, dtype=tf.int64))
+            total_steps = int(getattr(maddpg, 'training_stats', {}).get('total_steps', total_steps + 1))
             if timing_enabled:
                 _dt_env = _perf_counter() - _t_env0
                 timing_ep['env'] += _dt_env
@@ -20530,71 +23036,63 @@ def train(args):
                 _t_env = (time.time() - _t_env_start) * 1000
                 print(f"[PROFILE] env.step: {_t_env:.1f}ms")
 
-            total_steps += env.num_envs
-
-            # 🚨 每步收集d_min_current（确保数据完整性）
-            # 🔧 性能优化：降低收集频率，从每步改为每10步，减少性能开销
-            # 🔧 性能优化：使用缓存的环境结构和agents列表，避免每步重复检查
-            d_min_collect_interval = 10  # 🔧 性能优化：每10步收集一次，降低开销
-            if (step % d_min_collect_interval == 0) and len(episode_d_min_all_timesteps) < 100000:  # 防止列表过大
+            # 每10步收集所有子环境/所有agent的安全距离。ParallelEnv 从
+            # worker info 读取；单环境保留直接对象回退。
+            d_min_collect_interval = 10
+            if (
+                step % d_min_collect_interval == 0
+                and len(episode_d_min_all_timesteps) < 100000
+            ):
+                d_min_values = []
                 try:
-                    # 🔧 性能优化：只在第一次检查环境结构并缓存
-                    # 🚨 关键修复：确保正确访问环境结构，避免subscriptable错误
-                    if _cached_env_structure is None:
-                        if hasattr(env, 'envs') and isinstance(env.envs, (list, tuple)) and len(env.envs) > 0:
-                            # 安全访问：确保env.envs是列表/元组且不为空
-                            _cached_env_structure = ('parallel', env.envs[0])
-                        elif hasattr(env, 'env') and env.env is not None:
-                            _cached_env_structure = ('wrapped', env.env)
-                        elif hasattr(env, 'world') and env.world is not None:
-                            _cached_env_structure = ('direct', env)
-                        else:
-                            _cached_env_structure = ('none', None)
-
-                    # 🔧 性能优化：使用缓存的环境结构，直接访问
-                    if _cached_env_structure[0] != 'none':
-                        target_env = _cached_env_structure[1]
-                        if target_env is not None:
-                            # 🔧 性能优化：缓存agents列表，避免每步重复访问world.agents
-                            if _cached_agents_list is None:
-                                world = getattr(target_env, 'world', None)
-                                if world is not None:
-                                    _cached_agents_list = getattr(world, 'agents', None)
-
-                            # 🔧 性能优化：直接使用缓存的agents列表
-                            if _cached_agents_list is not None:
-                                # 🔧 性能优化：批量收集，减少异常处理开销
-                                # 使用列表推导式预分配，减少append开销
-                                d_min_values = []
-                                for agent in _cached_agents_list:
-                                    # 🔧 性能优化：直接访问debug_info，减少getattr调用
-                                    debug_info = getattr(agent, 'debug_info', None)
-                                    if debug_info is not None and isinstance(debug_info, dict):
-                                        d_min_current = debug_info.get('d_min_current', None)
-                                        if d_min_current is not None:
-                                            # 🔧 性能优化：简化类型检查和转换
-                                            try:
-                                                # 快速类型判断和转换
-                                                if isinstance(d_min_current, np.ndarray):
-                                                    if d_min_current.size > 0:
-                                                        d_min_val = float(d_min_current.item() if d_min_current.ndim == 0 else d_min_current[-1])
-                                                    else:
-                                                        continue
-                                                else:
-                                                    d_min_val = float(d_min_current)
-
-                                                # 快速检查有效性（使用numpy的isfinite，比Python的isfinite快）
-                                                if np.isfinite(d_min_val):
-                                                    d_min_values.append(d_min_val)
-                                            except (ValueError, TypeError, AttributeError):
-                                                continue
-
-                                # 🔧 性能优化：批量extend，减少多次append的开销
-                                if d_min_values:
-                                    episode_d_min_all_timesteps.extend(d_min_values)
+                    for env_info in list(info_n or []):
+                        rows = (
+                            env_info.get("n", [])
+                            if isinstance(env_info, dict)
+                            else []
+                        )
+                        for agent_info in rows:
+                            if not isinstance(agent_info, dict):
+                                continue
+                            value = _episode_audit_float(
+                                agent_info.get(
+                                    "episode_audit_d_min_current"
+                                ),
+                                default=None,
+                            )
+                            if value is not None:
+                                d_min_values.append(float(value))
                 except Exception:
-                    # 收集失败不影响训练，静默忽略
-                    pass
+                    d_min_values = []
+                if not d_min_values and hasattr(env, "env"):
+                    try:
+                        for agent in list(
+                            getattr(env.env.world, "agents", []) or []
+                        ):
+                            debug_info = (
+                                agent.debug_info
+                                if isinstance(
+                                    getattr(agent, "debug_info", None),
+                                    dict,
+                                )
+                                else {}
+                            )
+                            value = _episode_audit_float(
+                                debug_info.get(
+                                    "d_min_current",
+                                    getattr(
+                                        agent,
+                                        "last_min_distance",
+                                        None,
+                                    ),
+                                ),
+                                default=None,
+                            )
+                            if value is not None:
+                                d_min_values.append(float(value))
+                    except Exception:
+                        pass
+                episode_d_min_all_timesteps.extend(d_min_values)
 
             # 🔧 性能优化：降低轨迹收集频率，从每步改为每10步，减少性能开销
             # 收集轨迹数据（如果启用）
@@ -20644,6 +23142,13 @@ def train(args):
                     processed_next_obs = maddpg.obs_processor.batch_process_observations_vectorized(next_obs_n)
                 else:
                     processed_next_obs = maddpg.obs_processor.batch_process_observations_parallel(next_obs_n)
+            _validate_training_observation_batch(
+                processed_next_obs,
+                expected_envs=env.num_envs,
+                expected_agents=n_agents,
+                expected_obs_dim=max(obs_shapes),
+                context=f"episode {episode + 1} step {step + 1}",
+            )
             if timing_enabled:
                 _dt_obs = _perf_counter() - _t_obs0
                 timing_ep['obs'] += _dt_obs
@@ -21033,6 +23538,7 @@ def train(args):
                 avg_actor_loss = None
                 avg_cross_ref_loss = None
                 avg_cross_ref_valid_ratio = None
+                avg_cross_ref_active = None
                 avg_cross_ref_selector_loss = None
                 avg_cross_ref_selector_score = None
                 avg_cross_ref_y_mix = None
@@ -21045,6 +23551,16 @@ def train(args):
                 avg_cross_ref_advantage_pos_ratio = None
                 avg_cross_ref_selector_success_weight = None
                 avg_cross_ref_actor_weight = None
+                avg_cross_ref_head_twin_agreement_ratio = None
+                avg_cross_ref_tail_twin_agreement_ratio = None
+                avg_cross_ref_head_multiplier = None
+                avg_cross_ref_tail_multiplier = None
+                avg_cross_ref_head_suppressed_ratio = None
+                avg_cross_ref_tail_suppressed_ratio = None
+                avg_cross_ref_head_advantage_ema = None
+                avg_cross_ref_tail_advantage_ema = None
+                avg_cross_ref_selector_gradient_norm = None
+                avg_cross_ref_selector_update_count = None
                 cross_ref_selector_phase = None
                 if losses:
                     avg_critic_loss, avg_actor_loss = _compute_loss_stats(losses)
@@ -21074,6 +23590,9 @@ def train(args):
                         cross_ref_valid_vals = [v for v in cross_ref_valid_vals if np.isfinite(v)]
                         if cross_ref_valid_vals:
                             avg_cross_ref_valid_ratio = float(np.mean(cross_ref_valid_vals))
+                        avg_cross_ref_active = _mean_loss_field(
+                            'cross_ref_active'
+                        )
                         avg_cross_ref_selector_loss = _mean_loss_field('cross_ref_selector_loss')
                         avg_cross_ref_selector_score = _mean_loss_field('cross_ref_selector_score')
                         avg_cross_ref_y_mix = _mean_loss_field('cross_ref_y_mix')
@@ -21086,10 +23605,41 @@ def train(args):
                         avg_cross_ref_advantage_pos_ratio = _mean_loss_field('cross_ref_advantage_pos_ratio')
                         avg_cross_ref_selector_success_weight = _mean_loss_field('cross_ref_selector_success_weight')
                         avg_cross_ref_actor_weight = _mean_loss_field('cross_ref_actor_weight')
+                        avg_cross_ref_head_twin_agreement_ratio = _mean_loss_field(
+                            'cross_ref_head_twin_agreement_ratio'
+                        )
+                        avg_cross_ref_tail_twin_agreement_ratio = _mean_loss_field(
+                            'cross_ref_tail_twin_agreement_ratio'
+                        )
+                        avg_cross_ref_head_multiplier = _mean_loss_field(
+                            'cross_ref_head_multiplier'
+                        )
+                        avg_cross_ref_tail_multiplier = _mean_loss_field(
+                            'cross_ref_tail_multiplier'
+                        )
+                        avg_cross_ref_head_suppressed_ratio = _mean_loss_field(
+                            'cross_ref_head_suppressed_ratio'
+                        )
+                        avg_cross_ref_tail_suppressed_ratio = _mean_loss_field(
+                            'cross_ref_tail_suppressed_ratio'
+                        )
+                        avg_cross_ref_head_advantage_ema = _mean_loss_field(
+                            'cross_ref_head_advantage_ema'
+                        )
+                        avg_cross_ref_tail_advantage_ema = _mean_loss_field(
+                            'cross_ref_tail_advantage_ema'
+                        )
+                        avg_cross_ref_selector_gradient_norm = _mean_loss_field(
+                            'cross_ref_selector_gradient_norm'
+                        )
+                        avg_cross_ref_selector_update_count = _mean_loss_field(
+                            'cross_ref_selector_update_count'
+                        )
                         cross_ref_selector_phase = str(getattr(maddpg, '_last_cross_ref_selector_success_phase', 'reward'))
                     except Exception:
                         avg_cross_ref_loss = None
                         avg_cross_ref_valid_ratio = None
+                        avg_cross_ref_active = None
                         avg_cross_ref_selector_loss = None
                         avg_cross_ref_selector_score = None
                         avg_cross_ref_y_mix = None
@@ -21102,6 +23652,16 @@ def train(args):
                         avg_cross_ref_advantage_pos_ratio = None
                         avg_cross_ref_selector_success_weight = None
                         avg_cross_ref_actor_weight = None
+                        avg_cross_ref_head_twin_agreement_ratio = None
+                        avg_cross_ref_tail_twin_agreement_ratio = None
+                        avg_cross_ref_head_multiplier = None
+                        avg_cross_ref_tail_multiplier = None
+                        avg_cross_ref_head_suppressed_ratio = None
+                        avg_cross_ref_tail_suppressed_ratio = None
+                        avg_cross_ref_head_advantage_ema = None
+                        avg_cross_ref_tail_advantage_ema = None
+                        avg_cross_ref_selector_gradient_norm = None
+                        avg_cross_ref_selector_update_count = None
                         cross_ref_selector_phase = None
                     # 🔧 记录最近一次平均loss，用于进度条实时展示
                     last_avg_actor_loss = avg_actor_loss
@@ -21115,6 +23675,7 @@ def train(args):
                         'actor_loss': avg_actor_loss,
                         'cross_ref_loss': avg_cross_ref_loss,
                         'cross_ref_valid_ratio': avg_cross_ref_valid_ratio,
+                        'cross_ref_active': avg_cross_ref_active,
                         'cross_ref_selector_loss': avg_cross_ref_selector_loss,
                         'cross_ref_selector_score': avg_cross_ref_selector_score,
                         'cross_ref_y_mix': avg_cross_ref_y_mix,
@@ -21127,6 +23688,16 @@ def train(args):
                         'cross_ref_advantage_pos_ratio': avg_cross_ref_advantage_pos_ratio,
                         'cross_ref_selector_success_weight': avg_cross_ref_selector_success_weight,
                         'cross_ref_actor_weight': avg_cross_ref_actor_weight,
+                        'cross_ref_head_twin_agreement_ratio': avg_cross_ref_head_twin_agreement_ratio,
+                        'cross_ref_tail_twin_agreement_ratio': avg_cross_ref_tail_twin_agreement_ratio,
+                        'cross_ref_head_multiplier': avg_cross_ref_head_multiplier,
+                        'cross_ref_tail_multiplier': avg_cross_ref_tail_multiplier,
+                        'cross_ref_head_suppressed_ratio': avg_cross_ref_head_suppressed_ratio,
+                        'cross_ref_tail_suppressed_ratio': avg_cross_ref_tail_suppressed_ratio,
+                        'cross_ref_head_advantage_ema': avg_cross_ref_head_advantage_ema,
+                        'cross_ref_tail_advantage_ema': avg_cross_ref_tail_advantage_ema,
+                        'cross_ref_selector_gradient_norm': avg_cross_ref_selector_gradient_norm,
+                        'cross_ref_selector_update_count': avg_cross_ref_selector_update_count,
                         'cross_ref_selector_phase': cross_ref_selector_phase,
                     })
                     # 🔧 新增：同时追加到可视化用的loss历史列表
@@ -21351,124 +23922,85 @@ def train(args):
             except Exception as e:
                 raise RuntimeError(f"当前训练主线的回合末单环境回放补写失败: {e}") from e
         episode_final_goal_distance_matrix = _extract_goal_distance_matrix(processed_obs)
+        if not hasattr(env, "get_episode_audit_snapshots"):
+            raise RuntimeError(
+                "训练环境缺少 get_episode_audit_snapshots()，"
+                "无法核验并行环境的成功和碰撞标签"
+            )
+        try:
+            episode_audit_snapshots = _validate_episode_audit_snapshots(
+                env.get_episode_audit_snapshots(),
+                expected_envs=int(env.num_envs),
+                expected_agents=int(n_agents),
+            )
+        except Exception as audit_exc:
+            raise RuntimeError(
+                f"回合{episode + 1}并行环境审计快照读取失败: {audit_exc}"
+            ) from audit_exc
 
         # 打印奖励调试信息
         if not quiet_output:
             avg_step_reward = np.mean(step_rewards) if step_rewards else 0
             tqdm.write(f"📊 回合 {episode+1} 奖励分析: 平均单步奖励={avg_step_reward:.2f}", file=tqdm_file)
 
-        # 记录回合奖励：改为该回合奖励最佳的子环境
+        # 模型选择和训练曲线使用所有并行环境的等权均值；最佳子环境索引
+        # 只用于轨迹可视化，不能进入模型优劣判断。
         best_env_idx_this_ep = int(np.argmax(per_env_cum_rewards)) if env.num_envs > 0 else 0
-        avg_episode_reward = float(per_env_cum_rewards[best_env_idx_this_ep])
+        avg_episode_reward = float(np.mean(per_env_cum_rewards))
         episode_rewards.append(avg_episode_reward)
+        if not hasattr(maddpg, "_episode_rewards_per_env"):
+            maddpg._episode_rewards_per_env = []
+        maddpg._episode_rewards_per_env.append(
+            [float(value) for value in per_env_cum_rewards.tolist()]
+        )
 
         # 🔧 新增：记录当前回合的FR值
         current_fr = float(getattr(args, 'action_force_ratio', 0.0))
         episode_force_ratios.append(current_fr)
 
-        # 🔧 收集回合统计信息：碰撞次数和min_distance_to_obstacle
-        # 🚨 关键修复：从所有环境收集数据，而不是只从best_env收集
-        # 因为碰撞可能发生在任何环境中，只从best_env收集会导致统计不准确
-        episode_collision_counts = []
-        episode_min_distances = []
-        episode_terrain_total = 0   # 本回合地形碰撞次数汇总（仅显示）
-        episode_obstacle_total = 0  # 本回合球形障碍碰撞次数汇总（仅显示）
-        try:
-            # 🚨 关键修复：每次episode结束时重新检查环境结构，不使用训练循环中的缓存
-            # 因为训练循环中的缓存可能指向第一个环境，而我们需要检查所有环境
-            envs_to_check = []
-            if hasattr(env, 'envs') and isinstance(getattr(env, 'envs'), (list, tuple)) and len(env.envs) > 0:
-                # ParallelEnv: 遍历所有子环境
-                for env_idx, single_env in enumerate(env.envs):
-                    envs_to_check.append((env_idx, single_env))
-            elif hasattr(env, 'env'):
-                # SingleEnvWrapper: 直接使用包装的环境
-                envs_to_check.append((0, env.env))
-            elif hasattr(env, 'world'):
-                # 直接是 MultiAgentEnv: 直接使用
-                envs_to_check.append((0, env))
-
-            # 🔧 修复：遍历所有环境，收集所有智能体的碰撞数据
-            for env_idx, single_env in envs_to_check:
-                if hasattr(single_env, 'world') and hasattr(single_env.world, 'agents'):
-                    for agent in single_env.world.agents:
-                            # 收集碰撞次数（穿透次数）
-                            penetration_count = 0
-                            debug_info_exists = hasattr(agent, 'debug_info')
-                            debug_info_is_dict = debug_info_exists and isinstance(agent.debug_info, dict)
-                            if debug_info_is_dict:
-                                penetration_count = agent.debug_info.get('total_penetration_count', 0)
-                                # 🚨 关键修复：处理NaN和无效值
-                                try:
-                                    penetration_count = int(penetration_count) if np.isfinite(penetration_count) else 0
-                                except (ValueError, TypeError, OverflowError):
-                                    penetration_count = 0
-                            else:
-                                penetration_count = 0
-                            # 🚨 调试：输出详细信息，帮助诊断为什么碰撞计数为0
-                            if episode < 5 or (episode % 10 == 0):
-                                if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                                    print(f"[调试] 回合{episode+1} Env{env_idx} Agent: debug_info存在={debug_info_exists}, "
-                                          f"是字典={debug_info_is_dict}, 穿透计数={penetration_count}, "
-                                          f"agent类型={type(agent).__name__}, "
-                                          f"debug_info内容={list(agent.debug_info.keys()) if debug_info_is_dict else 'N/A'}")
-                            # 🚨 关键修复：记录所有智能体的碰撞数（包括0），确保汇总正确
-                            # 原因：用户要求记录每回合内三个智能体碰撞数汇总，即使某个智能体碰撞数为0也要记录
-                            episode_collision_counts.append(penetration_count)
-                            # 收集地形/球形分项碰撞（仅显示用，无则视为0）
-                            if debug_info_is_dict:
-                                tcnt = agent.debug_info.get('terrain_penetration_count', 0)
-                                ocnt = agent.debug_info.get('obstacle_collision_count', 0)
-                                try:
-                                    tcnt = int(tcnt) if np.isfinite(tcnt) else 0
-                                    ocnt = int(ocnt) if np.isfinite(ocnt) else 0
-                                except (ValueError, TypeError, OverflowError):
-                                    tcnt = ocnt = 0
-                                episode_terrain_total += tcnt
-                                episode_obstacle_total += ocnt
-
-                            # 收集min_distance_to_obstacle
-                            min_dist = None
-                            # 🚨 关键修复：优先从debug_info获取（向量化场景中会更新这个值）
-                            if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
-                                min_dist = agent.debug_info.get('d_min_current', None)
-                                if min_dist is not None:
-                                    try:
-                                        # 处理numpy数组情况
-                                        if isinstance(min_dist, np.ndarray):
-                                            if min_dist.size > 0:
-                                                min_dist = float(min_dist[-1] if min_dist.ndim > 0 else min_dist.item())
-                                            else:
-                                                min_dist = None
-                                        else:
-                                            min_dist = float(min_dist)
-                                    except (ValueError, TypeError, AttributeError):
-                                        min_dist = None
-
-                            # 如果debug_info中没有，尝试从last_min_distance获取
-                            if min_dist is None and hasattr(agent, 'last_min_distance') and agent.last_min_distance is not None:
-                                try:
-                                    # 🚨 关键修复：处理numpy数组情况（向量化场景中last_min_distance可能是数组）
-                                    last_min_dist = agent.last_min_distance
-                                    if isinstance(last_min_dist, np.ndarray):
-                                        # 如果是数组，取最后一个值（当前时刻的值）
-                                        if last_min_dist.size > 0:
-                                            min_dist = float(last_min_dist[-1] if last_min_dist.ndim > 0 else last_min_dist.item())
-                                        else:
-                                            min_dist = None
-                                    else:
-                                        min_dist = float(last_min_dist)
-                                except (ValueError, TypeError, AttributeError):
-                                    min_dist = None
-
-                            if min_dist is not None and np.isfinite(min_dist):
-                                # 🚨 关键修复：允许负值（表示穿透），但过滤无效值
-                                episode_min_distances.append(min_dist)
-        except Exception as e:
-            # 🔧 调试：输出异常信息，帮助诊断问题
-            if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1','true','yes','on')):
-                print(f"[警告] 收集碰撞统计信息时出错: {e}")
-            pass
+        # 每个统计量先保留环境维度，再做等权聚合。这样训练曲线仍然
+        # 与 train_episodes 一一对应，同时原始 E×A 结果可供实验审计。
+        collision_matrix = np.asarray(
+            [
+                snapshot["agent_collision_counts"]
+                for snapshot in episode_audit_snapshots
+            ],
+            dtype=np.float64,
+        )
+        terrain_collision_matrix = np.asarray(
+            [
+                snapshot["agent_terrain_collision_counts"]
+                for snapshot in episode_audit_snapshots
+            ],
+            dtype=np.float64,
+        )
+        obstacle_collision_matrix = np.asarray(
+            [
+                snapshot["agent_obstacle_collision_counts"]
+                for snapshot in episode_audit_snapshots
+            ],
+            dtype=np.float64,
+        )
+        episode_collision_counts = [
+            float(value) for value in np.mean(collision_matrix, axis=0).tolist()
+        ]
+        episode_collision_totals_by_env = np.sum(
+            collision_matrix, axis=1
+        ).astype(np.float64)
+        episode_terrain_totals_by_env = np.sum(
+            terrain_collision_matrix, axis=1
+        ).astype(np.float64)
+        episode_obstacle_totals_by_env = np.sum(
+            obstacle_collision_matrix, axis=1
+        ).astype(np.float64)
+        episode_terrain_total = float(np.mean(episode_terrain_totals_by_env))
+        episode_obstacle_total = float(np.mean(episode_obstacle_totals_by_env))
+        episode_min_distances = [
+            float(value)
+            for snapshot in episode_audit_snapshots
+            for value in snapshot["agent_min_distances"]
+            if value is not None and np.isfinite(value)
+        ]
 
         # 初始化统计列表（如果不存在）
         if not hasattr(maddpg, '_episode_collision_counts'):
@@ -21487,30 +24019,34 @@ def train(args):
             maddpg._episode_agent_success_flags = []  # 🚨 新增：每回合每个智能体的成功标志
         if not hasattr(maddpg, '_episode_team_success_flags'):
             maddpg._episode_team_success_flags = []  # 🚨 新增：每回合团队成功标志
+        if not hasattr(maddpg, '_episode_collision_counts_per_env'):
+            maddpg._episode_collision_counts_per_env = []
+        if not hasattr(maddpg, '_episode_agent_collision_counts_per_env'):
+            maddpg._episode_agent_collision_counts_per_env = []
+        if not hasattr(maddpg, '_episode_team_success_flags_per_env'):
+            maddpg._episode_team_success_flags_per_env = []
+        if not hasattr(maddpg, '_episode_agent_success_flags_per_env'):
+            maddpg._episode_agent_success_flags_per_env = []
+        if not hasattr(maddpg, '_cross_ref_labeled_env_counts'):
+            maddpg._cross_ref_labeled_env_counts = []
+        if not hasattr(maddpg, '_cross_ref_labeled_transition_counts'):
+            maddpg._cross_ref_labeled_transition_counts = []
 
-        # 记录该回合的统计信息
-        # 🚨 关键修复：处理NaN和无效值，确保计数是有效的整数
-        try:
-            total_collisions = sum(episode_collision_counts) if episode_collision_counts else 0
-            total_collisions = int(total_collisions) if np.isfinite(total_collisions) else 0
-        except (ValueError, TypeError, OverflowError):
-            total_collisions = 0
+        # 每个并行环境代表一个完整轨迹；主曲线记录每轨迹平均碰撞数。
+        total_collisions = float(np.mean(episode_collision_totals_by_env))
 
-        # 🚨 新增：记录每个智能体的碰撞次数（用于堆叠图显示）
-        try:
-            # episode_collision_counts 是按智能体顺序记录的碰撞次数列表
-            # 需要按回合组织：每个回合一个列表，包含所有智能体的碰撞次数
-            agent_collisions_this_episode = []
-            for count in episode_collision_counts:
-                try:
-                    count_int = int(count) if np.isfinite(count) else 0
-                    agent_collisions_this_episode.append(count_int)
-                except (ValueError, TypeError, OverflowError):
-                    agent_collisions_this_episode.append(0)
-            maddpg._episode_agent_collision_counts.append(agent_collisions_this_episode)
-        except Exception as e:
-            # 如果记录失败，使用空列表
-            maddpg._episode_agent_collision_counts.append([])
+        agent_collisions_this_episode = [
+            float(value) for value in episode_collision_counts
+        ]
+        maddpg._episode_agent_collision_counts.append(
+            agent_collisions_this_episode
+        )
+        maddpg._episode_collision_counts_per_env.append(
+            [float(value) for value in episode_collision_totals_by_env.tolist()]
+        )
+        maddpg._episode_agent_collision_counts_per_env.append(
+            collision_matrix.astype(float).tolist()
+        )
 
         # 成功判定与 [成功记录] 统一由下方同一套逻辑计算，不再在此处用 _episode_success_without_collision 改写碰撞计数
         maddpg._episode_collision_counts.append(total_collisions)
@@ -21525,53 +24061,47 @@ def train(args):
         # 🚨 权威来源：MultiAgentEnv 步末写入的 world._episode_*（policy_agents 与 scenario 阈值），
         #    与 [成功]/[到达目标] 一致；严格模式下不可用则直接报错终止，不允许回退。
         try:
-            agent_success_flags = []  # 每个智能体的成功标志
-            agent_reach_flags = []    # 每个智能体的到达目标标志（用于详细打印）
-            agent_safe_flags = []     # 每个智能体的无碰撞标志（用于详细打印）
-            agent_goal_distances = [] # 每个智能体终止帧到各自目标点的距离（用于失败诊断）
+            reach_matrix = np.asarray(
+                [
+                    snapshot["agent_reach_flags"]
+                    for snapshot in episode_audit_snapshots
+                ],
+                dtype=np.float32,
+            )
+            safe_matrix = np.asarray(
+                [
+                    snapshot["agent_safe_flags"]
+                    for snapshot in episode_audit_snapshots
+                ],
+                dtype=np.float32,
+            )
+            success_matrix = np.asarray(
+                [
+                    snapshot["agent_success_flags"]
+                    for snapshot in episode_audit_snapshots
+                ],
+                dtype=np.float32,
+            )
+            team_success_flags_by_env = [
+                int(snapshot["team_success"])
+                for snapshot in episode_audit_snapshots
+            ]
+            # 主训练曲线按完整环境轨迹等权平均，原始二值矩阵另行保留。
+            agent_reach_flags = np.mean(reach_matrix, axis=0).astype(float).tolist()
+            agent_safe_flags = np.mean(safe_matrix, axis=0).astype(float).tolist()
+            agent_success_flags = np.mean(success_matrix, axis=0).astype(float).tolist()
+            agent_goal_distances = [
+                [
+                    float(value)
+                    for value in snapshot["agent_goal_distances"]
+                ]
+                for snapshot in episode_audit_snapshots
+            ]
             episode_quality_labels_by_env = {}
-            team_success_flag = 1  # 跨子环境聚合：任一智能体失败则 0
-
-            for env_idx, single_env in envs_to_check:
-                base_env = getattr(single_env, 'env', None)
-                if base_env is None:
-                    base_env = single_env
-                world = getattr(base_env, 'world', None)
-                if world is None:
-                    raise RuntimeError(f"[成功记录] Env{env_idx} 缺少world，无法读取权威成功快照")
-
-                w_reach = getattr(world, '_episode_agent_reach_flags', None)
-                w_safe = getattr(world, '_episode_agent_safe_flags', None)
-                w_succ = getattr(world, '_episode_agent_success_flags', None)
-                if not (
-                    isinstance(w_reach, (list, tuple))
-                    and isinstance(w_safe, (list, tuple))
-                    and isinstance(w_succ, (list, tuple))
-                    and len(w_reach) == len(w_safe) == len(w_succ)
-                    and len(w_succ) > 0
-                ):
-                    raise RuntimeError(
-                        f"[成功记录] Env{env_idx} 权威快照无效: "
-                        f"reach={type(w_reach).__name__ if w_reach is not None else 'None'}({len(w_reach) if isinstance(w_reach, (list, tuple)) else 'NA'}), "
-                        f"safe={type(w_safe).__name__ if w_safe is not None else 'None'}({len(w_safe) if isinstance(w_safe, (list, tuple)) else 'NA'}), "
-                        f"succ={type(w_succ).__name__ if w_succ is not None else 'None'}({len(w_succ) if isinstance(w_succ, (list, tuple)) else 'NA'})"
-                    )
-                env_reach_flags = []
-                env_safe_flags = []
-                env_success_flags = []
-                for i in range(len(w_succ)):
-                    r_i = int(w_reach[i])
-                    s_i = int(w_safe[i])
-                    c_i = int(w_succ[i])
-                    agent_reach_flags.append(r_i)
-                    agent_safe_flags.append(s_i)
-                    agent_success_flags.append(c_i)
-                    env_reach_flags.append(r_i)
-                    env_safe_flags.append(s_i)
-                    env_success_flags.append(c_i)
-                    if c_i == 0:
-                        team_success_flag = 0
-
+            for env_idx, snapshot in enumerate(episode_audit_snapshots):
+                env_reach_flags = snapshot["agent_reach_flags"]
+                env_safe_flags = snapshot["agent_safe_flags"]
+                env_success_flags = snapshot["agent_success_flags"]
                 try:
                     init_goal = episode_initial_goal_distance_matrix[int(env_idx)].astype(np.float32, copy=False)
                 except Exception:
@@ -21597,35 +24127,44 @@ def train(args):
                     'agent_final_goal_distance': np.asarray(final_goal, dtype=np.float32),
                 }
 
-                world_agents = list(getattr(world, 'agents', []) or [])
-                scenario_ref = getattr(base_env, 'scenario', None)
-                for i, agent in enumerate(world_agents):
-                    goal_pos = None
-                    try:
-                        if hasattr(agent, 'goal_a') and agent.goal_a is not None:
-                            goal_pos = getattr(getattr(agent.goal_a, 'state', None), 'p_pos', None)
-                        elif scenario_ref is not None and getattr(scenario_ref, 'goal_pos', None) is not None:
-                            goal_pos = scenario_ref.goal_pos
-                    except Exception:
-                        goal_pos = None
-                    pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
-                    if goal_pos is None or pos is None:
-                        agent_goal_distances.append(None)
-                        continue
-                    try:
-                        dist = float(np.linalg.norm(np.asarray(pos, dtype=np.float32) - np.asarray(goal_pos, dtype=np.float32)))
-                    except Exception:
-                        dist = None
-                    agent_goal_distances.append(dist)
-
-            # 未处理到任何智能体时视为本回合失败
-            if len(agent_success_flags) == 0:
-                team_success_flag = 0
-            episode_success = team_success_flag == 1
+            team_success_flag = float(np.mean(team_success_flags_by_env))
+            success_count_mode = str(
+                getattr(
+                    args,
+                    "success_count_mode",
+                    os.getenv("SUCCESS_COUNT_MODE", "any"),
+                )
+            ).strip().lower()
+            if success_count_mode == "all":
+                episode_success = bool(all(team_success_flags_by_env))
+            elif success_count_mode == "majority":
+                try:
+                    majority_ratio = float(
+                        os.getenv("EARLY_STOP_MAJORITY_RATIO", "0.5")
+                    )
+                except Exception:
+                    majority_ratio = 0.5
+                required_successes = max(
+                    1,
+                    int(np.ceil(
+                        np.clip(majority_ratio, 0.0, 1.0)
+                        * len(team_success_flags_by_env)
+                    )),
+                )
+                episode_success = (
+                    int(sum(team_success_flags_by_env)) >= required_successes
+                )
+            else:
+                episode_success = bool(any(team_success_flags_by_env))
             success_flag = 1 if episode_success else 0
 
-            # 记录每个智能体的成功标志
             maddpg._episode_agent_success_flags.append(agent_success_flags)
+            maddpg._episode_agent_success_flags_per_env.append(
+                success_matrix.astype(int).tolist()
+            )
+            maddpg._episode_team_success_flags_per_env.append(
+                list(team_success_flags_by_env)
+            )
             # 更新公平权重（用于下一回合训练）
             if getattr(maddpg, 'fairness_reweight_enabled', True) and hasattr(maddpg, 'update_agent_fairness_weights'):
                 try:
@@ -21642,10 +24181,10 @@ def train(args):
                     if not quiet_output:
                         print(f"[警告] 更新公平权重失败: {e}")
 
-            # 记录团队成功标志（所有智能体都成功）
+            # 团队成功主曲线是本次同步迭代中各完整环境轨迹的成功率。
             maddpg._episode_team_success_flags.append(team_success_flag)
 
-            # 🚨 与 [成功记录] 一致：本回合成功 = 团队成功标志，写入 _episode_success_flags 供 [解锁计数] 使用
+            # 二值聚合仅供兼容课程/解锁逻辑；正式 Group-B 协议关闭课程。
             maddpg._episode_success_flags.append(success_flag)
 
             if cross_agent_reference_enabled and hasattr(replay_buffer, 'set_episode_quality_labels'):
@@ -21654,7 +24193,10 @@ def train(args):
                 for _env_idx, _labels in episode_quality_labels_by_env.items():
                     _refs = episode_replay_refs_by_env.get(int(_env_idx), [])
                     if not _refs:
-                        continue
+                        raise RuntimeError(
+                            f"回合{episode + 1} Env{_env_idx}没有回放引用，"
+                            "无法回填 selector 完整回合标签"
+                        )
                     try:
                         _positions = np.asarray([p for p, _g in _refs], dtype=np.int64)
                         _generations = np.asarray([_g for _p, _g in _refs], dtype=np.int64)
@@ -21668,16 +24210,38 @@ def train(args):
                             agent_progress=_labels.get('agent_progress'),
                             agent_final_goal_distance=_labels.get('agent_final_goal_distance'),
                         )
+                        if int(_count) != len(_refs):
+                            raise RuntimeError(
+                                f"仅回填 {int(_count)}/{len(_refs)} 条回放；"
+                                "本回合内发生覆盖或 generation 身份不一致"
+                            )
                         labeled_transition_count += int(_count)
-                        labeled_env_count += 1 if int(_count) > 0 else 0
+                        labeled_env_count += 1
                     except Exception as label_exc:
-                        if not quiet_output:
-                            print(f"[cross-agent-reference] 回合{episode+1} Env{_env_idx} 标签回填失败: {label_exc}")
-                try:
-                    maddpg._last_cross_agent_reference_labeled_transitions = int(labeled_transition_count)
-                    maddpg._last_cross_agent_reference_labeled_envs = int(labeled_env_count)
-                except Exception:
-                    pass
+                        raise RuntimeError(
+                            f"回合{episode + 1} Env{_env_idx} selector "
+                            f"完整回合标签回填失败: {label_exc}"
+                        ) from label_exc
+                if labeled_env_count != int(env.num_envs):
+                    raise RuntimeError(
+                        f"回合{episode + 1} selector 标签只覆盖 "
+                        f"{labeled_env_count}/{int(env.num_envs)} 个环境"
+                    )
+                maddpg._last_cross_agent_reference_labeled_transitions = int(
+                    labeled_transition_count
+                )
+                maddpg._last_cross_agent_reference_labeled_envs = int(
+                    labeled_env_count
+                )
+                maddpg._cross_ref_labeled_transition_counts.append(
+                    int(labeled_transition_count)
+                )
+                maddpg._cross_ref_labeled_env_counts.append(
+                    int(labeled_env_count)
+                )
+            else:
+                maddpg._cross_ref_labeled_transition_counts.append(0)
+                maddpg._cross_ref_labeled_env_counts.append(0)
 
             if (
                 cross_agent_reference_enabled
@@ -21732,9 +24296,8 @@ def train(args):
                     if not quiet_output:
                         print(f"[cross-agent-reference] 闭环selector反馈回填失败: {feedback_exc}")
 
-            # 🚨 关键修复：更新累计成功计数
-            if episode_success:
-                total_success_count += 1
+            # 累计数记录实际完成的环境轨迹数，不把一批四条轨迹压成一个事件。
+            total_success_count += int(sum(team_success_flags_by_env))
             # 🚨 关键调试：输出成功判断结果（每回合输出，帮助诊断问题）
             # 🔧 修复：每回合都输出成功记录，不再限制为前5回合或每10回合
             # 原因：用户需要每回合都能看到成功记录，以便更好地跟踪训练进度
@@ -21746,58 +24309,22 @@ def train(args):
             debug_episode_summary_default = '0' if quiet_output else '1'
             debug_episode_summary = os.getenv('DEBUG_EPISODE_SUMMARY', debug_episode_summary_default).lower() in ('1','true','yes','on')
             if debug_episode_summary:
-                # 🚨 关键修复：明确打印成功定义，帮助理解为什么"到达目标"不等于"成功"
-                try:
-                    reach_info = []
-                    safe_info = []
-                    for i in range(len(agent_success_flags)):
-                        # 获取Reach_i和Safe_i状态（已在循环中保存）
-                        reach_i = agent_reach_flags[i] if i < len(agent_reach_flags) else 0
-                        safe_i = agent_safe_flags[i] if i < len(agent_safe_flags) else 0
-
-                        reach_info.append(f"Agent{i}:{'✓' if reach_i else '✗'}")
-                        safe_info.append(f"Agent{i}:{'✓' if safe_i else '✗'}")
-
-                    reach_str = ", ".join(reach_info)
-                    safe_str = ", ".join(safe_info)
-                    print(f"[成功记录] 回合{episode+1}: 团队成功={episode_success} (Reach: {reach_str}, Safe: {safe_str}), 智能体成功={agent_success_flags}, total_success_count={total_success_count}")
-                    if not episode_success:
-                        # 分析失败原因
-                        all_reached = all(agent_reach_flags[i] if i < len(agent_reach_flags) else 0 for i in range(len(agent_success_flags)))
-                        all_safe = all(agent_safe_flags[i] if i < len(agent_safe_flags) else 0 for i in range(len(agent_success_flags)))
-                        if all_reached and not all_safe:
-                            print(f"  [说明] 所有智能体都到达目标但未成功（原因：有碰撞），成功定义=到达目标∧无碰撞")
-                        elif not all_reached and all_safe:
-                            print(f"  [说明] 所有智能体都无碰撞但未成功（原因：未到达目标），成功定义=到达目标∧无碰撞")
-                        elif not all_reached and not all_safe:
-                            print(f"  [说明] 部分智能体未到达目标或有碰撞，成功定义=到达目标∧无碰撞")
-                        if not all_reached:
-                            dist_parts = []
-                            unreached_distances = []
-                            for i in range(len(agent_success_flags)):
-                                dist_val = agent_goal_distances[i] if i < len(agent_goal_distances) else None
-                                reach_i = agent_reach_flags[i] if i < len(agent_reach_flags) else 0
-                                if dist_val is None or not np.isfinite(dist_val):
-                                    dist_repr = "NA"
-                                else:
-                                    dist_repr = f"{dist_val:.2f}m"
-                                    if not reach_i:
-                                        unreached_distances.append(float(dist_val))
-                                suffix = "" if reach_i else "(未到达)"
-                                dist_parts.append(f"Agent{i}={dist_repr}{suffix}")
-                            if unreached_distances:
-                                avg_unreached_dist = float(np.mean(unreached_distances))
-                                max_unreached_dist = float(np.max(unreached_distances))
-                                min_unreached_dist = float(np.min(unreached_distances))
-                                print(
-                                    f"[目标距离] 回合 {episode+1}: 各智能体终点距目标=[{', '.join(dist_parts)}], "
-                                    f"未到达智能体距离统计=min={min_unreached_dist:.2f}m, "
-                                    f"mean={avg_unreached_dist:.2f}m, max={max_unreached_dist:.2f}m"
-                                )
-                except Exception as e:
-                    # 如果打印失败，使用简化版本
-                    print(f"[成功记录] 回合{episode+1}: 团队成功={episode_success}, 智能体成功={agent_success_flags}, total_success_count={total_success_count}")
-                    print(f"  [警告] 详细打印失败: {e}")
+                env_summaries = []
+                for env_index, snapshot in enumerate(episode_audit_snapshots):
+                    env_summaries.append(
+                        f"Env{env_index}:team={int(snapshot['team_success'])},"
+                        f"reach={snapshot['agent_reach_flags']},"
+                        f"safe={snapshot['agent_safe_flags']},"
+                        f"succ={snapshot['agent_success_flags']},"
+                        f"goal_dist={[round(float(v), 2) for v in snapshot['agent_goal_distances']]}"
+                    )
+                print(
+                    f"[成功记录] 回合{episode + 1}: "
+                    f"环境成功率={team_success_flag:.3f}, "
+                    f"二值聚合({success_count_mode})={episode_success}, "
+                    f"累计成功轨迹={total_success_count} | "
+                    + " | ".join(env_summaries)
+                )
         except Exception as e:
             raise RuntimeError(f"[成功记录] 读取/统计失败，已按严格模式终止: {e}") from e
 
@@ -21806,39 +24333,17 @@ def train(args):
         debug_collision_summary_default = '0' if quiet_output else '1'
         debug_collision_summary = os.getenv('DEBUG_COLLISION_SUMMARY', debug_collision_summary_default).lower() in ('1','true','yes','on')
         if debug_collision_summary and (len(maddpg._episode_collision_counts) % 10 == 0 or total_collisions > 0):
-            # 🚨 新增：显示每个智能体的碰撞数，帮助诊断问题
-            agent_counts = []
-            env_count = 0
-            try:
-                # 🚨 关键修复：处理两种环境结构
-                envs_to_check = []
-                if hasattr(env, 'envs') and isinstance(env.envs, (list, tuple)) and len(env.envs) > 0:
-                    envs_to_check = [(i, e) for i, e in enumerate(env.envs)]
-                    env_count = len(env.envs)
-                elif hasattr(env, 'env'):
-                    envs_to_check = [(0, env.env)]
-                    env_count = 1
-                elif hasattr(env, 'world'):
-                    envs_to_check = [(0, env)]
-                    env_count = 1
-
-                for env_idx, single_env in envs_to_check:
-                    if hasattr(single_env, 'world') and hasattr(single_env.world, 'agents'):
-                        for agent_idx, agent in enumerate(single_env.world.agents):
-                            count = 0
-                            if hasattr(agent, 'debug_info') and isinstance(agent.debug_info, dict):
-                                count = agent.debug_info.get('total_penetration_count', 0)
-                            agent_counts.append(f"Env{env_idx}Agent{agent_idx}={count}")
-            except Exception as e:
-                if debug_collision_summary:
-                    print(f"[警告] 收集智能体碰撞计数时出错: {e}")
-                pass
+            agent_counts = [
+                f"Env{env_index}={snapshot['agent_collision_counts']}"
+                for env_index, snapshot in enumerate(episode_audit_snapshots)
+            ]
+            env_count = len(episode_audit_snapshots)
             # 🚨 关键修复：获取当前回合的成功状态和累计成功计数
             current_episode_success = maddpg._episode_success_flags[-1] if maddpg._episode_success_flags else 0
-            print(f"[碰撞统计] 回合 {len(maddpg._episode_collision_counts)}: 总碰撞次数={total_collisions} "
-                  f"(地形={episode_terrain_total}, 球形障碍={episode_obstacle_total}), "
+            print(f"[碰撞统计] 回合 {len(maddpg._episode_collision_counts)}: 每环境平均碰撞次数={total_collisions:.3f} "
+                  f"(地形均值={episode_terrain_total:.3f}, 球形障碍均值={episode_obstacle_total:.3f}), "
                   f"各智能体碰撞次数={agent_counts if agent_counts else '[]'}, "
-                  f"汇总列表={episode_collision_counts if episode_collision_counts else '[]'}, "
+                  f"按Agent环境均值={episode_collision_counts if episode_collision_counts else '[]'}, "
                   f"环境数量={env_count}, "
                   f"本回合成功={bool(current_episode_success)}, "
                   f"累计成功={total_success_count}")
@@ -21931,6 +24436,21 @@ def train(args):
         except Exception:
             _ns_float = float('nan')
         noise_scale_var_history.append(_ns_float)
+        try:
+            if hasattr(maddpg, 'current_ou_noise_std_var') and maddpg.current_ou_noise_std_var is not None:
+                _actual_ns = (
+                    maddpg.current_ou_noise_std_var.numpy()
+                    if hasattr(maddpg.current_ou_noise_std_var, 'numpy')
+                    else maddpg.current_ou_noise_std_var
+                )
+                _actual_ns_float = float(_actual_ns)
+                if not np.isfinite(_actual_ns_float):
+                    _actual_ns_float = float('nan')
+            else:
+                _actual_ns_float = float('nan')
+        except Exception:
+            _actual_ns_float = float('nan')
+        actual_noise_std_history.append(_actual_ns_float)
 
         # === 奖励调试器：记录episode结束 ===
         if reward_debugger is not None:
@@ -22109,23 +24629,6 @@ def train(args):
             except Exception as e:
                 if not quiet_output:
                     tqdm.write(f"生成回合{episode+1}可交互HTML失败: {e}", file=tqdm_file)
-
-        # 🚨 关键修复：更新total_steps统计（用于噪声衰减调度器）
-        # 注意：需要在每个episode的step循环结束后更新，确保噪声衰减调度器能正确计算
-        if hasattr(maddpg, 'training_stats'):
-            # 计算本回合实际步数（考虑早停，step是0-based，所以+1）
-            # 注意：step变量在for step in range(args.episode_length)循环中定义
-            # 如果循环正常结束，step应该是args.episode_length-1，所以实际步数是args.episode_length
-            # 如果循环提前结束（break），step会是最后执行的步数
-            try:
-                # 尝试获取step变量（如果循环正常结束）
-                actual_steps_this_episode = args.episode_length
-            except:
-                # 如果无法获取，使用默认值
-                actual_steps_this_episode = args.episode_length
-            maddpg.training_stats['total_steps'] += actual_steps_this_episode
-            if hasattr(maddpg, 'total_steps_var'):
-                maddpg.total_steps_var.assign_add(tf.cast(actual_steps_this_episode, tf.int64))
 
         # 更新最佳回合
         if avg_episode_reward > best_reward:
@@ -22343,7 +24846,7 @@ def train(args):
                     file=tqdm_file
                 )
             if args.save_model:
-                save_checkpoint(episode, "best_by_team_sr")
+                save_checkpoint(len(episode_rewards), "best_by_team_sr")
 
         # 🔧 回合结束：仅在预快照缺失时补全 last_*（避免被重建后的环境覆盖）
         try:
@@ -22701,18 +25204,22 @@ def train(args):
             tqdm.write("=" * 50, file=tqdm_file)
 
         # 定期保存模型
-        if args.save_model and (episode + 1) % args.save_interval == 0:
+        if (
+            args.save_model
+            and int(args.save_interval) > 0
+            and (episode + 1) % int(args.save_interval) == 0
+        ):
             save_checkpoint(len(episode_rewards), f"ep{episode+1}")
-            save_checkpoint(len(episode_rewards), "checkpoint")
+            if save_training_resume_state:
+                save_checkpoint(len(episode_rewards), "checkpoint")
 
         # 已移除训练阶段轨迹可视化生成
 
         # 噪声衰减（改为仅保留“每步指数衰减”；如需启用回合级衰减，设置 EPISODIC_NOISE_DECAY=1）
         try:
             if os.getenv('EPISODIC_NOISE_DECAY', '0').lower() in ('1','true','yes','on'):
-                next_noise = float(args.noise_scale) * float(args.noise_decay)
-                min_noise = float(getattr(args, 'noise_min', 0.0))
-                args.noise_scale = max(next_noise, min_noise)
+                next_noise = float(maddpg.noise_scale_var.numpy()) * float(args.noise_decay)
+                _assign_behavior_noise_scale(maddpg, next_noise, reanchor_schedule=True)
         except Exception:
             pass
 
@@ -22834,6 +25341,13 @@ def train(args):
                 processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
             else:
                 processed_obs = maddpg.obs_processor.batch_process_observations_parallel(obs_n)
+            _validate_training_observation_batch(
+                processed_obs,
+                expected_envs=env.num_envs,
+                expected_agents=n_agents,
+                expected_obs_dim=max(obs_shapes),
+                context=f"episode {episode + 2} delayed reset",
+            )
 
     # === 保存训练过程指标（奖励曲线 & Loss 曲线）===
     try:
@@ -22844,6 +25358,21 @@ def train(args):
         success_flags = getattr(maddpg, '_episode_success_flags', [])
         agent_success_flags = getattr(maddpg, '_episode_agent_success_flags', [])  # 🚨 新增：每回合每个智能体的成功标志
         team_success_flags = getattr(maddpg, '_episode_team_success_flags', [])  # 🚨 新增：每回合团队成功标志
+        episode_rewards_per_env_history = getattr(
+            maddpg, '_episode_rewards_per_env', []
+        )
+        team_success_flags_per_env = getattr(
+            maddpg, '_episode_team_success_flags_per_env', []
+        )
+        agent_success_flags_per_env = getattr(
+            maddpg, '_episode_agent_success_flags_per_env', []
+        )
+        collision_counts_per_env = getattr(
+            maddpg, '_episode_collision_counts_per_env', []
+        )
+        agent_collision_counts_per_env = getattr(
+            maddpg, '_episode_agent_collision_counts_per_env', []
+        )
 
         # 🚨 新增：计算单智能体成功率和团队成功率
         # SR_i := (1/N) * Σ_{k=1}^{N} 1{Succ_i^(k)}
@@ -22855,9 +25384,16 @@ def train(args):
             max_agents = max(len(flags) for flags in agent_success_flags if flags) if agent_success_flags else 0
             if max_agents > 0:
                 for agent_idx in range(max_agents):
-                    # 计算该智能体在所有回合中的成功次数
-                    success_count = sum(1 for flags in agent_success_flags if len(flags) > agent_idx and flags[agent_idx] == 1)
-                    agent_success_rate = success_count / num_episodes if num_episodes > 0 else 0.0
+                    values = [
+                        float(flags[agent_idx])
+                        for flags in agent_success_flags
+                        if len(flags) > agent_idx
+                        and np.isfinite(flags[agent_idx])
+                    ]
+                    agent_success_rate = (
+                        float(np.mean(np.clip(values, 0.0, 1.0)))
+                        if values else 0.0
+                    )
                     agent_success_rates.append(float(agent_success_rate))
 
         # 计算团队成功率
@@ -22868,9 +25404,21 @@ def train(args):
             "collision_counts": collision_counts,
             "min_distances_to_obstacle": min_distances,
             "noise_scale_var_history": noise_scale_var_history,
+            "actual_noise_std_history": actual_noise_std_history,
             "success_flags": success_flags,  # 🚨 新增：每回合成功标志列表（向后兼容）
             "agent_success_flags": agent_success_flags,  # 🚨 新增：每回合每个智能体的成功标志
             "team_success_flags": team_success_flags,  # 🚨 新增：每回合团队成功标志
+            "episode_rewards_per_env": episode_rewards_per_env_history,
+            "team_success_flags_per_env": team_success_flags_per_env,
+            "agent_success_flags_per_env": agent_success_flags_per_env,
+            "collision_counts_per_env": collision_counts_per_env,
+            "agent_collision_counts_per_env": agent_collision_counts_per_env,
+            "cross_ref_labeled_env_counts": getattr(
+                maddpg, '_cross_ref_labeled_env_counts', []
+            ),
+            "cross_ref_labeled_transition_counts": getattr(
+                maddpg, '_cross_ref_labeled_transition_counts', []
+            ),
             "agent_success_rates": agent_success_rates,  # 🚨 新增：每个智能体的成功率（SR_i）
             "team_success_rate": float(team_success_rate),  # 🚨 新增：团队成功率（SR_team）
             "best_team_success_rate": float(best_team_success_rate),
@@ -22879,7 +25427,50 @@ def train(args):
             "best_team_sr_reward": (
                 float(best_team_sr_reward) if np.isfinite(best_team_sr_reward) else None
             ),
+            "episode_force_ratios": [
+                float(value) for value in episode_force_ratios
+            ],
             "train_episodes": int(getattr(args, 'train_episodes', len(episode_rewards))),
+            "training_manifest_sha256": str(
+                os.getenv('TRAINING_MANIFEST_SHA256', '') or ''
+            ).strip() or None,
+            "training_manifest_path": str(
+                os.getenv('TRAINING_MANIFEST_PATH', '') or ''
+            ).strip() or None,
+            "training_environment_schema_version": int(
+                (
+                    getattr(args, "training_environment_config", {}) or {}
+                ).get("schema_version", TRAINING_ENVIRONMENT_SCHEMA_VERSION)
+            ),
+            "training_environment": dict(
+                getattr(args, "training_environment_config", {}) or {}
+            ),
+            "training_hyperparameters": dict(
+                getattr(args, "training_hyperparameters_config", {}) or {}
+            ),
+            "training_device": dict(training_device_info),
+            "training_parallelism": {
+                "num_envs": int(getattr(args, "num_envs", 1)),
+                "synchronous_iterations": int(len(episode_rewards)),
+                "environment_trajectories": int(
+                    len(episode_rewards) * int(getattr(args, "num_envs", 1))
+                ),
+                "reward_aggregation": "equal_mean_across_environments",
+                "success_aggregation": "equal_mean_across_environments",
+                "worker_seed_derivation": "base_seed_plus_env_id_times_100003",
+                "episode_audit_snapshot_schema_version": (
+                    EPISODE_AUDIT_SNAPSHOT_SCHEMA_VERSION
+                ),
+            },
+            "args": {
+                str(key): value
+                for key, value in vars(args).items()
+                if not str(key).startswith("_")
+                and key not in (
+                    "training_environment_config",
+                    "training_hyperparameters_config",
+                )
+            },
             "timestamp": _run_tag
         }
         metrics_path = os.path.join(run_dir, "episode_rewards.json")
@@ -22944,8 +25535,9 @@ def train(args):
     # 保存最终模型和检查点
     if args.save_model:
         maddpg.save_models(os.path.join("models", args.exp_name, "final"))
-        # 🔧 新增：保存最终检查点
-        save_checkpoint(len(episode_rewards), "checkpoint")
+        if save_training_resume_state:
+            # 仅显式启用 episode 续训时维护滚动 checkpoint。
+            save_checkpoint(len(episode_rewards), "checkpoint")
     if fast_artifacts_mode:
         best_trajectory_time_major = None
         first_trajectory_time_major = None
@@ -23121,6 +25713,13 @@ def train(args):
                                         processed_obs = maddpg.obs_processor.batch_process_observations_vectorized(obs_n)
                                     else:
                                         processed_obs = maddpg.obs_processor.batch_process_observations_parallel(obs_n)
+                                    _validate_training_observation_batch(
+                                        processed_obs,
+                                        expected_envs=env.num_envs,
+                                        expected_agents=n_agents,
+                                        expected_obs_dim=max(obs_shapes),
+                                        context="complexity rebuild reset",
+                                    )
                                     maddpg.reset_hidden_states(batch_size=args.num_envs)
                                 except Exception as e:
                                     tqdm.write(f"[WARN] 提升复杂度后重建环境失败: {e}", file=tqdm_file)
@@ -23350,11 +25949,15 @@ def train(args):
                                 if ep_idx < len(agent_collision_counts):
                                     ep_data = agent_collision_counts[ep_idx]
                                     if isinstance(ep_data, list) and agent_idx < len(ep_data):
-                                        agent_collisions.append(int(ep_data[agent_idx]) if np.isfinite(ep_data[agent_idx]) else 0)
+                                        agent_collisions.append(
+                                            float(ep_data[agent_idx])
+                                            if np.isfinite(ep_data[agent_idx])
+                                            else 0.0
+                                        )
                                     else:
-                                        agent_collisions.append(0)
+                                        agent_collisions.append(0.0)
                                 else:
-                                    agent_collisions.append(0)
+                                    agent_collisions.append(0.0)
                             agent_collision_arrays.append(agent_collisions)
 
                         # 使用堆叠面积图
@@ -23471,23 +26074,35 @@ def train(args):
             # 关闭图形以释放资源
             plt.close()
 
-            # 🔧 额外绘图：noise_scale_var vs episode
+            # 🔧 额外绘图：真实OU执行std与adaptive变量 vs episode
             try:
-                plot_len_noise = min(len(noise_scale_var_history), len(episode_rewards))
+                plot_len_noise = min(
+                    max(len(noise_scale_var_history), len(actual_noise_std_history)),
+                    len(episode_rewards),
+                )
                 if plot_len_noise > 0:
                     plt = get_plt()
                     setup_english_fonts()
 
-                    episodes_noise = range(1, plot_len_noise + 1)
-                    noise_vals = noise_scale_var_history[:plot_len_noise]
+                    actual_noise_vals = actual_noise_std_history[:plot_len_noise]
+                    adaptive_noise_vals = noise_scale_var_history[:plot_len_noise]
 
                     fig_noise, ax_noise = plt.subplots(1, 1, figsize=(12, 5))
                     # 处理非有限值：用 NaN 让 Matplotlib 断线显示
-                    noise_vals_plot = [v if (v is not None and np.isfinite(v)) else np.nan for v in noise_vals]
-                    ax_noise.plot(episodes_noise, noise_vals_plot, color='#333333', linewidth=2.2, label='noise_scale_var')
+                    actual_noise_vals_plot = [
+                        v if (v is not None and np.isfinite(v)) else np.nan
+                        for v in actual_noise_vals
+                    ]
+                    adaptive_noise_vals_plot = [
+                        v if (v is not None and np.isfinite(v)) else np.nan
+                        for v in adaptive_noise_vals
+                    ]
+                    ax_noise.plot(range(1, len(actual_noise_vals_plot) + 1), actual_noise_vals_plot, color='#0072B2', linewidth=2.2, label='actual_ou_std')
+                    if adaptive_noise_vals:
+                        ax_noise.plot(range(1, len(adaptive_noise_vals_plot) + 1), adaptive_noise_vals_plot, color='#555555', linewidth=1.6, linestyle='--', label='noise_scale_var')
                     ax_noise.set_xlabel('Episode', fontfamily='DejaVu Sans', fontsize=12)
-                    ax_noise.set_ylabel('noise_scale_var', fontfamily='DejaVu Sans', fontsize=12)
-                    ax_noise.set_title('Adaptive Noise Scale (noise_scale_var) vs Episode', fontfamily='DejaVu Sans', fontsize=14, fontweight='bold')
+                    ax_noise.set_ylabel('OU noise std', fontfamily='DejaVu Sans', fontsize=12)
+                    ax_noise.set_title('OU Noise Std vs Episode', fontfamily='DejaVu Sans', fontsize=14, fontweight='bold')
                     ax_noise.grid(True, linestyle='--', alpha=0.3)
                     ax_noise.legend(loc='best', fontsize=10, prop={'family': 'DejaVu Sans'})
                     ax_noise.set_facecolor('#fafafa')
@@ -23982,7 +26597,15 @@ def parse_args():
                         help="负向Z轴动作正则系数：对 az<0 的部分额外L2惩罚，防止策略整体被推向Z负半轴 (默认0=关闭)")
     parser.add_argument("--huber-delta", type=float, default=1.0, help="Huber损失的delta参数")
     parser.add_argument("--noise-scale", type=float, default=0.3, help="OU噪声标准差初值(std_dev)")
-    parser.add_argument("--noise-decay", type=float, default=0.9995, help="OU噪声衰减率")
+    parser.add_argument("--noise-decay", "--noise-decay-rate", dest="noise_decay", type=float, default=0.9995,
+                       help="OU噪声衰减率；用于独立OU噪声调度，不再复用学习率衰减率")
+    parser.add_argument("--noise-decay-steps", type=int, default=None,
+                       help="OU噪声每N个环境步应用一次衰减；未设置时沿用--lr-decay-steps作为兼容默认")
+    parser.add_argument("--noise-staircase", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+                       default=None,
+                       help="OU噪声是否使用阶梯式衰减；未设置时沿用--lr-staircase")
+    parser.add_argument("--noise-decay-enabled", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+                       default=True, help="是否启用独立OU噪声衰减调度")
     parser.add_argument("--noise-min", type=float, default=0.05, help="OU噪声标准差下限")
     # 参数空间噪声（Actor权重级扰动）
     # 参数空间噪声已移除，仅保留OU噪声探索；以下参数删除以避免误用
@@ -24079,7 +26702,7 @@ def parse_args():
             )
             or os.getenv('CROSS_AGENT_REFERENCE_START_EPISODE', '50')
         ),
-        help="从第N个训练回合开始让跨agent参考loss影响Actor；可晚于start-episode以预训练selector"
+        help="从第N个训练回合开始让跨agent参考loss影响Actor；共享adaptive selector协议要求与start-episode相同"
     )
     parser.add_argument(
         "--cross-agent-reference-actor-ramp-episodes",
@@ -24188,7 +26811,12 @@ def parse_args():
         type=str,
         choices=list(CROSS_AGENT_REFERENCE_SELECTOR_MODES),
         default=str(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_MODE', 'hard')).strip().lower(),
-        help="跨agent参考样本权重模式：hard=旧硬门控；soft_advantage=hindsight+critic advantage软权重；selector_mix=训练selector拟合混合软标签；reward_to_success_priority=前期奖励优先，局部成功启动后转成功优先；reward_to_success_head_tail=R2S双输出selector分别控制head/tail借鉴；closed_loop_team_head_tail=团队发现目标+延迟闭环反馈的双输出selector"
+        help=(
+            "正式训练模式：hard=硬质量门；"
+            "adaptive_twin_advantage_head_tail=target-twin自适应优势直接抑制；"
+            "shared_twin_advantage_head_tail=共享双输出selector。"
+            "其余取值仅为历史actor评估兼容，训练时会拒绝。"
+        )
     )
     parser.add_argument(
         "--cross-agent-reference-selector-alpha",
@@ -24217,14 +26845,38 @@ def parse_args():
     parser.add_argument(
         "--cross-agent-reference-selector-init-logit",
         type=float,
-        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT', '-2.0')),
-        help="selector输出层初始logit偏置，负值表示初始保守筛样本"
+        default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT', '0.0')),
+        help="selector输出层初始logit偏置；共享adaptive selector必须为0以保持初始中性"
     )
     parser.add_argument(
         "--cross-agent-reference-selector-adv-clip",
         type=float,
         default=float(os.getenv('CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP', '5.0')),
         help="critic advantage/tau进入sigmoid前的裁剪范围"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-advantage-ema-decay",
+        type=float,
+        default=float(
+            os.getenv('CROSS_AGENT_REFERENCE_ADVANTAGE_EMA_DECAY', '0.99')
+        ),
+        help="head/tail target-twin共识优势绝对值尺度的EMA衰减系数"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-advantage-epsilon",
+        type=float,
+        default=float(
+            os.getenv('CROSS_AGENT_REFERENCE_ADVANTAGE_EPSILON', '1e-6')
+        ),
+        help="自适应优势尺度的最小正值"
+    )
+    parser.add_argument(
+        "--cross-agent-reference-advantage-initial-scale",
+        type=float,
+        default=float(
+            os.getenv('CROSS_AGENT_REFERENCE_ADVANTAGE_INITIAL_SCALE', '1.0')
+        ),
+        help="首次获得有效target-twin共识样本前的head/tail优势尺度"
     )
     parser.add_argument(
         "--cross-agent-reference-selector-reward-tau",
@@ -24360,7 +27012,12 @@ def parse_args():
     # 保存参数
     parser.add_argument("--exp-name", type=str, default="debug", help="实验名称")
     parser.add_argument("--save-model", action="store_true", help="是否保存模型")
-    parser.add_argument("--save-interval", type=int, default=100, help="保存间隔")
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=0,
+        help="周期 epN 模型保存间隔；0 表示关闭中间回合快照，只保留完整训练模型候选",
+    )
     parser.add_argument("--seed", type=int, default=None, help="随机种子")
     # 🔧 新增：检查点恢复训练参数
     parser.add_argument("--resume", action="store_true", help="从最新检查点恢复训练（自动查找models/{exp_name}/checkpoint）")
@@ -24391,6 +27048,16 @@ def parse_args():
     parser.add_argument("--semi-random-hold-max-episodes", type=int, default=None, help="半随机范围保持最大回合数")
     parser.add_argument("--use-dynamic-obstacles", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
                        default=None, help="是否启用动态随机障碍物")
+    parser.add_argument("--obstacle-observation-mode", "--obstacle-obs-mode", dest="obstacle_observation_mode",
+                       type=str,
+                       default=os.getenv('OBSTACLE_OBSERVATION_MODE', os.getenv('OBSTACLE_OBS_MODE', 'nearest_surface')),
+                       help="障碍物15维槽位选择方式: nearest_surface 或 risk_lite_v2")
+    parser.add_argument("--obstacle-risk-velocity-forward-weight", type=float,
+                       default=float(os.getenv('OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT', os.getenv('OBSTACLE_OBS_VEL_FORWARD_WEIGHT', '4.0'))),
+                       help="risk_lite_v2 中速度方向前向距离惩罚权重")
+    parser.add_argument("--obstacle-risk-goal-along-weight", type=float,
+                       default=float(os.getenv('OBSTACLE_RISK_GOAL_ALONG_WEIGHT', os.getenv('OBSTACLE_OBS_GOAL_ALONG_WEIGHT', '3.0'))),
+                       help="risk_lite_v2 中目标走廊沿程距离惩罚权重")
     parser.add_argument("--terrain-contact-eps", type=float, default=float(os.getenv('TERRAIN_CONTACT_EPS', '0.2')),
                        help="地形接触/碰撞高度容差，默认从TERRAIN_CONTACT_EPS读取")
     parser.add_argument("--terrain-complexity-level", type=int, default=3, choices=[1, 2, 3, 4], help="地形复杂度等级 (1-4)")
@@ -24701,11 +27368,16 @@ def parse_args():
     parser.add_argument("--collapse-loss-threshold", type=float, default=1e3, help="损失爆炸阈值")
     parser.add_argument("--collapse-z-threshold", type=float, default=-50.0, help="Z轴深穿透阈值（低于则判为崩坏）")
 
+    add_runtime_environment_arguments(parser)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if int(getattr(args, "num_envs", 0)) <= 0:
+        raise SystemExit("--num-envs 必须为正整数")
+    if int(getattr(args, "train_episodes", 0)) <= 0:
+        raise SystemExit("--train-episodes 必须为正整数")
 
     # 创建必要的目录（run_dir 由 train 返回）；这里先确保模型目录存在
     os.makedirs(os.path.join("models", args.exp_name), exist_ok=True)
@@ -24713,18 +27385,20 @@ if __name__ == "__main__":
     try:
         # 开始训练
         maddpg, rewards, run_dir, episode_force_ratios = train(args)
+        training_device_info = _require_recorded_training_device_info(args)
 
         # 保存训练结果
         best_ep_idx = rewards.index(max(rewards))
         last_ep_idx = len(rewards) - 1  # 最后回合的索引
         results_args = dict(vars(args))
+        results_args.pop("_training_device_info", None)
         training_environment = dict(getattr(args, "training_environment_config", {}) or {})
         training_hyperparameters = dict(getattr(args, "training_hyperparameters_config", {}) or {})
         if not training_hyperparameters:
             training_hyperparameters = _capture_training_hyperparameters_config()
         if not training_environment:
             training_environment = {
-                "schema_version": 1,
+                "schema_version": TRAINING_ENVIRONMENT_SCHEMA_VERSION,
                 "source": "results_fallback",
                 "use_fixed_positions": bool(getattr(args, "use_fixed_positions", False)),
                 "use_dynamic_obstacles": bool(getattr(args, "use_dynamic_obstacles", False) or os.getenv('USE_DYNAMIC_OBSTACLES', '0').lower() in ('1', 'true', 'yes', 'on')),
@@ -24736,6 +27410,23 @@ if __name__ == "__main__":
                 "training_env_sequence_seed": int(os.getenv('TRAIN_ENV_SEQUENCE_SEED', str(getattr(args, 'training_env_sequence_seed', getattr(args, 'terrain_base_seed', getattr(args, 'terrain_seed', 67) or 67))))),
                 "train_obstacle_sequence_mode": str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_MODE', str(getattr(args, 'train_obstacle_sequence_mode', 'legacy_linear') or 'legacy_linear'))),
                 "train_obstacle_sequence_namespace": str(os.getenv('TRAIN_OBSTACLE_SEQUENCE_NAMESPACE', str(getattr(args, 'train_obstacle_sequence_namespace', 'train_obstacle') or 'train_obstacle'))),
+                "obstacle_observation_mode": normalize_obstacle_observation_mode(
+                    os.getenv('OBSTACLE_OBSERVATION_MODE', os.getenv('OBSTACLE_OBS_MODE', getattr(args, 'obstacle_observation_mode', 'nearest_surface')))
+                ),
+                "obstacle_risk_velocity_forward_weight": float(os.getenv(
+                    'OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT',
+                    os.getenv(
+                        'OBSTACLE_OBS_VEL_FORWARD_WEIGHT',
+                        str(4.0 if getattr(args, 'obstacle_risk_velocity_forward_weight', None) is None else getattr(args, 'obstacle_risk_velocity_forward_weight')),
+                    ),
+                )),
+                "obstacle_risk_goal_along_weight": float(os.getenv(
+                    'OBSTACLE_RISK_GOAL_ALONG_WEIGHT',
+                    os.getenv(
+                        'OBSTACLE_OBS_GOAL_ALONG_WEIGHT',
+                        str(3.0 if getattr(args, 'obstacle_risk_goal_along_weight', None) is None else getattr(args, 'obstacle_risk_goal_along_weight')),
+                    ),
+                )),
                 "peak_jitter_range": float(os.getenv('PEAK_JITTER_RANGE', str(getattr(args, 'peak_jitter_range', 0.0) or 0.0))),
                 "peak_center_jitter_range": float(os.getenv('PEAK_CENTER_JITTER_RANGE', str(getattr(args, 'peak_center_jitter_range', 0.0) or 0.0))),
                 "peak_height_jitter_ratio_min": float(os.getenv('PEAK_HEIGHT_JITTER_RATIO_MIN', str(getattr(args, 'peak_height_jitter_ratio_min', 0.0) or 0.0))),
@@ -24748,6 +27439,9 @@ if __name__ == "__main__":
                 "semi_random_hold_min_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES', str(getattr(args, 'semi_random_hold_min_episodes', 1) or 1))),
                 "semi_random_hold_max_episodes": int(os.getenv('SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES', str(getattr(args, 'semi_random_hold_max_episodes', 1) or 1))),
             }
+        for runtime_key, runtime_value in resolve_runtime_environment(args).items():
+            if training_environment.get(runtime_key) is None:
+                training_environment[runtime_key] = runtime_value
         if training_environment.get("terrain_contact_eps") is None:
             try:
                 training_environment["terrain_contact_eps"] = float(
@@ -24771,6 +27465,9 @@ if __name__ == "__main__":
             ("training_env_sequence_seed", "TRAIN_ENV_SEQUENCE_SEED", int),
             ("train_obstacle_sequence_mode", "TRAIN_OBSTACLE_SEQUENCE_MODE", str),
             ("train_obstacle_sequence_namespace", "TRAIN_OBSTACLE_SEQUENCE_NAMESPACE", str),
+            ("obstacle_observation_mode", "OBSTACLE_OBSERVATION_MODE", str),
+            ("obstacle_risk_velocity_forward_weight", "OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT", float),
+            ("obstacle_risk_goal_along_weight", "OBSTACLE_RISK_GOAL_ALONG_WEIGHT", float),
             ("semi_random_hold_episodes", "SEMI_RANDOM_TERRAIN_HOLD_EPISODES", int),
             ("semi_random_hold_min_episodes", "SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES", int),
             ("semi_random_hold_max_episodes", "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES", int),
@@ -24821,6 +27518,19 @@ if __name__ == "__main__":
         results_args["training_env_sequence_seed"] = int(training_environment.get("training_env_sequence_seed", results_args.get("training_env_sequence_seed", results_args["terrain_base_seed"])))
         results_args["train_obstacle_sequence_mode"] = str(training_environment.get("train_obstacle_sequence_mode", results_args.get("train_obstacle_sequence_mode", "legacy_linear")))
         results_args["train_obstacle_sequence_namespace"] = str(training_environment.get("train_obstacle_sequence_namespace", results_args.get("train_obstacle_sequence_namespace", "train_obstacle")))
+        results_args["obstacle_observation_mode"] = normalize_obstacle_observation_mode(
+            training_environment.get("obstacle_observation_mode", results_args.get("obstacle_observation_mode", "nearest_surface"))
+        )
+        results_args["obstacle_risk_velocity_forward_weight"] = float(
+            training_environment.get("obstacle_risk_velocity_forward_weight")
+            if training_environment.get("obstacle_risk_velocity_forward_weight") is not None
+            else (4.0 if results_args.get("obstacle_risk_velocity_forward_weight") is None else results_args.get("obstacle_risk_velocity_forward_weight"))
+        )
+        results_args["obstacle_risk_goal_along_weight"] = float(
+            training_environment.get("obstacle_risk_goal_along_weight")
+            if training_environment.get("obstacle_risk_goal_along_weight") is not None
+            else (3.0 if results_args.get("obstacle_risk_goal_along_weight") is None else results_args.get("obstacle_risk_goal_along_weight"))
+        )
         results_args["semi_random_terrain"] = bool(training_environment.get("semi_random_terrain", results_args.get("semi_random_terrain", False)))
         results_args["deterministic_train_env_sequence"] = bool(training_environment.get("deterministic_env_sequence", results_args.get("deterministic_train_env_sequence", False)))
         results_args["random_terrain"] = bool(training_environment.get("random_terrain", results_args.get("random_terrain", False)))
@@ -24870,8 +27580,24 @@ if __name__ == "__main__":
             'best_team_sr_force_ratio': float(getattr(maddpg, '_best_team_sr_force_ratio', 0.0)),
             'best_team_sr_reward': getattr(maddpg, '_best_team_sr_reward', None),
             'terrain_snapshot_artifacts': getattr(maddpg, '_terrain_snapshot_artifacts', {}),
+            'training_manifest_sha256': str(os.getenv('TRAINING_MANIFEST_SHA256', '') or '').strip() or None,
+            'training_manifest_path': str(os.getenv('TRAINING_MANIFEST_PATH', '') or '').strip() or None,
             'training_environment_schema_version': int(training_environment.get('schema_version', 1)),
             'training_environment': training_environment,
+            'training_device': training_device_info,
+            'training_parallelism': {
+                'num_envs': int(getattr(args, 'num_envs', 1)),
+                'synchronous_iterations': int(len(rewards)),
+                'environment_trajectories': int(
+                    len(rewards) * int(getattr(args, 'num_envs', 1))
+                ),
+                'reward_aggregation': 'equal_mean_across_environments',
+                'success_aggregation': 'equal_mean_across_environments',
+                'worker_seed_derivation': 'base_seed_plus_env_id_times_100003',
+                'episode_audit_snapshot_schema_version': int(
+                    EPISODE_AUDIT_SNAPSHOT_SCHEMA_VERSION
+                ),
+            },
             'training_hyperparameters': training_hyperparameters,
             'args': results_args
         }
@@ -24896,3 +27622,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"训练出错: {e}")
         traceback.print_exc()
+        raise

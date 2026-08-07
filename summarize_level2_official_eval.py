@@ -72,6 +72,10 @@ DISPLAY_NAME_MAP = {
     "matd3_full_dual_semantic_cross_agent_ref": "Full DS + CrossRef",
     "matd3_cross_agent_ref_no_quality_gate": "CrossRef No Gate",
     "matd3_cross_agent_ref_behavior_label": "CrossRef Behavior Label",
+    "matd3_cross_agent_ref_behavior_label_current_baseline": "Behavior Baseline",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate": "A: Agent Quality Gate",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_safe_reward": "B: Safe Reward",
+    "matd3_cross_agent_ref_behavior_label_team_feedback_selector_v2": "C: Team Feedback Selector",
 }
 
 
@@ -100,6 +104,10 @@ COLOR_MAP = {
     "matd3_full_dual_semantic_cross_agent_ref": "#2CA02C",
     "matd3_cross_agent_ref_no_quality_gate": "#FF7F0E",
     "matd3_cross_agent_ref_behavior_label": "#7F7F7F",
+    "matd3_cross_agent_ref_behavior_label_current_baseline": "#4D4D4D",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate": "#0072B2",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_safe_reward": "#D55E00",
+    "matd3_cross_agent_ref_behavior_label_team_feedback_selector_v2": "#009E73",
 }
 
 

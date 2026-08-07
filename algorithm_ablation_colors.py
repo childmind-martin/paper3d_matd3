@@ -196,6 +196,48 @@ ALGORITHM_ABLATION_STYLE_BY_LABEL: Dict[str, Dict[str, Any]] = {
         "marker": "X",
         "hatch": "--",
     },
+    "matd3_cross_agent_ref_behavior_label_current_baseline": {
+        "color": "#4D4D4D",  # dark neutral gray
+        "linestyle": "-",
+        "marker": "o",
+        "hatch": "",
+    },
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate": {
+        "color": "#4D4D4D",  # neutral control
+        "linestyle": "-",
+        "marker": "o",
+        "hatch": "",
+    },
+    "matd3_cross_agent_ref_aqual_split_teacher": {
+        "color": "#0072B2",  # blue
+        "linestyle": (0, (5.0, 1.6)),
+        "marker": "s",
+        "hatch": "//",
+    },
+    "matd3_cross_agent_ref_adaptive_twin_advantage": {
+        "color": "#E69F00",  # amber
+        "linestyle": (0, (2.0, 1.2)),
+        "marker": "D",
+        "hatch": "xx",
+    },
+    "matd3_cross_agent_ref_shared_twin_advantage_selector": {
+        "color": "#009E73",  # teal green
+        "linestyle": (0, (6.0, 1.5, 1.2, 1.5)),
+        "marker": "P",
+        "hatch": "++",
+    },
+    "matd3_cross_agent_ref_behavior_label_agent_quality_safe_reward": {
+        "color": "#D55E00",  # vermillion
+        "linestyle": (0, (2.0, 1.2)),
+        "marker": "D",
+        "hatch": "xx",
+    },
+    "matd3_cross_agent_ref_behavior_label_team_feedback_selector_v2": {
+        "color": "#009E73",  # teal green
+        "linestyle": (0, (6.0, 1.5, 1.2, 1.5)),
+        "marker": "P",
+        "hatch": "++",
+    },
     "maddpg_separated_gradient": {
         "color": "#9467BD",  # purple
         "linestyle": "-",

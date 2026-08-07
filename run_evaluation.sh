@@ -6,6 +6,33 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 手动运行评估脚本时，使用与训练入口相同的项目解释器发现顺序。
+# 不能默认落到系统 python3：该解释器在本项目机器上不包含 TensorFlow，
+# 会让参数解析完成后才以 ModuleNotFoundError 失败。
+if [ -z "${EVAL_PYTHON_BIN:-}" ]; then
+    if [ -n "${TRAIN_PYTHON_BIN:-}" ]; then
+        EVAL_PYTHON_BIN="$TRAIN_PYTHON_BIN"
+    else
+        for _MATD3_EVAL_CANDIDATE_PYTHON in \
+            "$SCRIPT_DIR/.venv/bin/python3" \
+            "/home/tang/miniconda3/envs/maddpg_env/bin/python3" \
+            "${HOME:-}/miniconda3/envs/maddpg_env/bin/python3" \
+            "${HOME:-}/anaconda3/envs/maddpg_env/bin/python3"
+        do
+            if [ -x "$_MATD3_EVAL_CANDIDATE_PYTHON" ] \
+               && "$_MATD3_EVAL_CANDIDATE_PYTHON" -c \
+                    'import importlib.util; raise SystemExit(0 if importlib.util.find_spec("tensorflow") else 1)' \
+                    >/dev/null 2>&1; then
+                EVAL_PYTHON_BIN="$_MATD3_EVAL_CANDIDATE_PYTHON"
+                break
+            fi
+        done
+        unset _MATD3_EVAL_CANDIDATE_PYTHON
+    fi
+fi
+EVAL_PYTHON_BIN=${EVAL_PYTHON_BIN:-python3}
+export EVAL_PYTHON_BIN
+
 resolve_default_model_path() {
     if [ -n "${MODEL_PATH:-}" ]; then
         printf '%s\n' "$MODEL_PATH"
@@ -50,6 +77,9 @@ STRICT_EVAL_MATCH=${STRICT_EVAL_MATCH:-1}
 EVAL_EPISODE_LENGTH_MULTIPLIER=${EVAL_EPISODE_LENGTH_MULTIPLIER:-${POST_EVAL_EPISODE_LENGTH_MULTIPLIER:-1}}
 EVAL_EPISODE_PARALLELISM=${EVAL_EPISODE_PARALLELISM:-1}
 EVAL_ENV_STEP_THREADS=${EVAL_ENV_STEP_THREADS:-1}
+EVAL_NOISE_SCALE=${EVAL_NOISE_SCALE:-0.0}
+EVAL_RANDOM_ACTION_PROB=${EVAL_RANDOM_ACTION_PROB:-0.0}
+EVAL_NOISE_SEED=${EVAL_NOISE_SEED:-}
 APF_BACKEND=${APF_BACKEND:-python_original}
 
 echo ""
@@ -64,6 +94,7 @@ echo "  - 禁用提前终止: $DISABLE_EARLY_TERMINATION"
 echo "  - 严格对齐训练配置: $STRICT_EVAL_MATCH"
 echo "  - Episode内并行(方案A): $EVAL_EPISODE_PARALLELISM"
 echo "  - env.step线程数(方案A): $EVAL_ENV_STEP_THREADS"
+echo "  - 评估动作噪声: scale=$EVAL_NOISE_SCALE, random_prob=$EVAL_RANDOM_ACTION_PROB, seed=${EVAL_NOISE_SEED:-<random>}"
 echo "  - APF后端: $APF_BACKEND"
 echo ""
 
@@ -264,6 +295,21 @@ TRAINING_AGENT_SIZE=""
 TRAINING_AGENT_MAX_SPEED=""
 TRAINING_AGENT_ACCEL=""
 TRAINING_USE_QUADROTOR_DYNAMICS=""
+TRAINING_START_ALTITUDE_OFFSET=""
+TRAINING_GOAL_ALTITUDE=""
+TRAINING_AGENT_GOAL_FORMATION_RADIUS=""
+TRAINING_ENABLE_ROLE_SHUFFLE=""
+TRAINING_INIT_VEL_JITTER_MAX=""
+TRAINING_MOUNTAIN_MARGIN=""
+TRAINING_OBSTACLE_MIN_CLEARANCE_START_GOAL=""
+TRAINING_TERRAIN_COLLISION_EPS=""
+TRAINING_USE_LEGACY_TERRAIN=""
+TRAINING_RING_BASE_REWARD=""
+TRAINING_MIN_START_GOAL_DIST=""
+TRAINING_MAX_START_GOAL_DIST=""
+TRAINING_START_POS_MARGIN=""
+TRAINING_START_POS_MAX_TRIALS=""
+TRAINING_RUNTIME_MANIFEST_PATH=""
 TRAINING_USE_FIXED_POSITIONS=""
 TRAINING_POSITIONS_FILE=""
 TRAINING_RANDOM_TERRAIN=""
@@ -275,8 +321,10 @@ TRAINING_TERRAIN_BASE_SEED=""
 TRAINING_TERRAIN_COMPLEXITY_LEVEL=""
 TRAINING_MAP_SIZE=""
 TRAINING_MOUNTAIN_MIN_DISTANCE=""
+TRAINING_OBSTACLE_OBSERVATION_MODE=""
+TRAINING_OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT=""
+TRAINING_OBSTACLE_RISK_GOAL_ALONG_WEIGHT=""
 EVAL_RESPECT_INPUT_POSITIONS=${EVAL_RESPECT_INPUT_POSITIONS:-0}
-EVAL_PYTHON_BIN=${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-python3}}
 
 # 检查GPU
 if command -v nvidia-smi &> /dev/null; then
@@ -537,6 +585,31 @@ try:
     training_environment = results.get('training_environment', {}) if isinstance(results, dict) else {}
     if not isinstance(training_environment, dict):
         training_environment = {}
+
+    # Older runs predate structured recording of scenario-level environment
+    # variables.  Their resolved ablation manifest is the authoritative source;
+    # recover it by exact exp_name/batch identity instead of substituting current
+    # defaults.
+    from pathlib import Path
+    from experiment_runtime_config import (
+        find_training_runtime_manifest,
+        load_training_runtime_manifest,
+        runtime_environment_from_manifest,
+    )
+    exp_name = str(args.get('exp_name') or Path("$MODEL_PARENT_DIR").name)
+    runtime_manifest_path = find_training_runtime_manifest(
+        Path("$SCRIPT_DIR"),
+        exp_name,
+        results.get('training_manifest_path'),
+    )
+    runtime_manifest_values = {}
+    if runtime_manifest_path is not None:
+        runtime_manifest = load_training_runtime_manifest(
+            runtime_manifest_path,
+            exp_name=exp_name,
+            expected_content_sha256=results.get('training_manifest_sha256'),
+        )
+        runtime_manifest_values = runtime_environment_from_manifest(runtime_manifest)
     
     if args is not None:
         params = {}
@@ -550,6 +623,7 @@ try:
             'action_force_ratio',
             'gravity',
             'control_accel_gain',
+            'agent_size',
             'agent_max_speed',
             'agent_accel',
             'goal_attraction',
@@ -568,6 +642,20 @@ try:
             'simulation_dt',
             'z_action_bias',
             'use_quadrotor_dynamics',
+            'start_altitude_offset',
+            'goal_altitude',
+            'agent_goal_formation_radius',
+            'enable_role_shuffle',
+            'init_vel_jitter_max',
+            'mountain_margin',
+            'obstacle_min_clearance_start_goal',
+            'terrain_collision_eps',
+            'use_legacy_terrain',
+            'ring_base_reward',
+            'min_start_goal_dist',
+            'max_start_goal_dist',
+            'start_pos_margin',
+            'start_pos_max_trials',
             'quadrotor_attitude_response_time',
             'quadrotor_psi_cmd',
             'reward_pos_scale',
@@ -611,23 +699,63 @@ try:
             'terrain_complexity_level',
             'map_size',
             'mountain_min_distance',
+            'obstacle_observation_mode',
+            'obstacle_risk_velocity_forward_weight',
+            'obstacle_risk_goal_along_weight',
+            'reward_version',
+            'reward_terminal_order_fix',
+            'goal_ring_individual_scale',
+            'goal_ring_team_gated',
+            'goal_ring_require_agent_safe',
+            'progress_distance_state_scale',
+            'progress_reward_scale',
+            'team_progress_bottleneck_only',
+            'team_progress_non_bottleneck_scale',
+            'team_progress_bottleneck_eps',
+            'team_success_bonus',
+            'unsafe_arrival_penalty',
+            'non_success_terminal_guard_enabled',
+            'non_success_terminal_penalty_base',
+            'non_success_terminal_penalty_per_meter',
+            'non_success_terminal_penalty_max',
+            'terminal_failure_penalty_base',
+            'terminal_failure_penalty_per_meter',
+            'terminal_failure_penalty_max',
+            'clearance_quality_bonus_weight',
+            'efficiency_bonus_weight',
+            'team_sync_reward_enabled',
+            'team_goal_occupancy_scale',
+            'team_bottleneck_progress_scale',
+            'team_waiting_scale',
+            'team_bottleneck_delta_clip',
+            'clearance_dense_positive_scale',
+            'height_dense_positive_scale',
             'use_fixed_positions',
             'positions_file'
         ]
         for param_name in param_names:
-            if param_name in args:
-                params[param_name] = args[param_name]
-            elif param_name in training_environment:
+            # schema>=2 training_environment is the canonical execution record;
+            # args is retained as a legacy fallback for fields not recorded there.
+            if param_name in training_environment and training_environment[param_name] is not None:
                 params[param_name] = training_environment[param_name]
+            elif param_name in args:
+                params[param_name] = args[param_name]
             elif isinstance(results, dict) and param_name in results:
                 params[param_name] = results[param_name]
+
+        for param_name, runtime_value in runtime_manifest_values.items():
+            if params.get(param_name) is None:
+                params[param_name] = runtime_value
+        params['_training_runtime_manifest_path'] = (
+            str(runtime_manifest_path) if runtime_manifest_path is not None else ''
+        )
         
         # 输出为JSON格式，方便bash解析
         import json
         print(json.dumps(params))
         sys.exit(0)
 except Exception as e:
-    pass
+    print(f"训练配置解析失败: {e}", file=sys.stderr)
 sys.exit(1)
 PYTHON_EOF
 )
@@ -661,6 +789,21 @@ if [ -n "$TRAINING_PARAMS" ]; then
         TRAINING_SIMULATION_DT=$(json_get_from_training_params simulation_dt)
         TRAINING_Z_ACTION_BIAS=$(json_get_from_training_params z_action_bias)
         TRAINING_USE_QUADROTOR_DYNAMICS=$(json_get_from_training_params use_quadrotor_dynamics)
+        TRAINING_START_ALTITUDE_OFFSET=$(json_get_from_training_params start_altitude_offset)
+        TRAINING_GOAL_ALTITUDE=$(json_get_from_training_params goal_altitude)
+        TRAINING_AGENT_GOAL_FORMATION_RADIUS=$(json_get_from_training_params agent_goal_formation_radius)
+        TRAINING_ENABLE_ROLE_SHUFFLE=$(json_get_from_training_params enable_role_shuffle)
+        TRAINING_INIT_VEL_JITTER_MAX=$(json_get_from_training_params init_vel_jitter_max)
+        TRAINING_MOUNTAIN_MARGIN=$(json_get_from_training_params mountain_margin)
+        TRAINING_OBSTACLE_MIN_CLEARANCE_START_GOAL=$(json_get_from_training_params obstacle_min_clearance_start_goal)
+        TRAINING_TERRAIN_COLLISION_EPS=$(json_get_from_training_params terrain_collision_eps)
+        TRAINING_USE_LEGACY_TERRAIN=$(json_get_from_training_params use_legacy_terrain)
+        TRAINING_RING_BASE_REWARD=$(json_get_from_training_params ring_base_reward)
+        TRAINING_MIN_START_GOAL_DIST=$(json_get_from_training_params min_start_goal_dist)
+        TRAINING_MAX_START_GOAL_DIST=$(json_get_from_training_params max_start_goal_dist)
+        TRAINING_START_POS_MARGIN=$(json_get_from_training_params start_pos_margin)
+        TRAINING_START_POS_MAX_TRIALS=$(json_get_from_training_params start_pos_max_trials)
+        TRAINING_RUNTIME_MANIFEST_PATH=$(json_get_from_training_params _training_runtime_manifest_path)
         TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME=$(json_get_from_training_params quadrotor_attitude_response_time)
         TRAINING_QUADROTOR_PSI_CMD=$(json_get_from_training_params quadrotor_psi_cmd)
         TRAINING_REWARD_POS_SCALE=$(json_get_from_training_params reward_pos_scale)
@@ -688,6 +831,9 @@ if [ -n "$TRAINING_PARAMS" ]; then
         TRAINING_TERRAIN_COMPLEXITY_LEVEL=$(json_get_from_training_params terrain_complexity_level)
         TRAINING_MAP_SIZE=$(json_get_from_training_params map_size)
         TRAINING_MOUNTAIN_MIN_DISTANCE=$(json_get_from_training_params mountain_min_distance)
+        TRAINING_OBSTACLE_OBSERVATION_MODE=$(json_get_from_training_params obstacle_observation_mode)
+        TRAINING_OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT=$(json_get_from_training_params obstacle_risk_velocity_forward_weight)
+        TRAINING_OBSTACLE_RISK_GOAL_ALONG_WEIGHT=$(json_get_from_training_params obstacle_risk_goal_along_weight)
 
         TRAINING_REWARD_PARAM_KEYS=(
             distance_weight exploration_weight stationary_weight direction_weight deviation_weight
@@ -703,6 +849,48 @@ if [ -n "$TRAINING_PARAMS" ]; then
             printf -v "$reward_var" '%s' "$reward_val"
             if [ -n "$reward_val" ]; then
                 echo "✅ 从训练配置读取$(printf '%s' "$reward_key" | tr '[:lower:]' '[:upper:]'): $reward_val"
+            fi
+        done
+
+        # 这些参数由场景/向量化奖励器直接从环境变量读取，不能只对齐
+        # argparse 中的基础 reward weights。尤其安全奖励消融的这些值与
+        # 其他模型不同，遗漏会导致评估奖励口径悄悄回到当前代码默认值。
+        TRAINING_RUNTIME_ENV_MAPPINGS=(
+            reward_version:REWARD_VERSION
+            reward_terminal_order_fix:REWARD_TERMINAL_ORDER_FIX
+            goal_ring_individual_scale:GOAL_RING_INDIVIDUAL_SCALE
+            goal_ring_team_gated:GOAL_RING_TEAM_GATED
+            goal_ring_require_agent_safe:GOAL_RING_REQUIRE_AGENT_SAFE
+            progress_distance_state_scale:PROGRESS_DISTANCE_STATE_SCALE
+            progress_reward_scale:PROGRESS_REWARD_SCALE
+            team_progress_bottleneck_only:TEAM_PROGRESS_BOTTLENECK_ONLY
+            team_progress_non_bottleneck_scale:TEAM_PROGRESS_NON_BOTTLENECK_SCALE
+            team_progress_bottleneck_eps:TEAM_PROGRESS_BOTTLENECK_EPS
+            team_success_bonus:TEAM_SUCCESS_BONUS
+            unsafe_arrival_penalty:UNSAFE_ARRIVAL_PENALTY
+            non_success_terminal_guard_enabled:NON_SUCCESS_TERMINAL_GUARD_ENABLED
+            non_success_terminal_penalty_base:NON_SUCCESS_TERMINAL_PENALTY_BASE
+            non_success_terminal_penalty_per_meter:NON_SUCCESS_TERMINAL_PENALTY_PER_METER
+            non_success_terminal_penalty_max:NON_SUCCESS_TERMINAL_PENALTY_MAX
+            terminal_failure_penalty_base:TERMINAL_FAILURE_PENALTY_BASE
+            terminal_failure_penalty_per_meter:TERMINAL_FAILURE_PENALTY_PER_METER
+            terminal_failure_penalty_max:TERMINAL_FAILURE_PENALTY_MAX
+            clearance_quality_bonus_weight:CLEARANCE_QUALITY_BONUS_WEIGHT
+            efficiency_bonus_weight:EFFICIENCY_BONUS_WEIGHT
+            team_sync_reward_enabled:TEAM_SYNC_REWARD_ENABLED
+            team_goal_occupancy_scale:TEAM_GOAL_OCCUPANCY_SCALE
+            team_bottleneck_progress_scale:TEAM_BOTTLENECK_PROGRESS_SCALE
+            team_waiting_scale:TEAM_WAITING_SCALE
+            team_bottleneck_delta_clip:TEAM_BOTTLENECK_DELTA_CLIP
+            clearance_dense_positive_scale:CLEARANCE_DENSE_POSITIVE_SCALE
+            height_dense_positive_scale:HEIGHT_DENSE_POSITIVE_SCALE
+        )
+        for runtime_mapping in "${TRAINING_RUNTIME_ENV_MAPPINGS[@]}"; do
+            IFS=':' read -r runtime_key runtime_env_name <<< "$runtime_mapping"
+            runtime_value=$(json_get_from_training_params "$runtime_key")
+            if [ -n "$runtime_value" ]; then
+                export "$runtime_env_name=$runtime_value"
+                echo "✅ 从训练配置读取${runtime_env_name}: $runtime_value"
             fi
         done
         
@@ -823,6 +1011,15 @@ if [ -n "$TRAINING_PARAMS" ]; then
         if [ -n "$TRAINING_MOUNTAIN_MIN_DISTANCE" ]; then
             echo "✅ 从训练配置读取MOUNTAIN_MIN_DISTANCE: $TRAINING_MOUNTAIN_MIN_DISTANCE"
         fi
+        if [ -n "$TRAINING_OBSTACLE_OBSERVATION_MODE" ]; then
+            echo "✅ 从训练配置读取OBSTACLE_OBSERVATION_MODE: $TRAINING_OBSTACLE_OBSERVATION_MODE"
+        fi
+        if [ -n "$TRAINING_OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT" ]; then
+            echo "✅ 从训练配置读取OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT: $TRAINING_OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"
+        fi
+        if [ -n "$TRAINING_OBSTACLE_RISK_GOAL_ALONG_WEIGHT" ]; then
+            echo "✅ 从训练配置读取OBSTACLE_RISK_GOAL_ALONG_WEIGHT: $TRAINING_OBSTACLE_RISK_GOAL_ALONG_WEIGHT"
+        fi
     fi
 fi
 
@@ -924,6 +1121,10 @@ fi
 if [ -n "$TRAINING_MOUNTAIN_MIN_DISTANCE" ]; then
     export MOUNTAIN_MIN_DISTANCE="$TRAINING_MOUNTAIN_MIN_DISTANCE"
 fi
+apply_training_or_default OBSTACLE_OBSERVATION_MODE TRAINING_OBSTACLE_OBSERVATION_MODE nearest_surface
+apply_training_or_default OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT TRAINING_OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT 4.0
+apply_training_or_default OBSTACLE_RISK_GOAL_ALONG_WEIGHT TRAINING_OBSTACLE_RISK_GOAL_ALONG_WEIGHT 3.0
+export OBSTACLE_OBS_MODE="$OBSTACLE_OBSERVATION_MODE"
 
 CMD_ARGS=$(echo "$CMD_ARGS" | sed -E 's/ --random-terrain//g')
 if [ "${RANDOM_TERRAIN,,}" = "1" ] || [ "${RANDOM_TERRAIN,,}" = "true" ] || [ "${RANDOM_TERRAIN,,}" = "yes" ] || [ "${RANDOM_TERRAIN,,}" = "on" ]; then
@@ -944,6 +1145,7 @@ fi
 if [ -n "$MOUNTAIN_MIN_DISTANCE" ]; then
     echo "⛰️ 山峰最小间距: $MOUNTAIN_MIN_DISTANCE"
 fi
+echo "🧭 障碍观测模式: $OBSTACLE_OBSERVATION_MODE (vel_w=$OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT, goal_w=$OBSTACLE_RISK_GOAL_ALONG_WEIGHT)"
 
 # 关键物理/控制参数最初在脚本前半段就写进了 CMD_ARGS；
 # 这里在训练配置读取完成后再次统一回写，确保最终命令真正使用训练时的值。
@@ -959,10 +1161,28 @@ apply_training_or_default DAMPING TRAINING_DAMPING 0.12
 apply_training_or_default SIMULATION_DT TRAINING_SIMULATION_DT 0.08
 apply_training_or_default Z_ACTION_BIAS TRAINING_Z_ACTION_BIAS 0.0
 apply_training_or_default USE_QUADROTOR_DYNAMICS TRAINING_USE_QUADROTOR_DYNAMICS 0
+apply_training_or_default START_ALTITUDE_OFFSET TRAINING_START_ALTITUDE_OFFSET 7.0
+apply_training_or_default GOAL_ALTITUDE TRAINING_GOAL_ALTITUDE 12.0
+apply_training_or_default AGENT_GOAL_FORMATION_RADIUS TRAINING_AGENT_GOAL_FORMATION_RADIUS 10.0
+apply_training_or_default ENABLE_ROLE_SHUFFLE TRAINING_ENABLE_ROLE_SHUFFLE 1
+apply_training_or_default INIT_VEL_JITTER_MAX TRAINING_INIT_VEL_JITTER_MAX 0.3
+apply_training_or_default MOUNTAIN_MIN_DISTANCE TRAINING_MOUNTAIN_MIN_DISTANCE 55
+apply_training_or_default MOUNTAIN_MARGIN TRAINING_MOUNTAIN_MARGIN 20
+apply_training_or_default OBSTACLE_MIN_CLEARANCE_START_GOAL TRAINING_OBSTACLE_MIN_CLEARANCE_START_GOAL 25.0
+apply_training_or_default TERRAIN_COLLISION_EPS TRAINING_TERRAIN_COLLISION_EPS 0.3
+apply_training_or_default USE_LEGACY_TERRAIN TRAINING_USE_LEGACY_TERRAIN 0
+apply_training_or_default RING_BASE_REWARD TRAINING_RING_BASE_REWARD 80.0
+apply_training_or_default MIN_START_GOAL_DIST TRAINING_MIN_START_GOAL_DIST 40.0
+apply_training_or_default MAX_START_GOAL_DIST TRAINING_MAX_START_GOAL_DIST 100.0
+apply_training_or_default START_POS_MARGIN TRAINING_START_POS_MARGIN 5.0
+apply_training_or_default START_POS_MAX_TRIALS TRAINING_START_POS_MAX_TRIALS 2000
 apply_training_or_default QUADROTOR_ATTITUDE_RESPONSE_TIME TRAINING_QUADROTOR_ATTITUDE_RESPONSE_TIME 0.0
 apply_training_or_default QUADROTOR_PSI_CMD TRAINING_QUADROTOR_PSI_CMD 0.0
 apply_training_or_default REWARD_POS_SCALE TRAINING_REWARD_POS_SCALE 1.0
 apply_training_or_default REWARD_NEG_SCALE TRAINING_REWARD_NEG_SCALE 1.0
+if [ -n "$TRAINING_RUNTIME_MANIFEST_PATH" ]; then
+    export TRAINING_RUNTIME_MANIFEST_PATH
+fi
 
 # 固定位置策略：在严格模式下优先对齐训练时的位置文件
 if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$STRICT_EVAL_MATCH" = "yes" ] || [ "$STRICT_EVAL_MATCH" = "on" ]; then
@@ -983,6 +1203,25 @@ if [ "$STRICT_EVAL_MATCH" = "1" ] || [ "$STRICT_EVAL_MATCH" = "true" ] || [ "$ST
     [ -z "$TRAINING_EPISODE_LENGTH" ] && missing_keys+=("episode_length")
     [ -z "$TRAINING_SUCCESS_DISTANCE_THRESHOLD" ] && missing_keys+=("success_distance_threshold")
     [ -z "$TRAINING_COLLISION_DISTANCE_THRESHOLD" ] && missing_keys+=("collision_distance_threshold")
+    [ -z "$TRAINING_AGENT_SIZE" ] && missing_keys+=("agent_size")
+    [ -z "$TRAINING_AGENT_MAX_SPEED" ] && missing_keys+=("agent_max_speed")
+    [ -z "$TRAINING_AGENT_ACCEL" ] && missing_keys+=("agent_accel")
+    [ -z "$TRAINING_USE_QUADROTOR_DYNAMICS" ] && missing_keys+=("use_quadrotor_dynamics")
+    [ -z "$TRAINING_START_ALTITUDE_OFFSET" ] && missing_keys+=("start_altitude_offset")
+    [ -z "$TRAINING_GOAL_ALTITUDE" ] && missing_keys+=("goal_altitude")
+    [ -z "$TRAINING_AGENT_GOAL_FORMATION_RADIUS" ] && missing_keys+=("agent_goal_formation_radius")
+    [ -z "$TRAINING_ENABLE_ROLE_SHUFFLE" ] && missing_keys+=("enable_role_shuffle")
+    [ -z "$TRAINING_INIT_VEL_JITTER_MAX" ] && missing_keys+=("init_vel_jitter_max")
+    [ -z "$TRAINING_MOUNTAIN_MIN_DISTANCE" ] && missing_keys+=("mountain_min_distance")
+    [ -z "$TRAINING_MOUNTAIN_MARGIN" ] && missing_keys+=("mountain_margin")
+    [ -z "$TRAINING_OBSTACLE_MIN_CLEARANCE_START_GOAL" ] && missing_keys+=("obstacle_min_clearance_start_goal")
+    [ -z "$TRAINING_TERRAIN_COLLISION_EPS" ] && missing_keys+=("terrain_collision_eps")
+    [ -z "$TRAINING_USE_LEGACY_TERRAIN" ] && missing_keys+=("use_legacy_terrain")
+    [ -z "$TRAINING_RING_BASE_REWARD" ] && missing_keys+=("ring_base_reward")
+    [ -z "$TRAINING_MIN_START_GOAL_DIST" ] && missing_keys+=("min_start_goal_dist")
+    [ -z "$TRAINING_MAX_START_GOAL_DIST" ] && missing_keys+=("max_start_goal_dist")
+    [ -z "$TRAINING_START_POS_MARGIN" ] && missing_keys+=("start_pos_margin")
+    [ -z "$TRAINING_START_POS_MAX_TRIALS" ] && missing_keys+=("start_pos_max_trials")
     [ -z "$TRAINING_GOAL_ATTRACTION" ] && missing_keys+=("goal_attraction")
     [ -z "$TRAINING_LAMBDA_1_BASE" ] && missing_keys+=("lambda_1_base")
     [ -z "$TRAINING_TERRAIN_REPULSION" ] && missing_keys+=("terrain_repulsion")
@@ -1362,6 +1601,8 @@ EVAL_CMD=(
     --scenario-name "$SCENARIO_NAME"
     --episode-length "$EPISODE_LENGTH"
     --algorithm "$ALGORITHM"
+    --eval-noise-scale "$EVAL_NOISE_SCALE"
+    --eval-random-action-prob "$EVAL_RANDOM_ACTION_PROB"
     --gravity "$GRAVITY"
     --control-accel-gain "$CONTROL_ACCEL_GAIN"
     --agent-size "$AGENT_SIZE"
@@ -1374,6 +1615,21 @@ EVAL_CMD=(
     --simulation-dt "$SIMULATION_DT"
     --z-action-bias "$Z_ACTION_BIAS"
     --use-quadrotor-dynamics "$USE_QUADROTOR_DYNAMICS"
+    --start-altitude-offset "$START_ALTITUDE_OFFSET"
+    --goal-altitude "$GOAL_ALTITUDE"
+    --agent-goal-formation-radius "$AGENT_GOAL_FORMATION_RADIUS"
+    --enable-role-shuffle "$ENABLE_ROLE_SHUFFLE"
+    --init-vel-jitter-max "$INIT_VEL_JITTER_MAX"
+    --mountain-min-distance "$MOUNTAIN_MIN_DISTANCE"
+    --mountain-margin "$MOUNTAIN_MARGIN"
+    --obstacle-min-clearance-start-goal "$OBSTACLE_MIN_CLEARANCE_START_GOAL"
+    --terrain-collision-eps "$TERRAIN_COLLISION_EPS"
+    --use-legacy-terrain "$USE_LEGACY_TERRAIN"
+    --ring-base-reward "$RING_BASE_REWARD"
+    --min-start-goal-dist "$MIN_START_GOAL_DIST"
+    --max-start-goal-dist "$MAX_START_GOAL_DIST"
+    --start-pos-margin "$START_POS_MARGIN"
+    --start-pos-max-trials "$START_POS_MAX_TRIALS"
     --quadrotor-attitude-response-time "$QUADROTOR_ATTITUDE_RESPONSE_TIME"
     --quadrotor-psi-cmd "$QUADROTOR_PSI_CMD"
     --reward-pos-scale "$REWARD_POS_SCALE"
@@ -1394,6 +1650,9 @@ EVAL_CMD=(
     --delta-radius "$DELTA_RADIUS"
     --max-force-magnitude "$MAX_FORCE_MAGNITUDE"
     --terrain-contact-eps "$TERRAIN_CONTACT_EPS"
+    --obstacle-observation-mode "$OBSTACLE_OBSERVATION_MODE"
+    --obstacle-risk-velocity-forward-weight "$OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"
+    --obstacle-risk-goal-along-weight "$OBSTACLE_RISK_GOAL_ALONG_WEIGHT"
     --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
     --distance-weight "$DISTANCE_WEIGHT"
     --exploration-weight "$EXPLORATION_WEIGHT"
@@ -1425,6 +1684,10 @@ EVAL_CMD=(
     --global-reward-mode "$GLOBAL_REWARD_MODE"
     --shaping-gamma "$SHAPING_GAMMA"
 )
+
+if [ -n "$EVAL_NOISE_SEED" ]; then
+    EVAL_CMD+=(--eval-noise-seed "$EVAL_NOISE_SEED")
+fi
 
 if [ -n "${FORCE_EVAL_ACTION_FORCE_RATIO}" ]; then
     EVAL_CMD+=(--force-action-force-ratio "$FORCE_EVAL_ACTION_FORCE_RATIO")
@@ -1458,6 +1721,9 @@ fi
 if [ "${DISABLE_GIF:-0}" = "1" ] || [ "${DISABLE_GIF,,}" = "true" ] || [ "${DISABLE_GIF,,}" = "yes" ] || [ "${DISABLE_GIF,,}" = "on" ]; then
     EVAL_CMD+=(--disable-gif)
 fi
+if [ "${EVAL_CONFIG_RESOLVE_ONLY:-0}" = "1" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "true" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "yes" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "on" ]; then
+    EVAL_CMD+=(--config-resolve-only)
+fi
 
 printf '正在执行:'
 printf ' %q' "${EVAL_CMD[@]}"
@@ -1469,7 +1735,9 @@ EVAL_EXIT_CODE=$?
 echo ""
 echo "======================================"
 
-if [ $EVAL_EXIT_CODE -eq 0 ]; then
+if [ $EVAL_EXIT_CODE -eq 0 ] && { [ "${EVAL_CONFIG_RESOLVE_ONLY:-0}" = "1" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "true" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "yes" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "on" ]; }; then
+    echo "✅ 评估配置解析与训练口径校验完成（未启动环境、未加载权重）"
+elif [ $EVAL_EXIT_CODE -eq 0 ]; then
     echo "✅ 评估成功完成!"
     echo ""
     echo "结果文件:"
@@ -1501,3 +1769,4 @@ else
 fi
 
 echo "======================================"
+exit "$EVAL_EXIT_CODE"

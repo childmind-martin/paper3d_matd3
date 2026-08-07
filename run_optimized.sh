@@ -186,6 +186,10 @@ if [ -z "${SEED:-}" ]; then
 else
     SEED_SOURCE="环境变量（复现模式）"
 fi
+export OBSTACLE_OBSERVATION_MODE=${OBSTACLE_OBSERVATION_MODE:-${OBSTACLE_OBS_MODE:-nearest_surface}}
+export OBSTACLE_OBS_MODE="$OBSTACLE_OBSERVATION_MODE"
+export OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT=${OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT:-${OBSTACLE_OBS_VEL_FORWARD_WEIGHT:-4.0}}
+export OBSTACLE_RISK_GOAL_ALONG_WEIGHT=${OBSTACLE_RISK_GOAL_ALONG_WEIGHT:-${OBSTACLE_OBS_GOAL_ALONG_WEIGHT:-3.0}}
 
 echo "" 
 echo "训练参数:"
@@ -196,10 +200,11 @@ echo "  - 带时间戳的实验名称: $EXP_NAME_WITH_TIMESTAMP"
 echo "  - 使用分项加权奖励: $USE_WEIGHTED_REWARD"
 echo "  - 训练算法: $ALGORITHM"
 echo "  - 训练障碍序列: ${TRAIN_OBSTACLE_SEQUENCE_MODE:-legacy_linear} (namespace=${TRAIN_OBSTACLE_SEQUENCE_NAMESPACE:-train_obstacle})"
+echo "  - 障碍观测模式: ${OBSTACLE_OBSERVATION_MODE} (vel_w=${OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT}, goal_w=${OBSTACLE_RISK_GOAL_ALONG_WEIGHT})"
 echo "  - 随机角色(Role Shuffle): ${ENABLE_ROLE_SHUFFLE:-1}"
 echo "  - 跨agent参考学习: ${CROSS_AGENT_REFERENCE_ENABLED:-0} (coef=${CROSS_AGENT_REFERENCE_COEF:-0.03}, gate=${CROSS_AGENT_REFERENCE_QUALITY_GATE:-1}, mode=${CROSS_AGENT_REFERENCE_GATE_MODE:-progress}, clean_label=${CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL:-1})"
-echo "  - 跨agent selector: ${CROSS_AGENT_REFERENCE_SELECTOR_ENABLED:-0} (mode=${CROSS_AGENT_REFERENCE_SELECTOR_MODE:-hard}, alpha=${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}, tau=${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}, lr=${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}, ref_interval=${CROSS_AGENT_REFERENCE_UPDATE_INTERVAL:-1}, pairs_per_agent=${CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT:-0})"
-echo "  - selector奖励→成功阶段: reward_tau=${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU:-500.0}, tie=${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK:-0.05}, stable_window=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW:-100}, stable_delta=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA:-0.02}, min_sr=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE:-0.05}, min_ep=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES:-200}, ramp=${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES:-50}"
+echo "  - 跨agent selector: ${CROSS_AGENT_REFERENCE_SELECTOR_ENABLED:-0} (mode=${CROSS_AGENT_REFERENCE_SELECTOR_MODE:-hard}, lr=${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}, ref_interval=${CROSS_AGENT_REFERENCE_UPDATE_INTERVAL:-1}, pairs_per_agent=${CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT:-0})"
+echo "  - adaptive twin尺度: decay=${CROSS_AGENT_REFERENCE_ADVANTAGE_EMA_DECAY:-0.99}, epsilon=${CROSS_AGENT_REFERENCE_ADVANTAGE_EPSILON:-1e-6}, initial=${CROSS_AGENT_REFERENCE_ADVANTAGE_INITIAL_SCALE:-1.0}, clip=${CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP:-5.0}"
 echo "  - 随机种子: $SEED ($SEED_SOURCE)"
 if [ -n "$RESUME_MODEL" ]; then
     echo "  - 🔧 持续训练: 从模型恢复 - $RESUME_MODEL"
@@ -269,7 +274,7 @@ export CPU_THREADS=${CPU_THREADS:-32}              # 默认12线程（Zen4 7945H
 export TQDM_MININTERVAL=${TQDM_MININTERVAL:-0.3}  # 进度条刷新间隔（秒）
 export TQDM_NCOLS=${TQDM_NCOLS:-100}              # 进度条列宽
 export GPU_ID=${GPU_ID:-0}
-export NUM_ENVS=${NUM_ENVS:-1}                     # 🔧 单环境运行，避免并行环境引入的干扰和复杂性
+export NUM_ENVS=${NUM_ENVS:-1}                     # 每个模型内部的同步环境进程数；正式入口会显式覆盖
 export ENABLE_ROLE_SHUFFLE=${ENABLE_ROLE_SHUFFLE:-1}  # 角色随机化：1启用，0禁用（默认开启）
 export TQDM_DISABLE=${TQDM_DISABLE:-1}            # 完全禁用tqdm进度条（默认安静）
 export SAVE_POSITIONS=${SAVE_POSITIONS:-1}        # 默认关闭保存位置
@@ -379,9 +384,12 @@ export REWARD_NEG_SCALE=${REWARD_NEG_SCALE:-1.0}    # 🔧 修复奖励累积：
 
 # 动作OU噪声参数（好效果复现）
 # 🔧 探索策略：前期略增探索、后期降低以保证稳定
-export NOISE_SCALE=${NOISE_SCALE:-0.30}           # 降低初始噪声，减少后期“安全但漂移不到目标”的随机性
-export NOISE_DECAY=${NOISE_DECAY:-0.9995}         # 略放慢衰减，保留前期探索但不靠高方差硬撞
-export NOISE_MIN=${NOISE_MIN:-0.003}              # 进一步降低末段噪声下限，利于精确收敛到目标
+export NOISE_SCALE=${NOISE_SCALE:-0.30}           # 初始OU噪声std
+export NOISE_DECAY=${NOISE_DECAY:-0.9995}         # OU噪声独立衰减率
+export NOISE_DECAY_STEPS=${NOISE_DECAY_STEPS:-$LR_DECAY_STEPS}  # OU噪声每N个环境步衰减一次
+export NOISE_STAIRCASE=${NOISE_STAIRCASE:-$LR_STAIRCASE}        # OU噪声是否阶梯式衰减
+export NOISE_DECAY_ENABLED=${NOISE_DECAY_ENABLED:-1}            # 是否启用OU噪声独立衰减
+export NOISE_MIN=${NOISE_MIN:-0.003}              # OU噪声std下限
 
 # === 🔧 自适应调整参数（Level-3 稳定性优化）===
 export ADAPTIVE_PATIENCE=${ADAPTIVE_PATIENCE:-60}              # Level-3奖励方差大，避免25回合未刷新best就过早调整
@@ -411,6 +419,7 @@ export DYNAMIC_FIRST_TIME=${DYNAMIC_FIRST_TIME:-1}    # 🔧 启用动态首次�
                                                         # 配合 USE_FIXED_POSITIONS=1 使用，实现固定起点训练
 export TERRAIN_COMPLEXITY_LEVEL=${TERRAIN_COMPLEXITY_LEVEL:-3} # 地形复杂度等级 (1-4) - 默认等级2
 export MOUNTAIN_MIN_DISTANCE=${MOUNTAIN_MIN_DISTANCE:-55}      # 山峰之间的最小距离（单位：地图单位，建议范围20-80）
+export MOUNTAIN_MARGIN=${MOUNTAIN_MARGIN:-20}                  # 山峰生成边界安全余量（地形网格整数）
 export MAP_SIZE=${MAP_SIZE:-200}
 export USE_DYNAMIC_OBSTACLES=${USE_DYNAMIC_OBSTACLES:-0}  # 🔧 障碍物生成模式（1=动态，每次reset重新生成；0=固定，只在首次生成）
                                                            # 1: 每次reset时重新生成障碍物位置（课程学习解锁后启用，增加训练多样性）
@@ -457,11 +466,14 @@ export TRAIN_ENV_SEQUENCE_SEED=${TRAIN_ENV_SEQUENCE_SEED:-${SCENARIO_SEED:-67}} 
 export MIN_START_GOAL_DIST=${MIN_START_GOAL_DIST:-75.0}        # 起点与目标的最小水平距离
 export MAX_START_GOAL_DIST=${MAX_START_GOAL_DIST:-120.0}       # 起点与目标的最大水平距离（控制随机幅度）
 export START_POS_MARGIN=${START_POS_MARGIN:-5.0}               # 起点生成的地图边缘安全距离
-export START_ALTITUDE_OFFSET=${START_ALTITUDE_OFFSET:-12.0}     # 🔧 起点离地高度：7米（平坦地形上方5-10米区间）
-                                                                # 说明：让智能体从较低位置起飞，学习向上飞行轨迹
-export GOAL_ALTITUDE=${GOAL_ALTITUDE:-25.0}                     # 🔧 目标离地高度：12米（略高于理想区间上限，引导向上飞）
+export START_ALTITUDE_OFFSET=${START_ALTITUDE_OFFSET:-12.0}     # 起点相对地形高度：12米
+export GOAL_ALTITUDE=${GOAL_ALTITUDE:-25.0}                     # 目标相对地形高度：25米
                                                                 # 说明：与HEIGHT_IDEAL_MAX(15米)配合，让智能体学习在合理高度完成任务
 export START_POS_MAX_TRIALS=${START_POS_MAX_TRIALS:-2000}      # 起点采样最大尝试次数
+export INIT_VEL_JITTER_MAX=${INIT_VEL_JITTER_MAX:-0.3}          # 初始速度随机扰动上限（m/s）
+export OBSTACLE_MIN_CLEARANCE_START_GOAL=${OBSTACLE_MIN_CLEARANCE_START_GOAL:-25.0} # 障碍与起终点最小净空
+export USE_LEGACY_TERRAIN=${USE_LEGACY_TERRAIN:-0}              # 0=当前地形生成器，1=旧地形路径
+export RING_BASE_REWARD=${RING_BASE_REWARD:-80.0}               # 目标环阶段奖励基值
 
 # === 🔧 智能体目标分布半径（减少到终点时的组间斥力）===
 export AGENT_GOAL_FORMATION_RADIUS=${AGENT_GOAL_FORMATION_RADIUS:-10.0}  # 各智能体目标绕中央目标的分布半径（米）
@@ -1265,7 +1277,7 @@ ARGS=(
     --batch-size "$BATCH_SIZE"    # 批大小：提升到1024以充分利用GPU
     --exp-name "$EXP_NAME_WITH_TIMESTAMP"              # 实验名称：用于日志与模型目录（带时间戳）
     --save-model                          # 开启周期保存模型
-    --save-interval "${SAVE_INTERVAL:-800}"                # 保存间隔（回合）：↑ IO频率↑
+    --save-interval "${SAVE_INTERVAL:-0}"                  # 0=不保存中间epN；完整批次只保留最终/选模候选
     --episode-length 2800               # 🔧 回滚到2200：步数翻倍会导致奖励尺度翻倍，Critic Loss反而更高
     --update-rate "$UPDATE_RATE"       # 更新频率（步）：可通过环境变量覆盖
     --learning-rate-actor "$LEARNING_RATE_ACTOR"   # Actor学习率（初始值）
@@ -1286,9 +1298,12 @@ ARGS=(
     --action-reg-coef "$ACTION_REG_COEF"              # Actor 动作正则系数（惩罚大幅动作）
     --neg-z-reg-coef "$NEG_Z_REG_COEF"                # 负向Z轴专用正则系数（仅惩罚az<0，防止整体偏向负半轴）
     # 探索噪声：作用于Actor输出（训练与评估时如需关闭，可将NOISE_SCALE设为0）
-    --noise-scale "$NOISE_SCALE"          # 初始噪声幅度：↑ 探索↑ 但轨迹更抖；↓ 更平滑但易早收敛
-    --noise-decay  "$NOISE_DECAY"         # 回合级衰减：接近1表示衰减很慢；过小会过早失去探索
-    --noise-min    "$NOISE_MIN"           # 噪声下限：保持少量探索，避免策略陷入局部最优
+    --noise-scale "$NOISE_SCALE"          # 初始OU噪声std
+    --noise-decay  "$NOISE_DECAY"         # OU噪声独立衰减率
+    --noise-decay-steps "$NOISE_DECAY_STEPS"  # OU噪声每N个环境步衰减一次
+    --noise-staircase "$NOISE_STAIRCASE"  # OU噪声是否阶梯式衰减
+    --noise-decay-enabled "$NOISE_DECAY_ENABLED"  # 是否启用OU噪声独立衰减
+    --noise-min    "$NOISE_MIN"           # OU噪声std下限
     --random-action-prob "$RANDOM_ACTION_PROB"  # 统一随机动作概率：主训练路径与旧回退路径共用
     --random-action-prob-training "$RANDOM_ACTION_PROB_TRAINING"  # 兼容旧参数名：保持与 RANDOM_ACTION_PROB 一致
     --lite-buffer true                    # 启用轻量缓冲区（预分配连续内存，峰值更低）
@@ -1311,6 +1326,23 @@ ARGS=(
     
     --gravity "$GRAVITY"                 # 环境重力
     --control-accel-gain "$CONTROL_ACCEL_GAIN" # 控制增益
+    --agent-size "$AGENT_SIZE"           # 智能体物理半径；同时影响碰撞与地形净空
+    --use-quadrotor-dynamics "$USE_QUADROTOR_DYNAMICS" # 动力学模型开关
+    --start-altitude-offset "$START_ALTITUDE_OFFSET" # 起点相对地形高度
+    --goal-altitude "$GOAL_ALTITUDE"     # 中央目标相对地形高度
+    --agent-goal-formation-radius "$AGENT_GOAL_FORMATION_RADIUS" # 个体目标阵型半径
+    --enable-role-shuffle "$ENABLE_ROLE_SHUFFLE" # 每回合角色映射是否打乱
+    --init-vel-jitter-max "$INIT_VEL_JITTER_MAX" # 初始速度扰动上限
+    --mountain-min-distance "$MOUNTAIN_MIN_DISTANCE" # 山峰最小间距
+    --mountain-margin "$MOUNTAIN_MARGIN" # 山峰生成边界余量
+    --obstacle-min-clearance-start-goal "$OBSTACLE_MIN_CLEARANCE_START_GOAL" # 障碍与起终点净空
+    --terrain-collision-eps "$TERRAIN_COLLISION_EPS" # 地形真实碰撞容差
+    --use-legacy-terrain "$USE_LEGACY_TERRAIN" # 旧地形生成路径开关
+    --ring-base-reward "$RING_BASE_REWARD" # 目标环阶段奖励基值
+    --min-start-goal-dist "$MIN_START_GOAL_DIST" # 随机起终点水平距离下限
+    --max-start-goal-dist "$MAX_START_GOAL_DIST" # 随机起终点水平距离上限
+    --start-pos-margin "$START_POS_MARGIN" # 起点离地图边界余量
+    --start-pos-max-trials "$START_POS_MAX_TRIALS" # 起点采样最大次数
     # --ground-friction 已弃用
     --damping "$DAMPING"                 # 速度阻尼系数
     --simulation-dt "$SIMULATION_DT"      # 仿真步长
@@ -1411,6 +1443,9 @@ ARGS=(
     --collapse-loss-threshold "1000"
     --collapse-z-threshold "-50.0"
     --terrain-contact-eps "$TERRAIN_CONTACT_EPS"
+    --obstacle-observation-mode "$OBSTACLE_OBSERVATION_MODE"
+    --obstacle-risk-velocity-forward-weight "$OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"
+    --obstacle-risk-goal-along-weight "$OBSTACLE_RISK_GOAL_ALONG_WEIGHT"
     --terrain-complexity-level "$TERRAIN_COMPLEXITY_LEVEL"
     --map-size "$MAP_SIZE"
 )
@@ -1429,6 +1464,9 @@ if [ "$ALGORITHM" = "matd3" ]; then
         --cross-agent-reference-enabled "${CROSS_AGENT_REFERENCE_ENABLED:-false}"
         --cross-agent-reference-coef "${CROSS_AGENT_REFERENCE_COEF:-0.03}"
         --cross-agent-reference-start-episode "${CROSS_AGENT_REFERENCE_START_EPISODE:-50}"
+        --cross-agent-reference-actor-start-episode "${CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE:-${CROSS_AGENT_REFERENCE_START_EPISODE:-50}}"
+        --cross-agent-reference-actor-ramp-episodes "${CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES:-0}"
+        --cross-agent-reference-actor-require-success "${CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS:-false}"
         --cross-agent-reference-progress-threshold "${CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD:-0.0005}"
         --cross-agent-reference-margin "${CROSS_AGENT_REFERENCE_MARGIN:-0.0}"
         --cross-agent-reference-head-weight "${CROSS_AGENT_REFERENCE_HEAD_WEIGHT:-1.0}"
@@ -1443,30 +1481,13 @@ if [ "$ALGORITHM" = "matd3" ]; then
         --cross-agent-reference-selector-enabled "${CROSS_AGENT_REFERENCE_SELECTOR_ENABLED:-false}"
         --cross-agent-reference-selector-train-in-graph "${CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH:-auto}"
         --cross-agent-reference-selector-mode "${CROSS_AGENT_REFERENCE_SELECTOR_MODE:-hard}"
-        --cross-agent-reference-selector-alpha "${CROSS_AGENT_REFERENCE_SELECTOR_ALPHA:-0.7}"
-        --cross-agent-reference-selector-q-tau "${CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU:-500.0}"
         --cross-agent-reference-selector-lr "${CROSS_AGENT_REFERENCE_SELECTOR_LR:-1e-4}"
         --cross-agent-reference-selector-hidden "${CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN:-128,64}"
-        --cross-agent-reference-selector-init-logit "${CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT:--2.0}"
+        --cross-agent-reference-selector-init-logit "${CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT:-0.0}"
         --cross-agent-reference-selector-adv-clip "${CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP:-5.0}"
-        --cross-agent-reference-selector-reward-tau "${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU:-500.0}"
-        --cross-agent-reference-selector-reward-tiebreak "${CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK:-0.05}"
-        --cross-agent-reference-selector-success-stable-window "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW:-100}"
-        --cross-agent-reference-selector-success-stable-delta "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA:-0.02}"
-        --cross-agent-reference-selector-success-stable-min-rate "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE:-0.05}"
-        --cross-agent-reference-selector-success-stable-min-episodes "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES:-200}"
-        --cross-agent-reference-selector-success-ramp-episodes "${CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES:-50}"
-        --cross-agent-reference-closed-loop-feedback-weight "${CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT:-0.15}"
-        --cross-agent-reference-closed-loop-use-q-advantage "${CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE:-0}"
-        --cross-agent-reference-team-target-two-plus "${CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS:-0.30}"
-        --cross-agent-reference-team-target-single-near "${CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR:-0.25}"
-        --cross-agent-reference-team-target-single-safe "${CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE:-0.20}"
-        --cross-agent-reference-team-target-safe-near "${CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR:-0.15}"
-        --cross-agent-reference-team-target-progress "${CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS:-0.05}"
-        --cross-agent-reference-feedback-two-plus-weight "${CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT:-0.20}"
-        --cross-agent-reference-feedback-any-weight "${CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT:-0.05}"
-        --cross-agent-reference-feedback-progress-weight "${CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT:-0.05}"
-        --cross-agent-reference-closed-loop-max-pending-updates "${CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES:-64}"
+        --cross-agent-reference-advantage-ema-decay "${CROSS_AGENT_REFERENCE_ADVANTAGE_EMA_DECAY:-0.99}"
+        --cross-agent-reference-advantage-epsilon "${CROSS_AGENT_REFERENCE_ADVANTAGE_EPSILON:-1e-6}"
+        --cross-agent-reference-advantage-initial-scale "${CROSS_AGENT_REFERENCE_ADVANTAGE_INITIAL_SCALE:-1.0}"
     )
 fi
 if [ "$ALGORITHM" = "maddpg" ]; then
@@ -1782,11 +1803,12 @@ manifest = {
         "exp_name": exp_name,
         "exp_name_with_timestamp": exp_name_with_timestamp,
         "seed": exec_env.get("SEED"),
+        "num_envs": int(exec_env.get("NUM_ENVS", "1")),
     },
 }
 
 manifest_path.parent.mkdir(parents=True, exist_ok=True)
-with open(manifest_path, "w", encoding="utf-8") as f:
+with open(manifest_path, "x", encoding="utf-8") as f:
     json.dump(manifest, f, ensure_ascii=False, indent=2)
 PY
 

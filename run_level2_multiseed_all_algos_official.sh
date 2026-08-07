@@ -11,7 +11,6 @@ TRAIN_MAX_PARALLEL="${TRAIN_MAX_PARALLEL:-$MAX_PARALLEL}"
 EVAL_MAX_PARALLEL="${EVAL_MAX_PARALLEL:-$MAX_PARALLEL}"
 SEEDS=(${SEEDS:-101 202 936487})
 STRICT_SUMMARY="${STRICT_SUMMARY:-1}"
-RESTART_INCOMPLETE="${RESTART_INCOMPLETE:-1}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 FORCE_EVAL_RERUN="${FORCE_EVAL_RERUN:-${FORCE_RERUN:-0}}"
 UTILITY_PYTHON_BIN="${UTILITY_PYTHON_BIN:-${EVAL_PYTHON_BIN:-${TRAIN_PYTHON_BIN:-python3}}}"
@@ -55,6 +54,9 @@ COMMON_ENV=(
   OFFICIAL_POST_EVAL_VALIDATION_CANDIDATES=best_by_team_sr,best,checkpoint,final,latest_ep
   OFFICIAL_EVAL_QUIET=1
   EVAL_ARTIFACT_FILENAME_TAG=model_fr
+  SAVE_INTERVAL=0
+  SAVE_TRAINING_RESUME_STATE=0
+  BATCH_RESUME_POLICY=completed_units_only_restart_incomplete
 )
 
 if [ -n "${LABELS_OVERRIDE:-}" ]; then
@@ -157,7 +159,7 @@ latest_completed_model_dir() {
   local seed="$2"
   local candidate
   while IFS= read -r candidate; do
-    if [ -n "$candidate" ] && model_completed "$candidate"; then
+    if [ -n "$candidate" ] && model_completed "$candidate" "$seed"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -167,36 +169,22 @@ latest_completed_model_dir() {
 
 model_completed() {
   local model_dir="$1"
-  "$UTILITY_PYTHON_BIN" - "$model_dir" "$EPISODES" <<'PY'
-import json
+  local seed="$2"
+  "$UTILITY_PYTHON_BIN" - "$model_dir" "$EPISODES" "$seed" <<'PY'
 import sys
 from pathlib import Path
 
-model_dir = Path(sys.argv[1])
-target = int(sys.argv[2])
-episodes = []
+from experiment_runtime_config import training_unit_completion_errors
 
-results_path = model_dir / "results.json"
-if results_path.exists():
-    try:
-        data = json.loads(results_path.read_text(encoding="utf-8"))
-        episodes.append(int(data.get("episodes", 0) or 0))
-    except Exception:
-        pass
-
-for state_path in model_dir.glob("*/checkpoint_state.json"):
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        continue
-    candidates = [int(state.get("episode", 0) or 0)]
-    for key in ("episode_rewards", "episode_force_ratios", "team_success_flags", "success_flags"):
-        value = state.get(key)
-        if isinstance(value, list):
-            candidates.append(len(value))
-    episodes.append(max(candidates))
-
-raise SystemExit(0 if episodes and max(episodes) >= target else 1)
+model_dir = Path(sys.argv[1]).resolve()
+errors = training_unit_completion_errors(
+    model_dir,
+    int(sys.argv[2]),
+    repo_root=model_dir.parent.parent,
+    expected_agents=3,
+    expected_seed=int(sys.argv[3]),
+)
+raise SystemExit(1 if errors else 0)
 PY
 }
 
@@ -345,19 +333,6 @@ raise SystemExit(0 if has_selection and protocol_ok and validation_ok and has_ex
 PY
 }
 
-resume_model_path() {
-  local model_dir="$1"
-  if [ -d "$model_dir/checkpoint" ]; then
-    printf '%s\n' "$model_dir"
-  elif [ -d "$model_dir/best_by_team_sr" ]; then
-    printf '%s\n' "$model_dir/best_by_team_sr"
-  elif [ -d "$model_dir/final" ]; then
-    printf '%s\n' "$model_dir/final"
-  else
-    printf '%s\n' "$model_dir"
-  fi
-}
-
 model_has_eval_candidate() {
   local model_dir="$1"
   local variant
@@ -402,7 +377,7 @@ delete_incomplete_artifacts_for_label_seed() {
 
   while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
-    if model_completed "$candidate"; then
+    if model_completed "$candidate" "$seed"; then
       continue
     fi
     delete_incomplete_artifacts "$candidate"
@@ -461,7 +436,8 @@ run_level2_job() {
   local resume_env=()
   local r2s_tail_weight="${CROSS_AGENT_REFERENCE_TAIL_WEIGHT:-0.3}"
   if [ -n "$resume_model" ]; then
-    resume_env+=(RESUME_MODEL_ENV="$resume_model")
+    echo "[refuse-resume] batch policy forbids episode/checkpoint continuation: $label seed${seed}" >&2
+    return 2
   fi
   case "$label" in
     matd3_cross_agent_ref_reward_to_success_selector_tail0)
@@ -961,7 +937,7 @@ fi
 for seed in "${SEEDS[@]}"; do
   for label in "${LABELS[@]}"; do
     model_dir="$(latest_completed_model_dir "$label" "$seed" || true)"
-    if [ -n "$model_dir" ] && model_completed "$model_dir"; then
+    if [ -n "$model_dir" ] && model_completed "$model_dir" "$seed"; then
       if official_eval_completed "$model_dir" "$seed"; then
         if ! truthy "$FORCE_EVAL_RERUN"; then
           echo "[skip] $label seed${seed}: training and official eval already complete ($model_dir)"
@@ -979,15 +955,9 @@ for seed in "${SEEDS[@]}"; do
     fi
 
     model_dir="$(latest_model_dir "$label" "$seed")"
-    resume_from=""
     if [ -n "$model_dir" ]; then
-      if truthy "$RESTART_INCOMPLETE"; then
-        echo "[restart-train] $label seed${seed}: incomplete previous run(s) will be deleted and restarted"
-        delete_incomplete_artifacts_for_label_seed "$label" "$seed"
-      else
-        resume_from="$(resume_model_path "$model_dir")"
-        echo "[resume-train] $label seed${seed}: resume from $resume_from"
-      fi
+      echo "[restart-train] $label seed${seed}: incomplete previous run(s) will be deleted; restart at episode 0"
+      delete_incomplete_artifacts_for_label_seed "$label" "$seed"
     else
       echo "[new-train] $label seed${seed}: no previous model directory found"
     fi
@@ -995,7 +965,7 @@ for seed in "${SEEDS[@]}"; do
     while [ "$(jobs -pr | wc -l)" -ge "$TRAIN_MAX_PARALLEL" ]; do
       wait -n
     done
-    run_level2_job "$label" "$seed" "$resume_from"
+    run_level2_job "$label" "$seed"
   done
 done
 

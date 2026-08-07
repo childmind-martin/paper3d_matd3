@@ -243,53 +243,57 @@ class ObservationProcessor:
 
     def batch_process_observations_parallel(self, obs_batch):
         """
-        🔧 单环境模式：处理单环境的观察数据（n_agents个智能体的观察）
+        处理单环境或多环境的观察数据。
         
         输入:
           - list[n_agents]: 单环境多智能体的观察列表
-          - ndarray 形状为 (1, n_agents, obs_dim_raw) 或 (n_agents, obs_dim_raw)
+          - list[num_envs][n_agents]: 多环境观察列表
+          - ndarray 形状为 (num_envs, n_agents, obs_dim_raw) 或
+            (n_agents, obs_dim_raw)
         
         返回:
-          - ndarray 形状为 (1, n_agents, obs_dim): 批次化的观察数据（保持API兼容性）
+          - ndarray 形状为 (num_envs, n_agents, obs_dim)
         """
-        # 🔧 单环境优化：直接处理单环境数据，移除多环境判断逻辑
-        
-        # 情况1：numpy数组输入
+        def _process_environments(environments):
+            result = np.zeros(
+                (len(environments), self.n_agents, self.obs_dim),
+                dtype=np.float32,
+            )
+            for env_index, env_obs in enumerate(environments):
+                try:
+                    agents = list(env_obs)
+                except TypeError:
+                    agents = [env_obs] * self.n_agents
+                for agent_index in range(min(self.n_agents, len(agents))):
+                    result[env_index, agent_index] = self.process_observation(
+                        agents[agent_index],
+                        agent_index,
+                    )
+            return result
+
         if isinstance(obs_batch, np.ndarray):
-            # 如果是3D数组 (1, n_agents, obs_dim_raw)，提取单环境数据
             if obs_batch.ndim == 3:
-                if obs_batch.shape[0] == 1:
-                    # 单环境批次化数据，提取实际数据
-                    obs_batch = obs_batch[0]  # (n_agents, obs_dim_raw)
-                else:
-                    # 多环境数据（不应该出现，但保持兼容）
-                    obs_batch = obs_batch[0]  # 只处理第一个环境
-            
-            # 如果是2D数组 (n_agents, obs_dim_raw)，直接处理
+                return _process_environments(obs_batch)
             if obs_batch.ndim == 2:
-                processed_batch = np.zeros((self.n_agents, self.obs_dim), dtype=np.float32)
-                for i in range(min(self.n_agents, obs_batch.shape[0])):
-                    obs_raw = obs_batch[i]
-                    obs_dim_raw = obs_raw.size if isinstance(obs_raw, np.ndarray) else len(obs_raw)
-                    obs_flat = obs_raw.flatten() if isinstance(obs_raw, np.ndarray) else obs_raw
-                    
-                    if obs_dim_raw == self.obs_dim:
-                        processed_batch[i] = np.asarray(obs_flat, dtype=np.float32)
-                    elif obs_dim_raw > self.obs_dim:
-                        processed_batch[i] = np.asarray(obs_flat[:self.obs_dim], dtype=np.float32)
-                    else:
-                        processed_batch[i, :obs_dim_raw] = np.asarray(obs_flat, dtype=np.float32)
-                
-                # 返回批次化格式 (1, n_agents, obs_dim) 保持API兼容
-                return processed_batch.reshape(1, self.n_agents, self.obs_dim)
+                return _process_environments([obs_batch])
 
-        # 情况2：list/tuple 结构（单环境多智能体）
         if isinstance(obs_batch, (list, tuple)):
-            # 单环境：直接处理n_agents个智能体的观察
-            processed_batch = self.batch_process_observations(list(obs_batch))
-            # 返回批次化格式 (1, n_agents, obs_dim) 保持API兼容
-            return processed_batch.reshape(1, self.n_agents, self.obs_dim)
+            try:
+                obs_array = np.asarray(obs_batch, dtype=np.float32)
+            except (TypeError, ValueError):
+                obs_array = None
+            if obs_array is not None:
+                if obs_array.ndim == 3:
+                    return _process_environments(obs_array)
+                if obs_array.ndim == 2:
+                    return _process_environments([obs_array])
+            if obs_batch:
+                try:
+                    first_ndim = np.asarray(obs_batch[0], dtype=object).ndim
+                except Exception:
+                    first_ndim = 0
+                if first_ndim >= 2:
+                    return _process_environments(obs_batch)
+            return _process_environments([obs_batch])
 
-        # 兜底：当成单环境
-        single_env = self.batch_process_observations([obs_batch] * self.n_agents)
-        return single_env.reshape(1, self.n_agents, self.obs_dim)
+        return _process_environments([[obs_batch] * self.n_agents])

@@ -132,36 +132,22 @@ model_dirs_newest_first() {
 
 model_completed() {
   local model_dir="$1"
-  "$PYTHON_BIN" - "$model_dir" "$TRAIN_EPISODES" <<'PY'
-import json
+  local train_seed="$2"
+  "$PYTHON_BIN" - "$model_dir" "$TRAIN_EPISODES" "$train_seed" <<'PY'
 import sys
 from pathlib import Path
 
-model_dir = Path(sys.argv[1])
-target = int(sys.argv[2])
-episodes = []
+from experiment_runtime_config import training_unit_completion_errors
 
-results_path = model_dir / "results.json"
-if results_path.exists():
-    try:
-        data = json.loads(results_path.read_text(encoding="utf-8"))
-        episodes.append(int(data.get("episodes", 0) or 0))
-    except Exception:
-        pass
-
-for state_path in model_dir.glob("*/checkpoint_state.json"):
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        continue
-    candidates = [int(state.get("episode", 0) or 0)]
-    for key in ("episode_rewards", "episode_force_ratios", "team_success_flags", "success_flags"):
-        value = state.get(key)
-        if isinstance(value, list):
-            candidates.append(len(value))
-    episodes.append(max(candidates))
-
-raise SystemExit(0 if episodes and max(episodes) >= target else 1)
+model_dir = Path(sys.argv[1]).resolve()
+errors = training_unit_completion_errors(
+    model_dir,
+    int(sys.argv[2]),
+    repo_root=model_dir.parent.parent,
+    expected_agents=3,
+    expected_seed=int(sys.argv[3]),
+)
+raise SystemExit(1 if errors else 0)
 PY
 }
 
@@ -170,7 +156,7 @@ latest_completed_model_dir() {
   local train_seed="$2"
   local candidate
   while IFS= read -r candidate; do
-    if [ -n "$candidate" ] && model_completed "$candidate"; then
+    if [ -n "$candidate" ] && model_completed "$candidate" "$train_seed"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -402,9 +388,22 @@ resolve_base_spec() {
   fi
   local base_name
   local child_tag
+  local candidate
   base_name="$(basename "$model_dir")"
   child_tag="${base_name#*__seed${first_seed}__}"
-  find "$ROOT_DIR/ablation_experiments" -path "*/seed_batches/${child_tag}/results/post_eval_shared_spec.json" -print -quit
+  candidate="$(find "$ROOT_DIR/ablation_experiments" -path "*/seed_batches/${child_tag}/results/post_eval_shared_spec.json" -print -quit)"
+  if [ -n "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  # run_optimized.sh appends its own YYYYMMDD_HHMMSS suffix to the
+  # ablation-provided experiment name.  The child batch directory itself does
+  # not contain that final training-launch suffix.
+  if [[ "$child_tag" =~ ^(.+)_[0-9]{8}_[0-9]{6}$ ]]; then
+    child_tag="${BASH_REMATCH[1]}"
+    find "$ROOT_DIR/ablation_experiments" -path "*/seed_batches/${child_tag}/results/post_eval_shared_spec.json" -print -quit
+  fi
 }
 
 prepare_specs() {
@@ -431,8 +430,11 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from selection_scoring import (
+    SELECTION_RESULT_SCHEMA_VERSION,
+    SELECTION_SCORE_SCHEMA_VERSION,
+)
 
-SCORE_SCHEMA_VERSION = 2
 VOLATILE_SPEC_HASH_KEYS = {"spec_path"}
 ALLOWED_CANDIDATES = {"auto", "final", "best", "best_by_team_sr", "latest_ep", "checkpoint"}
 
@@ -476,6 +478,24 @@ def to_bool(value):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+def model_signature(model_dir):
+    try:
+        weight_files = sorted(Path(model_dir).glob("actor_*.weights.h5"))
+        if not weight_files:
+            return None
+        hasher = hashlib.sha1()
+        for weight_path in weight_files:
+            hasher.update(weight_path.name.encode("utf-8", errors="ignore"))
+            with weight_path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return None
+
 path = Path(sys.argv[1])
 base_spec = Path(sys.argv[2]).resolve()
 expected_model_variant = str(sys.argv[3]).strip().lower() or "best_by_team_sr"
@@ -491,17 +511,21 @@ expected_agent_size = str(sys.argv[10]).strip() or "0.5"
 if not path.exists():
     raise SystemExit(1)
 data = json.loads(path.read_text(encoding="utf-8"))
-if int(data.get("schema_version", 0) or 0) != 2:
+if int(data.get("schema_version", 0) or 0) != SELECTION_RESULT_SCHEMA_VERSION:
     raise SystemExit(1)
 selection = data.get("model_selection", {})
 if not isinstance(selection, dict):
     raise SystemExit(1)
-if int(selection.get("selection_score_schema_version", 0) or 0) != SCORE_SCHEMA_VERSION:
+if int(selection.get("schema_version", 0) or 0) != SELECTION_RESULT_SCHEMA_VERSION:
+    raise SystemExit(1)
+if int(selection.get("selection_score_schema_version", 0) or 0) != SELECTION_SCORE_SCHEMA_VERSION:
     raise SystemExit(1)
 context = selection.get("selection_context", {})
 if not isinstance(context, dict):
     context = data.get("selection_context", {}) if isinstance(data.get("selection_context"), dict) else {}
-if int(context.get("selection_score_schema_version", 0) or 0) != SCORE_SCHEMA_VERSION:
+if int(context.get("schema_version", 0) or 0) != SELECTION_RESULT_SCHEMA_VERSION:
+    raise SystemExit(1)
+if int(context.get("selection_score_schema_version", 0) or 0) != SELECTION_SCORE_SCHEMA_VERSION:
     raise SystemExit(1)
 if not base_spec.exists():
     raise SystemExit(1)
@@ -539,7 +563,24 @@ if not model_path or not Path(model_path).exists():
 if not summary_path or not Path(summary_path).exists():
     raise SystemExit(1)
 summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
-if int(summary.get("selection_score_schema_version", 0) or 0) != SCORE_SCHEMA_VERSION:
+if int(summary.get("schema_version", 0) or 0) != SELECTION_RESULT_SCHEMA_VERSION:
+    raise SystemExit(1)
+if int(summary.get("selection_score_schema_version", 0) or 0) != SELECTION_SCORE_SCHEMA_VERSION:
+    raise SystemExit(1)
+selected_summary = summary.get("selected", {})
+if not isinstance(selected_summary, dict):
+    raise SystemExit(1)
+try:
+    resolved_model_path = Path(model_path).resolve()
+    summary_model_path = Path(str(selected_summary.get("model_path", "") or "")).resolve()
+except Exception:
+    raise SystemExit(1)
+if summary_model_path != resolved_model_path:
+    raise SystemExit(1)
+current_signature = model_signature(resolved_model_path)
+selection_signature = str(selection.get("selected_model_signature", "") or "").strip()
+summary_signature = str(selected_summary.get("model_signature", "") or "").strip()
+if not current_signature or selection_signature != current_signature or summary_signature != current_signature:
     raise SystemExit(1)
 print(model_path)
 print(summary_path)
@@ -820,9 +861,14 @@ preflight_checks() {
     fi
   fi
   [ -f "$ROOT_DIR/official_eval_with_matched_validation.py" ] || { echo "[preflight-error] official_eval_with_matched_validation.py missing" >&2; errors=$((errors + 1)); }
+  [ -f "$ROOT_DIR/selection_scoring.py" ] || { echo "[preflight-error] selection_scoring.py missing" >&2; errors=$((errors + 1)); }
   [ -f "$ROOT_DIR/prepare_level2_eval_seed_specs.py" ] || { echo "[preflight-error] prepare_level2_eval_seed_specs.py missing" >&2; errors=$((errors + 1)); }
   [ -f "$ROOT_DIR/summarize_level2_dual_semantics_eval_sweep.py" ] || { echo "[preflight-error] summarize_level2_dual_semantics_eval_sweep.py missing" >&2; errors=$((errors + 1)); }
   [ -x "$PYTHON_BIN" ] || { echo "[preflight-error] PYTHON_BIN not executable: $PYTHON_BIN" >&2; errors=$((errors + 1)); }
+  if [ -x "$PYTHON_BIN" ] && ! "$PYTHON_BIN" -c 'from selection_scoring import SELECTION_RESULT_SCHEMA_VERSION, SELECTION_SCORE_SCHEMA_VERSION' >/dev/null 2>&1; then
+    echo "[preflight-error] shared selection schema module cannot be imported" >&2
+    errors=$((errors + 1))
+  fi
   echo "[preflight] reward version: $REWARD_VERSION | terminal_order_fix=$REWARD_TERMINAL_ORDER_FIX"
   case "${EVAL_FR_MODE,,}" in
     checkpoint|checkpoint_fr|model|model_fr|corresponding|corresponding_fr|forced|fixed|fixed_fr) ;;

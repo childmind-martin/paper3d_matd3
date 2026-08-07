@@ -57,6 +57,21 @@ from algorithm_ablation_colors import (
     get_algorithm_ablation_color,
     get_algorithm_ablation_style,
 )
+from selection_scoring import (
+    SELECTION_RESULT_SCHEMA_VERSION as POST_EVAL_SELECTION_RESULT_SCHEMA_VERSION,
+    SELECTION_SCORE_SCHEMA_VERSION as POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION,
+    comparison_score as _shared_post_eval_comparison_score,
+    score_summary as _shared_post_eval_score_summary,
+    select_best_candidate as _shared_select_post_eval_candidate,
+    selection_score_schema as _shared_post_eval_selection_score_schema,
+    selection_summary_errors as _shared_post_eval_selection_summary_errors,
+)
+from experiment_runtime_config import training_unit_completion_errors
+from selector_experiment_protocol import (
+    SELECTOR_PROTOCOL_EXPERIMENT_CONFIGS,
+    SELECTOR_PROTOCOL_EXPERIMENT_LABELS,
+)
+from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
 
 # 🔧 新增：导入批次管理器
 try:
@@ -119,29 +134,10 @@ STRICT_CORE_EXPERIMENT_LABELS = [
 
 DUAL_SEMANTICS_EXPERIMENT_LABELS = [
     "matd3_full_dual_semantic",
-    "matd3_cross_agent_ref_agent_success",
-    "matd3_cross_agent_ref_agent_quality",
-    "matd3_cross_agent_ref_soft_advantage",
-    "matd3_cross_agent_ref_selector_mix",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail0",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail01",
-    "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_current",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045",
-    "matd3_cross_agent_ref_reward_to_success_selector_clean_label",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail10",
-    "matd3_cross_agent_ref_progress_gate",
-    "matd3_cross_agent_ref_agent_success_behavior_label",
-    "matd3_full_dual_semantic_cross_agent_ref",
-    "matd3_cross_agent_ref_no_quality_gate",
-    "matd3_cross_agent_ref_behavior_label",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate",
+    "matd3_cross_agent_ref_aqual_split_teacher",
+    "matd3_cross_agent_ref_adaptive_twin_advantage",
+    "matd3_cross_agent_ref_shared_twin_advantage_selector",
     "matd3_collapsed_replay",
     "matd3_no_corrected_target_reconstruction",
 ]
@@ -185,29 +181,10 @@ AUDIT_REFERENCE_LABEL_BY_EXPERIMENT = {
     "matd3_full_dual_semantic": "matd3_full_dual_semantic",
     "matd3_collapsed_replay": "matd3_full_dual_semantic",
     "matd3_no_corrected_target_reconstruction": "matd3_full_dual_semantic",
-    "matd3_cross_agent_ref_agent_success": "matd3_full_dual_semantic",
-    "matd3_cross_agent_ref_agent_quality": "matd3_cross_agent_ref_agent_success",
-    "matd3_cross_agent_ref_soft_advantage": "matd3_cross_agent_ref_agent_quality",
-    "matd3_cross_agent_ref_selector_mix": "matd3_cross_agent_ref_soft_advantage",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail0": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail01": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector": "matd3_cross_agent_ref_selector_mix",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_current": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045": "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_clean_label": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail10": "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_progress_gate": "matd3_cross_agent_ref_agent_success",
-    "matd3_cross_agent_ref_agent_success_behavior_label": "matd3_cross_agent_ref_agent_success",
-    "matd3_full_dual_semantic_cross_agent_ref": "matd3_full_dual_semantic",
-    "matd3_cross_agent_ref_no_quality_gate": "matd3_full_dual_semantic_cross_agent_ref",
-    "matd3_cross_agent_ref_behavior_label": "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate": "matd3_cross_agent_ref_behavior_label_agent_quality_gate",
+    "matd3_cross_agent_ref_aqual_split_teacher": "matd3_cross_agent_ref_behavior_label_agent_quality_gate",
+    "matd3_cross_agent_ref_adaptive_twin_advantage": "matd3_cross_agent_ref_aqual_split_teacher",
+    "matd3_cross_agent_ref_shared_twin_advantage_selector": "matd3_cross_agent_ref_adaptive_twin_advantage",
     "maddpg_separated_gradient": "maddpg_separated_gradient",
     "maddpg_dual_q": "maddpg_separated_gradient",
     "maddpg_baseline": "maddpg_separated_gradient",
@@ -235,7 +212,8 @@ DEFAULT_POST_EVAL_VALIDATION_CANDIDATES = (
 POST_EVAL_SELECTION_PROTOCOL_CHOICES = ("fixed", "matched_validation")
 DEFAULT_UNIFIED_ACTION_FORCE_RATIO = 0.50
 DEFAULT_UNIFIED_ACTION_FORCE_RATIO_SCHEDULE_PCT = "0%:0.50,25%:0.48,50%:0.45,70%:0.40,85%:0.35,100%:0.32"
-DEFAULT_FORCE_EVAL_ACTION_FORCE_RATIO = 0.50
+DEFAULT_FORCE_EVAL_ACTION_FORCE_RATIO = None
+BATCH_RESUME_POLICY = "completed_units_only_restart_incomplete"
 POST_EVAL_MODE_ALIAS_MAP = {
     "shared_match_train_env": DEFAULT_POST_EVAL_MODE,
     "heldout_shared": DEFAULT_POST_EVAL_MODE,
@@ -255,29 +233,10 @@ EXPERIMENT_ABBR_BY_LABEL = {
     "matd3_full_dual_semantic": "Full-DS",
     "matd3_collapsed_replay": "Coll-RB",
     "matd3_no_corrected_target_reconstruction": "No-Tgt",
-    "matd3_cross_agent_ref_agent_success": "XRef-Succ",
-    "matd3_cross_agent_ref_agent_quality": "XRef-Qual",
-    "matd3_cross_agent_ref_soft_advantage": "XRef-SoftAdv",
-    "matd3_cross_agent_ref_selector_mix": "XRef-Sel",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail0": "XRef-R2S-T0",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail01": "XRef-R2S-T01",
-    "matd3_cross_agent_ref_reward_to_success_selector": "XRef-R2S",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector": "XRef-R2S-HT",
-    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector": "XRef-CL-HT",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector": "XRef-R2S-HT-SplitT",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_current": "R2S-CurFR",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40": "R2S-FR40",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045": "R2S-FR45",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current": "R2S-HT-CurFR",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40": "R2S-HT-FR40",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045": "R2S-HT-FR45",
-    "matd3_cross_agent_ref_reward_to_success_selector_clean_label": "XRef-R2S-Clean",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail10": "XRef-R2S-T10",
-    "matd3_cross_agent_ref_progress_gate": "XRef-Prog",
-    "matd3_cross_agent_ref_agent_success_behavior_label": "XRef-Beh",
-    "matd3_full_dual_semantic_cross_agent_ref": "CrossRef",
-    "matd3_cross_agent_ref_no_quality_gate": "NoGate",
-    "matd3_cross_agent_ref_behavior_label": "BehLbl",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate": "M0-AQual",
+    "matd3_cross_agent_ref_aqual_split_teacher": "M1-SplitT",
+    "matd3_cross_agent_ref_adaptive_twin_advantage": "M2-ATwin",
+    "matd3_cross_agent_ref_shared_twin_advantage_selector": "M3-SharedSel",
     "maddpg_separated_gradient": "DPG-Sep",
     "maddpg_dual_q": "DPG-Uni",
     "maddpg_baseline": "DPG-Base",
@@ -379,30 +338,13 @@ CROSS_AGENT_REFERENCE_ENV_KEYS = {
     "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED",
     "CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH",
     "CROSS_AGENT_REFERENCE_SELECTOR_MODE",
-    "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA",
-    "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU",
     "CROSS_AGENT_REFERENCE_SELECTOR_LR",
     "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN",
     "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT",
     "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP",
-    "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU",
-    "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK",
-    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW",
-    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA",
-    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE",
-    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES",
-    "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES",
-    "CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT",
-    "CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE",
-    "CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS",
-    "CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT",
-    "CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT",
-    "CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT",
+    "CROSS_AGENT_REFERENCE_ADVANTAGE_EMA_DECAY",
+    "CROSS_AGENT_REFERENCE_ADVANTAGE_EPSILON",
+    "CROSS_AGENT_REFERENCE_ADVANTAGE_INITIAL_SCALE",
 }
 
 CROSS_AGENT_REFERENCE_ARG_KEYS = {
@@ -426,35 +368,13 @@ CROSS_AGENT_REFERENCE_ARG_KEYS = {
     "--cross-agent-reference-selector-enabled",
     "--cross-agent-reference-selector-train-in-graph",
     "--cross-agent-reference-selector-mode",
-    "--cross-agent-reference-selector-alpha",
-    "--cross-agent-reference-selector-q-tau",
     "--cross-agent-reference-selector-lr",
     "--cross-agent-reference-selector-hidden",
     "--cross-agent-reference-selector-init-logit",
     "--cross-agent-reference-selector-adv-clip",
-    "--cross-agent-reference-selector-reward-tau",
-    "--cross-agent-reference-selector-reward-tiebreak",
-    "--cross-agent-reference-selector-success-stable-window",
-    "--cross-agent-reference-selector-success-stable-delta",
-    "--cross-agent-reference-selector-success-stable-min-rate",
-    "--cross-agent-reference-selector-success-stable-min-episodes",
-    "--cross-agent-reference-selector-success-ramp-episodes",
-    "--cross-agent-reference-closed-loop-feedback-weight",
-    "--cross-agent-reference-closed-loop-use-q-advantage",
-    "--cross-agent-reference-closed-loop-max-pending-updates",
-    "--cross-agent-reference-team-target-two-plus",
-    "--cross-agent-reference-team-target-single-near",
-    "--cross-agent-reference-team-target-single-safe",
-    "--cross-agent-reference-team-target-safe-near",
-    "--cross-agent-reference-team-target-progress",
-    "--cross-agent-reference-feedback-two-plus-weight",
-    "--cross-agent-reference-feedback-any-weight",
-    "--cross-agent-reference-feedback-progress-weight",
-    "--cross-agent-reference-team-goal-relaxed-near-mult",
-    "--cross-agent-reference-team-goal-single-cap",
-    "--cross-agent-reference-team-goal-two-near-score",
-    "--cross-agent-reference-team-goal-all-near-score",
-    "--cross-agent-reference-team-goal-close-weight",
+    "--cross-agent-reference-advantage-ema-decay",
+    "--cross-agent-reference-advantage-epsilon",
+    "--cross-agent-reference-advantage-initial-scale",
 }
 
 REWARD_SHAPING_OVERRIDE_ENV_KEYS = {
@@ -486,42 +406,61 @@ REWARD_SHAPING_OVERRIDE_ENV_KEYS = {
     "HEIGHT_DENSE_POSITIVE_SCALE",
 }
 
-SELECTOR_TARGET_OVERRIDE_ENV_KEYS = {
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR",
-    "CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS",
-    "CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT",
-    "CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT",
-    "CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT",
+SAFE_REWARD_COMPARISON_LABELS = set()
+
+SAFE_REWARD_OVERRIDE_ENV_KEYS = {
+    "COLLISION_WEIGHT",
+    "COLLISION_PENALTY_VALUE",
+    "UNSAFE_ARRIVAL_PENALTY",
+    "CLEARANCE_QUALITY_BONUS_WEIGHT",
 }
 
-CROSS_AGENT_REFERENCE_LABELS = {
-    "matd3_cross_agent_ref_agent_success",
-    "matd3_cross_agent_ref_agent_quality",
-    "matd3_cross_agent_ref_soft_advantage",
-    "matd3_cross_agent_ref_selector_mix",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail0",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail01",
-    "matd3_cross_agent_ref_reward_to_success_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_current",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_floor40",
-    "matd3_cross_agent_ref_reward_to_success_selector_fr_fixed045",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_current",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_floor40",
-    "matd3_cross_agent_ref_reward_to_success_head_tail_selector_fr_fixed045",
-    "matd3_cross_agent_ref_reward_to_success_selector_clean_label",
-    "matd3_cross_agent_ref_reward_to_success_selector_tail10",
-    "matd3_cross_agent_ref_progress_gate",
-    "matd3_cross_agent_ref_agent_success_behavior_label",
-    "matd3_full_dual_semantic_cross_agent_ref",
-    "matd3_cross_agent_ref_no_quality_gate",
-    "matd3_cross_agent_ref_behavior_label",
+SAFE_REWARD_OVERRIDE_ARG_KEYS = {
+    "--collision-weight",
+    "--collision-penalty-value",
+    "--unsafe-arrival-penalty",
+    "--clearance-quality-bonus-weight",
 }
+
+SELECTOR_TARGET_OVERRIDE_ENV_KEYS = set()
+
+CROSS_AGENT_REFERENCE_LABELS = {
+    "matd3_cross_agent_ref_behavior_label_agent_quality_gate",
+    "matd3_cross_agent_ref_aqual_split_teacher",
+    "matd3_cross_agent_ref_adaptive_twin_advantage",
+    "matd3_cross_agent_ref_shared_twin_advantage_selector",
+}
+
+
+def _collect_cuda_runtime_library_paths(conda_prefix: str) -> List[str]:
+    paths: List[str] = []
+    wsl_cuda_lib = Path("/usr/lib/wsl/lib")
+    if wsl_cuda_lib.is_dir():
+        paths.append(str(wsl_cuda_lib))
+
+    if conda_prefix:
+        prefix = Path(conda_prefix)
+        conda_lib = prefix / "lib"
+        if conda_lib.is_dir():
+            paths.append(str(conda_lib))
+
+        py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        nvidia_root = prefix / "lib" / py_tag / "site-packages" / "nvidia"
+        if nvidia_root.is_dir():
+            paths.extend(str(path) for path in sorted(nvidia_root.glob("*/lib")) if path.is_dir())
+
+    return paths
+
+
+def _prepend_ld_library_paths(env: Dict[str, str], paths: Sequence[str]) -> None:
+    current_parts = [part for part in str(env.get("LD_LIBRARY_PATH", "")).split(":") if part]
+    current_set = set(current_parts)
+    prepend_parts: List[str] = []
+    for path in paths:
+        if path and path not in current_set and path not in prepend_parts:
+            prepend_parts.append(path)
+    if prepend_parts:
+        env["LD_LIBRARY_PATH"] = ":".join(prepend_parts + current_parts)
 
 
 def _build_process_env(env_isolation: str) -> Dict[str, str]:
@@ -554,10 +493,7 @@ def _build_process_env(env_isolation: str) -> Dict[str, str]:
         current_path = str(env.get("PATH", "")).strip()
         if conda_bin and conda_bin not in current_path.split(":"):
             env["PATH"] = f"{conda_bin}:{current_path}" if current_path else conda_bin
-        conda_lib = str(Path(conda_prefix) / "lib")
-        current_ld = str(env.get("LD_LIBRARY_PATH", "")).strip()
-        if conda_lib and conda_lib not in current_ld.split(":"):
-            env["LD_LIBRARY_PATH"] = f"{conda_lib}:{current_ld}" if current_ld else conda_lib
+    _prepend_ld_library_paths(env, _collect_cuda_runtime_library_paths(conda_prefix))
     return env
 
 
@@ -592,10 +528,7 @@ def _ensure_conda_runtime_env(env: Dict[str, str], python_bin: Optional[str] = N
         if conda_bin and conda_bin not in current_path.split(":"):
             env["PATH"] = f"{conda_bin}:{current_path}" if current_path else conda_bin
 
-        conda_lib = str(Path(conda_prefix) / "lib")
-        current_ld = str(env.get("LD_LIBRARY_PATH", "")).strip()
-        if conda_lib and conda_lib not in current_ld.split(":"):
-            env["LD_LIBRARY_PATH"] = f"{conda_lib}:{current_ld}" if current_ld else conda_lib
+    _prepend_ld_library_paths(env, _collect_cuda_runtime_library_paths(conda_prefix))
 
     for key in ("PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "LIBRARY_PATH"):
         if key in env:
@@ -839,6 +772,21 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
 
     args.episodes = int(parent_config.get("episodes", args.episodes))
     args.batch_size = int(parent_config.get("batch_size", args.batch_size))
+    saved_num_envs = parent_config.get("num_envs", None)
+    if saved_num_envs is not None:
+        saved_num_envs = int(saved_num_envs)
+        if saved_num_envs <= 0:
+            raise RuntimeError(
+                f"恢复父批次时，已有 num_envs 非法: {saved_num_envs}"
+            )
+        if bool(getattr(args, "cli_num_envs_specified", False)):
+            if int(args.num_envs) != saved_num_envs:
+                raise RuntimeError(
+                    "恢复父批次时，命令行 --num-envs 与已有批次不一致: "
+                    f"cli={int(args.num_envs)}, batch={saved_num_envs}"
+                )
+        else:
+            args.num_envs = saved_num_envs
     args.use_weighted_reward = int(parent_config.get("use_weighted_reward", args.use_weighted_reward))
     args.env_isolation = str(parent_config.get("env_isolation", args.env_isolation))
     args.config_mode = str(parent_config.get("config_mode", args.config_mode))
@@ -873,6 +821,10 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
             args.disable_post_eval = False
         else:
             args.disable_post_eval = not bool(parent_config.get("post_eval_enabled"))
+    if not bool(getattr(args, "allow_post_eval_without_train_success", False)):
+        args.allow_post_eval_without_train_success = bool(
+            parent_config.get("allow_post_eval_without_train_success", False)
+        )
     cli_post_eval_mode_specified = bool(getattr(args, "cli_post_eval_mode_specified", False))
     if cli_post_eval_mode_specified:
         pass
@@ -971,9 +923,13 @@ def _restore_args_from_parent_batch(args, batch_dir: Path) -> Dict[str, Any]:
         }
         if requested_saved_variant not in valid_requested_variants:
             requested_saved_variant = ""
-        # 兼容旧批次：历史配置里大量写死为 final，这会覆盖掉当前“按最大 team SR 选择 checkpoint”的默认行为。
-        # 如果用户没有显式传 --post-eval-model-variant，则优先保留新的默认值 best_by_team_sr。
-        if saved_variant.lower() == "final" and current_variant == DEFAULT_POST_EVAL_MODEL_VARIANT:
+        # New batches persist both the storage variant and the exact requested
+        # checkpoint variant. Prefer that explicit provenance on resume; only
+        # apply the historical "final meant old default" migration when the
+        # requested field is absent.
+        if requested_saved_variant:
+            args.post_eval_model_variant = requested_saved_variant
+        elif saved_variant.lower() == "final" and current_variant == DEFAULT_POST_EVAL_MODEL_VARIANT:
             args.post_eval_model_variant = DEFAULT_POST_EVAL_MODEL_VARIANT
         # 兼容误写入/内部存储值：matched_validation 是 post-eval 结果目录变体，不是合法的 CLI checkpoint 选择项。
         # 恢复历史父批次时应优先回退到记录下来的 requested checkpoint 变体，否则使用当前默认值。
@@ -1272,6 +1228,124 @@ def _save_json(path: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
 
 
+RESOLVED_TRAINING_MANIFEST_SCHEMA_VERSION = 2
+RESOLVED_TRAINING_MANIFEST_HASH_KEY = "content_sha256"
+
+
+def _resolved_manifest_content_sha256(manifest: Dict[str, Any]) -> str:
+    payload = copy.deepcopy(manifest)
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        meta.pop(RESOLVED_TRAINING_MANIFEST_HASH_KEY, None)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stamp_resolved_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    manifest["version"] = int(RESOLVED_TRAINING_MANIFEST_SCHEMA_VERSION)
+    meta = manifest.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        raise RuntimeError("配置清单 meta 必须是对象")
+    meta["manifest_role"] = "resolved_training_config"
+    meta["immutable"] = True
+    meta["hash_algorithm"] = "sha256"
+    meta.pop(RESOLVED_TRAINING_MANIFEST_HASH_KEY, None)
+    meta[RESOLVED_TRAINING_MANIFEST_HASH_KEY] = _resolved_manifest_content_sha256(manifest)
+    return manifest
+
+
+def _verify_resolved_manifest_fingerprint(manifest: Dict[str, Any], path: Path) -> None:
+    meta = manifest.get("meta", {})
+    if not isinstance(meta, dict):
+        raise RuntimeError(f"配置清单 meta 格式错误: {path}")
+    recorded = str(meta.get(RESOLVED_TRAINING_MANIFEST_HASH_KEY, "") or "").strip()
+    if not recorded:
+        if _to_bool(meta.get("immutable", False)):
+            raise RuntimeError(f"不可变配置清单缺少内容指纹: {path}")
+        return
+    actual = _resolved_manifest_content_sha256(manifest)
+    if recorded != actual:
+        raise RuntimeError(
+            f"配置清单内容指纹不匹配，文件已被修改或损坏: {path} "
+            f"(recorded={recorded}, actual={actual})"
+        )
+
+
+def _save_resolved_manifest_exclusive(path: Path, manifest: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "x", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, default=_json_default)
+
+
+def _validate_resolved_manifest_identity(
+    manifest: Dict[str, Any],
+    path: Path,
+    *,
+    label: str,
+    exp_name_base: str,
+    seed: Any,
+    episodes: int,
+    batch_size: int,
+    num_envs: int,
+) -> None:
+    meta = manifest.get("meta", {})
+    if not isinstance(meta, dict):
+        raise RuntimeError(f"配置清单 meta 格式错误: {path}")
+    expected = {
+        "label": str(label),
+        "exp_name_base": str(exp_name_base),
+        "seed": str(seed),
+        "episodes": int(episodes),
+        "batch_size": int(batch_size),
+        "num_envs": int(num_envs),
+    }
+    mismatches: List[str] = []
+    for key, expected_value in expected.items():
+        actual_value = meta.get(key)
+        if key == "num_envs" and actual_value is None:
+            exec_env = (
+                manifest.get("exec_env", {})
+                if isinstance(manifest.get("exec_env"), dict)
+                else {}
+            )
+            actual_value = exec_env.get("NUM_ENVS")
+            if actual_value is None:
+                argv = list(manifest.get("argv", []) or [])
+                try:
+                    flag_index = argv.index("--num-envs")
+                    actual_value = argv[flag_index + 1]
+                except (ValueError, IndexError):
+                    actual_value = None
+            if actual_value is None:
+                mismatches.append(
+                    f"num_envs: frozen manifest does not record it, "
+                    f"expected={expected_value}"
+                )
+                continue
+        if actual_value is None:
+            continue
+        if key in ("episodes", "batch_size", "num_envs"):
+            try:
+                matches = int(actual_value) == int(expected_value)
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = str(actual_value) == str(expected_value)
+        if not matches:
+            mismatches.append(f"{key}: got={actual_value}, expected={expected_value}")
+    if mismatches:
+        raise RuntimeError(
+            f"已有冻结配置不属于当前实验请求，拒绝覆盖或混用: {path} | "
+            + " | ".join(mismatches)
+        )
+
+
 @contextlib.contextmanager
 def _exclusive_file_lock(lock_path: Path, timeout_sec: float = 900.0):
     """使用文件锁串行化共享测试集生成，避免多 worker 同时重写同一目录。"""
@@ -1319,6 +1393,7 @@ def _load_manifest(path: Path) -> Dict[str, Any]:
         raise RuntimeError(f"配置清单缺少有效 argv: {path}")
     if not isinstance(exec_env, dict):
         raise RuntimeError(f"配置清单缺少有效 exec_env: {path}")
+    _verify_resolved_manifest_fingerprint(data, path)
     return data
 
 
@@ -1338,6 +1413,84 @@ def _normalize_cli_args(argv: List[str]) -> Dict[str, List[Any]]:
             normalized.setdefault("__positional__", []).append(token)
             i += 1
     return normalized
+
+
+RESULT_MANIFEST_HYPERPARAMETER_FIELDS = (
+    ("noise_scale", "--noise-scale", "float"),
+    ("noise_decay", "--noise-decay", "float"),
+    ("noise_decay_steps", "--noise-decay-steps", "int"),
+    ("noise_staircase", "--noise-staircase", "bool"),
+    ("noise_decay_enabled", "--noise-decay-enabled", "bool"),
+    ("noise_min", "--noise-min", "float"),
+    ("random_action_prob", "--random-action-prob", "float"),
+    ("learning_rate_actor", "--learning-rate-actor", "float"),
+    ("learning_rate_critic", "--learning-rate-critic", "float"),
+)
+
+
+def _manifest_cli_last_value(manifest: Dict[str, Any], flag: str) -> Any:
+    normalized = _normalize_cli_args(list(manifest.get("argv", [])))
+    values = normalized.get(flag, [])
+    return values[-1] if values else None
+
+
+def _provenance_values_equal(lhs: Any, rhs: Any, value_type: str) -> bool:
+    try:
+        if value_type == "bool":
+            return _to_bool(lhs) == _to_bool(rhs)
+        if value_type == "int":
+            return int(lhs) == int(rhs)
+        if value_type == "float":
+            return bool(np.isclose(float(lhs), float(rhs), atol=1e-12, rtol=1e-9))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return str(lhs) == str(rhs)
+
+
+def _validate_result_manifest_provenance(
+    run_args: Dict[str, Any],
+    results_payload: Optional[Dict[str, Any]],
+    manifest: Dict[str, Any],
+) -> List[str]:
+    errors: List[str] = []
+    meta = manifest.get("meta", {}) if isinstance(manifest.get("meta"), dict) else {}
+    expected_exp_name = str(meta.get("exp_name_with_timestamp", "") or "").strip()
+    actual_exp_name = str(run_args.get("exp_name", "") or "").strip()
+    if expected_exp_name and actual_exp_name and expected_exp_name != actual_exp_name:
+        errors.append(
+            f"results 与 manifest 的 exp_name 不一致: got={actual_exp_name}, expected={expected_exp_name}"
+        )
+
+    payload = results_payload if isinstance(results_payload, dict) else {}
+    recorded_manifest_hash = str(payload.get("training_manifest_sha256", "") or "").strip()
+    expected_manifest_hash = str(meta.get(RESOLVED_TRAINING_MANIFEST_HASH_KEY, "") or "").strip()
+    if expected_manifest_hash:
+        if not recorded_manifest_hash:
+            errors.append("results.json 缺少 training_manifest_sha256")
+        elif recorded_manifest_hash != expected_manifest_hash:
+            errors.append(
+                "results 与 manifest 的内容指纹不一致: "
+                f"got={recorded_manifest_hash}, expected={expected_manifest_hash}"
+            )
+
+    hyperparameters = payload.get("training_hyperparameters", {})
+    if not isinstance(hyperparameters, dict):
+        hyperparameters = {}
+    for result_key, manifest_flag, value_type in RESULT_MANIFEST_HYPERPARAMETER_FIELDS:
+        result_value = hyperparameters.get(result_key)
+        # Historical trainers mutated args.noise_scale in-place while decaying OU noise.
+        # Only the structured hyperparameter record is an initial-value source for this field.
+        if result_value is None and result_key != "noise_scale":
+            result_value = run_args.get(result_key)
+        manifest_value = _manifest_cli_last_value(manifest, manifest_flag)
+        if result_value is None or manifest_value is None:
+            continue
+        if not _provenance_values_equal(result_value, manifest_value, value_type):
+            errors.append(
+                f"results 与 manifest 的 {result_key} 不一致: "
+                f"got={result_value}, expected={manifest_value}"
+            )
+    return errors
 
 
 def _set_manifest_cli_flag(argv: List[str], flag: str, value: Any) -> List[str]:
@@ -1449,6 +1602,9 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "--deterministic-train-env-sequence",
         "--terrain-base-seed",
         "--training-env-sequence-seed",
+        "--obstacle-observation-mode",
+        "--obstacle-risk-velocity-forward-weight",
+        "--obstacle-risk-goal-along-weight",
     }
     allowed_argv_only_in_ref = set()
     allowed_argv_changed = set()
@@ -1463,6 +1619,10 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         "PEAK_HEIGHT_MAX_SCALE",
         "TERRAIN_VARIANT_NOISE_RATIO",
         "TRAIN_ENV_SEQUENCE_SEED",
+        "OBSTACLE_OBSERVATION_MODE",
+        "OBSTACLE_OBS_MODE",
+        "OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT",
+        "OBSTACLE_RISK_GOAL_ALONG_WEIGHT",
     }
     allowed_env_changed = {
         "LD_LIBRARY_PATH",
@@ -1500,6 +1660,11 @@ def _build_manifest_diff(reference: Dict[str, Any], current: Dict[str, Any]) -> 
         allowed_argv_only_in_cur.update(CROSS_AGENT_REFERENCE_ARG_KEYS)
         allowed_env_changed.update(CROSS_AGENT_REFERENCE_ENV_KEYS)
         allowed_env_only_in_cur.update(CROSS_AGENT_REFERENCE_ENV_KEYS)
+    if cur_label in SAFE_REWARD_COMPARISON_LABELS:
+        allowed_argv_changed.update(SAFE_REWARD_OVERRIDE_ARG_KEYS)
+        allowed_argv_only_in_cur.update(SAFE_REWARD_OVERRIDE_ARG_KEYS)
+        allowed_env_changed.update(SAFE_REWARD_OVERRIDE_ENV_KEYS)
+        allowed_env_only_in_cur.update(SAFE_REWARD_OVERRIDE_ENV_KEYS)
     if "_fr_" in cur_label:
         fr_schedule_arg_keys = {
             "--action-force-ratio",
@@ -1674,6 +1839,12 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _float_or_default_value(value: Any, default: float) -> float:
+    """Use the default only for a missing/invalid value; preserve explicit 0.0."""
+    parsed = _safe_float(value)
+    return float(default if parsed is None else parsed)
+
+
 def _post_eval_config_value(post_eval: Dict[str, Any], key: str) -> Any:
     """从 post_eval 顶层读取配置，缺失时兼容回退到 spec。"""
     if not isinstance(post_eval, dict):
@@ -1704,13 +1875,21 @@ def _post_eval_enabled(args) -> bool:
 def _training_team_success_feasibility(result: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     metrics = result.get("metrics", {}) if isinstance(result.get("metrics"), dict) else {}
     team_success_flags = metrics.get("team_success_flags", [])
-    success_count = 0
+    success_count = 0.0
     if isinstance(team_success_flags, list):
-        success_count = sum(1 for flag in team_success_flags if _safe_int(flag) and int(flag) > 0)
+        finite_flags = [
+            float(value)
+            for flag in team_success_flags
+            for value in [_safe_float(flag)]
+            if value is not None and np.isfinite(value)
+        ]
+        success_count = float(
+            sum(max(0.0, min(1.0, value)) for value in finite_flags)
+        )
         if success_count > 0:
             return True, {
                 "source": "team_success_flags",
-                "success_count": int(success_count),
+                "successful_environment_trajectories": float(success_count),
                 "team_success_rate": _safe_float(metrics.get("team_success_rate")),
             }
 
@@ -1718,7 +1897,7 @@ def _training_team_success_feasibility(result: Dict[str, Any]) -> Tuple[bool, Di
     if metric_team_sr is not None and metric_team_sr > 0.0:
         return True, {
             "source": "metrics.team_success_rate",
-            "success_count": int(success_count),
+            "successful_environment_trajectories": float(success_count),
             "team_success_rate": float(metric_team_sr),
         }
 
@@ -1730,14 +1909,14 @@ def _training_team_success_feasibility(result: Dict[str, Any]) -> Tuple[bool, Di
         if best_team_sr is not None and best_team_sr > 0.0:
             return True, {
                 "source": "results.best_team_success_rate",
-                "success_count": int(success_count),
+                "successful_environment_trajectories": float(success_count),
                 "team_success_rate": float(final_team_sr) if final_team_sr is not None else None,
                 "best_team_success_rate": float(best_team_sr),
             }
         if final_team_sr is not None and final_team_sr > 0.0:
             return True, {
                 "source": "results.team_success_rate",
-                "success_count": int(success_count),
+                "successful_environment_trajectories": float(success_count),
                 "team_success_rate": float(final_team_sr),
                 "best_team_success_rate": best_team_sr,
             }
@@ -2066,6 +2245,8 @@ def _resolve_training_environment_setup(args) -> Dict[str, Any]:
     if experiment_group == "B":
         use_dynamic_obstacles = True
     setup: Dict[str, Any] = {
+        "schema_version": 2,
+        "source": "ablation_resolved_setup",
         "use_fixed_positions": True,
         "use_dynamic_obstacles": use_dynamic_obstacles,
         "random_terrain": False,
@@ -2075,6 +2256,15 @@ def _resolve_training_environment_setup(args) -> Dict[str, Any]:
         "terrain_base_seed": terrain_seed,
         "training_env_sequence_seed": training_env_sequence_seed,
         "terrain_contact_eps": 0.2,
+        "obstacle_observation_mode": normalize_obstacle_observation_mode(
+            getattr(args, "obstacle_observation_mode", "nearest_surface")
+        ),
+        "obstacle_risk_velocity_forward_weight": _float_or_default_value(
+            getattr(args, "obstacle_risk_velocity_forward_weight", None), 4.0
+        ),
+        "obstacle_risk_goal_along_weight": _float_or_default_value(
+            getattr(args, "obstacle_risk_goal_along_weight", None), 3.0
+        ),
     }
     if experiment_group != "B":
         return setup
@@ -2153,6 +2343,15 @@ def _infer_training_environment_from_run_args(
         use_dynamic_obstacles = bool(fallback_use_dynamic_obstacles)
     else:
         use_dynamic_obstacles = _to_bool(dynamic_obstacles_raw)
+    obstacle_observation_mode = normalize_obstacle_observation_mode(
+        run_args.get("obstacle_observation_mode", "nearest_surface")
+    )
+    obstacle_risk_velocity_forward_weight = _safe_float(run_args.get("obstacle_risk_velocity_forward_weight"))
+    if obstacle_risk_velocity_forward_weight is None:
+        obstacle_risk_velocity_forward_weight = 4.0
+    obstacle_risk_goal_along_weight = _safe_float(run_args.get("obstacle_risk_goal_along_weight"))
+    if obstacle_risk_goal_along_weight is None:
+        obstacle_risk_goal_along_weight = 3.0
 
     if terrain_base_seed is None:
         if semi_random_terrain and training_env_sequence_seed is not None:
@@ -2176,6 +2375,9 @@ def _infer_training_environment_from_run_args(
         "terrain_base_seed": int(terrain_base_seed),
         "training_env_sequence_seed": int(training_env_sequence_seed),
         "terrain_contact_eps": terrain_contact_eps,
+        "obstacle_observation_mode": obstacle_observation_mode,
+        "obstacle_risk_velocity_forward_weight": float(obstacle_risk_velocity_forward_weight),
+        "obstacle_risk_goal_along_weight": float(obstacle_risk_goal_along_weight),
         "semi_random_hold_mode": hold_mode,
         "semi_random_hold_episodes": _safe_int(run_args.get("semi_random_hold_episodes")),
         "semi_random_hold_min_episodes": _safe_int(run_args.get("semi_random_hold_min_episodes")),
@@ -2274,6 +2476,28 @@ def _infer_training_environment_from_manifest(
         use_dynamic_obstacles = bool(fallback_use_dynamic_obstacles)
     else:
         use_dynamic_obstacles = _to_bool(dynamic_obstacles_raw)
+    obstacle_observation_mode = normalize_obstacle_observation_mode(
+        exec_env.get(
+            "OBSTACLE_OBSERVATION_MODE",
+            exec_env.get("OBSTACLE_OBS_MODE", _first_cli_value("--obstacle-observation-mode") or "nearest_surface"),
+        )
+    )
+    obstacle_risk_velocity_forward_weight = _safe_float(
+        exec_env.get(
+            "OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT",
+            exec_env.get("OBSTACLE_OBS_VEL_FORWARD_WEIGHT", _first_cli_value("--obstacle-risk-velocity-forward-weight")),
+        )
+    )
+    if obstacle_risk_velocity_forward_weight is None:
+        obstacle_risk_velocity_forward_weight = 4.0
+    obstacle_risk_goal_along_weight = _safe_float(
+        exec_env.get(
+            "OBSTACLE_RISK_GOAL_ALONG_WEIGHT",
+            exec_env.get("OBSTACLE_OBS_GOAL_ALONG_WEIGHT", _first_cli_value("--obstacle-risk-goal-along-weight")),
+        )
+    )
+    if obstacle_risk_goal_along_weight is None:
+        obstacle_risk_goal_along_weight = 3.0
 
     if terrain_base_seed is None:
         terrain_base_seed = int(terrain_seed)
@@ -2290,6 +2514,9 @@ def _infer_training_environment_from_manifest(
         "terrain_base_seed": int(terrain_base_seed),
         "training_env_sequence_seed": int(training_env_sequence_seed),
         "terrain_contact_eps": terrain_contact_eps,
+        "obstacle_observation_mode": obstacle_observation_mode,
+        "obstacle_risk_velocity_forward_weight": float(obstacle_risk_velocity_forward_weight),
+        "obstacle_risk_goal_along_weight": float(obstacle_risk_goal_along_weight),
         "semi_random_hold_mode": hold_mode,
         "semi_random_hold_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_EPISODES", "--semi-random-hold-episodes"),
         "semi_random_hold_min_episodes": _env_or_cli_int("SEMI_RANDOM_TERRAIN_HOLD_MIN_EPISODES", "--semi-random-hold-min-episodes"),
@@ -2342,6 +2569,8 @@ def _normalize_training_environment_record(record: Optional[Dict[str, Any]]) -> 
         "peak_height_max_scale",
         "terrain_variant_noise_ratio",
         "terrain_contact_eps",
+        "obstacle_risk_velocity_forward_weight",
+        "obstacle_risk_goal_along_weight",
     )
     for key in bool_keys:
         if key in record and record.get(key) is not None:
@@ -2356,11 +2585,43 @@ def _normalize_training_environment_record(record: Optional[Dict[str, Any]]) -> 
             normalized[key] = float(value)
     if record.get("source") is not None:
         normalized["source"] = str(record.get("source"))
+    if record.get("obstacle_observation_mode") is not None:
+        try:
+            normalized["obstacle_observation_mode"] = normalize_obstacle_observation_mode(
+                record.get("obstacle_observation_mode")
+            )
+        except ValueError:
+            normalized["obstacle_observation_mode"] = str(record.get("obstacle_observation_mode"))
     if record.get("semi_random_hold_mode") is not None:
         hold_mode = str(record.get("semi_random_hold_mode")).strip().lower()
         if hold_mode in ("episode", "fixed", "range"):
             normalized["semi_random_hold_mode"] = hold_mode
     return normalized if normalized else None
+
+
+def _required_training_environment_keys(record: Dict[str, Any]) -> Tuple[str, ...]:
+    schema_version = _safe_int(record.get("schema_version"))
+    if schema_version is None:
+        schema_version = 1
+    keys = [
+        "use_fixed_positions",
+        "use_dynamic_obstacles",
+        "random_terrain",
+        "semi_random_terrain",
+        "deterministic_env_sequence",
+        "terrain_seed",
+        "terrain_base_seed",
+        "training_env_sequence_seed",
+    ]
+    if schema_version >= 2:
+        keys.extend(
+            (
+                "obstacle_observation_mode",
+                "obstacle_risk_velocity_forward_weight",
+                "obstacle_risk_goal_along_weight",
+            )
+        )
+    return tuple(keys)
 
 
 def _infer_training_environment_from_existing_batch(
@@ -2915,24 +3176,37 @@ def _validate_loaded_result(
         structured_training_setup = _normalize_training_environment_record(
             results_payload.get("training_environment")
         )
+        top_level_training_schema = _safe_int(results_payload.get("training_environment_schema_version"))
+        record_training_schema = (
+            _safe_int(structured_training_setup.get("schema_version"))
+            if isinstance(structured_training_setup, dict)
+            else None
+        )
+        if (
+            top_level_training_schema is not None
+            and record_training_schema is not None
+            and top_level_training_schema != record_training_schema
+        ):
+            errors.append(
+                "training_environment schema 记录不一致: "
+                f"top_level={top_level_training_schema}, record={record_training_schema}"
+            )
     explicit_training_setup_available = bool(
         isinstance(structured_training_setup, dict) and structured_training_setup
     )
     if require_explicit_training_environment and explicit_training_setup_available:
         if isinstance(structured_training_setup, dict):
-            required_keys = (
-                "use_fixed_positions",
-                "use_dynamic_obstacles",
-                "random_terrain",
-                "semi_random_terrain",
-                "deterministic_env_sequence",
-                "terrain_seed",
-                "terrain_base_seed",
-                "training_env_sequence_seed",
-            )
+            required_keys = _required_training_environment_keys(structured_training_setup)
             for key in required_keys:
                 if structured_training_setup.get(key) is None:
                     errors.append(f"training_environment 缺少有效 {key}")
+            schema_version = _safe_int(structured_training_setup.get("schema_version")) or 1
+            if schema_version >= 2:
+                obstacle_mode = str(structured_training_setup.get("obstacle_observation_mode", "")).strip()
+                if obstacle_mode not in ("nearest_surface", "risk_lite_v2"):
+                    errors.append(
+                        f"training_environment.obstacle_observation_mode 无效: {obstacle_mode or 'missing'}"
+                    )
             if bool(structured_training_setup.get("semi_random_terrain", False)):
                 for key in (
                     "peak_jitter_range",
@@ -2958,13 +3232,23 @@ def _validate_loaded_result(
         fallback_use_dynamic_obstacles=fallback_dynamic_obstacles,
     )
     manifest_training_setup = None
+    manifest_payload = None
     if manifest_path is not None:
         try:
+            manifest_payload = _load_manifest(Path(manifest_path))
             manifest_training_setup = _infer_training_environment_from_manifest(
-                _load_manifest(Path(manifest_path)),
+                manifest_payload,
                 fallback_use_dynamic_obstacles=fallback_dynamic_obstacles,
             )
-        except Exception:
+            errors.extend(
+                _validate_result_manifest_provenance(
+                    run_args,
+                    results_payload,
+                    manifest_payload,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"manifest 无法验证: {exc}")
             manifest_training_setup = None
     actual_training_setup = _merge_training_environment_setups(
         results_training_setup,
@@ -2989,6 +3273,9 @@ def _validate_loaded_result(
                 "terrain_base_seed",
                 "training_env_sequence_seed",
                 "terrain_contact_eps",
+                "obstacle_observation_mode",
+                "obstacle_risk_velocity_forward_weight",
+                "obstacle_risk_goal_along_weight",
                 "peak_jitter_range",
                 "peak_center_jitter_range",
                 "peak_height_jitter_ratio_min",
@@ -3228,6 +3515,23 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
     match_train_use_dynamic_obstacles = bool(
         training_environment.get("use_dynamic_obstacles", getattr(args, "use_dynamic_obstacles", False))
     )
+    match_train_obstacle_observation_mode = normalize_obstacle_observation_mode(
+        training_environment.get("obstacle_observation_mode", getattr(args, "obstacle_observation_mode", "nearest_surface"))
+    )
+    match_train_obstacle_risk_velocity_forward_weight = _float_or_default_value(
+        training_environment.get(
+            "obstacle_risk_velocity_forward_weight",
+            getattr(args, "obstacle_risk_velocity_forward_weight", 4.0),
+        ),
+        4.0,
+    )
+    match_train_obstacle_risk_goal_along_weight = _float_or_default_value(
+        training_environment.get(
+            "obstacle_risk_goal_along_weight",
+            getattr(args, "obstacle_risk_goal_along_weight", 3.0),
+        ),
+        3.0,
+    )
     match_train_peak_jitter_range = float(training_environment.get("peak_jitter_range", 0.0))
     match_train_peak_center_jitter_range = float(training_environment.get("peak_center_jitter_range", 0.0))
     match_train_peak_height_jitter_ratio_min = float(training_environment.get("peak_height_jitter_ratio_min", 0.0))
@@ -3253,6 +3557,9 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
     spec_peak_height_max_scale = float(match_train_peak_height_max_scale)
     spec_terrain_variant_noise_ratio = float(match_train_variant_noise_ratio)
     spec_use_dynamic_obstacles = bool(match_train_use_dynamic_obstacles)
+    spec_obstacle_observation_mode = str(match_train_obstacle_observation_mode)
+    spec_obstacle_risk_velocity_forward_weight = float(match_train_obstacle_risk_velocity_forward_weight)
+    spec_obstacle_risk_goal_along_weight = float(match_train_obstacle_risk_goal_along_weight)
     episodes = int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES))
     spec = {
         "version": 10,
@@ -3289,6 +3596,9 @@ def _build_post_eval_spec(args, batch_dir: Path, positions_file: Path) -> Option
         "goal_region_radius": 0.0,
         "force_regenerate_testset": bool(getattr(args, "force_post_eval_testset_regen", False)) and not post_eval_testset_prepared,
         "use_dynamic_obstacles": bool(spec_use_dynamic_obstacles),
+        "obstacle_observation_mode": str(spec_obstacle_observation_mode),
+        "obstacle_risk_velocity_forward_weight": float(spec_obstacle_risk_velocity_forward_weight),
+        "obstacle_risk_goal_along_weight": float(spec_obstacle_risk_goal_along_weight),
         "use_fixed_positions": True,
         "shared_positions_file": str(positions_file),
         "default_positions_file": str(positions_file),
@@ -3355,6 +3665,150 @@ def _resolve_post_eval_model_root(result: Dict[str, Any]) -> Optional[Path]:
     return None
 
 
+def _expected_agent_count_from_positions_file(positions_file: Path) -> int:
+    payload = _load_json_file(Path(positions_file))
+    declared = _safe_int(payload.get("n_agents"))
+    agents = payload.get("agents")
+    listed = len(agents) if isinstance(agents, list) else None
+    if declared is None and listed is None:
+        raise RuntimeError(f"固定位置文件缺少 n_agents/agents: {positions_file}")
+    if declared is not None and listed is not None and declared != listed:
+        raise RuntimeError(
+            f"固定位置文件智能体数量不一致: n_agents={declared}, agents={listed}, path={positions_file}"
+        )
+    count = int(declared if declared is not None else listed)
+    if count <= 0:
+        raise RuntimeError(f"固定位置文件智能体数量无效: {count}, path={positions_file}")
+    return count
+
+
+def _completed_training_model_errors(
+    result: Dict[str, Any],
+    *,
+    positions_file: Path,
+    expected_episodes: int,
+    expected_seed: int,
+    expected_num_envs: Optional[int] = None,
+    require_gpu: bool = False,
+) -> List[str]:
+    model_root = _resolve_post_eval_model_root(result)
+    if model_root is None:
+        return ["无法从训练 results/manifest 定位模型根目录"]
+    try:
+        expected_agents = _expected_agent_count_from_positions_file(positions_file)
+    except Exception as exc:
+        return [str(exc)]
+    return training_unit_completion_errors(
+        model_root,
+        int(expected_episodes),
+        repo_root=Path(__file__).resolve().parent,
+        expected_agents=expected_agents,
+        expected_seed=int(expected_seed),
+        expected_num_envs=(
+            int(expected_num_envs)
+            if expected_num_envs is not None
+            else None
+        ),
+        require_gpu=bool(require_gpu),
+    )
+
+
+def _restart_incomplete_training_identity(
+    *,
+    manifest: Dict[str, Any],
+    manifest_path: Path,
+    label: str,
+    positions_file: Path,
+    args,
+    batch_dir: Path,
+    project_logs_root: Path,
+) -> None:
+    """Delete only the frozen identity of an incomplete unit before episode 0.
+
+    The immutable manifest is retained.  A complete unit is never removed: the
+    same final-results/model contract used by reuse is checked again immediately
+    before deletion.
+    """
+    meta = manifest.get("meta", {}) if isinstance(manifest.get("meta"), dict) else {}
+    exp_name = str(meta.get("exp_name_with_timestamp", "") or "").strip()
+    exp_name_base = str(meta.get("exp_name_base", "") or "").strip()
+    if not exp_name or not exp_name_base:
+        raise RuntimeError(
+            f"[{label}] 冻结 manifest 缺少 exp_name 身份，不能安全清理不完整训练: {manifest_path}"
+        )
+    suffix = exp_name[len(exp_name_base):] if exp_name.startswith(exp_name_base) else ""
+    if not (
+        suffix.startswith("_")
+        and _is_timestamp_token(suffix[1:])
+        and exp_name == f"{exp_name_base}_{suffix[1:]}"
+    ):
+        raise RuntimeError(
+            f"[{label}] 冻结训练身份格式异常，拒绝清理: base={exp_name_base!r}, exp={exp_name!r}"
+        )
+
+    repo_root = Path(__file__).resolve().parent
+    model_root = (repo_root / "models" / exp_name).resolve()
+    log_root = (project_logs_root / exp_name).resolve()
+    expected_model_parent = (repo_root / "models").resolve()
+    expected_log_parent = project_logs_root.resolve()
+    if model_root.parent != expected_model_parent or log_root.parent != expected_log_parent:
+        raise RuntimeError(
+            f"[{label}] 不完整训练清理目标越界: model={model_root}, log={log_root}"
+        )
+    existing_targets = [path for path in (model_root, log_root) if path.exists()]
+    if not existing_targets:
+        return
+    if any(path.is_symlink() for path in existing_targets):
+        raise RuntimeError(f"[{label}] 不完整训练目标包含符号链接，拒绝清理: {existing_targets}")
+    if any(not path.is_dir() for path in existing_targets):
+        raise RuntimeError(f"[{label}] 不完整训练目标不是目录，拒绝清理: {existing_targets}")
+
+    expected_agents = _expected_agent_count_from_positions_file(positions_file)
+    completion_errors = training_unit_completion_errors(
+        model_root,
+        int(args.episodes),
+        repo_root=repo_root,
+        expected_agents=expected_agents,
+        expected_seed=int(args.batch_seed),
+        expected_num_envs=int(args.num_envs),
+        require_gpu=_to_bool(
+            (manifest.get("exec_env") or {}).get(
+                "MATD3_REQUIRE_GPU",
+                "0",
+            )
+        ),
+    )
+    if not completion_errors:
+        raise RuntimeError(
+            f"[{label}] 训练身份已满足完整单元合同，拒绝删除并重训: {model_root}"
+        )
+
+    record_dir = batch_dir / "results" / "incomplete_training_restarts"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    record_path = record_dir / f"{label}_{time.time_ns()}.json"
+    _save_json(
+        record_path,
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "policy": BATCH_RESUME_POLICY,
+            "label": label,
+            "seed": int(args.batch_seed),
+            "expected_episodes": int(args.episodes),
+            "manifest_path": str(manifest_path),
+            "model_root": str(model_root),
+            "log_root": str(log_root),
+            "completion_errors": completion_errors,
+            "action": "delete_incomplete_identity_then_restart_episode_0",
+        },
+    )
+    for target in existing_targets:
+        shutil.rmtree(target)
+    print(
+        f"[批次恢复-{label}] 已确认旧身份不完整并清理，将从 episode 0 重训；"
+        f"审计记录: {record_path}"
+    )
+
+
 def _resolve_post_eval_python(result: Dict[str, Any]) -> str:
     manifest_path = str(result.get("manifest_path", "")).strip()
     if manifest_path:
@@ -3397,6 +3851,7 @@ POST_EVAL_LAUNCH_ENV_KEYS = (
     "LD_LIBRARY_PATH",
     "CUDA_VISIBLE_DEVICES",
     "GPU_ID",
+    "MATD3_REQUIRE_GPU",
 )
 
 
@@ -3471,6 +3926,11 @@ def _validate_post_eval_results(
         for key in ("team_success_rate", "avg_collision_count", "avg_team_total_path_length"):
             if key not in summary:
                 errors.append(f"summary 缺少关键字段: {key}")
+        if str(spec.get("validation_role", "")) == "checkpoint_selection":
+            errors.extend(
+                f"checkpoint selection summary: {item}"
+                for item in _shared_post_eval_selection_summary_errors(summary)
+            )
 
     expected_model_variant = str(
         spec.get("resolved_model_variant")
@@ -3486,16 +3946,29 @@ def _validate_post_eval_results(
                 f"resolved_model_variant 不匹配: got={actual_model_leaf or '<empty>'}, expected={expected_model_variant}"
             )
 
+    def _normalized_seed_sequence(value: Any) -> Optional[List[int]]:
+        if not isinstance(value, (list, tuple)):
+            return None
+        try:
+            return [int(seed) for seed in value]
+        except (TypeError, ValueError, OverflowError):
+            return None
+
     expected_seeds = [int(seed) for seed in spec.get("terrain_seed_sequence", [])]
     if expected_seeds:
-        actual_seeds = data.get("terrain_seed_sequence", [])
-        if [int(seed) for seed in actual_seeds] != expected_seeds:
+        actual_seeds = _normalized_seed_sequence(data.get("terrain_seed_sequence", []))
+        if actual_seeds != expected_seeds:
             errors.append("terrain_seed_sequence 不匹配")
     expected_variant_seeds = [int(seed) for seed in spec.get("terrain_variant_seed_sequence", [])]
     if expected_variant_seeds:
-        actual_variant_seeds = data.get("terrain_variant_seed_sequence", [])
-        if [int(seed) for seed in actual_variant_seeds] != expected_variant_seeds:
+        actual_variant_seeds = _normalized_seed_sequence(data.get("terrain_variant_seed_sequence", []))
+        if actual_variant_seeds != expected_variant_seeds:
             errors.append("terrain_variant_seed_sequence 不匹配")
+    expected_obstacle_seeds = [int(seed) for seed in spec.get("obstacle_seed_sequence", [])]
+    if expected_obstacle_seeds:
+        actual_obstacle_seeds = _normalized_seed_sequence(data.get("obstacle_seed_sequence", []))
+        if actual_obstacle_seeds != expected_obstacle_seeds:
+            errors.append("obstacle_seed_sequence 不匹配")
 
     artifact_policy = spec.get("artifact_policy", {}) if isinstance(spec.get("artifact_policy"), dict) else {}
     episode_details = data.get("episode_details", []) if isinstance(data.get("episode_details"), list) else []
@@ -3576,6 +4049,26 @@ def _validate_post_eval_results(
             errors.append("mountain_min_distance 不匹配")
         if bool(evaluation_setup.get("use_dynamic_obstacles", False)) != bool(spec.get("use_dynamic_obstacles", False)):
             errors.append("use_dynamic_obstacles 不匹配")
+        try:
+            actual_obstacle_mode = normalize_obstacle_observation_mode(
+                evaluation_setup.get("obstacle_observation_mode")
+            )
+            expected_obstacle_mode = normalize_obstacle_observation_mode(
+                spec.get("obstacle_observation_mode", "nearest_surface")
+            )
+        except ValueError:
+            actual_obstacle_mode = str(evaluation_setup.get("obstacle_observation_mode", "") or "")
+            expected_obstacle_mode = str(spec.get("obstacle_observation_mode", "") or "")
+        if actual_obstacle_mode != expected_obstacle_mode:
+            errors.append("obstacle_observation_mode 不匹配")
+        for setup_key, spec_key in (
+            ("obstacle_risk_velocity_forward_weight", "obstacle_risk_velocity_forward_weight"),
+            ("obstacle_risk_goal_along_weight", "obstacle_risk_goal_along_weight"),
+        ):
+            setup_value = _safe_float(evaluation_setup.get(setup_key))
+            spec_value = _safe_float(spec.get(spec_key))
+            if setup_value is None or spec_value is None or abs(setup_value - spec_value) > 1e-6:
+                errors.append(f"{setup_key} 不匹配")
         if bool(evaluation_setup.get("random_terrain", False)) != bool(spec.get("random_terrain", False)):
             errors.append("random_terrain 不匹配")
         if _safe_int(evaluation_setup.get("terrain_seed")) != _safe_int(spec.get("terrain_seed")):
@@ -3622,6 +4115,33 @@ def _validate_post_eval_results(
                 actual_value = _safe_float(evaluation_setup.get(setup_key))
                 if expected_value is None or actual_value is None or abs(actual_value - expected_value) > 1e-6:
                     errors.append(f"{setup_key} 不匹配")
+
+            if _to_bool(runtime_env.get("MATD3_REQUIRE_GPU", "0")):
+                eval_device = evaluation_setup.get("eval_device")
+                if not isinstance(eval_device, dict):
+                    errors.append("MATD3_REQUIRE_GPU=1 但缺少 eval_device")
+                else:
+                    if eval_device.get("require_gpu") is not True:
+                        errors.append(
+                            "MATD3_REQUIRE_GPU=1 但 eval_device.require_gpu "
+                            "不为 true"
+                        )
+                    physical_gpus = _safe_int(
+                        eval_device.get("physical_gpus")
+                    )
+                    logical_gpus = _safe_int(
+                        eval_device.get("logical_gpus")
+                    )
+                    if (
+                        physical_gpus is None
+                        or logical_gpus is None
+                        or physical_gpus < 1
+                        or logical_gpus < 1
+                    ):
+                        errors.append(
+                            "MATD3_REQUIRE_GPU=1 但 post-eval 未记录物理和"
+                            "逻辑 GPU"
+                        )
 
         action_force_ratio_source = str(evaluation_setup.get("action_force_ratio_source", "") or "").strip()
         force_eval_action_force_ratio = spec.get("force_eval_action_force_ratio")
@@ -3856,20 +4376,6 @@ def _resolve_model_variant_dir(model_root: Path, model_variant: str) -> Tuple[Op
 
 
 _POST_EVAL_MODEL_SIGNATURE_CACHE: Dict[str, Optional[str]] = {}
-POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION = 2
-POST_EVAL_SELECTION_GUARDED_MIN_COLLISION_FREE = 0.05
-POST_EVAL_SELECTION_GUARDED_COLLISION_COUNT_WEIGHT = 5.0
-POST_EVAL_SELECTION_SCORE_FIELDS = (
-    "team_success_rate",
-    "partial_success_mean",
-    "partial_success_max",
-    "partial_success_min",
-    "guarded_goal_progress_score",
-    "collision_free_rate",
-    "neg_avg_collision_count",
-    "neg_avg_team_final_goal_distance",
-    "neg_avg_team_total_path_length",
-)
 
 
 def _compute_post_eval_model_signature(model_dir: Path) -> Optional[str]:
@@ -3913,6 +4419,8 @@ def _build_matched_validation_spec(
     spec.update(_build_post_eval_sequence_fields(spec))
     spec["artifact_policy"] = _post_eval_validation_artifact_policy()
     spec["validation_role"] = "checkpoint_selection"
+    spec["selection_result_schema_version"] = int(POST_EVAL_SELECTION_RESULT_SCHEMA_VERSION)
+    spec["selection_score_schema_version"] = int(POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION)
     spec["testset_prepared"] = False
     spec["force_regenerate_testset"] = bool(getattr(args, "force_post_eval_testset_regen", False))
 
@@ -3930,15 +4438,7 @@ def _build_matched_validation_spec(
 
 
 def _post_eval_selection_score_schema() -> Dict[str, Any]:
-    return {
-        "version": int(POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION),
-        "fields": list(POST_EVAL_SELECTION_SCORE_FIELDS),
-        "guarded_goal_progress": {
-            "min_collision_free_rate": float(POST_EVAL_SELECTION_GUARDED_MIN_COLLISION_FREE),
-            "collision_count_weight": float(POST_EVAL_SELECTION_GUARDED_COLLISION_COUNT_WEIGHT),
-        },
-        "ordering": "lexicographic_desc",
-    }
+    return _shared_post_eval_selection_score_schema()
 
 
 def _post_eval_candidate_cache_key(candidate: Dict[str, Any], signature: Optional[str]) -> Optional[str]:
@@ -3958,60 +4458,8 @@ def _post_eval_candidate_cache_key(candidate: Dict[str, Any], signature: Optiona
     )
 
 
-def _post_eval_selection_metric(summary: Dict[str, Any], key: str, *, fallback: float) -> float:
-    value = _safe_float(summary.get(key))
-    if value is None:
-        return fallback
-    return float(value)
-
-
-def _post_eval_partial_success_scores(summary: Dict[str, Any]) -> Tuple[float, float, float]:
-    rates = summary.get("agent_success_rates")
-    if not isinstance(rates, list):
-        return 0.0, 0.0, 0.0
-    values: List[float] = []
-    for value in rates:
-        numeric = _safe_float(value)
-        if numeric is not None:
-            values.append(max(0.0, min(1.0, float(numeric))))
-    if not values:
-        return 0.0, 0.0, 0.0
-    return (
-        float(sum(values) / len(values)),
-        float(max(values)),
-        float(min(values)),
-    )
-
-
-def _post_eval_guarded_goal_progress_score(summary: Dict[str, Any]) -> float:
-    distance = max(0.0, _post_eval_selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12))
-    collision_count = max(0.0, _post_eval_selection_metric(summary, "avg_collision_count", fallback=1e12))
-    collision_free = max(0.0, min(1.0, _post_eval_selection_metric(summary, "collision_free_rate", fallback=0.0)))
-
-    guarded_distance = (
-        distance / max(collision_free, POST_EVAL_SELECTION_GUARDED_MIN_COLLISION_FREE)
-        + collision_count * POST_EVAL_SELECTION_GUARDED_COLLISION_COUNT_WEIGHT
-    )
-    return -guarded_distance
-
-
 def _score_post_eval_summary(summary: Dict[str, Any]) -> Tuple[float, ...]:
-    partial_mean, partial_max, partial_min = _post_eval_partial_success_scores(summary)
-    collision_free = _post_eval_selection_metric(summary, "collision_free_rate", fallback=-1.0)
-    collision_count = _post_eval_selection_metric(summary, "avg_collision_count", fallback=1e12)
-    distance = _post_eval_selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12)
-    path_length = _post_eval_selection_metric(summary, "avg_team_total_path_length", fallback=1e12)
-    return (
-        _post_eval_selection_metric(summary, "team_success_rate", fallback=-1.0),
-        partial_mean,
-        partial_max,
-        partial_min,
-        _post_eval_guarded_goal_progress_score(summary),
-        collision_free,
-        -collision_count,
-        -distance,
-        -path_length,
-    )
+    return _shared_post_eval_score_summary(summary)
 
 
 def _execute_post_eval_run(
@@ -4028,6 +4476,7 @@ def _execute_post_eval_run(
     force_rerun: bool,
 ) -> Dict[str, Any]:
     eval_dir = Path(eval_dir)
+    model_path = Path(model_path).resolve()
     if force_rerun and eval_dir.exists():
         shutil.rmtree(eval_dir)
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -4036,6 +4485,10 @@ def _execute_post_eval_run(
     spec = dict(eval_spec)
     spec["resolved_model_variant"] = str(resolved_model_variant)
     spec["selected_model_path"] = str(model_path)
+    selected_model_signature = _compute_post_eval_model_signature(model_path)
+    if not selected_model_signature:
+        raise RuntimeError(f"[{banner_prefix}-{label}] 模型缺少可读取的 actor 权重: {model_path}")
+    spec["selected_model_signature"] = str(selected_model_signature)
     spec["force_eval_action_force_ratio"] = (
         None
         if getattr(args, "force_eval_action_force_ratio", None) is None
@@ -4045,7 +4498,6 @@ def _execute_post_eval_run(
     eval_results_json = eval_dir / "evaluation_results.json"
     eval_log_path = eval_dir / "post_eval.log"
     eval_spec_path = eval_dir / "post_eval_spec.json"
-    _save_json(eval_spec_path, spec)
 
     artifact_policy = (
         spec.get("artifact_policy", {})
@@ -4055,10 +4507,22 @@ def _execute_post_eval_run(
 
     payload = None
     if (not force_rerun) and eval_results_json.exists():
-        validation_errors = _validate_post_eval_results(
-            eval_results_json,
-            spec,
-            expected_runtime_env=inherited_runtime_env,
+        validation_errors: List[str] = []
+        if not eval_spec_path.exists():
+            validation_errors.append("缺少旧 post_eval_spec.json")
+        else:
+            try:
+                previous_spec = _load_json_file(eval_spec_path)
+                if previous_spec != spec:
+                    validation_errors.append("post_eval_spec 与当前请求不一致")
+            except Exception as exc:
+                validation_errors.append(f"旧 post_eval_spec 无法读取: {exc}")
+        validation_errors.extend(
+            _validate_post_eval_results(
+                eval_results_json,
+                spec,
+                expected_runtime_env=inherited_runtime_env,
+            )
         )
         if not validation_errors:
             eval_data = _load_json_file(eval_results_json)
@@ -4068,6 +4532,9 @@ def _execute_post_eval_run(
             )
 
     if payload is None:
+        _save_json(eval_spec_path, spec)
+        if eval_results_json.exists():
+            eval_results_json.unlink()
         env = _build_process_env(args.env_isolation)
         env.update(inherited_runtime_env)
         conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
@@ -4147,9 +4614,6 @@ def _execute_post_eval_run(
         if force_eval_action_force_ratio is not None:
             env["FORCE_EVAL_ACTION_FORCE_RATIO"] = str(float(force_eval_action_force_ratio))
             env["ACTION_FORCE_RATIO"] = str(float(force_eval_action_force_ratio))
-        elif getattr(args, "action_force_ratio", None) is not None:
-            env["ACTION_FORCE_RATIO"] = str(float(args.action_force_ratio))
-            env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
         else:
             env.pop("ACTION_FORCE_RATIO", None)
             env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
@@ -4172,6 +4636,16 @@ def _execute_post_eval_run(
         env["HELDOUT_AGENT_LOCAL_JITTER"] = str(spec.get("agent_local_jitter", 3.0))
         env["HELDOUT_GOAL_REGION_RADIUS"] = str(spec.get("goal_region_radius", 18.0))
         env["USE_DYNAMIC_OBSTACLES"] = "1" if spec.get("use_dynamic_obstacles") else "0"
+        env["OBSTACLE_OBSERVATION_MODE"] = normalize_obstacle_observation_mode(
+            spec.get("obstacle_observation_mode", "nearest_surface")
+        )
+        env["OBSTACLE_OBS_MODE"] = env["OBSTACLE_OBSERVATION_MODE"]
+        env["OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"] = str(
+            _float_or_default_value(spec.get("obstacle_risk_velocity_forward_weight"), 4.0)
+        )
+        env["OBSTACLE_RISK_GOAL_ALONG_WEIGHT"] = str(
+            _float_or_default_value(spec.get("obstacle_risk_goal_along_weight"), 3.0)
+        )
         env["POST_EVAL_MODE"] = str(spec.get("mode", DEFAULT_POST_EVAL_MODE))
         env["POST_EVAL_TERRAIN_FAMILY"] = str(spec.get("terrain_family", "train_match"))
         env["POST_EVAL_POSITION_FAMILY"] = str(spec.get("position_family", "train_match"))
@@ -4334,6 +4808,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                     "eval_record": cached_candidate["eval_record"],
                     "summary": cached_candidate["summary"],
                     "score": list(cached_candidate["score"]),
+                    "comparison_score": list(cached_candidate["comparison_score"]),
                     "model_signature": candidate_signature,
                     "candidate_eval_cache_key": candidate_cache_key,
                     "reused_validation_from_candidate": str(cached_candidate["candidate_alias"]),
@@ -4383,12 +4858,14 @@ def _select_post_eval_checkpoint_with_matched_validation(
             else {}
         )
         score = _score_post_eval_summary(summary if isinstance(summary, dict) else {})
+        normalized_score = _shared_post_eval_comparison_score(score)
         scored_entry = {
             **candidate,
             "order": int(order_idx),
             "eval_record": eval_record,
             "summary": summary,
             "score": list(score),
+            "comparison_score": list(normalized_score),
             "model_signature": candidate_signature,
             "candidate_eval_cache_key": candidate_cache_key,
         }
@@ -4399,6 +4876,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                 "eval_record": eval_record,
                 "summary": summary,
                 "score": list(score),
+                "comparison_score": list(normalized_score),
             }
 
     if not scored_candidates:
@@ -4408,16 +4886,10 @@ def _select_post_eval_checkpoint_with_matched_validation(
         ) or "无候选评估结果"
         raise RuntimeError(f"[验证选模-{label}] 所有候选 checkpoint 均评估失败: {failure_details}")
 
-    best_candidate = max(
-        scored_candidates,
-        key=lambda item: (
-            tuple(item["score"]),
-            -int(item["order"]),
-        ),
-    )
+    best_candidate = _shared_select_post_eval_candidate(scored_candidates)
 
     selection_summary = {
-        "schema_version": 2,
+        "schema_version": int(POST_EVAL_SELECTION_RESULT_SCHEMA_VERSION),
         "selection_protocol": "matched_validation",
         "selection_score_schema_version": int(POST_EVAL_SELECTION_SCORE_SCHEMA_VERSION),
         "selection_score_schema": _post_eval_selection_score_schema(),
@@ -4433,6 +4905,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
                 "candidate_eval_cache_key": item.get("candidate_eval_cache_key"),
                 "reused_validation_from_candidate": item.get("reused_validation_from_candidate"),
                 "score": item["score"],
+                "comparison_score": item["comparison_score"],
                 "summary": item["summary"],
                 "eval_dir": item["eval_record"]["eval_dir"],
                 "results_path": item["eval_record"]["results_path"],
@@ -4448,6 +4921,7 @@ def _select_post_eval_checkpoint_with_matched_validation(
             "candidate_eval_cache_key": best_candidate.get("candidate_eval_cache_key"),
             "reused_validation_from_candidate": best_candidate.get("reused_validation_from_candidate"),
             "score": best_candidate["score"],
+            "comparison_score": best_candidate["comparison_score"],
             "summary": best_candidate["summary"],
             "eval_dir": best_candidate["eval_record"]["eval_dir"],
             "results_path": best_candidate["eval_record"]["results_path"],
@@ -4656,6 +5130,48 @@ def _run_post_eval_command_with_live_output(
             pass
 
 
+def _build_claims_report(evaluated: List[Dict[str, Any]]) -> Dict[str, Any]:
+    required_rows = [row for row in evaluated if bool(row.get("required", False))]
+    applicable_rows = [row for row in required_rows if row.get("status") != "skipped"]
+    skipped_rows = [row for row in required_rows if row.get("status") == "skipped"]
+    failed_rows = [row for row in applicable_rows if row.get("status") != "valid"]
+
+    if not applicable_rows:
+        required_status = "not_applicable"
+        required_pass: Optional[bool] = None
+    elif failed_rows:
+        required_status = "failed"
+        required_pass = False
+    elif skipped_rows:
+        required_status = "incomplete"
+        required_pass = False
+    else:
+        required_status = "passed"
+        required_pass = True
+
+    required_failed = [
+        f"{row.get('name')} status={row.get('status')}"
+        for row in failed_rows
+    ]
+    required_incomplete = [
+        f"{row.get('name')} status=skipped"
+        for row in skipped_rows
+    ]
+    if required_status == "incomplete":
+        required_failed.extend(required_incomplete)
+
+    return {
+        "claims": evaluated,
+        "required_failed": required_failed,
+        "required_incomplete": required_incomplete,
+        "required_status": required_status,
+        "required_pass": required_pass,
+        "required_claim_count": len(required_rows),
+        "required_applicable_count": len(applicable_rows),
+        "required_skipped_count": len(skipped_rows),
+    }
+
+
 def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict[str, Any]:
     """生成消融有效性声明检查（只对可严格解释的比较给出通过）。"""
     by_label = {item.get("label"): item for item in series}
@@ -4728,7 +5244,6 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
     ]
 
     evaluated = []
-    required_failed = []
     for c in claims:
         lhs = c["lhs"]
         rhs = c["rhs"]
@@ -4756,16 +5271,7 @@ def _evaluate_claims(series: List[Dict[str, Any]], selected_labels: set) -> Dict
         }
         evaluated.append(row)
 
-        if c.get("required", False) and status != "valid":
-            required_failed.append(
-                f"{c['name']} status={status}"
-            )
-
-    return {
-        "claims": evaluated,
-        "required_failed": required_failed,
-        "required_pass": len(required_failed) == 0,
-    }
+    return _build_claims_report(evaluated)
 
 
 def _sort_experiment_configs(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -5991,6 +6497,9 @@ def _write_experiment_result_artifact(
         "use_dynamic_obstacles": getattr(args, "use_dynamic_obstacles", False),
         "training_environment": _effective_training_environment_setup(args),
         "post_eval_enabled": post_eval_enabled,
+        "allow_post_eval_without_train_success": bool(
+            getattr(args, "allow_post_eval_without_train_success", False)
+        ),
         "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
@@ -6016,6 +6525,7 @@ def _load_experiment_series_from_artifacts(
     expected_terrain_seed: int,
     expected_training_setup: Optional[Dict[str, Any]],
     batch_seed: int,
+    expected_num_envs: int,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     artifact_dir = batch_dir / "results" / "experiment_artifacts"
     series: List[Dict[str, Any]] = []
@@ -6044,9 +6554,28 @@ def _load_experiment_series_from_artifacts(
             batch_seed=int(batch_seed),
             manifest_path=Path(exp.get("manifest_path")) if str(exp.get("manifest_path", "")).strip() else None,
         )
+        if not validation_errors:
+            validation_errors.extend(
+                _completed_training_model_errors(
+                    {
+                        "log_dir": log_dir,
+                        "manifest_path": exp.get("manifest_path", ""),
+                    },
+                    positions_file=positions_file,
+                    expected_episodes=int(expected_episodes),
+                    expected_seed=int(batch_seed),
+                    expected_num_envs=int(expected_num_envs),
+                    require_gpu=_to_bool(
+                        (cfg.get("env") or {}).get(
+                            "MATD3_REQUIRE_GPU",
+                            "0",
+                        )
+                    ),
+                )
+            )
         if validation_errors:
             raise RuntimeError(
-                f"[种子汇总-{cfg['label']}] 历史结果有效性校验失败: {' | '.join(validation_errors)}"
+                f"[种子汇总-{cfg['label']}] 完整训练单元有效性校验失败: {' | '.join(validation_errors)}"
             )
 
         post_eval = exp.get("post_eval", {}) if isinstance(exp.get("post_eval"), dict) else {}
@@ -6186,6 +6715,7 @@ def _finalize_seed_batch_from_artifacts(
         expected_terrain_seed=int(args.resolved_scenario_seed),
         expected_training_setup=_effective_training_environment_setup(args),
         batch_seed=int(batch_seed),
+        expected_num_envs=int(args.num_envs),
     )
     if missing_labels:
         raise RuntimeError(f"[种子汇总] 缺少实验结果 artifacts: {missing_labels}")
@@ -6193,7 +6723,7 @@ def _finalize_seed_batch_from_artifacts(
     selected_labels = {cfg["label"] for cfg in configs_to_run}
     claims_report = _evaluate_claims(series, selected_labels)
     strict_validity_enabled = not bool(args.disable_strict_validity)
-    if not claims_report["required_pass"] and strict_validity_enabled:
+    if claims_report["required_pass"] is False and strict_validity_enabled:
         raise RuntimeError("[严格校验失败] 请先修复上述问题后再生成消融结论。")
 
     return _write_single_seed_outputs(
@@ -6330,6 +6860,9 @@ def _write_single_seed_outputs(
         "strict_validity_enabled": strict_validity_enabled,
         "skip_local_plots": bool(args.skip_local_plots),
         "post_eval_enabled": _post_eval_enabled(args),
+        "allow_post_eval_without_train_success": bool(
+            getattr(args, "allow_post_eval_without_train_success", False)
+        ),
         "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
@@ -6727,7 +7260,6 @@ def _evaluate_multi_seed_claims(aggregated: Dict[str, Dict[str, Any]], selected_
     ]
 
     evaluated = []
-    required_failed = []
     for claim in claims:
         lhs = claim["lhs"]
         rhs = claim["rhs"]
@@ -6766,14 +7298,7 @@ def _evaluate_multi_seed_claims(aggregated: Dict[str, Dict[str, Any]], selected_
             "delta_std": delta_std,
         }
         evaluated.append(row)
-        if claim.get("required", False) and status != "valid":
-            required_failed.append(f"{claim['name']} status={status}")
-
-    return {
-        "claims": evaluated,
-        "required_failed": required_failed,
-        "required_pass": len(required_failed) == 0,
-    }
+    return _build_claims_report(evaluated)
 
 
 def plot_seed_overlay_by_experiment(
@@ -7123,12 +7648,16 @@ EXPERIMENT_CONFIGS = [
         "description": "Focused semantic ablation control: raw policy action and corrected executed action are both preserved in replay, critic inputs, and target construction.",
         "env": {
             "ALGORITHM": "matd3",
+            "MATD3_REQUIRE_GPU": "1",
             "MATD3_USE_DUAL_Q": "1",
             "MATD3_USE_SEPARATED_GRADIENT": "1",
             "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
             "MATD3_ACTION_SEMANTICS_MODE": "dual",
             "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
             "USE_TF_POTENTIAL_FIELD": "1",
+            "USE_FR_FEATURE": "1",
+            "USE_PF_FEATURE": "1",
+            "SELECTOR_PROTOCOL_LOCK": "1",
             "CROSS_AGENT_REFERENCE_ENABLED": "0",
         }
     },
@@ -7596,6 +8125,153 @@ EXPERIMENT_CONFIGS = [
         }
     },
     {
+        "label": "matd3_cross_agent_ref_behavior_label_current_baseline",
+        "name": "MATD3 Cross-Agent Reference - Behavior Label Current Baseline",
+        "name_en": "Cross-Agent Ref - Behavior Label Current Baseline",
+        "description": "Four-way comparison baseline: reruns the current behavior-action teacher under the current reward and selection code, without changing the progress gate.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS": "legacy",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "progress",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "0",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_behavior_label_agent_quality_gate",
+        "name": "MATD3 Cross-Agent Reference - Behavior Label Agent Quality Gate",
+        "name_en": "Cross-Agent Ref - Behavior Label Agent Quality Gate",
+        "description": "Four-way comparison A: keeps the behavior-action teacher but filters reference samples by per-agent safe quality labels instead of one-step progress only.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS": "legacy",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "0",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_behavior_label_agent_quality_safe_reward",
+        "name": "MATD3 Cross-Agent Reference - Behavior Label Agent Quality Safe Reward",
+        "name_en": "Cross-Agent Ref - Behavior Label Agent Quality Safe Reward",
+        "description": "Four-way comparison B: adds conservative safety reward pressure on top of A to test whether unsafe arrivals convert into safe team success.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS": "legacy",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "0",
+            "COLLISION_WEIGHT": "6.0",
+            "COLLISION_PENALTY_VALUE": "160.0",
+            "UNSAFE_ARRIVAL_PENALTY": "6500.0",
+            "CLEARANCE_QUALITY_BONUS_WEIGHT": "1200.0",
+        }
+    },
+    {
+        "label": "matd3_cross_agent_ref_behavior_label_team_feedback_selector_v2",
+        "name": "MATD3 Cross-Agent Reference - Behavior Label Team Feedback Selector v2",
+        "name_en": "Cross-Agent Ref - Behavior Label Team Feedback Selector v2",
+        "description": "Four-way comparison C: keeps A's safe behavior-action teacher and uses a less delayed closed-loop team head/tail selector to improve two-agent to team-success conversion.",
+        "env": {
+            "ALGORITHM": "matd3",
+            "MATD3_USE_DUAL_Q": "1",
+            "MATD3_USE_SEPARATED_GRADIENT": "1",
+            "MATD3_USE_HYBRID_ACTOR_OBJECTIVE": "0",
+            "MATD3_ACTION_SEMANTICS_MODE": "dual",
+            "MATD3_RECONSTRUCT_CORRECTED_TARGET": "1",
+            "USE_TF_POTENTIAL_FIELD": "1",
+            "CROSS_AGENT_REFERENCE_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_COEF": "0.03",
+            "CROSS_AGENT_REFERENCE_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE": "50",
+            "CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES": "50",
+            "CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS": "0",
+            "CROSS_AGENT_REFERENCE_UPDATE_INTERVAL": "2",
+            "CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT": "1",
+            "CROSS_AGENT_REFERENCE_PROGRESS_THRESHOLD": "0.0005",
+            "CROSS_AGENT_REFERENCE_MARGIN": "0.0",
+            "CROSS_AGENT_REFERENCE_HEAD_WEIGHT": "1.0",
+            "CROSS_AGENT_REFERENCE_TAIL_WEIGHT": "0.3",
+            "CROSS_AGENT_REFERENCE_USE_CLEAN_LABEL": "0",
+            "CROSS_AGENT_REFERENCE_TARGET_SEMANTICS": "legacy",
+            "CROSS_AGENT_REFERENCE_EXCLUDE_RANDOM": "1",
+            "CROSS_AGENT_REFERENCE_QUALITY_GATE": "1",
+            "CROSS_AGENT_REFERENCE_GATE_MODE": "agent_quality",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED": "1",
+            "CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH": "auto",
+            "CROSS_AGENT_REFERENCE_SELECTOR_MODE": "closed_loop_team_head_tail",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA": "0.7",
+            "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_LR": "0.0001",
+            "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN": "128,64",
+            "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT": "-2.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP": "5.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU": "500.0",
+            "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW": "100",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA": "0.02",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE": "0.05",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES": "200",
+            "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES": "50",
+            "CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT": "0.25",
+            "CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE": "0",
+            "CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES": "64",
+            "CROSS_AGENT_REFERENCE_TEAM_TARGET_TWO_PLUS": "0.50",
+            "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_NEAR": "0.35",
+            "CROSS_AGENT_REFERENCE_TEAM_TARGET_SINGLE_SAFE": "0.25",
+            "CROSS_AGENT_REFERENCE_TEAM_TARGET_SAFE_NEAR": "0.25",
+            "CROSS_AGENT_REFERENCE_TEAM_TARGET_PROGRESS": "0.08",
+            "CROSS_AGENT_REFERENCE_FEEDBACK_TWO_PLUS_WEIGHT": "0.35",
+            "CROSS_AGENT_REFERENCE_FEEDBACK_ANY_WEIGHT": "0.10",
+            "CROSS_AGENT_REFERENCE_FEEDBACK_PROGRESS_WEIGHT": "0.08",
+        }
+    },
+    {
         "label": "matd3_collapsed_replay",
         "name": "MATD3 Collapsed Replay",
         "name_en": "Collapsed Replay",
@@ -7702,151 +8378,80 @@ EXPERIMENT_CONFIGS = [
 ]
 
 
-def _insert_r2s_tail_weight_ablation_configs() -> None:
-    """Add R2S tail-weight variants cloned from the canonical R2S config."""
-    base_label = "matd3_cross_agent_ref_reward_to_success_selector"
-    existing_labels = {str(cfg.get("label")) for cfg in EXPERIMENT_CONFIGS}
-    try:
-        base_index, base_config = next(
-            (idx, cfg)
-            for idx, cfg in enumerate(EXPERIMENT_CONFIGS)
-            if str(cfg.get("label")) == base_label
-        )
-    except StopIteration as exc:
-        raise RuntimeError(f"base R2S experiment config missing: {base_label}") from exc
+RETIRED_CROSS_AGENT_REFERENCE_LABELS = {
+    "matd3_cross_agent_ref_agent_success",
+    "matd3_cross_agent_ref_agent_quality",
+    "matd3_cross_agent_ref_soft_advantage",
+    "matd3_cross_agent_ref_selector_mix",
+    "matd3_cross_agent_ref_reward_to_success_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
+    "matd3_cross_agent_ref_closed_loop_team_head_tail_selector",
+    "matd3_cross_agent_ref_reward_to_success_head_tail_split_teacher_selector",
+    "matd3_cross_agent_ref_reward_to_success_selector_clean_label",
+    "matd3_cross_agent_ref_progress_gate",
+    "matd3_cross_agent_ref_agent_success_behavior_label",
+    "matd3_full_dual_semantic_cross_agent_ref",
+    "matd3_cross_agent_ref_no_quality_gate",
+    "matd3_cross_agent_ref_behavior_label",
+    "matd3_cross_agent_ref_behavior_label_current_baseline",
+    "matd3_cross_agent_ref_behavior_label_agent_quality_safe_reward",
+    "matd3_cross_agent_ref_behavior_label_team_feedback_selector_v2",
+}
 
-    variants = [
-        (
-            "matd3_cross_agent_ref_reward_to_success_selector_tail0",
-            "0.0",
-            "MATD3 Cross-Agent Reference - Reward-to-Success Selector (Tail 0.0)",
-            "Cross-Agent Ref - R2S Selector Tail 0.0",
-            "Tail-weight ablation: same reward-to-success selector as the canonical R2S run, but cross-agent reference imitation is applied only to the actor head.",
-        ),
-        (
-            "matd3_cross_agent_ref_reward_to_success_selector_tail01",
-            "0.1",
-            "MATD3 Cross-Agent Reference - Reward-to-Success Selector (Tail 0.1)",
-            "Cross-Agent Ref - R2S Selector Tail 0.1",
-            "Tail-weight ablation: same reward-to-success selector as the canonical R2S run, with weak APF/tail imitation weight 0.1.",
-        ),
-        (
-            "matd3_cross_agent_ref_reward_to_success_selector_tail10",
-            "1.0",
-            "MATD3 Cross-Agent Reference - Reward-to-Success Selector (Tail 1.0)",
-            "Cross-Agent Ref - R2S Selector Tail 1.0",
-            "Tail-weight ablation: same reward-to-success selector as the canonical R2S run, with full-strength APF/tail imitation weight 1.0.",
-        ),
-    ]
-
-    insert_at = base_index + 1
-    for label, tail_weight, name, name_en, description in variants:
-        if label in existing_labels:
-            continue
-        cfg = copy.deepcopy(base_config)
-        cfg["label"] = label
-        cfg["name"] = name
-        cfg["name_en"] = name_en
-        cfg["description"] = description
-        cfg.setdefault("env", {})["CROSS_AGENT_REFERENCE_TAIL_WEIGHT"] = tail_weight
-        EXPERIMENT_CONFIGS.insert(insert_at, cfg)
-        insert_at += 1
-        existing_labels.add(label)
-
-
-_insert_r2s_tail_weight_ablation_configs()
-
-
-def _insert_r2s_fr_schedule_ablation_configs() -> None:
-    """Add paired R2S FR-schedule variants for unified vs head/tail borrowing."""
-    base_specs = [
-        (
-            "matd3_cross_agent_ref_reward_to_success_selector",
-            "MATD3 Cross-Agent Reference - R2S Unified",
-            "Cross-Agent Ref - R2S Unified",
-            "reward-to-success selector with one shared selector score for head and tail imitation",
-            "matd3_cross_agent_ref_reward_to_success_selector",
-        ),
-        (
-            "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-            "MATD3 Cross-Agent Reference - R2S Head/Tail",
-            "Cross-Agent Ref - R2S Head/Tail",
-            "reward-to-success selector with separate selector scores for actor head and APF/tail imitation",
-            "matd3_cross_agent_ref_reward_to_success_head_tail_selector",
-        ),
-    ]
-    schedule_specs = [
-        (
-            "fr_current",
-            "Current FR Schedule",
-            "current FR",
-            "0.50",
-            DEFAULT_UNIFIED_ACTION_FORCE_RATIO_SCHEDULE_PCT,
-        ),
-        (
-            "fr_floor40",
-            "FR Schedule Floor 0.40",
-            "FR floor 0.40",
-            "0.50",
-            "0%:0.50,25%:0.48,50%:0.45,70%:0.43,85%:0.40,100%:0.40",
-        ),
-        (
-            "fr_fixed045",
-            "Fixed FR 0.45",
-            "fixed FR 0.45",
-            "0.45",
-            "DISABLED",
-        ),
-    ]
-
-    existing_labels = {str(cfg.get("label")) for cfg in EXPERIMENT_CONFIGS}
-    config_by_label = {str(cfg.get("label")): (idx, cfg) for idx, cfg in enumerate(EXPERIMENT_CONFIGS)}
-
-    insert_at = max(
-        idx
-        for idx, cfg in enumerate(EXPERIMENT_CONFIGS)
-        if str(cfg.get("label")) in {base_label for base_label, *_ in base_specs}
-    ) + 1
-
-    for base_label, name_prefix, name_en_prefix, description_prefix, label_prefix in base_specs:
-        if base_label not in config_by_label:
-            raise RuntimeError(f"base R2S experiment config missing: {base_label}")
-        _, base_config = config_by_label[base_label]
-        for suffix, schedule_name, schedule_short, action_force_ratio, schedule_pct in schedule_specs:
-            label = f"{label_prefix}_{suffix}"
-            if label in existing_labels:
-                continue
-            cfg = copy.deepcopy(base_config)
-            cfg["label"] = label
-            cfg["name"] = f"{name_prefix} ({schedule_name})"
-            cfg["name_en"] = f"{name_en_prefix} ({schedule_name})"
-            cfg["description"] = (
-                f"FR-schedule ablation: {description_prefix}; uses {schedule_short} "
-                "under the same seed101 training and official 10x30 evaluation environment."
-            )
-            env = cfg.setdefault("env", {})
-            env["ACTION_FORCE_RATIO"] = action_force_ratio
-            env["ACTION_FORCE_RATIO_SCHEDULE_PCT"] = schedule_pct
-            env["FR_SCHEDULE_VARIANT_LOCK"] = "1"
-            EXPERIMENT_CONFIGS.insert(insert_at, cfg)
-            insert_at += 1
-            existing_labels.add(label)
-
-
-_insert_r2s_fr_schedule_ablation_configs()
+# Retired selector/reward heuristics remain readable in historical result files,
+# but they are deliberately absent from the current training registry.
+EXPERIMENT_CONFIGS = [
+    config
+    for config in EXPERIMENT_CONFIGS
+    if str(config.get("label")) not in RETIRED_CROSS_AGENT_REFERENCE_LABELS
+    and str(config.get("label"))
+    != "matd3_cross_agent_ref_behavior_label_agent_quality_gate"
+]
+_selector_insert_index = next(
+    (
+        index
+        for index, config in enumerate(EXPERIMENT_CONFIGS)
+        if str(config.get("label")) == "matd3_collapsed_replay"
+    ),
+    len(EXPERIMENT_CONFIGS),
+)
+EXPERIMENT_CONFIGS[
+    _selector_insert_index:_selector_insert_index
+] = SELECTOR_PROTOCOL_EXPERIMENT_CONFIGS
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="围绕 MATD3 separated-skeleton / actor-objective 主线的模块消融实验")
     parser.add_argument("--episodes", type=int, default=1000, help="训练回合数")
     parser.add_argument("--batch-size", type=int, default=1024, help="训练批次大小")
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help=(
+            "每个训练模型内部同步并行的环境进程数；train_episodes 仍表示"
+            "同步训练迭代数，实际完整环境轨迹数为 episodes × num_envs"
+        ),
+    )
     parser.add_argument("--multi-seed", action="store_true", help="开启多随机种子模式，由当前脚本并发调度多个单-seed子批次")
     parser.add_argument("--seeds", type=str, default=None, help="多seed列表，逗号分隔，例如 101,202,303")
     parser.add_argument(
         "--resume-parent-batch-dir",
         type=str,
         default=None,
-        help="继续运行已存在的 multi-seed 父批次目录；会在原时间戳目录内补齐剩余 seed/实验并最终汇总",
+        help=(
+            "继续运行已存在的 multi-seed 父批次目录；只保留通过最终 results+final模型校验的"
+            "完整 algorithm×seed，未完成单元清理旧身份后从 episode 0 重跑"
+        ),
+    )
+    parser.add_argument(
+        "--parent-run-stamp",
+        type=str,
+        default=None,
+        help=(
+            "新建 multi-seed 父批次时使用的稳定 YYYYMMDD_HHMMSS 标识；"
+            "供一键脚本在中断后定位并恢复同一父批次"
+        ),
     )
     parser.add_argument("--max-parallel", type=int, default=3, help="多seed模式下最多并发多少个子批次；0表示全部同时启动")
     parser.add_argument(
@@ -7964,12 +8569,32 @@ def parse_args():
         "--force-eval-action-force-ratio",
         type=float,
         default=DEFAULT_FORCE_EVAL_ACTION_FORCE_RATIO,
-        help="后评估/验证集选模时强制使用的固定 FR；默认与统一训练口径对齐为 0.50",
+        help="后评估/验证集选模时强制使用的固定 FR；默认不强制覆盖，使用被评估 checkpoint/model 记录的 FR",
+    )
+    parser.add_argument(
+        "--obstacle-observation-mode",
+        "--obstacle-obs-mode",
+        dest="obstacle_observation_mode",
+        type=str,
+        default=os.getenv("OBSTACLE_OBSERVATION_MODE", os.getenv("OBSTACLE_OBS_MODE", "nearest_surface")),
+        help="障碍物15维槽位选择方式：nearest_surface 或 risk_lite_v2",
+    )
+    parser.add_argument(
+        "--obstacle-risk-velocity-forward-weight",
+        type=float,
+        default=float(os.getenv("OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT", os.getenv("OBSTACLE_OBS_VEL_FORWARD_WEIGHT", "4.0"))),
+        help="risk_lite_v2 中速度方向前向距离惩罚权重",
+    )
+    parser.add_argument(
+        "--obstacle-risk-goal-along-weight",
+        type=float,
+        default=float(os.getenv("OBSTACLE_RISK_GOAL_ALONG_WEIGHT", os.getenv("OBSTACLE_OBS_GOAL_ALONG_WEIGHT", "3.0"))),
+        help="risk_lite_v2 中目标走廊沿程距离惩罚权重",
     )
     parser.add_argument(
         "--no-force-eval-action-force-ratio",
         action="store_true",
-        help="后评估/验证集选模不强制固定 FR，改为使用被评估 checkpoint 对应的模型 FR",
+        help="兼容旧命令：清除显式固定 FR，使用被评估 checkpoint/model 记录的 FR",
     )
     parser.add_argument("--output-dir", type=str, default="ablation_dual_q_outputs", help="图表输出目录")
     parser.add_argument("--logs-root", type=str, default="logs", help="训练日志根目录")
@@ -8438,6 +9063,65 @@ def _prepare_positions_for_batch(args, positions_file: Path) -> None:
     print(f"[位置文件] {positions_file}")
 
 
+def _merge_resumed_child_batch_config(
+    existing: Dict[str, Any],
+    requested: Dict[str, Any],
+    requested_experiments: Sequence[str],
+    *,
+    config_path: Path,
+) -> Dict[str, Any]:
+    """Preserve child-batch provenance while allowing a subset resume."""
+    immutable_keys = (
+        "episodes",
+        "batch_size",
+        "num_envs",
+        "seed",
+        "scenario_seed",
+        "config_mode",
+        "experiment_group",
+        "positions_file",
+        "post_eval_enabled",
+        "allow_post_eval_without_train_success",
+        "post_eval_episode_length_multiplier",
+        "post_eval_selection_protocol",
+        "post_eval_model_variant",
+        "post_eval_requested_model_variant",
+    )
+    for key in immutable_keys:
+        if key not in existing or existing.get(key) is None:
+            continue
+        if key not in requested or requested.get(key) is None:
+            continue
+        existing_value = existing.get(key)
+        requested_value = requested.get(key)
+        if key == "positions_file":
+            try:
+                equal = Path(str(existing_value)).expanduser().resolve() == Path(str(requested_value)).expanduser().resolve()
+            except Exception:
+                equal = str(existing_value) == str(requested_value)
+        else:
+            equal = existing_value == requested_value
+        if not equal:
+            raise RuntimeError(
+                f"恢复子批次配置不一致，拒绝覆盖 {config_path}: "
+                f"{key} existing={existing_value!r} requested={requested_value!r}"
+            )
+
+    merged = dict(existing)
+    for key, value in requested.items():
+        if key not in merged or merged.get(key) is None:
+            merged[key] = value
+
+    experiments: List[str] = []
+    for label in list(existing.get("experiments", []) or []) + list(requested_experiments):
+        label_str = str(label)
+        if label_str and label_str not in experiments:
+            experiments.append(label_str)
+    merged["experiments"] = experiments
+    merged["last_resumed_at"] = datetime.now().isoformat(timespec="seconds")
+    return merged
+
+
 def _create_batch_dir(
     args,
     batch_seed: int,
@@ -8465,6 +9149,7 @@ def _create_batch_dir(
     batch_config = {
         "episodes": args.episodes,
         "batch_size": args.batch_size,
+        "num_envs": int(args.num_envs),
         "use_weighted_reward": args.use_weighted_reward,
         "seed": batch_seed,
         "scenario_seed": int(args.resolved_scenario_seed),
@@ -8481,6 +9166,9 @@ def _create_batch_dir(
         "unlock_env_on_plateau": int(args.resolved_unlock_env_on_plateau),
         "positions_file": str(positions_file),
         "post_eval_enabled": _post_eval_enabled(args),
+        "allow_post_eval_without_train_success": bool(
+            getattr(args, "allow_post_eval_without_train_success", False)
+        ),
         "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
         "post_eval_episode_length_multiplier": float(_resolve_post_eval_episode_length_multiplier(args)),
@@ -8506,6 +9194,8 @@ def _create_batch_dir(
         "post_eval_agent_local_jitter": float(_resolve_post_eval_agent_local_jitter(args)),
         "post_eval_goal_region_radius": float(_resolve_post_eval_goal_region_radius(args)),
         "batch_mode": batch_mode,
+        "batch_resume_policy": BATCH_RESUME_POLICY,
+        "episode_checkpoint_resume_enabled": False,
         "notes": (
             f"MATD3 separated-skeleton / actor-objective ablation: "
             f"default core experiments={STRICT_CORE_EXPERIMENT_LABELS}, "
@@ -8514,25 +9204,45 @@ def _create_batch_dir(
         ),
     }
 
+    requested_experiments = [str(c["label"]) for c in configs_to_run]
+    existing_config_path = batch_root / batch_id / "config.json"
+    if is_resume and existing_config_path.exists():
+        existing_config = _load_json_file(existing_config_path)
+        batch_config = _merge_resumed_child_batch_config(
+            existing_config,
+            batch_config,
+            requested_experiments,
+            config_path=existing_config_path,
+        )
+        requested_experiments = list(batch_config.get("experiments", requested_experiments))
+
     if AblationBatchManager is not None:
         manager = AblationBatchManager(root_dir=str(batch_root))
         batch_dir = manager.create_batch(
             batch_id=batch_id,
             config=batch_config,
-            experiments=[c["label"] for c in configs_to_run],
+            experiments=requested_experiments,
         )
     else:
         batch_dir = batch_root / batch_id
         batch_dir.mkdir(parents=True, exist_ok=True)
         (batch_dir / "plots").mkdir(parents=True, exist_ok=True)
         (batch_dir / "results").mkdir(parents=True, exist_ok=True)
-        for cfg in configs_to_run:
-            (batch_dir / cfg["label"]).mkdir(parents=True, exist_ok=True)
-        _save_json(batch_dir / "config.json", {**batch_config, "experiments": [c["label"] for c in configs_to_run]})
+        for label in requested_experiments:
+            (batch_dir / label).mkdir(parents=True, exist_ok=True)
+        _save_json(batch_dir / "config.json", {**batch_config, "experiments": requested_experiments})
 
     output_dir = batch_dir / "plots"
     output_dir.mkdir(parents=True, exist_ok=True)
     seed_file = batch_dir / "shared_seed.json"
+    if seed_file.exists():
+        existing_seed_payload = _load_json_file(seed_file)
+        existing_seed = _safe_int(existing_seed_payload.get("seed"))
+        if existing_seed is not None and existing_seed != int(batch_seed):
+            raise RuntimeError(
+                f"恢复子批次共享种子不一致，拒绝覆盖 {seed_file}: "
+                f"existing={existing_seed}, requested={batch_seed}"
+            )
     _save_json(
         seed_file,
         {
@@ -8740,6 +9450,11 @@ def setup_base_env_vars(
     env["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
     env["AUTO_EVAL"] = "0"
     env.setdefault("HEARTBEAT_ENABLE", "0")
+    # 批次恢复只复用完整的 (algorithm, seed) 单元。批次 worker 不保存或
+    # 消费 episode 级续训状态；中断单元会在下次调度时从 episode 0 重跑。
+    env["SAVE_INTERVAL"] = "0"
+    env["SAVE_TRAINING_RESUME_STATE"] = "0"
+    env["BATCH_RESUME_POLICY"] = BATCH_RESUME_POLICY
 
     # 仅保留运行时必要的非训练语义开关。
     # 训练完成后的轨迹图/损失图/HTML 等产物默认沿用 run_optimized.sh 的标准行为；
@@ -8871,6 +9586,7 @@ def setup_base_env_vars(
 
 def _runtime_override_summary(args) -> Dict[str, Any]:
     return {
+        "num_envs": int(getattr(args, "num_envs", 1)),
         "xla_global": None if getattr(args, "xla_global", None) is None else int(args.xla_global),
         "jit_compile": None if getattr(args, "jit_compile", None) is None else int(args.jit_compile),
         "force_outer_jit_compile": bool(getattr(args, "force_outer_jit_compile", False)),
@@ -8887,6 +9603,10 @@ def _runtime_override_summary(args) -> Dict[str, Any]:
 
 
 def _apply_runtime_env_overrides(env: Dict[str, str], args) -> Dict[str, str]:
+    num_envs = int(getattr(args, "num_envs", 1))
+    if num_envs <= 0:
+        raise ValueError(f"--num-envs 必须为正整数，当前={num_envs}")
+    env["NUM_ENVS"] = str(num_envs)
     for arg_name, env_name in (
         ("xla_global", "XLA_GLOBAL"),
         ("jit_compile", "JIT_COMPILE"),
@@ -8923,33 +9643,36 @@ def _apply_runtime_env_overrides(env: Dict[str, str], args) -> Dict[str, str]:
         env["FORCE_EVAL_ACTION_FORCE_RATIO"] = str(float(args.force_eval_action_force_ratio))
     else:
         env.pop("FORCE_EVAL_ACTION_FORCE_RATIO", None)
-    if os.environ.get("CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"):
-        env["CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"] = str(
-            max(1, int(os.environ["CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"]))
-        )
-    if os.environ.get("CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"):
-        env["CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"] = str(
-            max(0, int(os.environ["CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"]))
-        )
-    if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"):
-        env["CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"] = str(
-            max(0, int(os.environ["CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"]))
-        )
-    if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"):
-        env["CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"] = str(
-            max(0, int(os.environ["CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"]))
-        )
-    if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"):
-        env["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"] = "1" if _to_bool(
-            os.environ["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"]
-        ) else "0"
-    for override_key in sorted(REWARD_SHAPING_OVERRIDE_ENV_KEYS | SELECTOR_TARGET_OVERRIDE_ENV_KEYS):
+    selector_protocol_locked = _to_bool(env.get("SELECTOR_PROTOCOL_LOCK", "0"))
+    if not selector_protocol_locked:
+        if os.environ.get("CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"):
+            env["CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"] = str(
+                max(1, int(os.environ["CROSS_AGENT_REFERENCE_UPDATE_INTERVAL"]))
+            )
+        if os.environ.get("CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"):
+            env["CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"] = str(
+                max(0, int(os.environ["CROSS_AGENT_REFERENCE_PAIRS_PER_AGENT"]))
+            )
+        if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"):
+            env["CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"] = str(
+                max(0, int(os.environ["CROSS_AGENT_REFERENCE_ACTOR_START_EPISODE"]))
+            )
+        if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"):
+            env["CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"] = str(
+                max(0, int(os.environ["CROSS_AGENT_REFERENCE_ACTOR_RAMP_EPISODES"]))
+            )
+        if os.environ.get("CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"):
+            env["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"] = "1" if _to_bool(
+                os.environ["CROSS_AGENT_REFERENCE_ACTOR_REQUIRE_SUCCESS"]
+            ) else "0"
+    for override_key in sorted(REWARD_SHAPING_OVERRIDE_ENV_KEYS):
         if override_key in os.environ:
             env[override_key] = str(os.environ[override_key])
     return env
 
 
 def _append_runtime_override_args(command: List[str], args) -> None:
+    command.extend(["--num-envs", str(int(getattr(args, "num_envs", 1)))])
     for flag, value in (
         ("--xla-global", getattr(args, "xla_global", None)),
         ("--jit-compile", getattr(args, "jit_compile", None)),
@@ -8986,8 +9709,16 @@ def _resolve_experiment_manifest(
         config_mode=args.config_mode,
         scenario_seed=int(args.resolved_scenario_seed),
     )
-    if os.environ.get("SAVE_INTERVAL"):
-        env["SAVE_INTERVAL"] = os.environ["SAVE_INTERVAL"]
+    for key in (
+        "NOISE_SCALE",
+        "NOISE_DECAY",
+        "NOISE_DECAY_STEPS",
+        "NOISE_STAIRCASE",
+        "NOISE_DECAY_ENABLED",
+        "NOISE_MIN",
+    ):
+        if os.environ.get(key) is not None:
+            env[key] = str(os.environ[key])
 
     for key, value in env_vars.items():
         env[key] = value
@@ -9001,6 +9732,22 @@ def _resolve_experiment_manifest(
     env["USE_DYNAMIC_OBSTACLES"] = "1" if getattr(args, "use_dynamic_obstacles", False) else "0"
     training_environment = _effective_training_environment_setup(args)
     env["TERRAIN_CONTACT_EPS"] = str(float(training_environment.get("terrain_contact_eps", env.get("TERRAIN_CONTACT_EPS", "0.2"))))
+    env["OBSTACLE_OBSERVATION_MODE"] = normalize_obstacle_observation_mode(
+        training_environment.get("obstacle_observation_mode", env.get("OBSTACLE_OBSERVATION_MODE", "nearest_surface"))
+    )
+    env["OBSTACLE_OBS_MODE"] = env["OBSTACLE_OBSERVATION_MODE"]
+    env["OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"] = str(
+        _float_or_default_value(
+            training_environment.get("obstacle_risk_velocity_forward_weight", env.get("OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT")),
+            4.0,
+        )
+    )
+    env["OBSTACLE_RISK_GOAL_ALONG_WEIGHT"] = str(
+        _float_or_default_value(
+            training_environment.get("obstacle_risk_goal_along_weight", env.get("OBSTACLE_RISK_GOAL_ALONG_WEIGHT")),
+            3.0,
+        )
+    )
     env["RANDOM_TERRAIN"] = "1" if training_environment.get("random_terrain") else "0"
     env["SEMI_RANDOM_TERRAIN"] = "1" if training_environment.get("semi_random_terrain") else "0"
     env["DETERMINISTIC_TRAIN_ENV_SEQUENCE"] = "1" if training_environment.get("deterministic_env_sequence") else "0"
@@ -9041,6 +9788,24 @@ def _resolve_experiment_manifest(
 
     algorithm = env.get("ALGORITHM", "matd3")
     manifest_path = manifest_dir / f"{label}_resolved_manifest.json"
+    if manifest_path.exists():
+        manifest = _load_manifest(manifest_path)
+        _validate_resolved_manifest_identity(
+            manifest,
+            manifest_path,
+            label=label,
+            exp_name_base=exp_name_base,
+            seed=env["SEED"],
+            episodes=int(args.episodes),
+            batch_size=int(args.batch_size),
+            num_envs=int(args.num_envs),
+        )
+        print(f"[配置冻结-{label}] 复用不可变训练清单: {manifest_path}")
+        return manifest, manifest_path
+
+    raw_manifest_path = manifest_dir / (
+        f".{label}_resolved_manifest.{os.getpid()}.{time.time_ns()}.json"
+    )
 
     resolve_env = dict(env)
     training_python = _resolve_training_python()
@@ -9052,7 +9817,7 @@ def _resolve_experiment_manifest(
         )
     resolve_env["TRAIN_PYTHON_BIN"] = training_python
     resolve_env["ABLATION_RESOLVE_ONLY"] = "1"
-    resolve_env["ABLATION_MANIFEST_PATH"] = str(manifest_path)
+    resolve_env["ABLATION_MANIFEST_PATH"] = str(raw_manifest_path)
 
     cmd = [
         "/bin/bash",
@@ -9064,10 +9829,18 @@ def _resolve_experiment_manifest(
         algorithm,
     ]
 
-    subprocess.run(cmd, env=resolve_env, cwd=Path(args.script).resolve().parent, check=True)
-    manifest = _load_manifest(manifest_path)
+    try:
+        subprocess.run(cmd, env=resolve_env, cwd=Path(args.script).resolve().parent, check=True)
+    except Exception:
+        try:
+            raw_manifest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    manifest = _load_manifest(raw_manifest_path)
     manifest_exec_env = manifest.setdefault("exec_env", {})
     training_env_exec_keys = (
+        "NUM_ENVS",
         "RANDOM_TERRAIN",
         "SEMI_RANDOM_TERRAIN",
         "DETERMINISTIC_TRAIN_ENV_SEQUENCE",
@@ -9085,6 +9858,10 @@ def _resolve_experiment_manifest(
         "SEMI_RANDOM_TERRAIN_HOLD_MAX_EPISODES",
         "USE_DYNAMIC_OBSTACLES",
         "TERRAIN_CONTACT_EPS",
+        "OBSTACLE_OBSERVATION_MODE",
+        "OBSTACLE_OBS_MODE",
+        "OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT",
+        "OBSTACLE_RISK_GOAL_ALONG_WEIGHT",
         "ACTION_FORCE_RATIO",
         "ACTION_FORCE_RATIO_SCHEDULE_PCT",
         "FR_SCHEDULE_VARIANT_LOCK",
@@ -9111,24 +9888,24 @@ def _resolve_experiment_manifest(
         "CROSS_AGENT_REFERENCE_SELECTOR_ENABLED",
         "CROSS_AGENT_REFERENCE_SELECTOR_TRAIN_IN_GRAPH",
         "CROSS_AGENT_REFERENCE_SELECTOR_MODE",
-        "CROSS_AGENT_REFERENCE_SELECTOR_ALPHA",
-        "CROSS_AGENT_REFERENCE_SELECTOR_Q_TAU",
         "CROSS_AGENT_REFERENCE_SELECTOR_LR",
         "CROSS_AGENT_REFERENCE_SELECTOR_HIDDEN",
         "CROSS_AGENT_REFERENCE_SELECTOR_INIT_LOGIT",
         "CROSS_AGENT_REFERENCE_SELECTOR_ADV_CLIP",
-        "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TAU",
-        "CROSS_AGENT_REFERENCE_SELECTOR_REWARD_TIEBREAK",
-        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_WINDOW",
-        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_DELTA",
-        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_RATE",
-        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_STABLE_MIN_EPISODES",
-        "CROSS_AGENT_REFERENCE_SELECTOR_SUCCESS_RAMP_EPISODES",
-        "CROSS_AGENT_REFERENCE_CLOSED_LOOP_FEEDBACK_WEIGHT",
-        "CROSS_AGENT_REFERENCE_CLOSED_LOOP_USE_Q_ADVANTAGE",
-        "CROSS_AGENT_REFERENCE_CLOSED_LOOP_MAX_PENDING_UPDATES",
+        "CROSS_AGENT_REFERENCE_ADVANTAGE_EMA_DECAY",
+        "CROSS_AGENT_REFERENCE_ADVANTAGE_EPSILON",
+        "CROSS_AGENT_REFERENCE_ADVANTAGE_INITIAL_SCALE",
+        "SELECTOR_PROTOCOL_LOCK",
     )
-    for key in tuple(dict.fromkeys(training_env_exec_keys + tuple(sorted(REWARD_SHAPING_OVERRIDE_ENV_KEYS)))):
+    tracked_override_keys = tuple(
+        dict.fromkeys(
+            training_env_exec_keys
+            + tuple(sorted(REWARD_SHAPING_OVERRIDE_ENV_KEYS))
+            + tuple(sorted(SAFE_REWARD_OVERRIDE_ENV_KEYS))
+            + tuple(sorted(SELECTOR_TARGET_OVERRIDE_ENV_KEYS))
+        )
+    )
+    for key in tracked_override_keys:
         if key in env:
             manifest_exec_env[key] = env[key]
         else:
@@ -9179,6 +9956,23 @@ def _resolve_experiment_manifest(
         "--terrain-contact-eps",
         float(training_environment.get("terrain_contact_eps", 0.2)),
     )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--obstacle-observation-mode",
+        normalize_obstacle_observation_mode(
+            training_environment.get("obstacle_observation_mode", "nearest_surface")
+        ),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--obstacle-risk-velocity-forward-weight",
+        _float_or_default_value(training_environment.get("obstacle_risk_velocity_forward_weight"), 4.0),
+    )
+    argv = _set_manifest_cli_flag(
+        argv,
+        "--obstacle-risk-goal-along-weight",
+        _float_or_default_value(training_environment.get("obstacle_risk_goal_along_weight"), 3.0),
+    )
     for flag, key in (
         ("--peak-jitter-range", "peak_jitter_range"),
         ("--peak-center-jitter-range", "peak_center_jitter_range"),
@@ -9212,6 +10006,9 @@ def _resolve_experiment_manifest(
         "terrain_base_seed",
         "training_env_sequence_seed",
         "terrain_contact_eps",
+        "obstacle_observation_mode",
+        "obstacle_risk_velocity_forward_weight",
+        "obstacle_risk_goal_along_weight",
         "peak_jitter_range",
         "peak_center_jitter_range",
         "peak_height_jitter_ratio_min",
@@ -9246,9 +10043,29 @@ def _resolve_experiment_manifest(
         "experiment_group": args.experiment_group,
         "training_python": training_python,
         "exp_name_base": exp_name_base,
+        "num_envs": int(args.num_envs),
         "training_environment": _effective_training_environment_setup(args),
     })
-    _save_json(manifest_path, manifest)
+    _stamp_resolved_manifest(manifest)
+    try:
+        _save_resolved_manifest_exclusive(manifest_path, manifest)
+    except FileExistsError:
+        manifest = _load_manifest(manifest_path)
+        _validate_resolved_manifest_identity(
+            manifest,
+            manifest_path,
+            label=label,
+            exp_name_base=exp_name_base,
+            seed=env["SEED"],
+            episodes=int(args.episodes),
+            batch_size=int(args.batch_size),
+            num_envs=int(args.num_envs),
+        )
+    finally:
+        try:
+            raw_manifest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     return manifest, manifest_path
 
 
@@ -9265,10 +10082,13 @@ def run_experiment(
     project_logs_root = Path(args.script).resolve().parent / "logs"
 
     if args.reuse:
+        reuse_failure: Optional[Exception] = None
+        reused: Optional[Dict[str, Any]] = None
         try:
             reuse_logs_root = project_logs_root if args.logs_root == "logs" else Path(args.logs_root).resolve()
             log_dir = None
             reuse_manifest_path = None
+            reuse_manifest = None
             try:
                 candidate_manifest_path = Path(args.manifest_dir) / f"{label}_resolved_manifest.json"
                 if candidate_manifest_path.exists():
@@ -9287,6 +10107,22 @@ def run_experiment(
                     reuse_require_explicit_training_environment = False
             seeded_exp_name_base = _build_seeded_exp_name_base(label, args)
             reuse_candidates: List[Path] = []
+            exact_model_root_candidate: Optional[Path] = None
+            if isinstance(reuse_manifest, dict):
+                manifest_meta = (
+                    reuse_manifest.get("meta", {})
+                    if isinstance(reuse_manifest.get("meta"), dict)
+                    else {}
+                )
+                manifest_exp_name = str(
+                    manifest_meta.get("exp_name_with_timestamp", "") or ""
+                ).strip()
+                if manifest_exp_name:
+                    exact_model_root = (
+                        Path(__file__).resolve().parent / "models" / manifest_exp_name
+                    ).resolve()
+                    if exact_model_root.is_dir():
+                        exact_model_root_candidate = exact_model_root
             if seeded_exp_name_base and seeded_exp_name_base != label:
                 reuse_candidates.extend(_candidate_log_dirs_by_exp_name_base(reuse_logs_root, seeded_exp_name_base))
             reuse_candidates.extend(_candidate_log_dirs_by_exp_name_base(reuse_logs_root, label))
@@ -9296,6 +10132,11 @@ def run_experiment(
                     reuse_candidates.append(Path(latest_fallback))
             except Exception:
                 pass
+            # Keep the normal log directory first because it contains richer
+            # loss/collision histories.  The final model result is a fallback
+            # when a completed unit survived but its mirrored log was lost.
+            if exact_model_root_candidate is not None:
+                reuse_candidates.append(exact_model_root_candidate)
             seen_candidates = set()
             validation_failures: List[str] = []
             metrics: Dict[str, Any] = {}
@@ -9317,6 +10158,26 @@ def run_experiment(
                     manifest_path=Path(reuse_manifest_path) if reuse_manifest_path is not None else None,
                     require_explicit_training_environment=reuse_require_explicit_training_environment,
                 )
+                candidate_result = {
+                    "log_dir": candidate_key,
+                    "manifest_path": str(reuse_manifest_path) if reuse_manifest_path is not None else "",
+                }
+                if not validation_errors:
+                    validation_errors.extend(
+                        _completed_training_model_errors(
+                            candidate_result,
+                            positions_file=Path(positions_file),
+                            expected_episodes=int(args.episodes),
+                            expected_seed=int(args.batch_seed),
+                            expected_num_envs=int(args.num_envs),
+                            require_gpu=_to_bool(
+                                (cfg.get("env") or {}).get(
+                                    "MATD3_REQUIRE_GPU",
+                                    "0",
+                                )
+                            ),
+                        )
+                    )
                 if not validation_errors:
                     log_dir = candidate_key
                     metrics = candidate_metrics
@@ -9324,7 +10185,7 @@ def run_experiment(
                 validation_failures.append(f"{candidate_key}: {' | '.join(validation_errors)}")
             if not log_dir:
                 detail = " ; ".join(validation_failures[:5]) if validation_failures else "未找到候选日志目录"
-                raise RuntimeError(f"[复用-{label}] 未找到通过校验的历史结果: {detail}")
+                raise RuntimeError(f"[复用-{label}] 未找到通过完整单元校验的历史结果: {detail}")
             reused = {
                 "label": label,
                 "name": cfg.get("name", label),
@@ -9333,25 +10194,51 @@ def run_experiment(
                 "log_dir": log_dir,
                 "manifest_path": str(reuse_manifest_path) if reuse_manifest_path is not None else "",
                 "metrics": metrics,
-                "success": True
+                "success": True,
             }
+        except Exception as exc:
+            reuse_failure = exc
+
+        if reused is not None:
+            # 训练完整性与后评估恢复是两层状态。后评估失败必须向上抛出，
+            # 绝不能落回下面的新训练路径而覆盖已完成的 algorithm×seed。
+            print(f"[批次恢复-{label}] 完整训练单元已通过校验，保留模型并仅补齐/复用后评估。")
             reused = _run_post_training_evaluation(
                 reused, cfg, positions_file, args, batch_dir, post_eval_spec
             )
             cache[label] = reused
             return reused
-        except Exception as e:
-            if getattr(args, "reuse_only", False):
-                raise RuntimeError(
-                    f"[复用失败-{label}] 仅复用模式已开启，停止训练。原因: {e}"
-                )
-            pass
+        if getattr(args, "reuse_only", False):
+            raise RuntimeError(
+                f"[复用失败-{label}] 仅复用模式已开启，停止训练。原因: {reuse_failure}"
+            )
+        print(
+            f"[批次恢复-{label}] 没有完整训练单元，将按 {BATCH_RESUME_POLICY} "
+            f"从 episode 0 重训。原因: {reuse_failure}"
+        )
 
     manifest_dir = Path(args.manifest_dir)
     manifest, manifest_path = _resolve_experiment_manifest(cfg, positions_file, args, manifest_dir)
+    _restart_incomplete_training_identity(
+        manifest=manifest,
+        manifest_path=manifest_path,
+        label=label,
+        positions_file=Path(positions_file),
+        args=args,
+        batch_dir=batch_dir,
+        project_logs_root=project_logs_root,
+    )
     algorithm = str(manifest.get("meta", {}).get("algorithm", "matd3")).strip().lower()
 
     exec_env = dict(manifest.get("exec_env", {}))
+    # Operational batch policy is applied even when resuming an older immutable
+    # manifest.  It does not change the scientific configuration, but prevents
+    # inherited/manual checkpoint continuation from entering a batch worker.
+    exec_env.pop("RESUME_MODEL_ENV", None)
+    exec_env.pop("CHECKPOINT_MODEL", None)
+    exec_env["SAVE_INTERVAL"] = "0"
+    exec_env["SAVE_TRAINING_RESUME_STATE"] = "0"
+    exec_env["BATCH_RESUME_POLICY"] = BATCH_RESUME_POLICY
     if algorithm == "matd3":
         dual_q_flag = exec_env.get("MATD3_USE_DUAL_Q")
         sep_grad_flag = exec_env.get("MATD3_USE_SEPARATED_GRADIENT")
@@ -9394,11 +10281,23 @@ def run_experiment(
         or _resolve_training_python()
         or "python3"
     )
+    execution_argv = list(manifest.get("argv", []))
+    execution_argv = _remove_manifest_cli_flag(execution_argv, "--checkpoint")
+    execution_argv = _remove_manifest_cli_flag(execution_argv, "--resume")
     cmd = [
         str(python_bin),
         str(manifest.get("python_script")),
-        *list(manifest.get("argv", [])),
+        *execution_argv,
     ]
+    manifest_meta = manifest.get("meta", {}) if isinstance(manifest.get("meta"), dict) else {}
+    manifest_sha256 = str(manifest_meta.get(RESOLVED_TRAINING_MANIFEST_HASH_KEY, "") or "").strip()
+    if not manifest_sha256:
+        raise RuntimeError(
+            f"[运行-{label}] 历史 manifest 没有不可变内容指纹，禁止据此启动新训练。"
+            "历史结果仍可在配置完全匹配时复用；需要重训时请创建新批次。"
+        )
+    exec_env["TRAINING_MANIFEST_SHA256"] = manifest_sha256
+    exec_env["TRAINING_MANIFEST_PATH"] = str(Path(manifest_path).resolve())
 
     print(f"\n{'='*70}")
     print(f"[运行] {cfg.get('name', label)}")
@@ -9439,6 +10338,25 @@ def run_experiment(
         manifest_path=Path(manifest_path),
         require_explicit_training_environment=True,
     )
+    if not validation_errors:
+        validation_errors.extend(
+            _completed_training_model_errors(
+                {
+                    "log_dir": log_dir,
+                    "manifest_path": str(manifest_path),
+                },
+                positions_file=Path(positions_file),
+                expected_episodes=int(args.episodes),
+                expected_seed=int(args.batch_seed),
+                expected_num_envs=int(args.num_envs),
+                require_gpu=_to_bool(
+                    (cfg.get("env") or {}).get(
+                        "MATD3_REQUIRE_GPU",
+                        "0",
+                    )
+                ),
+            )
+        )
     if validation_errors:
         raise RuntimeError(
             "[运行-{}] 结果有效性校验失败: {}".format(label, " | ".join(validation_errors))
@@ -9601,6 +10519,21 @@ def _close_worker_job_log(job: Dict[str, Any]) -> None:
         log_handle.close()
 
 
+def _append_obstacle_observation_args(command: List[str], args) -> None:
+    command.extend(
+        [
+            "--obstacle-observation-mode",
+            normalize_obstacle_observation_mode(
+                getattr(args, "obstacle_observation_mode", "nearest_surface")
+            ),
+            "--obstacle-risk-velocity-forward-weight",
+            str(_float_or_default_value(getattr(args, "obstacle_risk_velocity_forward_weight", None), 4.0)),
+            "--obstacle-risk-goal-along-weight",
+            str(_float_or_default_value(getattr(args, "obstacle_risk_goal_along_weight", None), 3.0)),
+        ]
+    )
+
+
 def _terminate_active_worker_jobs(active_jobs: Sequence[Dict[str, Any]]) -> None:
     for job in active_jobs:
         process = job.get("process")
@@ -9749,6 +10682,7 @@ def _build_single_seed_experiment_job(
     ):
         if value is not None:
             command.extend([flag, "1" if _to_bool(value) else "0"])
+    _append_obstacle_observation_args(command, args)
     _append_runtime_override_args(command, args)
     command.append("--positions-prepared")
     return {
@@ -9784,14 +10718,6 @@ def _run_parallel_experiments_for_single_seed(
         while pending_jobs or active_jobs:
             while pending_jobs and len(active_jobs) < max_parallel:
                 job = pending_jobs.pop(0)
-                artifact_path = job.get("artifact_path")
-                if artifact_path:
-                    try:
-                        Path(artifact_path).unlink()
-                    except FileNotFoundError:
-                        pass
-                    except Exception:
-                        pass
                 _launch_worker_job(job)
                 active_jobs.append(job)
                 print(f"[实验并发] 已启动 exp={job['label']} -> {job['launcher_log']}")
@@ -9829,6 +10755,7 @@ def _run_parallel_experiments_for_single_seed(
         expected_terrain_seed=int(args.resolved_scenario_seed),
         expected_training_setup=_effective_training_environment_setup(args),
         batch_seed=int(batch_seed),
+        expected_num_envs=int(args.num_envs),
     )
     failed_jobs = [job for job in completed_jobs if int(job.get("returncode", 1)) != 0]
     if failed_jobs or missing_labels:
@@ -10064,8 +10991,14 @@ def _write_multi_seed_outputs(
         "training_environment": _effective_training_environment_setup(args),
         "skip_local_plots_for_children": bool(args.skip_local_plots),
         "post_eval_enabled": _post_eval_enabled(args),
+        "allow_post_eval_without_train_success": bool(
+            getattr(args, "allow_post_eval_without_train_success", False)
+        ),
         "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
+        "post_eval_episode_length_multiplier": float(
+            _resolve_post_eval_episode_length_multiplier(args)
+        ),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
         "post_eval_model_variant": _resolve_post_eval_storage_variant(args),
         "post_eval_requested_model_variant": getattr(args, "post_eval_model_variant", DEFAULT_POST_EVAL_MODEL_VARIANT),
@@ -10217,6 +11150,12 @@ def run_single_seed_batch(args) -> int:
     print(f"环境隔离: {args.env_isolation}")
     print(f"动态障碍物: {'启用' if getattr(args, 'use_dynamic_obstacles', False) else '禁用'}")
     training_environment = _effective_training_environment_setup(args)
+    print(
+        "障碍观测: "
+        f"{training_environment.get('obstacle_observation_mode', 'nearest_surface')} "
+        f"(vel_w={_float_or_default_value(training_environment.get('obstacle_risk_velocity_forward_weight'), 4.0):.3f}, "
+        f"goal_w={_float_or_default_value(training_environment.get('obstacle_risk_goal_along_weight'), 3.0):.3f})"
+    )
     if training_environment.get("semi_random_terrain"):
         print(
             "训练地形: 同源半随机"
@@ -10239,6 +11178,7 @@ def run_single_seed_batch(args) -> int:
     print(f"训练种子: {batch_seed}")
     print(f"场景Seed: {args.resolved_scenario_seed}")
     print(f"运行时覆盖: {_runtime_override_summary(args)}")
+    print(f"批次恢复策略: {BATCH_RESUME_POLICY}（禁用 episode/checkpoint 级续训）")
     print(f"配置清单目录: {manifest_dir}")
     print(f"严格有效性校验: {'关闭' if args.disable_strict_validity else '开启'}")
     print(f"跳过本地图表: {'是' if args.skip_local_plots else '否'}")
@@ -10304,7 +11244,9 @@ def run_single_seed_batch(args) -> int:
         delta = row.get("tail100_delta_rhs_minus_lhs")
         delta_str = f"{delta:.2f}" if isinstance(delta, (int, float)) else "N/A"
         print(f"  - {row['name']}: {row['status']} (tail100 Δ={delta_str})")
-    if not claims_report["required_pass"]:
+    if claims_report["required_pass"] is None:
+        print("[有效性检查] 当前实验组不包含核心声明所需对照，核心声明状态=not_applicable。")
+    elif claims_report["required_pass"] is False:
         print("[有效性检查] 核心声明检查失败：")
         for item in claims_report["required_failed"]:
             print(f"  - {item}")
@@ -10354,10 +11296,25 @@ def run_multi_seed_parent(args) -> int:
         configs_for_summary = list(configs_to_run)
     if resume_batch_dir is not None:
         run_stamp = _extract_parent_run_stamp(resume_batch_dir, group_label)
+        requested_run_stamp = str(
+            getattr(args, "parent_run_stamp", "") or ""
+        ).strip()
+        if requested_run_stamp and requested_run_stamp != run_stamp:
+            raise RuntimeError(
+                "--parent-run-stamp 与待恢复父批次身份不一致: "
+                f"cli={requested_run_stamp}, batch={run_stamp}"
+            )
         batch_dir = resume_batch_dir
         parent_batch_id = batch_dir.name
     else:
-        run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        requested_run_stamp = str(
+            getattr(args, "parent_run_stamp", "") or ""
+        ).strip()
+        run_stamp = (
+            requested_run_stamp
+            if requested_run_stamp
+            else datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
         parent_batch_id = f"multi_seed_{group_label}_{run_stamp}"
         batch_root = Path("ablation_experiments")
         batch_root.mkdir(parents=True, exist_ok=True)
@@ -10365,6 +11322,7 @@ def run_multi_seed_parent(args) -> int:
     parent_config = {
         "episodes": args.episodes,
         "batch_size": args.batch_size,
+        "num_envs": int(args.num_envs),
         "use_weighted_reward": args.use_weighted_reward,
         "scenario_seed": int(args.resolved_scenario_seed),
         "env_isolation": args.env_isolation,
@@ -10383,8 +11341,14 @@ def run_multi_seed_parent(args) -> int:
         "seeds": seeds,
         "max_parallel": args.max_parallel if args.max_parallel > 0 else len(seeds),
         "post_eval_enabled": _post_eval_enabled(args),
+        "allow_post_eval_without_train_success": bool(
+            getattr(args, "allow_post_eval_without_train_success", False)
+        ),
         "post_eval_mode": getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE),
         "post_eval_episodes": int(getattr(args, "post_eval_episodes", DEFAULT_POST_EVAL_EPISODES)),
+        "post_eval_episode_length_multiplier": float(
+            _resolve_post_eval_episode_length_multiplier(args)
+        ),
         "post_eval_seed": int(getattr(args, "resolved_post_eval_seed", _resolve_post_eval_seed(args))),
         "post_eval_selection_protocol": str(_resolve_post_eval_selection_protocol(args)),
         "post_eval_validation_episodes": int(_resolve_post_eval_validation_episodes(args)),
@@ -10414,6 +11378,8 @@ def run_multi_seed_parent(args) -> int:
         "post_eval_disable_gif": bool(_resolve_post_eval_artifact_policy(args).get("disable_gif", True)),
         "runtime_overrides": _runtime_override_summary(args),
         "batch_mode": "multi_seed_parent",
+        "batch_resume_policy": BATCH_RESUME_POLICY,
+        "episode_checkpoint_resume_enabled": False,
         "experiments": [cfg["label"] for cfg in configs_for_summary],
     }
     if resume_batch_dir is not None:
@@ -10478,6 +11444,7 @@ def run_multi_seed_parent(args) -> int:
         )
     print(f"运行时覆盖: {_runtime_override_summary(args)}")
     print(f"父批次目录: {batch_dir}")
+    print(f"批次恢复策略: {BATCH_RESUME_POLICY}（完整单元保留；不完整单元从 episode 0 重训）")
     print(f"子批次根目录: {seed_batches_root}")
     print(f"共享位置文件: {positions_file}")
     print(f"{'='*70}\n")
@@ -10634,6 +11601,7 @@ def run_multi_seed_parent(args) -> int:
         ):
             if value is not None:
                 command.extend([flag, "1" if _to_bool(value) else "0"])
+        _append_obstacle_observation_args(command, args)
         _append_runtime_override_args(command, args)
         command.append("--positions-prepared")
 
@@ -10794,6 +11762,7 @@ def run_multi_seed_parent(args) -> int:
         ):
             if value is not None:
                 bootstrap_command.extend([flag, "1" if _to_bool(value) else "0"])
+        _append_obstacle_observation_args(bootstrap_command, args)
         _append_runtime_override_args(bootstrap_command, args)
         bootstrap_job = {
             "seed": int(bootstrap_seed),
@@ -10810,14 +11779,6 @@ def run_multi_seed_parent(args) -> int:
             job for job in pending_jobs
             if not (job.get("seed") == int(bootstrap_seed) and job.get("label") == first_label)
         ]
-        bootstrap_artifact_path = bootstrap_job.get("artifact_path")
-        if bootstrap_artifact_path:
-            try:
-                Path(bootstrap_artifact_path).unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
         _launch_worker_job(bootstrap_job)
         active_jobs.append(bootstrap_job)
         print(
@@ -10864,14 +11825,6 @@ def run_multi_seed_parent(args) -> int:
 
             while pending_jobs and len(active_jobs) < max_parallel and bootstrap_released:
                 job = pending_jobs.pop(0)
-                artifact_path = job.get("artifact_path")
-                if artifact_path:
-                    try:
-                        Path(artifact_path).unlink()
-                    except FileNotFoundError:
-                        pass
-                    except Exception:
-                        pass
                 _launch_worker_job(job)
                 active_jobs.append(job)
                 print(f"[多seed] 已启动 seed={job['seed']} | exp={job['label']} -> {job['launcher_log']}")
@@ -10923,13 +11876,16 @@ def run_multi_seed_parent(args) -> int:
                 batch_seed=int(seed),
                 experiment_group=args.experiment_group,
                 group_desc=group_desc,
-            configs_to_run=configs_for_summary,
-        )
+                configs_to_run=configs_for_summary,
+            )
             if seed_ctx["summary_path"].exists():
-                summary_data = _load_json_file(seed_ctx["summary_path"])
-                summary_data["summary_path"] = str(seed_ctx["summary_path"])
-                child_summaries.append(summary_data)
-                status = "completed"
+                if failed_jobs:
+                    status = "failed_jobs"
+                else:
+                    summary_data = _load_json_file(seed_ctx["summary_path"])
+                    summary_data["summary_path"] = str(seed_ctx["summary_path"])
+                    child_summaries.append(summary_data)
+                    status = "completed"
             else:
                 status = "missing_summary"
         except Exception as exc:
@@ -10984,7 +11940,7 @@ def run_multi_seed_parent(args) -> int:
         raise RuntimeError(f"多seed子批次完整性/后评估审计失败，详情见: {audit_report_path}")
 
     aggregates = _aggregate_multi_seed_runs(child_summaries)
-    selected_labels = {cfg["label"] for cfg in configs_to_run}
+    selected_labels = {cfg["label"] for cfg in configs_for_summary}
     claims_report_multi_seed = _evaluate_multi_seed_claims(aggregates, selected_labels)
     _write_multi_seed_outputs(
         batch_dir=batch_dir,
@@ -11011,6 +11967,7 @@ def main():
         args.force_eval_action_force_ratio = None
     args.post_eval_mode = _canonicalize_post_eval_mode(getattr(args, "post_eval_mode", DEFAULT_POST_EVAL_MODE))
     args.cli_max_parallel_specified = ("--max-parallel" in sys.argv)
+    args.cli_num_envs_specified = ("--num-envs" in sys.argv)
     args.cli_disable_post_eval_specified = ("--disable-post-eval" in sys.argv)
     args.cli_post_eval_mode_specified = ("--post-eval-mode" in sys.argv)
     args.cli_post_eval_model_variant_specified = ("--post-eval-model-variant" in sys.argv)
@@ -11022,6 +11979,18 @@ def main():
         "--post-eval-episode-length-multiplier" in sys.argv
     )
     args.parsed_seeds = _parse_seed_list(args.seeds)
+    if int(args.num_envs) <= 0:
+        raise RuntimeError("--num-envs 必须为正整数")
+    parent_run_stamp = str(
+        getattr(args, "parent_run_stamp", "") or ""
+    ).strip()
+    if parent_run_stamp and (
+        len(parent_run_stamp) != 15
+        or not _is_timestamp_token(parent_run_stamp)
+    ):
+        raise RuntimeError(
+            "--parent-run-stamp 必须是 YYYYMMDD_HHMMSS 格式"
+        )
     args.resolved_scenario_seed = _resolve_scenario_seed(args.config_mode, args.scenario_seed)
     args.resolved_post_eval_seed = _resolve_post_eval_seed(args)
     (

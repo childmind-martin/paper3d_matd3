@@ -7,6 +7,62 @@ MADDPG优化版模型评估与可视化脚本
 
 import os
 import sys
+from pathlib import Path
+
+
+def _bootstrap_gpu_ld_path_before_tensorflow():
+    """Ensure TensorFlow sees WSL/conda CUDA libraries before it is imported."""
+    entrypoint_name = Path(sys.argv[0]).name
+    if __name__ != '__main__' and entrypoint_name not in {'evaluate_mappo.py'}:
+        return
+    if os.environ.get('CUDA_VISIBLE_DEVICES') == '':
+        return
+    if os.environ.get('MATD3_SKIP_GPU_LD_BOOTSTRAP', '').lower() in ('1', 'true', 'yes', 'on'):
+        return
+    if os.environ.get('MATD3_EVAL_GPU_LD_BOOTSTRAPPED') == '1':
+        return
+
+    current_parts = [p for p in os.environ.get('LD_LIBRARY_PATH', '').split(':') if p]
+    current_set = set(current_parts)
+
+    candidate_paths = []
+    wsl_cuda_lib = Path('/usr/lib/wsl/lib')
+    if wsl_cuda_lib.is_dir():
+        candidate_paths.append(str(wsl_cuda_lib))
+
+    env_prefix = os.environ.get('CONDA_PREFIX') or sys.prefix
+    if env_prefix:
+        prefix = Path(env_prefix)
+        conda_lib = prefix / 'lib'
+        if conda_lib.is_dir():
+            candidate_paths.append(str(conda_lib))
+
+        py_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        nvidia_root = prefix / 'lib' / py_tag / 'site-packages' / 'nvidia'
+        if nvidia_root.is_dir():
+            candidate_paths.extend(str(path) for path in sorted(nvidia_root.glob('*/lib')) if path.is_dir())
+
+    prepend_paths = []
+    for path in candidate_paths:
+        if path not in current_set and path not in prepend_paths:
+            prepend_paths.append(path)
+
+    if not prepend_paths:
+        os.environ['MATD3_EVAL_GPU_LD_BOOTSTRAPPED'] = '1'
+        return
+
+    os.environ['LD_LIBRARY_PATH'] = ':'.join(prepend_paths + current_parts)
+    os.environ['MATD3_EVAL_GPU_LD_BOOTSTRAPPED'] = '1'
+    print(
+        "[Eval GPU Bootstrap] added CUDA library paths before TensorFlow import: "
+        + ':'.join(prepend_paths),
+        flush=True,
+    )
+    os.execve(sys.executable, [sys.executable] + sys.argv, os.environ.copy())
+
+
+_bootstrap_gpu_ld_path_before_tensorflow()
+
 import argparse
 import numpy as np
 import tensorflow as tf
@@ -24,8 +80,19 @@ import signal
 import subprocess
 from collections import deque
 from contextlib import contextmanager
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from experiment_runtime_config import (
+    SCIENTIFIC_RUNTIME_ENV_FIELDS,
+    add_runtime_environment_arguments,
+    apply_runtime_environment,
+    find_training_runtime_manifest,
+    load_training_runtime_manifest,
+    runtime_environment_from_manifest,
+)
+from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
+
+_EVAL_NOISE_TYPE = "gaussian"
+_EVAL_NOISE_STREAM_MODE = "per_episode_seedsequence_pcg64_v1"
 
 # 设置环境变量抑制多智能体环境警告
 os.environ['SUPPRESS_MA_PROMPT'] = '1'
@@ -1153,6 +1220,30 @@ def _sequence_implies_random_terrain(terrain_seed_sequence, terrain_variant_seed
     return len(set(normalized)) > 1
 
 
+def _set_scenario_terrain_complexity(scenario, terrain_level):
+    """Apply an episode complexity level and refresh all derived parameters."""
+    if scenario is None:
+        raise ValueError("scenario is required when applying terrain complexity")
+    terrain_level = max(1, min(4, int(terrain_level)))
+    scenario.terrain_complexity_level = terrain_level
+    setup_complexity = getattr(scenario, '_setup_complexity_parameters', None)
+    if callable(setup_complexity):
+        setup_complexity()
+    return terrain_level
+
+
+def _scenario_terrain_variant_seed(scenario, fallback=None):
+    """Return a variant seed only when the scenario actually uses variants."""
+    if scenario is None or not bool(getattr(scenario, 'use_semi_random_terrain', False)):
+        return None
+    value = getattr(
+        scenario,
+        'current_terrain_variant_seed',
+        getattr(scenario, 'terrain_variant_seed', fallback),
+    )
+    return None if value is None else int(value)
+
+
 def _iter_results_json_paths(model_path):
     if not model_path:
         return
@@ -1179,8 +1270,10 @@ def _iter_results_json_paths(model_path):
         seen_dirs.add(norm)
         potential_log_dirs.append(norm)
 
-    _add_candidate_dir(os.path.join("logs", exp_name))
     _add_candidate_dir(model_base_dir)
+    # The mirrored model-local record is identity-bound to the checkpoint root.
+    # Only fall back to the logs tree for legacy runs without that mirror.
+    _add_candidate_dir(os.path.join("logs", exp_name))
 
     parent_dir = os.path.dirname(os.path.normpath(model_base_dir))
     # Some legacy layouts store results.json one level above a checkpoint
@@ -1205,6 +1298,38 @@ def _iter_results_json_paths(model_path):
             yield results_path
 
 
+_TRAINING_RUNTIME_REWARD_ENV_FIELDS = (
+    ('reward_version', 'REWARD_VERSION', 'str'),
+    ('reward_terminal_order_fix', 'REWARD_TERMINAL_ORDER_FIX', 'bool'),
+    ('goal_ring_individual_scale', 'GOAL_RING_INDIVIDUAL_SCALE', 'float'),
+    ('goal_ring_team_gated', 'GOAL_RING_TEAM_GATED', 'bool'),
+    ('goal_ring_require_agent_safe', 'GOAL_RING_REQUIRE_AGENT_SAFE', 'bool'),
+    ('progress_distance_state_scale', 'PROGRESS_DISTANCE_STATE_SCALE', 'float'),
+    ('progress_reward_scale', 'PROGRESS_REWARD_SCALE', 'float'),
+    ('team_progress_bottleneck_only', 'TEAM_PROGRESS_BOTTLENECK_ONLY', 'bool'),
+    ('team_progress_non_bottleneck_scale', 'TEAM_PROGRESS_NON_BOTTLENECK_SCALE', 'float'),
+    ('team_progress_bottleneck_eps', 'TEAM_PROGRESS_BOTTLENECK_EPS', 'float'),
+    ('team_success_bonus', 'TEAM_SUCCESS_BONUS', 'float'),
+    ('unsafe_arrival_penalty', 'UNSAFE_ARRIVAL_PENALTY', 'float'),
+    ('non_success_terminal_guard_enabled', 'NON_SUCCESS_TERMINAL_GUARD_ENABLED', 'bool'),
+    ('non_success_terminal_penalty_base', 'NON_SUCCESS_TERMINAL_PENALTY_BASE', 'float'),
+    ('non_success_terminal_penalty_per_meter', 'NON_SUCCESS_TERMINAL_PENALTY_PER_METER', 'float'),
+    ('non_success_terminal_penalty_max', 'NON_SUCCESS_TERMINAL_PENALTY_MAX', 'float'),
+    ('terminal_failure_penalty_base', 'TERMINAL_FAILURE_PENALTY_BASE', 'float'),
+    ('terminal_failure_penalty_per_meter', 'TERMINAL_FAILURE_PENALTY_PER_METER', 'float'),
+    ('terminal_failure_penalty_max', 'TERMINAL_FAILURE_PENALTY_MAX', 'float'),
+    ('clearance_quality_bonus_weight', 'CLEARANCE_QUALITY_BONUS_WEIGHT', 'float'),
+    ('efficiency_bonus_weight', 'EFFICIENCY_BONUS_WEIGHT', 'float'),
+    ('team_sync_reward_enabled', 'TEAM_SYNC_REWARD_ENABLED', 'bool'),
+    ('team_goal_occupancy_scale', 'TEAM_GOAL_OCCUPANCY_SCALE', 'float'),
+    ('team_bottleneck_progress_scale', 'TEAM_BOTTLENECK_PROGRESS_SCALE', 'float'),
+    ('team_waiting_scale', 'TEAM_WAITING_SCALE', 'float'),
+    ('team_bottleneck_delta_clip', 'TEAM_BOTTLENECK_DELTA_CLIP', 'float'),
+    ('clearance_dense_positive_scale', 'CLEARANCE_DENSE_POSITIVE_SCALE', 'float'),
+    ('height_dense_positive_scale', 'HEIGHT_DENSE_POSITIVE_SCALE', 'float'),
+)
+
+
 def _load_training_alignment_snapshot(model_path):
     for results_path in _iter_results_json_paths(model_path):
         try:
@@ -1220,12 +1345,36 @@ def _load_training_alignment_snapshot(model_path):
         if not isinstance(training_environment, dict):
             training_environment = {}
 
+        model_candidate = Path(str(model_path or '')).expanduser()
+        if _is_model_variant_dir_name(model_candidate.name):
+            model_exp_name = model_candidate.parent.name
+        else:
+            model_exp_name = model_candidate.name
+        exp_name = str(training_args.get('exp_name') or model_exp_name or '').strip()
+        explicit_manifest_path = str(results.get('training_manifest_path') or '').strip()
+        expected_manifest_sha256 = str(results.get('training_manifest_sha256') or '').strip()
+        runtime_manifest_path = find_training_runtime_manifest(
+            Path(__file__).resolve().parent,
+            exp_name,
+            explicit_manifest_path or None,
+        )
+        manifest_runtime_environment = {}
+        if runtime_manifest_path is not None:
+            runtime_manifest = load_training_runtime_manifest(
+                runtime_manifest_path,
+                exp_name=exp_name,
+                expected_content_sha256=expected_manifest_sha256 or None,
+            )
+            manifest_runtime_environment = runtime_environment_from_manifest(runtime_manifest)
+
         def _metadata_value(key):
-            if key in training_args and training_args.get(key) is not None:
-                return training_args.get(key)
             if key in training_environment and training_environment.get(key) is not None:
                 return training_environment.get(key)
-            return results.get(key)
+            if key in training_args and training_args.get(key) is not None:
+                return training_args.get(key)
+            if results.get(key) is not None:
+                return results.get(key)
+            return manifest_runtime_environment.get(key)
 
         scenario_name = (
             training_args.get('scenario_name')
@@ -1239,28 +1388,37 @@ def _load_training_alignment_snapshot(model_path):
             or results.get('algorithm')
             or results.get('algo')
         )
-        terrain_seed = training_args.get('terrain_seed')
+        terrain_seed = _metadata_value('terrain_seed')
         if terrain_seed is None:
             terrain_seed = training_args.get('scenario_seed', results.get('terrain_seed', results.get('scenario_seed')))
 
         snapshot = {
             'results_path': results_path,
+            'training_runtime_manifest_path': (
+                str(runtime_manifest_path) if runtime_manifest_path is not None else ''
+            ),
             'scenario_name': scenario_name,
             'algorithm': algorithm,
-            'random_terrain': _coerce_optional_bool(training_args.get('random_terrain', results.get('random_terrain'))),
-            'use_dynamic_obstacles': _coerce_optional_bool(training_args.get('use_dynamic_obstacles', results.get('use_dynamic_obstacles'))),
+            'random_terrain': _coerce_optional_bool(_metadata_value('random_terrain')),
+            'use_dynamic_obstacles': _coerce_optional_bool(_metadata_value('use_dynamic_obstacles')),
             'terrain_seed': _coerce_optional_int(terrain_seed),
             'per_episode_terrain': _coerce_optional_bool(training_args.get('per_episode_terrain', results.get('per_episode_terrain'))),
             'per_env_terrain': _coerce_optional_bool(training_args.get('per_env_terrain', results.get('per_env_terrain'))),
-            'semi_random_terrain': _coerce_optional_bool(training_args.get('semi_random_terrain', results.get('semi_random_terrain'))),
-            'terrain_base_seed': _coerce_optional_int(training_args.get('terrain_base_seed', results.get('terrain_base_seed'))),
-            'peak_jitter_range': _coerce_optional_float(training_args.get('peak_jitter_range', results.get('peak_jitter_range'))),
-            'peak_center_jitter_range': _coerce_optional_float(training_args.get('peak_center_jitter_range', results.get('peak_center_jitter_range'))),
-            'peak_height_jitter_ratio_min': _coerce_optional_float(training_args.get('peak_height_jitter_ratio_min', results.get('peak_height_jitter_ratio_min'))),
-            'peak_height_jitter_ratio_max': _coerce_optional_float(training_args.get('peak_height_jitter_ratio_max', results.get('peak_height_jitter_ratio_max'))),
-            'peak_height_max_scale': _coerce_optional_float(training_args.get('peak_height_max_scale', results.get('peak_height_max_scale'))),
-            'terrain_variant_noise_ratio': _coerce_optional_float(training_args.get('terrain_variant_noise_ratio', results.get('terrain_variant_noise_ratio'))),
+            'semi_random_terrain': _coerce_optional_bool(_metadata_value('semi_random_terrain')),
+            'terrain_base_seed': _coerce_optional_int(_metadata_value('terrain_base_seed')),
+            'peak_jitter_range': _coerce_optional_float(_metadata_value('peak_jitter_range')),
+            'peak_center_jitter_range': _coerce_optional_float(_metadata_value('peak_center_jitter_range')),
+            'peak_height_jitter_ratio_min': _coerce_optional_float(_metadata_value('peak_height_jitter_ratio_min')),
+            'peak_height_jitter_ratio_max': _coerce_optional_float(_metadata_value('peak_height_jitter_ratio_max')),
+            'peak_height_max_scale': _coerce_optional_float(_metadata_value('peak_height_max_scale')),
+            'terrain_variant_noise_ratio': _coerce_optional_float(_metadata_value('terrain_variant_noise_ratio')),
             'terrain_contact_eps': _coerce_optional_float(_metadata_value('terrain_contact_eps')),
+            'agent_size': _coerce_optional_float(_metadata_value('agent_size')),
+            'obstacle_observation_mode': normalize_obstacle_observation_mode(
+                _metadata_value('obstacle_observation_mode')
+            ),
+            'obstacle_risk_velocity_forward_weight': _coerce_optional_float(_metadata_value('obstacle_risk_velocity_forward_weight')),
+            'obstacle_risk_goal_along_weight': _coerce_optional_float(_metadata_value('obstacle_risk_goal_along_weight')),
             'terrain_complexity_level': _coerce_optional_int(training_args.get('terrain_complexity_level', results.get('terrain_complexity_level'))),
             'map_size': _coerce_optional_float(training_args.get('map_size', results.get('map_size'))),
             'mountain_min_distance': _coerce_optional_float(training_args.get('mountain_min_distance', results.get('mountain_min_distance'))),
@@ -1274,6 +1432,24 @@ def _load_training_alignment_snapshot(model_path):
             'global_reward_mode': _metadata_value('global_reward_mode'),
             'shaping_gamma': _coerce_optional_float(_metadata_value('shaping_gamma')),
         }
+        for runtime_field in SCIENTIFIC_RUNTIME_ENV_FIELDS:
+            raw_value = _metadata_value(runtime_field.attr)
+            if runtime_field.kind == 'float':
+                snapshot[runtime_field.attr] = _coerce_optional_float(raw_value)
+            elif runtime_field.kind == 'int':
+                snapshot[runtime_field.attr] = _coerce_optional_int(raw_value)
+            elif runtime_field.kind == 'bool':
+                snapshot[runtime_field.attr] = _coerce_optional_bool(raw_value)
+            else:
+                snapshot[runtime_field.attr] = None if raw_value is None else str(raw_value)
+        for field_name, _env_name, value_kind in _TRAINING_RUNTIME_REWARD_ENV_FIELDS:
+            raw_value = _metadata_value(field_name)
+            if value_kind == 'float':
+                snapshot[field_name] = _coerce_optional_float(raw_value)
+            elif value_kind == 'bool':
+                snapshot[field_name] = _coerce_optional_bool(raw_value)
+            else:
+                snapshot[field_name] = None if raw_value is None else str(raw_value)
         if snapshot['terrain_base_seed'] is None and snapshot['terrain_seed'] is not None:
             snapshot['terrain_base_seed'] = snapshot['terrain_seed']
         return snapshot
@@ -1308,6 +1484,10 @@ def _apply_training_alignment_to_args(args, snapshot, quiet=False):
     _apply('peak_height_max_scale', snapshot.get('peak_height_max_scale'))
     _apply('terrain_variant_noise_ratio', snapshot.get('terrain_variant_noise_ratio'))
     _apply('terrain_contact_eps', snapshot.get('terrain_contact_eps'))
+    _apply('agent_size', snapshot.get('agent_size'))
+    _apply('obstacle_observation_mode', snapshot.get('obstacle_observation_mode'))
+    _apply('obstacle_risk_velocity_forward_weight', snapshot.get('obstacle_risk_velocity_forward_weight'))
+    _apply('obstacle_risk_goal_along_weight', snapshot.get('obstacle_risk_goal_along_weight'))
     _apply('terrain_complexity_level', snapshot.get('terrain_complexity_level'))
     _apply('map_size', snapshot.get('map_size'))
     _apply('mountain_min_distance', snapshot.get('mountain_min_distance'))
@@ -1320,6 +1500,10 @@ def _apply_training_alignment_to_args(args, snapshot, quiet=False):
     _apply('collision_distance_threshold', snapshot.get('collision_distance_threshold'))
     _apply('global_reward_mode', snapshot.get('global_reward_mode'))
     _apply('shaping_gamma', snapshot.get('shaping_gamma'))
+    for runtime_field in SCIENTIFIC_RUNTIME_ENV_FIELDS:
+        _apply(runtime_field.attr, snapshot.get(runtime_field.attr))
+    for field_name, _env_name, _value_kind in _TRAINING_RUNTIME_REWARD_ENV_FIELDS:
+        _apply(field_name, snapshot.get(field_name))
 
     if applied and not quiet:
         pretty = ", ".join(f"{k}={applied[k]}" for k in sorted(applied.keys()))
@@ -1330,6 +1514,7 @@ def _apply_training_alignment_to_args(args, snapshot, quiet=False):
 
 def _apply_runtime_env_overrides_from_args(args):
     """将依赖环境变量的隐藏运行时参数与args保持同步。"""
+    apply_runtime_environment(args)
     runtime_pairs = (
         ("simulation_dt", "SIMULATION_DT"),
         ("z_action_bias", "Z_ACTION_BIAS"),
@@ -1369,6 +1554,16 @@ def _apply_runtime_env_overrides_from_args(args):
         os.environ[env_name] = "1" if bool(value) else "0"
 
     try:
+        obstacle_observation_mode = getattr(args, "obstacle_observation_mode", None)
+    except Exception:
+        obstacle_observation_mode = None
+    if obstacle_observation_mode is not None:
+        obstacle_observation_mode = normalize_obstacle_observation_mode(obstacle_observation_mode)
+        args.obstacle_observation_mode = obstacle_observation_mode
+        os.environ["OBSTACLE_OBSERVATION_MODE"] = obstacle_observation_mode
+        os.environ["OBSTACLE_OBS_MODE"] = obstacle_observation_mode
+
+    try:
         terrain_seed = getattr(args, "terrain_seed", None)
     except Exception:
         terrain_seed = None
@@ -1392,6 +1587,8 @@ def _apply_runtime_env_overrides_from_args(args):
         ("peak_height_max_scale", "PEAK_HEIGHT_MAX_SCALE"),
         ("terrain_variant_noise_ratio", "TERRAIN_VARIANT_NOISE_RATIO"),
         ("terrain_contact_eps", "TERRAIN_CONTACT_EPS"),
+        ("obstacle_risk_velocity_forward_weight", "OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"),
+        ("obstacle_risk_goal_along_weight", "OBSTACLE_RISK_GOAL_ALONG_WEIGHT"),
     )
     for attr_name, env_name in terrain_numeric_env_pairs:
         try:
@@ -1405,10 +1602,19 @@ def _apply_runtime_env_overrides_from_args(args):
         except Exception:
             continue
 
+    for attr_name, env_name, value_kind in _TRAINING_RUNTIME_REWARD_ENV_FIELDS:
+        value = getattr(args, attr_name, None)
+        if value is None:
+            continue
+        if value_kind == 'bool':
+            os.environ[env_name] = '1' if bool(value) else '0'
+        else:
+            os.environ[env_name] = str(value)
+
     numeric_env_pairs = (
         ("terrain_complexity_level", "TERRAIN_COMPLEXITY_LEVEL", int),
         ("map_size", "MAP_SIZE", float),
-        ("mountain_min_distance", "MOUNTAIN_MIN_DISTANCE", float),
+        ("mountain_min_distance", "MOUNTAIN_MIN_DISTANCE", int),
     )
     for attr_name, env_name, caster in numeric_env_pairs:
         try:
@@ -1423,8 +1629,20 @@ def _apply_runtime_env_overrides_from_args(args):
             continue
 
 
-def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
-    """将地形关键参数显式下发到scenario/world，确保重建环境时真正生效。"""
+def _apply_terrain_runtime_params_to_scenario(
+    scenario,
+    world,
+    args,
+    *,
+    preserve_episode_terrain=False,
+):
+    """将地形关键参数显式下发到scenario/world。
+
+    ``args.terrain_seed`` 是训练/评估的基础配置，不一定是当前回合已经显式
+    生成的地形种子。重建某个回合的 world 时必须保留 scenario 中已生成的
+    seed、variant 和 RNG 状态，否则会形成“地形数组来自新种子、元数据和
+    后续位置随机流却来自基础种子”的混合环境。
+    """
     if scenario is None or args is None:
         return
 
@@ -1444,6 +1662,9 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
         ('terrain_contact_eps', float, 'terrain_contact_eps'),
         ('terrain_complexity_level', int, 'terrain_complexity_level'),
         ('map_size', float, 'map_size'),
+        ('obstacle_observation_mode', str, 'obstacle_observation_mode'),
+        ('obstacle_risk_velocity_forward_weight', float, 'obstacle_risk_velocity_forward_weight'),
+        ('obstacle_risk_goal_along_weight', float, 'obstacle_risk_goal_along_weight'),
     )
     for arg_name, caster, scenario_attr in scalar_mappings:
         try:
@@ -1451,6 +1672,9 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
         except Exception:
             value = None
         if value is None:
+            continue
+        if scenario_attr == 'obstacle_observation_mode':
+            setattr(scenario, scenario_attr, normalize_obstacle_observation_mode(value))
             continue
         try:
             setattr(scenario, scenario_attr, caster(value))
@@ -1461,7 +1685,7 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
         terrain_seed = getattr(args, 'terrain_seed', None)
     except Exception:
         terrain_seed = None
-    if terrain_seed is not None:
+    if terrain_seed is not None and not preserve_episode_terrain:
         try:
             terrain_seed_int = int(terrain_seed)
             scenario.seed = terrain_seed_int
@@ -1493,7 +1717,7 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
         terrain_variant_seed = getattr(args, 'terrain_variant_seed', None)
     except Exception:
         terrain_variant_seed = None
-    if terrain_variant_seed is not None:
+    if terrain_variant_seed is not None and not preserve_episode_terrain:
         try:
             scenario.terrain_variant_seed = int(terrain_variant_seed)
             setattr(scenario, 'current_terrain_variant_seed', int(terrain_variant_seed))
@@ -1502,9 +1726,15 @@ def _apply_terrain_runtime_params_to_scenario(scenario, world, args):
 
     if world is None:
         return
-    if terrain_seed is not None and hasattr(world, 'terrain_seed'):
+    if hasattr(world, 'terrain_seed'):
         try:
-            world.terrain_seed = int(terrain_seed)
+            effective_terrain_seed = (
+                getattr(scenario, 'current_terrain_seed', getattr(scenario, 'seed', None))
+                if preserve_episode_terrain
+                else terrain_seed
+            )
+            if effective_terrain_seed is not None:
+                world.terrain_seed = int(effective_terrain_seed)
         except Exception:
             pass
     try:
@@ -2287,6 +2517,17 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
         "success_episode_count": None,
         "team_success_rate": None,
         "agent_success_rates": [],
+        "agent_reach_rates": [],
+        "agent_safe_rates": [],
+        "done_reason_counts": {},
+        "all_reached_without_safe_team_success_count": 0,
+        "all_reached_without_safe_team_success_rate": None,
+        "two_success_not_team_count": 0,
+        "two_success_not_team_rate": None,
+        "all_safe_not_team_count": 0,
+        "all_safe_not_team_rate": None,
+        "unsafe_reached_agent_slot_count": 0,
+        "unsafe_reached_agent_slot_rate": None,
         "avg_steps": None,
         "std_steps": None,
         "avg_collision_count": None,
@@ -2358,14 +2599,44 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
     violation_count = 0
 
     agent_success_lists = []
+    agent_reach_lists = []
+    agent_safe_lists = []
     agent_path_length_lists = []
     agent_path_length_success_lists = []
     agent_path_efficiency_lists = []
     agent_path_efficiency_success_lists = []
     agent_final_goal_distance_lists = []
     agent_min_goal_distance_lists = []
+    done_reason_counts = {}
+    all_reached_without_safe_team_success_count = 0
+    two_success_not_team_count = 0
+    all_safe_not_team_count = 0
+    unsafe_reached_agent_slot_count = 0
+    reached_agent_slot_count = 0
+
+    def _episode_flag(value):
+        try:
+            return 1 if int(value) != 0 else 0
+        except Exception:
+            return 0
+
+    def _episode_reach_flags(ep):
+        explicit_flags = ep.get("agent_reach_flags")
+        if isinstance(explicit_flags, list) and explicit_flags:
+            return [_episode_flag(flag) for flag in explicit_flags]
+        reach_steps = ep.get("agent_first_reach_steps", [])
+        flags = []
+        if isinstance(reach_steps, list):
+            for step in reach_steps:
+                numeric = _finite_float_or_none(step)
+                flags.append(1 if numeric is not None and numeric >= 0 else 0)
+        return flags
 
     for ep in all_episodes_data:
+        team_success_flag = int(ep.get("team_success", ep.get("success", 0)) or 0)
+        done_reason = ep.get("episode_done_reason") or ep.get("done_reason") or "unknown"
+        done_reason_counts[str(done_reason)] = done_reason_counts.get(str(done_reason), 0) + 1
+
         min_distance = ep.get("min_distance")
         if isinstance(min_distance, dict):
             mean_clearance = _finite_float_or_none(min_distance.get("mean"))
@@ -2420,6 +2691,51 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
                 except Exception:
                     agent_success_lists[idx].append(0)
 
+        agent_reach_flags = _episode_reach_flags(ep)
+        if agent_reach_flags:
+            for idx, flag in enumerate(agent_reach_flags):
+                while len(agent_reach_lists) <= idx:
+                    agent_reach_lists.append([])
+                agent_reach_lists[idx].append(_episode_flag(flag))
+
+        agent_safe_flags = ep.get("agent_safe_flags", [])
+        if isinstance(agent_safe_flags, list):
+            for idx, flag in enumerate(agent_safe_flags):
+                while len(agent_safe_lists) <= idx:
+                    agent_safe_lists.append([])
+                agent_safe_lists[idx].append(_episode_flag(flag))
+
+        success_count = 0
+        if isinstance(agent_success_flags, list):
+            success_count = sum(_episode_flag(flag) for flag in agent_success_flags)
+        reach_count = sum(_episode_flag(flag) for flag in agent_reach_flags)
+        safe_count = 0
+        if isinstance(agent_safe_flags, list):
+            safe_count = sum(_episode_flag(flag) for flag in agent_safe_flags)
+        n_agents_diag = max(
+            len(agent_success_flags) if isinstance(agent_success_flags, list) else 0,
+            len(agent_reach_flags),
+            len(agent_safe_flags) if isinstance(agent_safe_flags, list) else 0,
+        )
+        all_reached = bool(n_agents_diag > 0 and reach_count >= n_agents_diag)
+        if team_success_flag == 0 and (
+            str(done_reason) == "all_reached_without_safe_team_success" or all_reached
+        ):
+            all_reached_without_safe_team_success_count += 1
+        if team_success_flag == 0 and success_count >= min(2, max(n_agents_diag, 1)):
+            two_success_not_team_count += 1
+        if team_success_flag == 0 and n_agents_diag > 0 and safe_count >= n_agents_diag:
+            all_safe_not_team_count += 1
+        if agent_reach_flags:
+            reached_agent_slot_count += reach_count
+            safe_for_slots = agent_safe_flags if isinstance(agent_safe_flags, list) else []
+            for idx, reach_flag in enumerate(agent_reach_flags):
+                if _episode_flag(reach_flag) == 0:
+                    continue
+                safe_flag = _episode_flag(safe_for_slots[idx]) if idx < len(safe_for_slots) else 0
+                if safe_flag == 0:
+                    unsafe_reached_agent_slot_count += 1
+
         agent_path_lengths = ep.get("agent_path_lengths", [])
         if isinstance(agent_path_lengths, list):
             for idx, value in enumerate(agent_path_lengths):
@@ -2469,6 +2785,31 @@ def _build_evaluation_summary(all_rewards, all_episodes_data, collision_distance
             "success_episode_count": int(sum(success_flags)),
             "team_success_rate": _safe_mean(team_success_flags),
             "agent_success_rates": [_safe_mean(flags) for flags in agent_success_lists],
+            "agent_reach_rates": [_safe_mean(flags) for flags in agent_reach_lists],
+            "agent_safe_rates": [_safe_mean(flags) for flags in agent_safe_lists],
+            "done_reason_counts": dict(sorted(done_reason_counts.items())),
+            "all_reached_without_safe_team_success_count": int(
+                all_reached_without_safe_team_success_count
+            ),
+            "all_reached_without_safe_team_success_rate": (
+                float(all_reached_without_safe_team_success_count / len(all_episodes_data))
+                if all_episodes_data else None
+            ),
+            "two_success_not_team_count": int(two_success_not_team_count),
+            "two_success_not_team_rate": (
+                float(two_success_not_team_count / len(all_episodes_data))
+                if all_episodes_data else None
+            ),
+            "all_safe_not_team_count": int(all_safe_not_team_count),
+            "all_safe_not_team_rate": (
+                float(all_safe_not_team_count / len(all_episodes_data))
+                if all_episodes_data else None
+            ),
+            "unsafe_reached_agent_slot_count": int(unsafe_reached_agent_slot_count),
+            "unsafe_reached_agent_slot_rate": (
+                float(unsafe_reached_agent_slot_count / reached_agent_slot_count)
+                if reached_agent_slot_count > 0 else None
+            ),
             "avg_steps": _safe_mean(step_values),
             "std_steps": _safe_std(step_values),
             "avg_collision_count": _safe_mean(collision_counts),
@@ -2667,10 +3008,25 @@ class ModelEvaluator:
     def __init__(self, args):
         self.args = args
         self._current_episode_terrain_info = {}
+        self._eval_noise_scale = max(0.0, float(getattr(args, 'eval_noise_scale', 0.0) or 0.0))
+        self._eval_random_action_prob = min(
+            1.0,
+            max(0.0, float(getattr(args, 'eval_random_action_prob', 0.0) or 0.0)),
+        )
+        eval_noise_seed = getattr(args, 'eval_noise_seed', None)
+        self._eval_noise_seed = int(eval_noise_seed) if eval_noise_seed is not None else None
         self.training_alignment = _load_training_alignment_snapshot(getattr(args, 'load_model_path', None))
         if self.training_alignment:
             _apply_training_alignment_to_args(self.args, self.training_alignment)
             _apply_runtime_env_overrides_from_args(self.args)
+        if self._eval_noise_scale > 0.0 or self._eval_random_action_prob > 0.0:
+            print(
+                "[EvalNoise] "
+                f"type={_EVAL_NOISE_TYPE}, stream={_EVAL_NOISE_STREAM_MODE}, "
+                f"noise_scale={self._eval_noise_scale:.6g}, "
+                f"random_action_prob={self._eval_random_action_prob:.6g}, "
+                f"seed={self._eval_noise_seed}"
+            )
         self.setup_environment()
         self.setup_visualizer()
         
@@ -2689,6 +3045,31 @@ class ModelEvaluator:
         except Exception:
             logical_gpus = []
         cuda_visible = os.getenv('CUDA_VISIBLE_DEVICES', '<unset>')
+        ld_parts = [p for p in os.getenv('LD_LIBRARY_PATH', '').split(':') if p]
+        conda_prefix = os.getenv('CONDA_PREFIX', '')
+        conda_lib = str(Path(conda_prefix) / 'lib') if conda_prefix else ''
+        cuda_ld_entries = [
+            p for p in ld_parts
+            if (
+                p == '/usr/lib/wsl/lib'
+                or (conda_lib and p == conda_lib)
+                or '/site-packages/nvidia/' in p
+            )
+        ]
+        self._eval_device_info = {
+            'python': sys.executable,
+            'cuda_visible_devices': cuda_visible,
+            'physical_gpus': len(physical_gpus),
+            'logical_gpus': len(logical_gpus),
+            'physical_gpu_names': [getattr(gpu, 'name', str(gpu)) for gpu in physical_gpus],
+            'logical_gpu_names': [getattr(gpu, 'name', str(gpu)) for gpu in logical_gpus],
+            'configure_gpu': 'ok' if gpu_configured else 'fallback_cpu',
+            'require_gpu': _env_flag('MATD3_REQUIRE_GPU', False),
+            'gpu_ld_bootstrapped': os.getenv('MATD3_EVAL_GPU_LD_BOOTSTRAPPED') == '1',
+            'ld_library_path_has_wsl_cuda': '/usr/lib/wsl/lib' in ld_parts,
+            'ld_library_path_has_conda_lib': bool(conda_lib and conda_lib in ld_parts),
+            'ld_library_path_cuda_entries': cuda_ld_entries,
+        }
         print(
             "[Eval Device] "
             f"python={sys.executable} | "
@@ -2699,6 +3080,10 @@ class ModelEvaluator:
         )
         if not physical_gpus:
             print("⚠️  TensorFlow 当前未检测到可用 GPU，评估会回退到 CPU。")
+            if _env_flag('MATD3_REQUIRE_GPU', False):
+                raise RuntimeError(
+                    "MATD3_REQUIRE_GPU=1，但 TensorFlow 未检测到 GPU；已拒绝继续用 CPU 跑评估。"
+                )
         
         # 根据场景名称选择场景，支持新的场景选择逻辑
         scenario_name = self.args.scenario_name
@@ -2901,12 +3286,22 @@ class ModelEvaluator:
         """初始化可视化器"""
         self.visualizer = TrajectoryVisualizer() if not self.args.disable_visualization else None
 
-    def _rebuild_environment(self):
+    def _rebuild_environment(self, *, preserve_episode_terrain=False):
         """在场景被重新生成后重建world/env，并重新应用关键运行时参数。"""
         _apply_runtime_env_overrides_from_args(self.args)
-        _apply_terrain_runtime_params_to_scenario(self.scenario, None, self.args)
+        _apply_terrain_runtime_params_to_scenario(
+            self.scenario,
+            None,
+            self.args,
+            preserve_episode_terrain=preserve_episode_terrain,
+        )
         self.world = self.scenario.make_world()
-        _apply_terrain_runtime_params_to_scenario(self.scenario, self.world, self.args)
+        _apply_terrain_runtime_params_to_scenario(
+            self.scenario,
+            self.world,
+            self.args,
+            preserve_episode_terrain=preserve_episode_terrain,
+        )
 
         try:
             if hasattr(self.world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
@@ -3115,11 +3510,7 @@ class ModelEvaluator:
             except Exception:
                 pass
             terrain_seed = getattr(self.scenario, 'current_terrain_seed', getattr(self.scenario, 'seed', None))
-            terrain_variant_seed = getattr(
-                self.scenario,
-                'current_terrain_variant_seed',
-                getattr(self.scenario, 'terrain_variant_seed', None),
-            )
+            terrain_variant_seed = _scenario_terrain_variant_seed(self.scenario)
             self._current_episode_terrain_info = {
                 'terrain_seed': terrain_seed,
                 'terrain_variant_seed': terrain_variant_seed,
@@ -3161,7 +3552,7 @@ class ModelEvaluator:
             except Exception:
                 pass
 
-        self._rebuild_environment()
+        self._rebuild_environment(preserve_episode_terrain=True)
         self._load_episode_positions(episode_idx, terrain_seed, terrain_variant_seed)
 
         try:
@@ -3192,9 +3583,8 @@ class ModelEvaluator:
 
         self._current_episode_terrain_info = {
             'terrain_seed': getattr(self.scenario, 'current_terrain_seed', terrain_seed),
-            'terrain_variant_seed': getattr(
+            'terrain_variant_seed': _scenario_terrain_variant_seed(
                 self.scenario,
-                'current_terrain_variant_seed',
                 terrain_variant_seed,
             ),
             'obstacle_seed': int(obstacle_seed) if obstacle_seed is not None else None,
@@ -3349,9 +3739,21 @@ class ModelEvaluator:
             scenario.positions_initialized = False
             print(f"⚠️  加载Episode {episode_idx + 1}位置文件失败: {e}，将使用动态生成")
 
-    def _apply_eval_context_runtime_params(self, scenario, world, env=None):
+    def _apply_eval_context_runtime_params(
+        self,
+        scenario,
+        world,
+        env=None,
+        *,
+        preserve_episode_terrain=False,
+    ):
         """把评估运行时参数应用到 batch 子环境，保持与单环境评估一致。"""
-        _apply_terrain_runtime_params_to_scenario(scenario, world, self.args)
+        _apply_terrain_runtime_params_to_scenario(
+            scenario,
+            world,
+            self.args,
+            preserve_episode_terrain=preserve_episode_terrain,
+        )
 
         try:
             if hasattr(world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
@@ -3453,10 +3855,7 @@ class ModelEvaluator:
             raise RuntimeError(f"无法加载场景: {self.args.scenario_name}")
         _apply_runtime_env_overrides_from_args(self.args)
         _apply_terrain_runtime_params_to_scenario(scenario, None, self.args)
-        try:
-            scenario.terrain_complexity_level = terrain_level
-        except Exception:
-            pass
+        terrain_level = _set_scenario_terrain_complexity(scenario, terrain_level)
 
         use_random_terrain = (
             bool(getattr(self.args, 'random_terrain', False))
@@ -3467,11 +3866,7 @@ class ModelEvaluator:
             obstacle_seed = int(obstacle_seed_sequence[episode_idx])
 
         terrain_seed = getattr(scenario, 'current_terrain_seed', getattr(scenario, 'seed', None))
-        terrain_variant_seed = getattr(
-            scenario,
-            'current_terrain_variant_seed',
-            getattr(scenario, 'terrain_variant_seed', None),
-        )
+        terrain_variant_seed = _scenario_terrain_variant_seed(scenario)
 
         if use_random_terrain:
             if terrain_seed_sequence and episode_idx < len(terrain_seed_sequence):
@@ -3511,7 +3906,12 @@ class ModelEvaluator:
             info_callback=None,
             shared_viewer=False
         )
-        self._apply_eval_context_runtime_params(scenario, world, env)
+        self._apply_eval_context_runtime_params(
+            scenario,
+            world,
+            env,
+            preserve_episode_terrain=use_random_terrain,
+        )
 
         if use_random_terrain:
             self._load_episode_positions_into_scenario(
@@ -3550,7 +3950,7 @@ class ModelEvaluator:
 
         terrain_info = {
             'terrain_seed': getattr(scenario, 'current_terrain_seed', terrain_seed),
-            'terrain_variant_seed': getattr(scenario, 'current_terrain_variant_seed', terrain_variant_seed),
+            'terrain_variant_seed': _scenario_terrain_variant_seed(scenario, terrain_variant_seed),
             'obstacle_seed': int(obstacle_seed) if obstacle_seed is not None else None,
         }
         return argparse.Namespace(
@@ -3576,6 +3976,120 @@ class ModelEvaluator:
         """
         # 🔧 性能优化：使用tf.function装饰器加速（与训练代码一致）
         return self._select_actions_eval_tf(processed_obs, use_fr, use_pf)
+
+    def _make_eval_noise_streams(self, episode_idx):
+        """Create independent, topology-invariant streams for one episode.
+
+        Gaussian perturbations, random-action masks, and replacement actions use
+        separate PCG64 streams.  Consequently the Gaussian sequence is identical
+        between Gaussian-only and combined modes, and one episode ending early
+        cannot advance another episode's random state.
+        """
+        eval_noise_seed = getattr(self, '_eval_noise_seed', None)
+        eval_noise_scale = float(getattr(self, '_eval_noise_scale', 0.0) or 0.0)
+        eval_random_action_prob = float(
+            getattr(self, '_eval_random_action_prob', 0.0) or 0.0
+        )
+        if eval_noise_seed is None:
+            if eval_noise_scale > 0.0 or eval_random_action_prob > 0.0:
+                raise RuntimeError("启用评估动作扰动时必须先解析 eval_noise_seed")
+            return None
+        base_seed = int(eval_noise_seed)
+        episode_seed = int(episode_idx)
+
+        def _stream(stream_id):
+            seed_sequence = np.random.SeedSequence(
+                [
+                    base_seed & 0xFFFFFFFF,
+                    (base_seed >> 32) & 0xFFFFFFFF,
+                    episode_seed & 0xFFFFFFFF,
+                    (episode_seed >> 32) & 0xFFFFFFFF,
+                    int(stream_id),
+                ]
+            )
+            return np.random.default_rng(seed_sequence)
+
+        return {
+            "gaussian": _stream(1),
+            "random_mask": _stream(2),
+            "random_action": _stream(3),
+        }
+
+    def _apply_eval_action_noise(self, actions, episode_streams):
+        """Apply recorded Gaussian/random-action perturbations to raw actions."""
+        eval_noise_scale = float(getattr(self, '_eval_noise_scale', 0.0) or 0.0)
+        eval_random_action_prob = float(
+            getattr(self, '_eval_random_action_prob', 0.0) or 0.0
+        )
+        if eval_noise_scale <= 0.0 and eval_random_action_prob <= 0.0:
+            return actions
+        if episode_streams is None:
+            raise RuntimeError("评估动作扰动缺少 episode 独立随机流")
+
+        actions_tensor = tf.convert_to_tensor(actions)
+        squeeze_output = len(actions_tensor.shape) == 2
+        batched_actions = tf.expand_dims(actions_tensor, axis=0) if squeeze_output else actions_tensor
+        if len(batched_actions.shape) != 3:
+            raise ValueError(f"评估动作必须是2维或3维，实际shape={batched_actions.shape}")
+
+        streams = [episode_streams] if isinstance(episode_streams, dict) else list(episode_streams)
+        batch_size = batched_actions.shape[0]
+        agent_count = batched_actions.shape[1]
+        action_dim = batched_actions.shape[2]
+        if batch_size is None or agent_count is None or action_dim is None:
+            dynamic_shape = tf.shape(batched_actions).numpy().tolist()
+            batch_size, agent_count, action_dim = map(int, dynamic_shape)
+        else:
+            batch_size = int(batch_size)
+            agent_count = int(agent_count)
+            action_dim = int(action_dim)
+        if len(streams) != batch_size:
+            raise ValueError(
+                f"episode随机流数量与动作batch不一致: streams={len(streams)}, batch={batch_size}"
+            )
+
+        result = batched_actions
+        if eval_noise_scale > 0.0:
+            gaussian_noise = np.stack(
+                [
+                    stream["gaussian"].normal(
+                        loc=0.0,
+                        scale=eval_noise_scale,
+                        size=(agent_count, min(3, action_dim)),
+                    )
+                    for stream in streams
+                ],
+                axis=0,
+            ).astype(result.dtype.as_numpy_dtype, copy=False)
+            noisy_head = tf.clip_by_value(
+                result[:, :, :3] + tf.convert_to_tensor(gaussian_noise, dtype=result.dtype),
+                tf.cast(-1.0, result.dtype),
+                tf.cast(1.0, result.dtype),
+            )
+            result = tf.concat([noisy_head, result[:, :, 3:]], axis=2)
+
+        if eval_random_action_prob > 0.0:
+            random_mask = np.stack(
+                [
+                    stream["random_mask"].random(agent_count) < eval_random_action_prob
+                    for stream in streams
+                ],
+                axis=0,
+            )
+            random_actions = np.stack(
+                [
+                    stream["random_action"].uniform(-1.0, 1.0, size=(agent_count, action_dim))
+                    for stream in streams
+                ],
+                axis=0,
+            ).astype(result.dtype.as_numpy_dtype, copy=False)
+            result = tf.where(
+                tf.expand_dims(tf.convert_to_tensor(random_mask, dtype=tf.bool), axis=2),
+                tf.convert_to_tensor(random_actions, dtype=result.dtype),
+                result,
+            )
+
+        return result[0] if squeeze_output else result
 
     def _process_observations_for_eval(self, obs_n):
         """评估侧优先复用训练主线的向量化观测预处理，避免逐智能体 Python 循环。"""
@@ -3866,7 +4380,7 @@ class ModelEvaluator:
         
         # 堆叠为 (batch_size, n_agents, action_dim)
         actions = tf.stack(actions_list, axis=1)
-        
+
         # 如果输入没有批次维度，移除输出的批次维度
         if squeeze_output:
             actions = actions[0]  # (n_agents, action_dim)
@@ -4569,13 +5083,14 @@ class ModelEvaluator:
                     if algorithm == 'matd3':
                         cp1 = os.path.join(dir_path, f"critic1_{i}.weights.h5")
                         cp2 = os.path.join(dir_path, f"critic2_{i}.weights.h5")
-                        # 如果新格式文件不存在，尝试旧格式（兼容性）
-                        if not (os.path.isfile(cp1) and os.path.getsize(cp1) > 0) and \
-                           not (os.path.isfile(cp2) and os.path.getsize(cp2) > 0):
-                            # 回退到旧格式检查
-                            cp_old = os.path.join(dir_path, f"critic_{i}.weights.h5")
-                            if not os.path.isfile(cp_old) or os.path.getsize(cp_old) <= 0:
-                                return False
+                        cp_old = os.path.join(dir_path, f"critic_{i}.weights.h5")
+                        has_twin_critics = (
+                            os.path.isfile(cp1) and os.path.getsize(cp1) > 0
+                            and os.path.isfile(cp2) and os.path.getsize(cp2) > 0
+                        )
+                        has_legacy_critic = os.path.isfile(cp_old) and os.path.getsize(cp_old) > 0
+                        if not has_twin_critics and not has_legacy_critic:
+                            return False
                     elif algorithm == 'mappo':
                         continue
                     else:
@@ -4588,8 +5103,11 @@ class ModelEvaluator:
                 return False
 
         def _find_fallback_dir(preferred_dir: str, n_agents: int) -> str:
-            # 🔧 关键修复：支持中文路径，在传入路径下查找子目录
-            # 首先尝试在传入路径下查找 final -> best -> 最新 ep*
+            # 只在显式传入“实验根目录”时解析其子目录。若调用方已经指定
+            # final/best/epXXX 等具体 checkpoint，则不允许静默改用兄弟目录，
+            # 否则结果中的模型身份会与请求不一致。
+            if _is_model_variant_dir_name(preferred_dir):
+                return None
             candidates = []
             for name in ("final", "best", "best_by_team_sr", "best_by_strict_success"):
                 candidates.append(os.path.join(preferred_dir, name))
@@ -4605,23 +5123,6 @@ class ModelEvaluator:
                     candidates.extend([os.path.join(preferred_dir, d) for d in eps_sorted])
             except Exception:
                 pass
-            
-            # 🔧 关键修复：如果传入路径下找不到，再尝试在父目录下查找（兼容旧格式）
-            if not any(_is_valid_weights_dir(c, n_agents) for c in candidates):
-                parent = os.path.dirname(preferred_dir)
-                for name in ("final", "best", "best_by_team_sr", "best_by_strict_success"):
-                    candidates.append(os.path.join(parent, name))
-                try:
-                    if os.path.isdir(parent):
-                        eps = [d for d in os.listdir(parent) if d.startswith("ep") and os.path.isdir(os.path.join(parent, d))]
-                        def _ep_key(s):
-                            import re
-                            m = re.search(r"\d+", s)
-                            return int(m.group(0)) if m else -1
-                        eps_sorted = sorted(eps, key=_ep_key, reverse=True)
-                        candidates.extend([os.path.join(parent, d) for d in eps_sorted])
-                except Exception:
-                    pass
             
             for c in candidates:
                 if _is_valid_weights_dir(c, n_agents):
@@ -4698,73 +5199,18 @@ class ModelEvaluator:
                     # MADDPG：单个Critic网络
                     critic_output = self.maddpg.agents[i]['critic'](critic_inputs, training=False)
         except Exception as e:
-            print(f"⚠️ 网络构建警告: {e}")
-            pass
+            raise RuntimeError(f"评估网络构建失败，拒绝继续加载或运行: {e}") from e
 
-        # 🔧 关键修复：手动加载权重，支持新格式权重文件
-        def _manual_load_weights(model, weight_file: str):
-            """手动从 HDF5 文件加载权重，支持新格式（layers/*/vars/*）"""
-            try:
-                import h5py
-                with h5py.File(weight_file, 'r') as f:
-                    # 检查是否是新格式（有 layers 组）
-                    if 'layers' in f:
-                        # 新格式：layers/dense/vars/0, layers/dense/vars/1
-                        layer_weights = {}
-                        def collect_weights(name, obj):
-                            if isinstance(obj, h5py.Dataset):
-                                # 提取层名（例如：layers/dense/vars/0 -> dense）
-                                parts = name.split('/')
-                                if len(parts) >= 3 and parts[0] == 'layers' and parts[2] == 'vars':
-                                    layer_name = parts[1]
-                                    var_idx = int(parts[3]) if len(parts) > 3 else 0
-                                    if layer_name not in layer_weights:
-                                        layer_weights[layer_name] = {}
-                                    layer_weights[layer_name][var_idx] = obj[:]
-                        f.visititems(collect_weights)
-                        
-                        # 将权重设置到模型中
-                        loaded_count = 0
-                        for layer in model.layers:
-                            if layer.name in layer_weights:
-                                weights_data = layer_weights[layer.name]
-                                # 按索引排序（0=kernel, 1=bias 或 gamma, beta）
-                                sorted_vars = [weights_data[i] for i in sorted(weights_data.keys())]
-                                try:
-                                    layer.set_weights(sorted_vars)
-                                    loaded_count += 1
-                                except Exception as e:
-                                    # 如果形状不匹配，跳过
-                                    pass
-                        return loaded_count > 0
-                    else:
-                        # 旧格式，使用标准加载
-                        model.load_weights(weight_file)
-                        return True
-            except Exception as e:
-                return False
-        
-        # 安全加载：先常规加载，失败则尝试手动加载，最后 skip_mismatch 兜底
+        # 实验评估必须使用拓扑完全匹配的权重。旧实现的手动逐层加载和
+        # skip_mismatch 会在只加载部分变量时仍返回成功，进而把随机初始化参数
+        # 混入正式结果。标准 load_weights 失败即判定该 checkpoint 不兼容。
         def _safe_load(agent, path: str, kind: str):
             try:
                 agent.load_weights(path)
                 return True
             except Exception as e:
-                # 🔧 关键修复：尝试手动加载（支持新格式权重文件）
-                try:
-                    if _manual_load_weights(agent, path):
-                        print(f"✅ {kind} 使用手动加载方式成功加载: {os.path.basename(path)}")
-                        return True
-                except Exception as e_manual:
-                    pass
-                try:
-                    # 兼容可能的细微层名差异，只使用skip_mismatch
-                    agent.load_weights(path, skip_mismatch=True)
-                    print(f"⚠️  {kind} 使用skip_mismatch方式加载: {os.path.basename(path)} | {e}")
-                    return True
-                except Exception as e2:
-                    print(f"❌ 加载{kind}失败: {path} | {e2}")
-                    return False
+                print(f"❌ 严格加载{kind}失败: {path} | {e}")
+                return False
 
         print(f"正在从 {model_dir} 加载模型...")
         ok = True
@@ -4925,6 +5371,25 @@ class ModelEvaluator:
         else:
             obs_n = reset_result
 
+        # reset_world 才会根据本回合上下文最终生成动态障碍。这里必须在
+        # reset 之后回填实际种子，否则 batch 路径会把已使用的障碍种子
+        # 永久记录为 None，后续无法证明不同模型是否使用了同一组环境。
+        try:
+            eval_ctx.terrain_info['terrain_seed'] = getattr(
+                scenario,
+                'current_terrain_seed',
+                eval_ctx.terrain_info.get('terrain_seed'),
+            )
+            eval_ctx.terrain_info['terrain_variant_seed'] = _scenario_terrain_variant_seed(
+                scenario,
+                eval_ctx.terrain_info.get('terrain_variant_seed'),
+            )
+            actual_obstacle_seed = getattr(scenario, 'current_episode_obstacle_seed', None)
+            if actual_obstacle_seed is not None:
+                eval_ctx.terrain_info['obstacle_seed'] = int(actual_obstacle_seed)
+        except Exception:
+            pass
+
         initial_positions = _capture_agent_positions(world.agents)
         agent_goal_positions = _extract_agent_goal_positions(world, scenario)
         direct_goal_distances = [
@@ -5025,6 +5490,7 @@ class ModelEvaluator:
             'episode_min_inter_agent_clearance': None,
             'episode_length': int(getattr(self.args, 'episode_length', 2200) or 2200),
             'eval_diagnostics': _new_eval_diagnostics_accumulator(),
+            'eval_noise_streams': self._make_eval_noise_streams(episode_idx),
         }
 
     def _prepare_batched_episode_step(self, state, actions, raw_actions, step):
@@ -5498,6 +5964,10 @@ class ModelEvaluator:
                         action_force_ratio=action_force_ratio,
                     )
                     raw_actions_tf = self.select_actions_eval(policy_obs, use_fr=use_fr, use_pf=use_pf)
+                    raw_actions_tf = self._apply_eval_action_noise(
+                        raw_actions_tf,
+                        [state['eval_noise_streams'] for state in active_states],
+                    )
                     if isinstance(raw_actions_tf, tf.Tensor):
                         raw_actions_tensor = raw_actions_tf
                     else:
@@ -5623,6 +6093,7 @@ class ModelEvaluator:
             quiet_output = os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on")
         except Exception:
             quiet_output = True
+        eval_noise_streams = self._make_eval_noise_streams(episode_idx)
         if not quiet_output:
             print(f"\n🚀 开始评估回合 {episode_idx + 1}")
         
@@ -6206,6 +6677,7 @@ class ModelEvaluator:
                     action_force_ratio=action_force_ratio,
                 )
             raw_actions_tf = self.select_actions_eval(policy_obs, use_fr=use_fr, use_pf=use_pf)
+            raw_actions_tf = self._apply_eval_action_noise(raw_actions_tf, eval_noise_streams)
             # 🔧 性能优化：延迟numpy转换，尽量在tensor空间内操作
             raw_actions = raw_actions_tf.numpy() if isinstance(raw_actions_tf, tf.Tensor) else raw_actions_tf
             
@@ -8258,10 +8730,12 @@ class ModelEvaluator:
                 terrain_level_sequence = None
 
         def _select_episode_terrain_level(episode_index):
-            if self.args.terrain_complexity_level is not None:
-                return int(self.args.terrain_complexity_level)
+            # An explicit evaluation sequence is the episode protocol and must
+            # take precedence over the model's single training-time level.
             if terrain_level_sequence:
                 return int(terrain_level_sequence[int(episode_index) % len(terrain_level_sequence)])
+            if self.args.terrain_complexity_level is not None:
+                return int(self.args.terrain_complexity_level)
             return int(np.random.randint(1, 5))
 
         # 🔧 关键修复：从环境变量读取地形种子序列，确保所有评估模式使用相同的地图顺序
@@ -8326,6 +8800,18 @@ class ModelEvaluator:
         effective_quadrotor_psi_cmd = _finite_float_or_none(getattr(self.args, 'quadrotor_psi_cmd', None))
         if effective_quadrotor_psi_cmd is None:
             effective_quadrotor_psi_cmd = _env_float('QUADROTOR_PSI_CMD', 0.0)
+        reward_runtime = getattr(self.scenario, 'vectorized_calculator', None)
+
+        def _actual_reward_float(attribute_name, env_name, default_value):
+            value = getattr(reward_runtime, attribute_name, None) if reward_runtime is not None else None
+            numeric = _finite_float_or_none(value)
+            return numeric if numeric is not None else _env_float(env_name, default_value)
+
+        def _actual_reward_bool(attribute_name, env_name, default_value):
+            if reward_runtime is not None and hasattr(reward_runtime, attribute_name):
+                return bool(getattr(reward_runtime, attribute_name))
+            return _env_flag(env_name, default_value)
+
         evaluation_setup = {
             'terrain_family': terrain_family_override or (
                 'similar_unseen' if setup_semi_random_terrain else (
@@ -8347,12 +8833,151 @@ class ModelEvaluator:
             'peak_height_max_scale': _env_float('PEAK_HEIGHT_MAX_SCALE', 1.30),
             'terrain_variant_noise_ratio': _env_float('TERRAIN_VARIANT_NOISE_RATIO', 0.15),
             'terrain_contact_eps': _env_float('TERRAIN_CONTACT_EPS', _finite_float_or_none(getattr(self.args, 'terrain_contact_eps', None)) or 0.2),
+            'obstacle_observation_mode': normalize_obstacle_observation_mode(
+                os.getenv(
+                    'OBSTACLE_OBSERVATION_MODE',
+                    os.getenv('OBSTACLE_OBS_MODE', getattr(self.args, 'obstacle_observation_mode', 'nearest_surface')),
+                )
+            ),
+            'obstacle_risk_velocity_forward_weight': _env_float(
+                'OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT',
+                4.0
+                if _finite_float_or_none(getattr(self.args, 'obstacle_risk_velocity_forward_weight', None)) is None
+                else _finite_float_or_none(getattr(self.args, 'obstacle_risk_velocity_forward_weight', None)),
+            ),
+            'obstacle_risk_goal_along_weight': _env_float(
+                'OBSTACLE_RISK_GOAL_ALONG_WEIGHT',
+                3.0
+                if _finite_float_or_none(getattr(self.args, 'obstacle_risk_goal_along_weight', None)) is None
+                else _finite_float_or_none(getattr(self.args, 'obstacle_risk_goal_along_weight', None)),
+            ),
+            'reward_pos_scale': _finite_float_or_none(getattr(self.args, 'reward_pos_scale', None)),
+            'reward_neg_scale': _finite_float_or_none(getattr(self.args, 'reward_neg_scale', None)),
+            'distance_weight': _finite_float_or_none(getattr(self.args, 'distance_weight', None)),
+            'exploration_weight': _finite_float_or_none(getattr(self.args, 'exploration_weight', None)),
+            'stationary_weight': _finite_float_or_none(getattr(self.args, 'stationary_weight', None)),
+            'direction_weight': _finite_float_or_none(getattr(self.args, 'direction_weight', None)),
+            'deviation_weight': _finite_float_or_none(getattr(self.args, 'deviation_weight', None)),
+            'start_area_weight': _finite_float_or_none(getattr(self.args, 'start_area_weight', None)),
+            'approach_weight': _finite_float_or_none(getattr(self.args, 'approach_weight', None)),
+            'energy_weight': _finite_float_or_none(getattr(self.args, 'energy_weight', None)),
+            'height_weight': _finite_float_or_none(getattr(self.args, 'height_weight', None)),
+            'height_reward_enabled': bool(getattr(self.args, 'height_reward_enabled', True)),
+            'height_ideal_min': _finite_float_or_none(getattr(self.args, 'height_ideal_min', None)),
+            'height_ideal_max': _finite_float_or_none(getattr(self.args, 'height_ideal_max', None)),
+            'lateral_weight': _finite_float_or_none(getattr(self.args, 'lateral_weight', None)),
+            'clearance_weight': _finite_float_or_none(getattr(self.args, 'clearance_weight', None)),
+            'clearance_d_max': _finite_float_or_none(getattr(self.args, 'clearance_d_max', None)),
+            'success_weight': _finite_float_or_none(getattr(self.args, 'success_weight', None)),
+            'collision_weight': _finite_float_or_none(getattr(self.args, 'collision_weight', None)),
+            'collision_reduction_weight': _finite_float_or_none(
+                getattr(self.args, 'collision_reduction_weight', None)
+            ),
+            'global_weight': _finite_float_or_none(getattr(self.args, 'global_weight', None)),
+            'shaping_weight': _finite_float_or_none(getattr(self.args, 'shaping_weight', None)),
+            'max_reward': _finite_float_or_none(getattr(self.args, 'max_reward', None)),
+            'min_reward': _finite_float_or_none(getattr(self.args, 'min_reward', None)),
+            'success_reward_value': _finite_float_or_none(getattr(self.args, 'success_reward_value', None)),
+            'no_collision_reward_value': _finite_float_or_none(
+                getattr(self.args, 'no_collision_reward_value', None)
+            ),
+            'success_distance_threshold': _finite_float_or_none(
+                getattr(self.args, 'success_distance_threshold', None)
+            ),
+            'collision_penalty_value': _finite_float_or_none(
+                getattr(self.args, 'collision_penalty_value', None)
+            ),
+            'collision_distance_threshold': _finite_float_or_none(
+                getattr(self.args, 'collision_distance_threshold', None)
+            ),
+            'global_reward_mode': str(getattr(self.args, 'global_reward_mode', 'success_rate')),
+            'shaping_gamma': _finite_float_or_none(getattr(self.args, 'shaping_gamma', None)),
             'reward_version': str(os.getenv('REWARD_VERSION', os.getenv('reward_version', 'v1')) or 'v1').strip(),
             'reward_terminal_order_fix': bool(
                 getattr(getattr(self, 'env', None), '_reward_terminal_order_fix_enabled', True)
             ),
+            'goal_ring_individual_scale': _actual_reward_float(
+                'goal_ring_individual_scale', 'GOAL_RING_INDIVIDUAL_SCALE', 0.25
+            ),
+            'goal_ring_team_gated': _actual_reward_bool(
+                'goal_ring_team_gated', 'GOAL_RING_TEAM_GATED', False
+            ),
+            'goal_ring_require_agent_safe': _actual_reward_bool(
+                'goal_ring_require_agent_safe', 'GOAL_RING_REQUIRE_AGENT_SAFE', True
+            ),
+            'progress_distance_state_scale': _actual_reward_float(
+                'progress_distance_state_scale', 'PROGRESS_DISTANCE_STATE_SCALE', 0.0
+            ),
+            'progress_reward_scale': _actual_reward_float(
+                'progress_reward_scale', 'PROGRESS_REWARD_SCALE', 1.0
+            ),
+            'team_progress_bottleneck_only': _actual_reward_bool(
+                'team_progress_bottleneck_only', 'TEAM_PROGRESS_BOTTLENECK_ONLY', False
+            ),
+            'team_progress_non_bottleneck_scale': _actual_reward_float(
+                'team_progress_non_bottleneck_scale', 'TEAM_PROGRESS_NON_BOTTLENECK_SCALE', 1.0
+            ),
+            'team_progress_bottleneck_eps': _actual_reward_float(
+                'team_progress_bottleneck_eps', 'TEAM_PROGRESS_BOTTLENECK_EPS', 1.0
+            ),
+            'team_success_bonus': _actual_reward_float(
+                'team_success_bonus', 'TEAM_SUCCESS_BONUS', 3000.0
+            ),
+            'unsafe_arrival_penalty': _actual_reward_float(
+                'unsafe_arrival_penalty', 'UNSAFE_ARRIVAL_PENALTY', 1200.0
+            ),
+            'non_success_terminal_guard_enabled': _actual_reward_bool(
+                'non_success_terminal_guard_enabled', 'NON_SUCCESS_TERMINAL_GUARD_ENABLED', True
+            ),
+            'non_success_terminal_penalty_base': _actual_reward_float(
+                'non_success_terminal_penalty_base', 'NON_SUCCESS_TERMINAL_PENALTY_BASE', 250.0
+            ),
+            'non_success_terminal_penalty_per_meter': _actual_reward_float(
+                'non_success_terminal_penalty_per_meter', 'NON_SUCCESS_TERMINAL_PENALTY_PER_METER', 900.0
+            ),
+            'non_success_terminal_penalty_max': _actual_reward_float(
+                'non_success_terminal_penalty_max', 'NON_SUCCESS_TERMINAL_PENALTY_MAX', 1200.0
+            ),
+            'terminal_failure_penalty_base': _actual_reward_float(
+                'terminal_failure_penalty_base', 'TERMINAL_FAILURE_PENALTY_BASE', 30.0
+            ),
+            'terminal_failure_penalty_per_meter': _actual_reward_float(
+                'terminal_failure_penalty_per_meter', 'TERMINAL_FAILURE_PENALTY_PER_METER', 120.0
+            ),
+            'terminal_failure_penalty_max': _actual_reward_float(
+                'terminal_failure_penalty_max', 'TERMINAL_FAILURE_PENALTY_MAX', 180.0
+            ),
+            'clearance_quality_bonus_weight': _actual_reward_float(
+                'clearance_quality_bonus_weight', 'CLEARANCE_QUALITY_BONUS_WEIGHT', 800.0
+            ),
+            'efficiency_bonus_weight': _actual_reward_float(
+                'efficiency_bonus_weight', 'EFFICIENCY_BONUS_WEIGHT', 800.0
+            ),
+            'team_sync_reward_enabled': _actual_reward_bool(
+                'team_sync_enabled', 'TEAM_SYNC_REWARD_ENABLED', True
+            ),
+            'team_goal_occupancy_scale': _actual_reward_float(
+                'team_goal_occupancy_scale', 'TEAM_GOAL_OCCUPANCY_SCALE', 1.0
+            ),
+            'team_bottleneck_progress_scale': _actual_reward_float(
+                'team_bottleneck_progress_scale', 'TEAM_BOTTLENECK_PROGRESS_SCALE', 4.0
+            ),
+            'team_waiting_scale': _actual_reward_float(
+                'team_waiting_scale', 'TEAM_WAITING_SCALE', 0.6
+            ),
+            'team_bottleneck_delta_clip': _actual_reward_float(
+                'team_bottleneck_delta_clip', 'TEAM_BOTTLENECK_DELTA_CLIP', 1.0
+            ),
+            'clearance_dense_positive_scale': _actual_reward_float(
+                'clearance_dense_positive_scale', 'CLEARANCE_DENSE_POSITIVE_SCALE', 0.0
+            ),
+            'height_dense_positive_scale': _actual_reward_float(
+                'height_dense_positive_scale', 'HEIGHT_DENSE_POSITIVE_SCALE', 0.0
+            ),
             'position_family': position_family_override or os.getenv('HELDOUT_POSITION_MODE', 'train_match'),
             'reference_positions_file': os.getenv('HELDOUT_REFERENCE_POSITIONS_FILE', ''),
+            'use_fixed_positions': bool(getattr(self.args, 'use_fixed_positions', False)),
+            'positions_file': str(getattr(self.args, 'positions_file', '') or ''),
             'start_center_jitter': _env_float('HELDOUT_START_CENTER_JITTER', 12.0),
             'agent_local_jitter': _env_float('HELDOUT_AGENT_LOCAL_JITTER', 3.0),
             'goal_region_radius': _env_float('HELDOUT_GOAL_REGION_RADIUS', 18.0),
@@ -8411,7 +9036,25 @@ class ModelEvaluator:
             'forced_action_force_ratio': _finite_float_or_none(
                 getattr(self, '_forced_eval_action_force_ratio', None)
             ),
+            'eval_noise_scale': _finite_float_or_none(getattr(self.args, 'eval_noise_scale', 0.0)),
+            'eval_random_action_prob': _finite_float_or_none(getattr(self.args, 'eval_random_action_prob', 0.0)),
+            'eval_noise_seed': _safe_int(getattr(self.args, 'eval_noise_seed', None)),
+            'eval_noise_type': _EVAL_NOISE_TYPE,
+            'eval_noise_stream_mode': _EVAL_NOISE_STREAM_MODE,
+            'training_runtime_manifest_path': str(
+                os.getenv('TRAINING_RUNTIME_MANIFEST_PATH', '') or ''
+            ),
+            'eval_device': getattr(self, '_eval_device_info', {}),
         }
+        for runtime_field in SCIENTIFIC_RUNTIME_ENV_FIELDS:
+            runtime_value = getattr(self.args, runtime_field.attr, None)
+            if runtime_field.kind == 'float':
+                runtime_value = _finite_float_or_none(runtime_value)
+            elif runtime_field.kind == 'int':
+                runtime_value = _safe_int(runtime_value)
+            elif runtime_field.kind == 'bool' and runtime_value is not None:
+                runtime_value = bool(runtime_value)
+            evaluation_setup[runtime_field.attr] = runtime_value
 
         def _log_episode_timing(episode_idx, episode_data, wall_seconds, failed=False):
             if not log_episode_timing:
@@ -8587,16 +9230,18 @@ class ModelEvaluator:
             if not quiet_output:
                 print(f"\n🚀 开始评估回合 {episode + 1}/{self.args.eval_episodes}")
             
-            # 为每个回合随机选择地形复杂度等级（如果未指定）
-            if self.args.terrain_complexity_level is None:
-                terrain_level = _select_episode_terrain_level(episode)
+            # 显式评估序列优先；无序列时再使用固定等级或随机等级。
+            terrain_level = _select_episode_terrain_level(episode)
+            if terrain_level_sequence:
+                if not quiet_output:
+                    print(f"🔧 使用预定义地形复杂度等级: {terrain_level}")
+            elif self.args.terrain_complexity_level is None:
                 if not quiet_output:
                     print(f"🎲 随机选择地形复杂度等级: {terrain_level}")
             else:
-                terrain_level = self.args.terrain_complexity_level
                 if not quiet_output:
                     print(f"🏔️ 使用指定地形复杂度等级: {terrain_level}")
-            self.scenario.terrain_complexity_level = terrain_level
+            terrain_level = _set_scenario_terrain_complexity(self.scenario, terrain_level)
 
             terrain_info = self._prepare_episode_terrain(
                 episode,
@@ -8638,13 +9283,10 @@ class ModelEvaluator:
                         'current_terrain_seed',
                         getattr(self.scenario, 'seed', None),
                     )
-                actual_terrain_variant_seed = terrain_variant_seed
-                if actual_terrain_variant_seed is None:
-                    actual_terrain_variant_seed = getattr(
-                        self.scenario,
-                        'current_terrain_variant_seed',
-                        getattr(self.scenario, 'terrain_variant_seed', None),
-                    )
+                actual_terrain_variant_seed = _scenario_terrain_variant_seed(
+                    self.scenario,
+                    terrain_variant_seed,
+                )
                 actual_obstacle_seed = obstacle_seed
                 if actual_obstacle_seed is None:
                     actual_obstacle_seed = getattr(self.scenario, 'current_episode_obstacle_seed', None)
@@ -8718,6 +9360,26 @@ class ModelEvaluator:
                 # 继续下一个回合，不中断整个评估流程
                 continue
                 
+        actual_episode_indices = []
+        for episode_data in all_episodes_data:
+            try:
+                actual_episode_indices.append(int(episode_data.get('episode')))
+            except Exception:
+                pass
+        expected_episode_indices = list(range(eval_episode_start_index, eval_episode_stop_index))
+        if sorted(actual_episode_indices) != expected_episode_indices or len(all_rewards) != eval_episode_count:
+            missing = sorted(set(expected_episode_indices) - set(actual_episode_indices))
+            duplicates = sorted(
+                episode_idx
+                for episode_idx in set(actual_episode_indices)
+                if actual_episode_indices.count(episode_idx) > 1
+            )
+            raise RuntimeError(
+                "评估回合不完整，拒绝写入可复用结果: "
+                f"completed={len(all_rewards)}/{eval_episode_count}, "
+                f"missing={missing}, duplicates={duplicates}"
+            )
+
         # 评估总结
         print("\n" + "="*60)
         print("📈 评估结果总结")
@@ -9021,9 +9683,17 @@ class ModelEvaluator:
             'summary': summary,
             'evaluation_setup': evaluation_setup,
             'visualization_artifacts': visualization_artifacts,
-            'terrain_complexity_level_sequence': terrain_level_sequence or [],
-            'terrain_seed_sequence': terrain_seed_sequence or [],
-            'terrain_variant_seed_sequence': terrain_variant_seed_sequence or [],
+            # 结果文件记录“实际执行”的逐回合环境，而不是只记录调用方是否
+            # 显式传入过序列。否则自动生成的地形/障碍在结果中会显示为空，
+            # 无法用于跨模型配对审计。
+            'terrain_complexity_level_sequence': [
+                ep.get('terrain_complexity_level') for ep in all_episodes_data
+            ],
+            'terrain_seed_sequence': [ep.get('terrain_seed') for ep in all_episodes_data],
+            'terrain_variant_seed_sequence': [
+                ep.get('terrain_variant_seed') for ep in all_episodes_data
+            ],
+            'obstacle_seed_sequence': [ep.get('obstacle_seed') for ep in all_episodes_data],
             'episode_details': [
                 {
                     'episode': ep['episode'],
@@ -9506,10 +10176,20 @@ HTML交互式轨迹图功能:
                        help="每回合最大步数（默认2200，与训练脚本一致）")
     parser.add_argument("--eval-episodes", type=int, default=3, 
                        help="评估回合数（将随机生成不同复杂度的地图）")
+    parser.add_argument("--config-resolve-only", action="store_true", default=False,
+                       help="完成训练配置对齐与参数解析后输出JSON并退出，不构建环境或加载模型")
     parser.add_argument("--eval-episode-parallelism", type=int, default=_env_int('EVAL_EPISODE_PARALLELISM', 1),
                        help="方案A：单进程内同时推进的评估回合数；1为旧串行路径")
     parser.add_argument("--eval-env-step-threads", type=int, default=_env_int('EVAL_ENV_STEP_THREADS', 1),
                        help="方案A：batch内并行env.step的线程数；1为串行env.step")
+    parser.add_argument("--eval-process-shards", type=int, default=_env_int('EVAL_PROCESS_SHARDS', 1),
+                       help="方案B：将评估回合切成多个独立子进程并行运行；1为关闭")
+    parser.add_argument("--eval-process-workers", type=int, default=_env_int('EVAL_PROCESS_WORKERS', 0),
+                       help="方案B：同时运行的子进程数；0表示等于eval-process-shards")
+    parser.add_argument("--eval-shard-episode-parallelism", type=int, default=_env_int('EVAL_SHARD_EPISODE_PARALLELISM', 0),
+                       help="方案B：每个子进程内部的episode_parallelism；0表示按总parallelism自动均分")
+    parser.add_argument("--eval-shard-env-step-threads", type=int, default=_env_int('EVAL_SHARD_ENV_STEP_THREADS', 0),
+                       help="方案B：每个子进程内部的env_step_threads；0表示按总threads自动均分")
     parser.add_argument("--eval-backend", "--eval_backend", type=str,
                        default=os.getenv("EVAL_BACKEND", None),
                        choices=["python_only", "gazebo_live", "both"],
@@ -9523,6 +10203,16 @@ HTML交互式轨迹图功能:
                        help="Gazebo GUI启动失败时直接中断；等价于设置GAZEBO_LIVE_GUI_REQUIRED=1")
     parser.add_argument("--terrain-contact-eps", type=float, default=float(os.getenv('TERRAIN_CONTACT_EPS', '0.2')),
                        help="地形接触/碰撞高度容差，默认从TERRAIN_CONTACT_EPS读取")
+    parser.add_argument("--obstacle-observation-mode", "--obstacle-obs-mode", dest="obstacle_observation_mode",
+                       type=str,
+                       default=os.getenv('OBSTACLE_OBSERVATION_MODE', os.getenv('OBSTACLE_OBS_MODE', 'nearest_surface')),
+                       help="障碍物15维槽位选择方式: nearest_surface 或 risk_lite_v2")
+    parser.add_argument("--obstacle-risk-velocity-forward-weight", type=float,
+                       default=float(os.getenv('OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT', os.getenv('OBSTACLE_OBS_VEL_FORWARD_WEIGHT', '4.0'))),
+                       help="risk_lite_v2 中速度方向前向距离惩罚权重")
+    parser.add_argument("--obstacle-risk-goal-along-weight", type=float,
+                       default=float(os.getenv('OBSTACLE_RISK_GOAL_ALONG_WEIGHT', os.getenv('OBSTACLE_OBS_GOAL_ALONG_WEIGHT', '3.0'))),
+                       help="risk_lite_v2 中目标走廊沿程距离惩罚权重")
     parser.add_argument("--terrain-complexity-level", type=int, default=None, 
                        help="地形复杂度等级 (1-4)，None表示随机选择")
     parser.add_argument("--random-terrain", action="store_true", default=False,
@@ -9629,6 +10319,12 @@ HTML交互式轨迹图功能:
     # 🔧 新增：算法选择
     parser.add_argument("--algorithm", type=str, default="matd3", choices=["maddpg", "matd3", "mappo"],
                        help="Training algorithm selection (maddpg, matd3 or mappo)")
+    parser.add_argument("--eval-noise-scale", type=float, default=0.0,
+                       help="评估时加到Actor原始动作前3维的高斯噪声标准差；默认0，保持纯策略评估")
+    parser.add_argument("--eval-random-action-prob", type=float, default=0.0,
+                       help="评估时用均匀随机raw action替换Actor输出的概率；默认0")
+    parser.add_argument("--eval-noise-seed", type=int, default=None,
+                       help="评估扰动基础种子；按全局episode拆分独立随机流，不受分片和提前终止影响")
     
     # 分项加权奖励参数（如果使用加权场景）
     parser.add_argument("--distance-weight", type=float, default=None, help="距离奖励权重")
@@ -9691,7 +10387,8 @@ HTML交互式轨迹图功能:
     # 与训练一致的隐藏层配置（可选），用于构建相同拓扑以加载权重
     parser.add_argument("--actor-hidden", type=str, default=None, help="Actor隐藏层，例如: 384,256,128,64")
     parser.add_argument("--critic-hidden", type=str, default=None, help="Critic隐藏层，例如: 512,256,128,64")
-    
+
+    add_runtime_environment_arguments(parser)
     return parser.parse_args()
 
 
@@ -9905,6 +10602,428 @@ def _run_paired_backend_evaluation(args):
     }
 
 
+def _split_eval_episode_shards(start_index, episode_count, shard_count):
+    shard_count = max(1, min(int(shard_count), int(episode_count)))
+    base_count = int(episode_count) // shard_count
+    remainder = int(episode_count) % shard_count
+    shards = []
+    cursor = int(start_index)
+    for shard_idx in range(shard_count):
+        count = base_count + (1 if shard_idx < remainder else 0)
+        if count <= 0:
+            continue
+        shards.append(
+            {
+                "index": int(shard_idx),
+                "start": int(cursor),
+                "count": int(count),
+            }
+        )
+        cursor += count
+    return shards
+
+
+def _append_arg_override(argv, name, value):
+    return list(argv) + [str(name), str(value)]
+
+
+def _eval_shard_worker_tuning(args, shard_count):
+    total_episode_parallelism = max(1, int(getattr(args, "eval_episode_parallelism", 1) or 1))
+    total_env_threads = max(1, int(getattr(args, "eval_env_step_threads", 1) or 1))
+    requested_parallelism = int(getattr(args, "eval_shard_episode_parallelism", 0) or 0)
+    requested_threads = int(getattr(args, "eval_shard_env_step_threads", 0) or 0)
+    if requested_parallelism > 0:
+        worker_parallelism = requested_parallelism
+    else:
+        worker_parallelism = max(1, int(math.ceil(float(total_episode_parallelism) / max(1, shard_count))))
+    if requested_threads > 0:
+        worker_threads = requested_threads
+    else:
+        worker_threads = max(1, int(math.ceil(float(total_env_threads) / max(1, shard_count))))
+    worker_threads = min(worker_threads, worker_parallelism)
+    return int(worker_parallelism), int(worker_threads)
+
+
+def _merge_process_shard_results(args, shard_specs, shard_root, output_dir, started_at):
+    shard_root = Path(shard_root)
+    shard_root.mkdir(parents=True, exist_ok=True)
+    shard_results = []
+    for spec in shard_specs:
+        shard_dir = Path(spec["dir"])
+        result_path = shard_dir / "evaluation_results.json"
+        if not result_path.exists():
+            raise FileNotFoundError(f"分片结果不存在: {result_path}")
+        with result_path.open("r", encoding="utf-8") as f:
+            shard_result = json.load(f)
+        expected_shard_episodes = list(
+            range(int(spec["start"]), int(spec["start"]) + int(spec["count"]))
+        )
+        shard_details = shard_result.get("episode_details", []) or []
+        try:
+            actual_shard_episodes = [int(ep.get("episode")) for ep in shard_details]
+        except Exception as exc:
+            raise RuntimeError(f"分片 episode_details 无法解析: {result_path} | {exc}") from exc
+        if sorted(actual_shard_episodes) != expected_shard_episodes:
+            raise RuntimeError(
+                f"分片 episode 范围不完整: {result_path} | "
+                f"got={actual_shard_episodes}, expected={expected_shard_episodes}"
+            )
+        try:
+            recorded_shard_count = int(shard_result.get("episodes", 0) or 0)
+        except Exception:
+            recorded_shard_count = 0
+        if recorded_shard_count != int(spec["count"]):
+            raise RuntimeError(
+                f"分片 episodes 不匹配: {result_path} | "
+                f"got={recorded_shard_count}, expected={spec['count']}"
+            )
+        shard_results.append(
+            {
+                "spec": dict(spec),
+                "path": str(result_path),
+                "result": shard_result,
+            }
+        )
+
+    details_by_episode = {}
+    for item in shard_results:
+        for ep in item["result"].get("episode_details", []) or []:
+            try:
+                episode_idx = int(ep.get("episode"))
+            except Exception:
+                continue
+            if episode_idx in details_by_episode:
+                raise RuntimeError(f"分片结果中出现重复episode: {episode_idx}")
+            details_by_episode[episode_idx] = ep
+
+    expected_start = max(0, _env_int("EVAL_EPISODE_START_INDEX", 0))
+    expected_count = max(1, int(getattr(args, "eval_episodes", 1) or 1))
+    expected_episodes = list(range(expected_start, expected_start + expected_count))
+    missing_episodes = [ep for ep in expected_episodes if ep not in details_by_episode]
+    if missing_episodes:
+        raise RuntimeError(f"分片结果缺少episode: {missing_episodes}")
+
+    episode_details = [details_by_episode[ep] for ep in expected_episodes]
+    all_rewards = [float(ep.get("reward", 0.0) or 0.0) for ep in episode_details]
+    summary = _build_evaluation_summary(
+        all_rewards,
+        episode_details,
+        getattr(args, "collision_distance_threshold", None),
+    )
+
+    template = copy.deepcopy(shard_results[0]["result"]) if shard_results else {}
+    evaluation_setup = copy.deepcopy(template.get("evaluation_setup", {}) or {})
+    evaluation_setup["eval_episode_parallelism_mode"] = "process_shards"
+    evaluation_setup["eval_process_shards"] = int(len(shard_specs))
+    evaluation_setup["eval_process_workers"] = int(getattr(args, "eval_process_workers", 0) or len(shard_specs))
+    evaluation_setup["eval_process_shard_root"] = str(shard_root)
+    evaluation_setup["eval_process_started_at"] = started_at
+    evaluation_setup["eval_process_finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    evaluation_setup["eval_process_shard_specs"] = [
+        {
+            "index": int(spec["index"]),
+            "start": int(spec["start"]),
+            "count": int(spec["count"]),
+            "dir": str(spec["dir"]),
+            "log": str(spec["log"]),
+            "eval_noise_seed": spec.get("eval_noise_seed"),
+        }
+        for spec in shard_specs
+    ]
+    evaluation_setup["eval_noise_seed_base"] = getattr(args, "eval_noise_seed", None)
+    try:
+        evaluation_setup["eval_episode_parallelism"] = int(getattr(args, "eval_episode_parallelism", 1) or 1)
+        evaluation_setup["eval_env_step_threads"] = int(getattr(args, "eval_env_step_threads", 1) or 1)
+    except Exception:
+        pass
+
+    merged = copy.deepcopy(template)
+    merged["model_path"] = getattr(args, "load_model_path", template.get("model_path", None))
+    merged["scenario"] = getattr(args, "scenario_name", template.get("scenario", None))
+    merged["episodes"] = int(len(episode_details))
+    merged["avg_reward"] = float(np.mean(all_rewards)) if all_rewards else None
+    merged["std_reward"] = float(np.std(all_rewards)) if all_rewards else None
+    merged["max_reward"] = float(np.max(all_rewards)) if all_rewards else None
+    merged["min_reward"] = float(np.min(all_rewards)) if all_rewards else None
+    merged["all_rewards"] = all_rewards
+    merged["summary"] = summary
+    merged["evaluation_setup"] = evaluation_setup
+    merged["episode_details"] = episode_details
+    merged["terrain_complexity_level_sequence"] = [
+        ep.get("terrain_complexity_level") for ep in episode_details
+    ]
+    merged["terrain_seed_sequence"] = [ep.get("terrain_seed") for ep in episode_details]
+    merged["terrain_variant_seed_sequence"] = [
+        ep.get("terrain_variant_seed") for ep in episode_details
+    ]
+    merged["obstacle_seed_sequence"] = [
+        ep.get("obstacle_seed") for ep in episode_details
+    ]
+
+    def _resolve_shard_artifact(value, shard_dir):
+        if value is None or not str(value).strip():
+            return None
+        candidate = Path(str(value))
+        if candidate.is_absolute() and candidate.exists():
+            return str(candidate)
+        direct = Path(shard_dir) / candidate
+        if direct.exists():
+            return str(direct.resolve())
+        by_name = Path(shard_dir) / candidate.name
+        if by_name.exists():
+            return str(by_name.resolve())
+        return str(candidate)
+
+    episode_visualizations = []
+    for item in shard_results:
+        shard_dir = Path(item["spec"]["dir"])
+        shard_artifacts = item["result"].get("visualization_artifacts", {})
+        if not isinstance(shard_artifacts, dict):
+            continue
+        for entry in shard_artifacts.get("episode_visualizations", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            normalized_entry = copy.deepcopy(entry)
+            files = normalized_entry.get("files", {})
+            if isinstance(files, dict):
+                normalized_entry["files"] = {
+                    key: _resolve_shard_artifact(value, shard_dir)
+                    for key, value in files.items()
+                }
+            episode_visualizations.append(normalized_entry)
+    episode_visualizations.sort(key=lambda entry: int(entry.get("episode", -1)))
+
+    visualization_artifacts = {
+        "process_shard_root": str(shard_root),
+        "process_shard_results": [
+            {
+                "index": int(item["spec"]["index"]),
+                "start": int(item["spec"]["start"]),
+                "count": int(item["spec"]["count"]),
+                "result": item["path"],
+            }
+            for item in shard_results
+        ],
+        "episode_visualizations": episode_visualizations,
+    }
+
+    def _shard_for_episode(episode_idx):
+        for item in shard_results:
+            start = int(item["spec"]["start"])
+            stop = start + int(item["spec"]["count"])
+            if start <= int(episode_idx) < stop:
+                return item
+        return None
+
+    best_reward_episode = max(
+        episode_details,
+        key=lambda ep: float(ep.get("reward", -float("inf"))),
+    )
+    best_reward_shard = _shard_for_episode(best_reward_episode["episode"])
+    best_success_candidates = [ep for ep in episode_details if int(ep.get("team_success", 0) or 0) == 1]
+    best_success_shard = None
+    if best_success_candidates:
+        best_success_episode = max(
+            best_success_candidates,
+            key=lambda ep: float(ep.get("reward", -float("inf"))),
+        )
+        best_success_shard = _shard_for_episode(best_success_episode["episode"])
+
+    def _copy_selected_artifacts(item, prefix):
+        if item is None:
+            return
+        shard_artifacts = item["result"].get("visualization_artifacts", {})
+        if not isinstance(shard_artifacts, dict):
+            return
+        shard_dir = Path(item["spec"]["dir"])
+        for key, value in shard_artifacts.items():
+            if key.startswith(prefix):
+                visualization_artifacts[key] = _resolve_shard_artifact(value, shard_dir)
+
+    _copy_selected_artifacts(best_reward_shard, "best_reward_")
+    _copy_selected_artifacts(best_success_shard, "team_success_best_")
+    merged["visualization_artifacts"] = visualization_artifacts
+    merged["evaluation_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results_path = output_dir / "evaluation_results.json"
+    with results_path.open("w", encoding="utf-8") as f:
+        json.dump(_json_safe_eval_value(merged), f, indent=2, ensure_ascii=False)
+    print(f"✅ 分片评估结果已合并: {results_path}")
+
+    index_path = shard_root / "shard_results_index.json"
+    with index_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            _json_safe_eval_value(
+                {
+                    "output_results": str(results_path),
+                    "shards": evaluation_setup["eval_process_shard_specs"],
+                    "summary": summary,
+                }
+            ),
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    return merged
+
+
+def _terminate_process_shard_workers(active_workers):
+    for active in active_workers:
+        proc = active.get("proc")
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+    for active in active_workers:
+        proc = active.get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        log_fh = active.get("log_fh")
+        if log_fh is not None and not log_fh.closed:
+            log_fh.close()
+
+
+def _run_process_sharded_evaluation(args):
+    if os.getenv("MATD3_EVAL_PROCESS_SHARD_WORKER") == "1":
+        return None
+    shard_count = int(getattr(args, "eval_process_shards", 1) or 1)
+    if shard_count <= 1:
+        return None
+    requested_backend = getattr(args, "eval_backend", None)
+    if requested_backend in ("both", "gazebo_live"):
+        raise RuntimeError("--eval-process-shards 暂不支持 gazebo_live/both 后端")
+
+    eval_episode_count = max(1, int(getattr(args, "eval_episodes", 1) or 1))
+    eval_episode_start = max(0, _env_int("EVAL_EPISODE_START_INDEX", 0))
+    shard_specs = _split_eval_episode_shards(eval_episode_start, eval_episode_count, shard_count)
+    shard_count = len(shard_specs)
+    process_workers = int(getattr(args, "eval_process_workers", 0) or 0)
+    if process_workers <= 0:
+        process_workers = shard_count
+    process_workers = max(1, min(process_workers, shard_count))
+    worker_parallelism, worker_threads = _eval_shard_worker_tuning(args, shard_count)
+
+    output_dir = Path(getattr(args, "save_viz_path", "evaluation_results")).expanduser().resolve()
+    shard_root = output_dir / "_episode_shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    print(
+        "[EvalProcessShards] "
+        f"shards={shard_count}, workers={process_workers}, "
+        f"worker_episode_parallelism={worker_parallelism}, worker_env_step_threads={worker_threads}, "
+        f"episode_range={eval_episode_start}-{eval_episode_start + eval_episode_count - 1}"
+    )
+
+    base_argv = list(sys.argv[1:])
+    script_path = Path(__file__).resolve()
+    pending = []
+    for spec in shard_specs:
+        shard_dir = shard_root / f"shard_{spec['index']:02d}_start{spec['start']:03d}_count{spec['count']:03d}"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        log_path = shard_dir / "worker.log"
+        worker_argv = list(base_argv)
+        worker_argv = _append_arg_override(worker_argv, "--eval-process-shards", 1)
+        worker_argv = _append_arg_override(worker_argv, "--eval-process-workers", 1)
+        worker_argv = _append_arg_override(worker_argv, "--eval-episodes", spec["count"])
+        worker_argv = _append_arg_override(worker_argv, "--eval-episode-parallelism", min(worker_parallelism, spec["count"]))
+        worker_argv = _append_arg_override(worker_argv, "--eval-env-step-threads", min(worker_threads, spec["count"]))
+        worker_argv = _append_arg_override(worker_argv, "--save-viz-path", str(shard_dir))
+        base_noise_seed = getattr(args, "eval_noise_seed", None)
+        if base_noise_seed is not None:
+            # Every worker receives the same base.  The evaluator folds the
+            # global episode index into independent per-episode PCG64 streams,
+            # so changing shard boundaries cannot change action perturbations.
+            worker_argv = _append_arg_override(worker_argv, "--eval-noise-seed", int(base_noise_seed))
+            spec["eval_noise_seed"] = int(base_noise_seed)
+        command = [sys.executable, str(script_path)] + worker_argv
+        worker_env = os.environ.copy()
+        worker_env["MATD3_EVAL_PROCESS_SHARD_WORKER"] = "1"
+        worker_env["EVAL_EPISODE_START_INDEX"] = str(spec["start"])
+        worker_env["EVAL_PROCESS_SHARD_INDEX"] = str(spec["index"])
+        worker_env["EVAL_PROCESS_SHARD_COUNT"] = str(shard_count)
+        worker_env.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+        worker_env.setdefault("OMP_NUM_THREADS", str(max(1, worker_threads)))
+        worker_env.setdefault("TF_NUM_INTRAOP_THREADS", str(max(1, worker_threads)))
+        worker_env.setdefault("TF_NUM_INTEROP_THREADS", "1")
+        spec["dir"] = str(shard_dir)
+        spec["log"] = str(log_path)
+        pending.append(
+            {
+                "spec": spec,
+                "command": command,
+                "env": worker_env,
+                "log_path": log_path,
+            }
+        )
+
+    running = []
+    launched = 0
+    try:
+        while pending or running:
+            while pending and len(running) < process_workers:
+                item = pending.pop(0)
+                log_fh = open(item["log_path"], "w", encoding="utf-8")
+                proc = subprocess.Popen(
+                    item["command"],
+                    cwd=str(Path.cwd()),
+                    env=item["env"],
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                launched += 1
+                print(
+                    "[EvalProcessShards] launched "
+                    f"shard={item['spec']['index']} start={item['spec']['start']} "
+                    f"count={item['spec']['count']} pid={proc.pid} log={item['log_path']}"
+                )
+                running.append({"item": item, "proc": proc, "log_fh": log_fh})
+
+            time.sleep(2.0)
+            still_running = []
+            failed_active = None
+            for active in running:
+                ret = active["proc"].poll()
+                if ret is None:
+                    still_running.append(active)
+                    continue
+                active["log_fh"].close()
+                spec = active["item"]["spec"]
+                if ret != 0:
+                    failed_active = active
+                    break
+                print(
+                    "[EvalProcessShards] finished "
+                    f"shard={spec['index']} start={spec['start']} count={spec['count']}"
+                )
+            if failed_active is not None:
+                failed_spec = failed_active["item"]["spec"]
+                _terminate_process_shard_workers(running)
+                running = []
+                raise RuntimeError(
+                    f"评估分片失败: shard={failed_spec['index']} "
+                    f"retcode={failed_active['proc'].returncode} "
+                    f"log={failed_active['item']['log_path']}"
+                )
+            running = still_running
+    except KeyboardInterrupt:
+        _terminate_process_shard_workers(running)
+        running = []
+        raise
+    finally:
+        if running:
+            _terminate_process_shard_workers(running)
+
+    if launched != len(shard_specs):
+        raise RuntimeError(f"分片启动数量异常: launched={launched}, expected={len(shard_specs)}")
+    return _merge_process_shard_results(args, shard_specs, shard_root, output_dir, started_at)
+
+
 def main():
     """主函数"""
     _apply_fast_artifact_env_defaults()
@@ -9914,12 +11033,34 @@ def main():
     except ValueError as e:
         print(f"\n❌ 参数错误: {e}")
         sys.exit(2)
+    if bool(getattr(args, "config_resolve_only", False)):
+        alignment = _load_training_alignment_snapshot(getattr(args, 'load_model_path', None))
+        if alignment:
+            _apply_training_alignment_to_args(args, alignment, quiet=True)
+        _apply_runtime_env_overrides_from_args(args)
+        resolved_payload = {
+            "schema_version": 1,
+            "mode": "config_resolve_only",
+            "args": dict(vars(args)),
+            "training_results_path": alignment.get("results_path") if alignment else None,
+            "training_runtime_manifest_path": (
+                alignment.get("training_runtime_manifest_path") if alignment else None
+            ),
+        }
+        print(
+            "RESOLVED_EVAL_CONFIG_JSON="
+            + json.dumps(resolved_payload, ensure_ascii=False, sort_keys=True, default=str)
+        )
+        return
     if bool(getattr(args, "gazebo_live_gui", False)):
         os.environ["GAZEBO_LIVE_AUTOLAUNCH_GUI"] = "1"
     if bool(getattr(args, "gazebo_live_gui_required", False)):
         os.environ["GAZEBO_LIVE_GUI_REQUIRED"] = "1"
     disable_viz_env = _env_flag("EVAL_DISABLE_VISUALIZATION", False)
     light_mode_env = _env_flag("EVAL_LIGHT_MODE", False)
+    save_interactive_traj = _env_flag("SAVE_INTERACTIVE_TRAJ", True)
+    save_all_episode_visualizations = _env_flag("SAVE_EVAL_ALL_EPISODES", False)
+    save_best_traj = _env_flag("SAVE_BEST_TRAJ", True)
     save_trajectory_png = _env_flag("SAVE_EVAL_TRAJECTORY_PNG", True)
     save_team_success_html = _env_flag("SAVE_TEAM_SUCCESS_HTML", False)
     save_actor_sequence = _env_flag("SAVE_EVAL_ACTOR_SEQUENCE", False)
@@ -9927,8 +11068,14 @@ def main():
     save_gazebo_replay = _env_flag("SAVE_GAZEBO_REPLAY", False)
     save_gazebo_dynamic_replay = _env_flag("SAVE_GAZEBO_DYNAMIC_REPLAY", False)
     save_trajectory_snapshot = _env_flag("SAVE_TRAJECTORY_SNAPSHOT", save_gazebo_replay or save_gazebo_dynamic_replay)
+    needs_interactive_visualization = save_interactive_traj and (
+        save_all_episode_visualizations
+        or save_best_traj
+        or save_team_success_html
+    )
     keep_viz_artifacts_in_light_mode = (
-        save_trajectory_png
+        needs_interactive_visualization
+        or save_trajectory_png
         or save_team_success_html
         or save_actor_sequence
         or save_control_diagnostics
@@ -9942,6 +11089,20 @@ def main():
         setattr(args, 'disable_html', True)
     elif light_mode_env:
         args.disable_gif = True
+
+    noise_active = (
+        float(getattr(args, 'eval_noise_scale', 0.0) or 0.0) > 0.0
+        or float(getattr(args, 'eval_random_action_prob', 0.0) or 0.0) > 0.0
+    )
+    if noise_active and getattr(args, 'eval_noise_seed', None) is None:
+        args.eval_noise_seed = int(time.time_ns() % (2**31 - 1))
+        print(f"[EvalNoise] 未指定seed，已生成并记录基础seed={args.eval_noise_seed}")
+
+    sharded_results = _run_process_sharded_evaluation(args)
+    if sharded_results is not None:
+        print("\n🎉 分片评估完成!")
+        return
+
     # 在任何 TensorFlow 操作之前优先配置GPU，避免已初始化后再设内存增长
     try:
         configure_gpu()
@@ -9992,14 +11153,20 @@ def main():
     else:
         print("ℹ️  XLA加速未启用（设置XLA_GLOBAL=1以启用）")
 
-    # 设置随机种子以确保每次评估都有不同的随机性
+    # 设置随机种子；噪声对照实验可通过 --eval-noise-seed 固定随机流
     import time
     import random
-    current_time = int(time.time() * 1000000) % 2**32
-    random.seed(current_time)
-    np.random.seed(current_time)
-    tf.random.set_seed(current_time)
-    print(f"🎲 设置随机种子: {current_time} (确保每次评估的随机性)")
+    eval_noise_seed = getattr(args, 'eval_noise_seed', None)
+    if eval_noise_seed is not None:
+        current_seed = int(eval_noise_seed) % 2**32
+        seed_reason = "固定评估噪声/随机流"
+    else:
+        current_seed = int(time.time() * 1000000) % 2**32
+        seed_reason = "确保每次评估的随机性"
+    random.seed(current_seed)
+    np.random.seed(current_seed)
+    tf.random.set_seed(current_seed)
+    print(f"🎲 设置随机种子: {current_seed} ({seed_reason})")
     
     # 显示HTML生成状态
     enable_html = getattr(args, 'enable_html', True) and not getattr(args, 'disable_html', False)
@@ -10041,6 +11208,7 @@ def main():
         
     except KeyboardInterrupt:
         print("\n⚠️ 评估被用户中断")
+        raise
     except Exception as e:
         print(f"\n❌ 评估出错: {e}")
         traceback.print_exc()

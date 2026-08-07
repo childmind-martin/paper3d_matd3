@@ -10,6 +10,7 @@ import time
 import matplotlib.pyplot as plt
 import os
 import traceback  # 添加traceback模块用于错误跟踪
+from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
 
 
 def _scenario_quiet_output():
@@ -19,6 +20,24 @@ def _scenario_quiet_output():
         return os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')
     except Exception:
         return True
+
+
+# Backward-compatible private name used by older callers of this scenario module.
+_normalize_obstacle_observation_mode = normalize_obstacle_observation_mode
+
+
+def _float_from_kwargs_or_env(kwargs, key, env_names, default):
+    value = kwargs.get(key, None)
+    if value is None:
+        for env_name in env_names:
+            raw = os.getenv(env_name, '').strip()
+            if raw:
+                value = raw
+                break
+    try:
+        return float(default if value is None else value)
+    except Exception:
+        return float(default)
 
 
 class Scenario(BaseScenario):
@@ -135,6 +154,25 @@ class Scenario(BaseScenario):
         self._obs_step_cache_key = None
         self._obs_step_cache = {}
         self.observation_dim = 81
+        obstacle_obs_mode_kw = kwargs.get('obstacle_observation_mode', kwargs.get('obstacle_obs_mode', None))
+        if obstacle_obs_mode_kw is None:
+            obstacle_obs_mode_kw = os.getenv(
+                'OBSTACLE_OBSERVATION_MODE',
+                os.getenv('OBSTACLE_OBS_MODE', 'nearest_surface'),
+            )
+        self.obstacle_observation_mode = _normalize_obstacle_observation_mode(obstacle_obs_mode_kw)
+        self.obstacle_risk_velocity_forward_weight = _float_from_kwargs_or_env(
+            kwargs,
+            'obstacle_risk_velocity_forward_weight',
+            ('OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT', 'OBSTACLE_OBS_VEL_FORWARD_WEIGHT'),
+            4.0,
+        )
+        self.obstacle_risk_goal_along_weight = _float_from_kwargs_or_env(
+            kwargs,
+            'obstacle_risk_goal_along_weight',
+            ('OBSTACLE_RISK_GOAL_ALONG_WEIGHT', 'OBSTACLE_OBS_GOAL_ALONG_WEIGHT'),
+            3.0,
+        )
         
         # 🔧 障碍物生成模式：从环境变量读取
         use_dynamic_obstacles_kw = kwargs.get('use_dynamic_obstacles', None)
@@ -393,7 +431,135 @@ class Scenario(BaseScenario):
                     dtype=np.float32,
                 )
                 self._obs_env_info_agent_count = num_agents
-        
+
+    def _sort_obstacle_indices_by_score(self, scores, top_k):
+        obstacle_count = int(scores.shape[1]) if getattr(scores, 'ndim', 0) == 2 else 0
+        if obstacle_count <= 0 or top_k <= 0:
+            return np.zeros((scores.shape[0], 0), dtype=np.int64)
+        top_k = min(int(top_k), obstacle_count)
+        safe_scores = np.nan_to_num(scores, nan=np.inf, posinf=np.inf, neginf=-np.inf)
+        if obstacle_count > top_k:
+            candidate_indices = np.argpartition(safe_scores, kth=top_k - 1, axis=1)[:, :top_k]
+            candidate_scores = np.take_along_axis(safe_scores, candidate_indices, axis=1)
+            return np.take_along_axis(candidate_indices, np.argsort(candidate_scores, axis=1), axis=1)
+        return np.argsort(safe_scores, axis=1)
+
+    def _select_obstacle_observation_indices(
+        self,
+        positions,
+        velocities,
+        goal_positions,
+        rel_positions,
+        dists_to_center,
+        dists_to_surface,
+        top_k,
+    ):
+        mode = _normalize_obstacle_observation_mode(getattr(self, 'obstacle_observation_mode', 'nearest_surface'))
+        if mode != 'risk_lite_v2':
+            return self._sort_obstacle_indices_by_score(dists_to_surface, top_k)
+
+        try:
+            positions = np.asarray(positions, dtype=np.float32)
+            velocities = np.asarray(velocities, dtype=np.float32)
+            goal_positions = np.asarray(goal_positions, dtype=np.float32)
+            rel_positions = np.asarray(rel_positions, dtype=np.float32)
+            dists_to_center = np.asarray(dists_to_center, dtype=np.float32)
+            dists_to_surface = np.asarray(dists_to_surface, dtype=np.float32)
+            radii = np.asarray(self._obs_radii, dtype=np.float32)[None, :]
+
+            eps = np.float32(1e-6)
+            center_dist_sq = np.maximum(dists_to_center * dists_to_center, 0.0)
+            radius_sq = radii * radii
+            nearest_score = dists_to_surface * dists_to_surface
+
+            goal_vec = goal_positions - positions
+            goal_dist = np.linalg.norm(goal_vec, axis=1, keepdims=True)
+            goal_dir = np.zeros_like(goal_vec, dtype=np.float32)
+            goal_valid = goal_dist[:, 0] > eps
+            if np.any(goal_valid):
+                goal_dir[goal_valid] = goal_vec[goal_valid] / np.maximum(goal_dist[goal_valid], eps)
+
+            vel_norm = np.linalg.norm(velocities, axis=1, keepdims=True)
+            vel_dir = np.zeros_like(velocities, dtype=np.float32)
+            moving = vel_norm[:, 0] > eps
+            if np.any(moving):
+                vel_dir[moving] = velocities[moving] / np.maximum(vel_norm[moving], eps)
+            fallback_to_goal = ~moving & goal_valid
+            if np.any(fallback_to_goal):
+                vel_dir[fallback_to_goal] = goal_dir[fallback_to_goal]
+            unresolved = np.linalg.norm(vel_dir, axis=1) <= eps
+            if np.any(unresolved):
+                vel_dir[unresolved, 0] = 1.0
+
+            forward = np.sum(rel_positions * vel_dir[:, None, :], axis=2)
+            vel_lateral_sq = np.maximum(center_dist_sq - forward * forward, 0.0)
+            vel_score = (
+                vel_lateral_sq
+                - radius_sq
+                + float(getattr(self, 'obstacle_risk_velocity_forward_weight', 4.0)) * np.maximum(forward, 0.0)
+            )
+            vel_score = np.where(forward > 0.0, vel_score, np.inf)
+
+            along = np.sum(rel_positions * goal_dir[:, None, :], axis=2)
+            goal_lateral_sq = np.maximum(center_dist_sq - along * along, 0.0)
+            goal_dist_2d = goal_dist[:, None, 0]
+            goal_corridor_valid = (goal_dist_2d > eps) & (along >= 0.0) & (along <= goal_dist_2d)
+            goal_score = (
+                goal_lateral_sq
+                - radius_sq
+                + float(getattr(self, 'obstacle_risk_goal_along_weight', 3.0)) * np.maximum(along, 0.0)
+            )
+            goal_score = np.where(goal_corridor_valid, goal_score, np.inf)
+
+            score_channels = (nearest_score, vel_score, goal_score)
+            selected = np.full((positions.shape[0], top_k), -1, dtype=np.int64)
+            nearest_order = self._sort_obstacle_indices_by_score(nearest_score, dists_to_surface.shape[1])
+
+            for row in range(positions.shape[0]):
+                used = set()
+                slot = 0
+                for scores in score_channels[:top_k]:
+                    row_scores = np.nan_to_num(scores[row], nan=np.inf, posinf=np.inf, neginf=-np.inf)
+                    chosen = None
+                    for candidate in np.argsort(row_scores):
+                        candidate = int(candidate)
+                        if candidate not in used and np.isfinite(row_scores[candidate]):
+                            chosen = candidate
+                            break
+                    if chosen is None:
+                        for candidate in nearest_order[row]:
+                            candidate = int(candidate)
+                            if candidate not in used:
+                                chosen = candidate
+                                break
+                    if chosen is None:
+                        break
+                    selected[row, slot] = chosen
+                    used.add(chosen)
+                    slot += 1
+                    if slot >= top_k:
+                        break
+
+                while slot < top_k:
+                    chosen = None
+                    for candidate in nearest_order[row]:
+                        candidate = int(candidate)
+                        if candidate not in used:
+                            chosen = candidate
+                            break
+                    if chosen is None:
+                        break
+                    selected[row, slot] = chosen
+                    used.add(chosen)
+                    slot += 1
+
+            if np.any(selected < 0):
+                nearest_fallback = self._sort_obstacle_indices_by_score(dists_to_surface, top_k)
+                selected = np.where(selected < 0, nearest_fallback[:, :top_k], selected)
+            return selected
+        except Exception:
+            return self._sort_obstacle_indices_by_score(dists_to_surface, top_k)
+
     def _get_start_altitude_offset(self):
         """统一获取起始离地高度配置"""
         try:
@@ -4471,10 +4637,12 @@ class Scenario(BaseScenario):
 
             # 2. 目标信息 (7维)
             goal_info = np.zeros((num_agents, 7), dtype=np.float32)
+            goal_positions = positions.copy()
             for idx, ag in enumerate(agents):
                 try:
                     if hasattr(ag, 'goal_a') and ag.goal_a.state.p_pos is not None:
                         goal_pos = np.asarray(ag.goal_a.state.p_pos, dtype=np.float32)
+                        goal_positions[idx] = goal_pos
                         goal_rel_pos = goal_pos - positions[idx]
                         dist_to_goal = float(np.linalg.norm(goal_rel_pos))
                         norm_direction = goal_rel_pos / (dist_to_goal + 1e-6)
@@ -4599,16 +4767,15 @@ class Scenario(BaseScenario):
                     dists_to_surface = np.maximum(0.0, dists_to_center - self._obs_radii[None, :])
                     obstacle_count = dists_to_surface.shape[1]
                     top_k = min(3, obstacle_count)
-                    if obstacle_count > top_k:
-                        nearest_indices = np.argpartition(dists_to_surface, kth=top_k - 1, axis=1)[:, :top_k]
-                        nearest_dists = np.take_along_axis(dists_to_surface, nearest_indices, axis=1)
-                        sorted_indices = np.take_along_axis(
-                            nearest_indices,
-                            np.argsort(nearest_dists, axis=1),
-                            axis=1,
-                        )
-                    else:
-                        sorted_indices = np.argsort(dists_to_surface, axis=1)
+                    sorted_indices = self._select_obstacle_observation_indices(
+                        positions,
+                        velocities,
+                        goal_positions,
+                        rel_positions,
+                        dists_to_center,
+                        dists_to_surface,
+                        top_k,
+                    )
                     row_idx = np.arange(num_agents)
                     for k in range(top_k):
                         idx = sorted_indices[:, k]
@@ -4696,9 +4863,11 @@ class Scenario(BaseScenario):
         # 2. 目标信息 (7维) - 🚨 关键修复：添加目标绝对位置（3维），从4维扩展到7维
         # 原因：势场代码从obs[57:60]读取目标绝对位置，但之前只有4维目标信息，导致读取到错误数据
         goal_info = []
+        goal_position_for_obstacles = np.asarray(agent.state.p_pos, dtype=np.float32)
         try:
             if hasattr(agent, 'goal_a') and agent.goal_a.state.p_pos is not None:
-                goal_pos = agent.goal_a.state.p_pos
+                goal_pos = np.asarray(agent.goal_a.state.p_pos, dtype=np.float32)
+                goal_position_for_obstacles = goal_pos
                 # 计算到目标的向量和距离
                 goal_rel_pos = goal_pos - agent.state.p_pos
                 dist_to_goal = np.linalg.norm(goal_rel_pos)
@@ -4859,19 +5028,21 @@ class Scenario(BaseScenario):
             traceback.print_exc()
             terrain_info = np.zeros(32)
         
-        # 4. 障碍物信息 (15维) - Top-3最近障碍物编码
-        # 编码结构：3个最近障碍物 × 5维(归一化相对位置3 + 归一化表面距离1 + 归一化半径1) = 15维
+        # 4. 障碍物信息 (15维) - 3个选中障碍物编码
+        # 编码结构：3个障碍物 × 5维(归一化相对位置3 + 归一化表面距离1 + 归一化半径1) = 15维
         # 每个障碍物槽位(5维)：
         #   [0] rel_x / max_dist : 归一化X方向相对位置（智能体→障碍物中心）
         #   [1] rel_y / max_dist : 归一化Y方向相对位置
         #   [2] rel_z / max_dist : 归一化Z方向相对位置
         #   [3] surface_dist / max_dist : 归一化表面距离（到障碍物表面的最短距离）
         #   [4] radius / max_dist : 归一化障碍物半径
-        # 按表面距离升序排列（最近→最远），不足3个时用sentinel (0,0,0,1,0)填充
+        # 默认按表面距离排序；risk_lite_v2 下按近距/速度方向/目标走廊风险排序。
+        # 不足3个时用sentinel (0,0,0,1,0)填充。
         # 优点：信息密度高（15维全部携带有效障碍物信息），PF修正可直接使用无需重建
         obstacle_info = np.zeros(15, dtype=np.float32)
+        obstacle_info[3::5] = 1.0
         try:
-            agent_pos = agent.state.p_pos
+            agent_pos = np.asarray(agent.state.p_pos, dtype=np.float32)
             max_dist = max(self.map_size, 1e-6)
             
             if getattr(self, '_obs_centers', None) is not None and self._obs_centers.shape[0] > 0:
@@ -4879,8 +5050,16 @@ class Scenario(BaseScenario):
                 dists_to_center = np.linalg.norm(rel_positions, axis=1)  # (N,)
                 dists_to_surface = np.maximum(0.0, dists_to_center - self._obs_radii)  # (N,)
                 
-                sorted_indices = np.argsort(dists_to_surface)
-                top_k = min(3, len(sorted_indices))
+                top_k = min(3, len(dists_to_surface))
+                sorted_indices = self._select_obstacle_observation_indices(
+                    agent_pos[None, :],
+                    np.asarray(agent.state.p_vel, dtype=np.float32)[None, :],
+                    goal_position_for_obstacles[None, :],
+                    rel_positions[None, :, :],
+                    dists_to_center[None, :],
+                    dists_to_surface[None, :],
+                    top_k,
+                )[0]
                 
                 for k in range(top_k):
                     idx = sorted_indices[k]
@@ -4902,6 +5081,7 @@ class Scenario(BaseScenario):
         except Exception as e:
             print(f"障碍物信息计算错误: {e}")
             obstacle_info = np.zeros(15, dtype=np.float32)
+            obstacle_info[3::5] = 1.0
         
         # 5. 其他智能体信息 (12维) - 修复：确保固定12维输出
         other_agents_obs = np.zeros(12, dtype=np.float32)

@@ -14,6 +14,17 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from selection_scoring import (
+    SELECTION_RESULT_SCHEMA_VERSION,
+    SELECTION_SCORE_SCHEMA_VERSION,
+    comparison_score as _shared_comparison_score,
+    score_summary as _shared_score_summary,
+    select_best_candidate as _shared_select_best_candidate,
+    selection_score_schema as _shared_selection_score_schema,
+    selection_summary_errors as _shared_selection_summary_errors,
+)
+from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
+
 
 DEFAULT_MODEL_VARIANT = "best_by_team_sr"
 DEFAULT_SELECTION_PROTOCOL = "matched_validation"
@@ -26,21 +37,6 @@ DEFAULT_VALIDATION_CANDIDATES = (
     "latest_ep",
 )
 SELECTION_PROTOCOL_CHOICES = ("fixed", "matched_validation")
-SELECTION_RESULT_SCHEMA_VERSION = 2
-SELECTION_SCORE_SCHEMA_VERSION = 2
-SELECTION_GUARDED_MIN_COLLISION_FREE = 0.05
-SELECTION_GUARDED_COLLISION_COUNT_WEIGHT = 5.0
-SELECTION_SCORE_FIELDS = (
-    "team_success_rate",
-    "partial_success_mean",
-    "partial_success_max",
-    "partial_success_min",
-    "guarded_goal_progress_score",
-    "collision_free_rate",
-    "neg_avg_collision_count",
-    "neg_avg_team_final_goal_distance",
-    "neg_avg_team_total_path_length",
-)
 CHECKPOINT_FR_MODES = {
     "checkpoint",
     "checkpoint_fr",
@@ -110,15 +106,7 @@ def _spec_for_hash(spec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _selection_score_schema() -> Dict[str, Any]:
-    return {
-        "version": int(SELECTION_SCORE_SCHEMA_VERSION),
-        "fields": list(SELECTION_SCORE_FIELDS),
-        "guarded_goal_progress": {
-            "min_collision_free_rate": float(SELECTION_GUARDED_MIN_COLLISION_FREE),
-            "collision_count_weight": float(SELECTION_GUARDED_COLLISION_COUNT_WEIGHT),
-        },
-        "ordering": "lexicographic_desc",
-    }
+    return _shared_selection_score_schema()
 
 
 def _to_bool(value: Any) -> bool:
@@ -387,6 +375,8 @@ def _build_validation_spec(
     spec.update(_build_post_eval_sequence_fields(spec))
     spec["artifact_policy"] = _validation_artifact_policy()
     spec["validation_role"] = "checkpoint_selection"
+    spec["selection_result_schema_version"] = int(SELECTION_RESULT_SCHEMA_VERSION)
+    spec["selection_score_schema_version"] = int(SELECTION_SCORE_SCHEMA_VERSION)
     spec["validation_seed_index"] = int(validation_seed_index)
     spec["force_regenerate_testset"] = True
     validation_testset_root = _matched_validation_root(Path(args.output_dir)) / "testset"
@@ -560,62 +550,8 @@ def _compute_model_signature(model_dir: Path) -> Optional[str]:
         return None
 
 
-def _partial_success_scores(summary: Dict[str, Any]) -> Tuple[float, float, float]:
-    rates = summary.get("agent_success_rates")
-    if not isinstance(rates, list):
-        return 0.0, 0.0, 0.0
-    values: List[float] = []
-    for value in rates:
-        numeric = _safe_float(value)
-        if numeric is not None:
-            values.append(max(0.0, min(1.0, float(numeric))))
-    if not values:
-        return 0.0, 0.0, 0.0
-    return (
-        float(sum(values) / len(values)),
-        float(max(values)),
-        float(min(values)),
-    )
-
-
-def _selection_metric(summary: Dict[str, Any], key: str, *, fallback: float) -> float:
-    value = _safe_float(summary.get(key))
-    if value is None:
-        return fallback
-    return float(value)
-
-
-def _guarded_goal_progress_score(summary: Dict[str, Any]) -> float:
-    distance = max(0.0, _selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12))
-    collision_count = max(0.0, _selection_metric(summary, "avg_collision_count", fallback=1e12))
-    collision_free = max(0.0, min(1.0, _selection_metric(summary, "collision_free_rate", fallback=0.0)))
-
-    # Compare goal progress only after discounting unsafe trajectories. This keeps a close,
-    # moderately-colliding checkpoint competitive while rejecting collision-heavy shortcuts.
-    guarded_distance = (
-        distance / max(collision_free, SELECTION_GUARDED_MIN_COLLISION_FREE)
-        + collision_count * SELECTION_GUARDED_COLLISION_COUNT_WEIGHT
-    )
-    return -guarded_distance
-
-
 def _score_summary(summary: Dict[str, Any]) -> Tuple[float, ...]:
-    partial_mean, partial_max, partial_min = _partial_success_scores(summary)
-    collision_free = _selection_metric(summary, "collision_free_rate", fallback=-1.0)
-    collision_count = _selection_metric(summary, "avg_collision_count", fallback=1e12)
-    distance = _selection_metric(summary, "avg_team_final_goal_distance", fallback=1e12)
-    path_length = _selection_metric(summary, "avg_team_total_path_length", fallback=1e12)
-    return (
-        _selection_metric(summary, "team_success_rate", fallback=-1.0),
-        partial_mean,
-        partial_max,
-        partial_min,
-        _guarded_goal_progress_score(summary),
-        collision_free,
-        -collision_count,
-        -distance,
-        -path_length,
-    )
+    return _shared_score_summary(summary)
 
 
 def _build_eval_env(base_env: Dict[str, str], spec: Dict[str, Any], *, quiet_output: str, python_bin: str) -> Dict[str, str]:
@@ -647,6 +583,15 @@ def _build_eval_env(base_env: Dict[str, str], spec: Dict[str, Any], *, quiet_out
     env["PEAK_HEIGHT_JITTER_RATIO_MAX"] = str(spec.get("peak_height_jitter_ratio_max", 0.0))
     env["PEAK_HEIGHT_MAX_SCALE"] = str(spec.get("peak_height_max_scale", 1.0))
     env["TERRAIN_VARIANT_NOISE_RATIO"] = str(spec.get("terrain_variant_noise_ratio", 0.0))
+    env["OBSTACLE_OBSERVATION_MODE"] = normalize_obstacle_observation_mode(
+        spec.get(
+            "obstacle_observation_mode",
+            env.get("OBSTACLE_OBSERVATION_MODE", env.get("OBSTACLE_OBS_MODE", "nearest_surface")),
+        )
+    )
+    env["OBSTACLE_OBS_MODE"] = env["OBSTACLE_OBSERVATION_MODE"]
+    env["OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT"] = str(spec.get("obstacle_risk_velocity_forward_weight", env.get("OBSTACLE_RISK_VELOCITY_FORWARD_WEIGHT", env.get("OBSTACLE_OBS_VEL_FORWARD_WEIGHT", "4.0"))))
+    env["OBSTACLE_RISK_GOAL_ALONG_WEIGHT"] = str(spec.get("obstacle_risk_goal_along_weight", env.get("OBSTACLE_RISK_GOAL_ALONG_WEIGHT", env.get("OBSTACLE_OBS_GOAL_ALONG_WEIGHT", "3.0"))))
     env["HELDOUT_POSITION_MODE"] = str(spec.get("position_family", "train_match"))
     env["HELDOUT_REFERENCE_POSITIONS_FILE"] = str(spec.get("reference_positions_file", ""))
     env["HELDOUT_START_CENTER_JITTER"] = str(spec.get("start_center_jitter", 0.0))
@@ -782,6 +727,82 @@ def _existing_eval_reuse_errors(
     if actual_episodes != expected_episodes:
         errors.append(f"episodes 不一致: got={actual_episodes} expected={expected_episodes}")
 
+    episode_details = results.get("episode_details", [])
+    if not isinstance(episode_details, list) or len(episode_details) != expected_episodes:
+        errors.append(
+            f"episode_details 长度不一致: got={len(episode_details) if isinstance(episode_details, list) else 'invalid'} "
+            f"expected={expected_episodes}"
+        )
+    else:
+        try:
+            episode_ids = sorted(int(item.get("episode")) for item in episode_details)
+        except Exception:
+            episode_ids = []
+        expected_ids = list(range(expected_episodes))
+        if episode_ids != expected_ids:
+            errors.append(f"episode_details episode编号不完整: got={episode_ids} expected={expected_ids}")
+
+    for result_key, spec_key in (
+        ("terrain_seed_sequence", "terrain_seed_sequence"),
+        ("terrain_variant_seed_sequence", "terrain_variant_seed_sequence"),
+        ("obstacle_seed_sequence", "obstacle_seed_sequence"),
+    ):
+        expected_sequence = expected_spec.get(spec_key, [])
+        if not expected_sequence:
+            continue
+        actual_sequence = results.get(result_key, [])
+        if actual_sequence != expected_sequence:
+            errors.append(f"{result_key} 与 spec 不一致")
+
+    recorded_model_path = str(results.get("model_path", "") or "").strip()
+    try:
+        if not recorded_model_path or Path(recorded_model_path).resolve() != Path(model_path).resolve():
+            errors.append("evaluation_results.model_path 与当前模型不一致")
+    except Exception:
+        errors.append("evaluation_results.model_path 无法解析")
+
+    setup = results.get("evaluation_setup", {})
+    if not isinstance(setup, dict):
+        errors.append("缺少 evaluation_setup")
+        setup = {}
+    setup_checks = (
+        ("semi_random_terrain", "semi_random_terrain"),
+        ("random_terrain", "random_terrain"),
+        ("use_dynamic_obstacles", "use_dynamic_obstacles"),
+        ("terrain_seed", "terrain_seed"),
+        ("terrain_base_seed", "terrain_base_seed"),
+    )
+    for setup_key, spec_key in setup_checks:
+        if spec_key in expected_spec and setup.get(setup_key) != expected_spec.get(spec_key):
+            errors.append(f"evaluation_setup.{setup_key} 与 spec 不一致")
+    if "obstacle_observation_mode" in expected_spec:
+        try:
+            actual_mode = normalize_obstacle_observation_mode(setup.get("obstacle_observation_mode"))
+            expected_mode = normalize_obstacle_observation_mode(expected_spec.get("obstacle_observation_mode"))
+        except ValueError:
+            actual_mode = setup.get("obstacle_observation_mode")
+            expected_mode = expected_spec.get("obstacle_observation_mode")
+        if actual_mode != expected_mode:
+            errors.append("evaluation_setup.obstacle_observation_mode 与 spec 不一致")
+    for key in ("obstacle_risk_velocity_forward_weight", "obstacle_risk_goal_along_weight"):
+        if key not in expected_spec:
+            continue
+        actual_value = _safe_float(setup.get(key))
+        expected_value = _safe_float(expected_spec.get(key))
+        if actual_value is None or expected_value is None or abs(actual_value - expected_value) > 1e-9:
+            errors.append(f"evaluation_setup.{key} 与 spec 不一致")
+    if "episode_length_multiplier" in expected_spec:
+        actual_multiplier = _safe_float(setup.get("requested_episode_length_multiplier"))
+        expected_multiplier = _safe_float(expected_spec.get("episode_length_multiplier"))
+        if actual_multiplier is None or expected_multiplier is None or abs(actual_multiplier - expected_multiplier) > 1e-9:
+            errors.append("evaluation_setup.requested_episode_length_multiplier 与 spec 不一致")
+
+    if str(expected_spec.get("validation_role", "")) == "checkpoint_selection":
+        errors.extend(
+            f"checkpoint selection summary: {item}"
+            for item in _shared_selection_summary_errors(summary)
+        )
+
     errors.extend(_checkpoint_fr_source_errors(results, model_path))
 
     selection = results.get("model_selection", {}) if isinstance(results.get("model_selection"), dict) else {}
@@ -803,6 +824,13 @@ def _execute_eval_run(
     banner_prefix: str,
     force_rerun: bool,
 ) -> Dict[str, Any]:
+    spec = dict(spec)
+    model_path = Path(model_path).resolve()
+    model_signature = _compute_model_signature(model_path)
+    if not model_signature:
+        raise RuntimeError(f"{banner_prefix}模型缺少可读取的 actor 权重: {model_path}")
+    spec["evaluated_model_path"] = str(model_path)
+    spec["evaluated_model_signature"] = str(model_signature)
     if force_rerun and eval_dir.exists():
         shutil.rmtree(eval_dir)
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -855,7 +883,6 @@ def _execute_eval_run(
     print(f"{banner_prefix}模型路径: {model_path}")
     print(f"{banner_prefix}输出目录: {eval_dir}")
     print(f"{banner_prefix}测试回合数: {spec.get('episodes')}")
-    command_error = None
     try:
         _run_command_with_live_output(
             cmd,
@@ -865,21 +892,23 @@ def _execute_eval_run(
             prefix=f"{banner_prefix}",
         )
     except RuntimeError as exc:
-        command_error = exc
-        if not results_path.exists():
-            raise
-        print(
-            f"{banner_prefix}评估命令非零退出，但结果文件已生成，继续读取结果: "
-            f"{results_path} | {exc}"
-        )
+        raise RuntimeError(f"{banner_prefix}评估命令失败，拒绝复用可能不完整的结果: {exc}") from exc
     if not results_path.exists():
         raise RuntimeError(f"{banner_prefix}缺少 evaluation_results.json: {results_path}")
     try:
         results = _load_json(results_path)
     except Exception as exc:
-        if command_error is not None:
-            raise command_error from exc
         raise
+    validation_errors = _existing_eval_reuse_errors(
+        results=results,
+        spec_path=spec_path,
+        expected_spec=spec,
+        model_path=model_path,
+    )
+    if validation_errors:
+        raise RuntimeError(
+            f"{banner_prefix}新评估结果校验失败: {'; '.join(validation_errors)}"
+        )
     summary = results.get("summary", {}) if isinstance(results.get("summary"), dict) else {}
     return {
         "results_path": str(results_path),
@@ -930,6 +959,12 @@ def _select_candidate(
         if summary_path and Path(summary_path).exists():
             try:
                 selection_summary = _load_json(Path(summary_path))
+                result_schema_version = int(selection_summary.get("schema_version", 0) or 0)
+                if result_schema_version != int(SELECTION_RESULT_SCHEMA_VERSION):
+                    raise RuntimeError(
+                        f"预选 checkpoint 的 selection_summary 结果 schema 过期: "
+                        f"got={result_schema_version} expected={SELECTION_RESULT_SCHEMA_VERSION}"
+                    )
                 schema_version = int(selection_summary.get("selection_score_schema_version", 0) or 0)
                 if schema_version != int(SELECTION_SCORE_SCHEMA_VERSION):
                     raise RuntimeError(
@@ -943,6 +978,13 @@ def _select_candidate(
                 )
                 selected = selection_summary.get("selected", {})
                 if isinstance(selected, dict):
+                    selected_summary_path = str(selected.get("model_path", "") or "").strip()
+                    if not selected_summary_path or Path(selected_summary_path).resolve() != selected_path:
+                        raise RuntimeError("selection_summary.selected.model_path 与预选模型不一致")
+                    recorded_signature = str(selected.get("model_signature", "") or "").strip()
+                    current_signature = _compute_model_signature(selected_path) or ""
+                    if not recorded_signature or not current_signature or recorded_signature != current_signature:
+                        raise RuntimeError("selection_summary.selected.model_signature 与当前模型不一致")
                     candidate_alias = str(selected.get("candidate_alias") or candidate_alias)
                     resolved_variant = str(selected.get("resolved_variant") or resolved_variant)
             except Exception as exc:
@@ -1037,6 +1079,7 @@ def _select_candidate(
                     "order": order_idx,
                     "summary": dict(cached["summary"]),
                     "score": list(cached["score"]),
+                    "comparison_score": list(cached["comparison_score"]),
                     "validation_runs": list(cached["validation_runs"]),
                     "model_signature": signature,
                     "candidate_eval_cache_key": cache_key,
@@ -1091,11 +1134,13 @@ def _select_candidate(
 
         aggregate_summary = _aggregate_summaries(candidate_summaries)
         score = _score_summary(aggregate_summary)
+        normalized_score = _shared_comparison_score(score)
         scored_entry = {
             **candidate,
             "order": order_idx,
             "summary": aggregate_summary,
             "score": list(score),
+            "comparison_score": list(normalized_score),
             "validation_runs": validation_runs,
             "model_signature": signature,
             "candidate_eval_cache_key": cache_key,
@@ -1106,6 +1151,7 @@ def _select_candidate(
                 "candidate_alias": candidate["candidate_alias"],
                 "summary": aggregate_summary,
                 "score": list(score),
+                "comparison_score": list(normalized_score),
                 "validation_runs": validation_runs,
             }
 
@@ -1113,7 +1159,7 @@ def _select_candidate(
         details = " | ".join(f"{item['candidate_alias']}={item['failure_reason']}" for item in failed_candidates)
         raise RuntimeError(f"所有 matched validation 候选均失败: {details or '无候选可用'}")
 
-    best_candidate = max(scored_candidates, key=lambda item: (tuple(item["score"]), -int(item["order"])))
+    best_candidate = _shared_select_best_candidate(scored_candidates)
     selection_summary = {
         "schema_version": int(SELECTION_RESULT_SCHEMA_VERSION),
         "selection_protocol": "matched_validation",
@@ -1134,6 +1180,7 @@ def _select_candidate(
             "model_signature": best_candidate.get("model_signature"),
             "candidate_eval_cache_key": best_candidate.get("candidate_eval_cache_key"),
             "score": best_candidate["score"],
+            "comparison_score": best_candidate["comparison_score"],
             "summary": best_candidate["summary"],
             "validation_runs": best_candidate.get("validation_runs", []),
             "reused_validation_from_candidate": best_candidate.get("reused_validation_from_candidate"),

@@ -391,6 +391,14 @@ def _save_checkpoint(
 ) -> None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     trainer.save_models(checkpoint_dir)
+    state_path = os.path.join(checkpoint_dir, "checkpoint_state.json")
+    if not _env_flag_enabled("SAVE_TRAINING_RESUME_STATE", default=True):
+        try:
+            if os.path.exists(state_path):
+                os.unlink(state_path)
+        except Exception as exc:
+            raise RuntimeError(f"清理已禁用的旧续训状态失败: {state_path}") from exc
+        return
     state = {
         "episode": int(episode_idx),
         "episode_rewards": list(episode_rewards),
@@ -415,7 +423,7 @@ def _save_checkpoint(
         "exp_name": str(getattr(trainer.args, "exp_name", "")),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    with open(os.path.join(checkpoint_dir, "checkpoint_state.json"), "w", encoding="utf-8") as f:
+    with open(state_path, "w", encoding="utf-8") as f:
         json.dump(_make_json_safe(state), f, ensure_ascii=False, indent=2)
 
 
@@ -428,7 +436,12 @@ def parse_args():
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--exp-name", type=str, default="mappo_experiment")
     parser.add_argument("--save-model", action="store_true")
-    parser.add_argument("--save-interval", type=int, default=100)
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=0,
+        help="周期 epN 模型保存间隔；0 表示关闭中间回合快照",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
@@ -1261,26 +1274,31 @@ def train(args):
                         critic_losses_history,
                     )
 
-            if args.save_model and ((episode + 1) % max(1, int(args.save_interval)) == 0):
+            if (
+                args.save_model
+                and int(args.save_interval) > 0
+                and ((episode + 1) % int(args.save_interval) == 0)
+            ):
                 trainer.save_models(os.path.join(model_root, f"ep{episode + 1}"))
-                _save_checkpoint(
-                    trainer,
-                    os.path.join(model_root, "checkpoint"),
-                    episode + 1,
-                    episode_rewards,
-                    episode_force_ratios,
-                    best_reward,
-                    best_episode,
-                    best_team_success_rate,
-                    best_team_sr_episode,
-                    best_team_sr_force_ratio,
-                    best_team_sr_reward,
-                    success_flags,
-                    agent_success_flags,
-                    team_success_flags,
-                    actor_losses_history,
-                    critic_losses_history,
-                )
+                if _env_flag_enabled("SAVE_TRAINING_RESUME_STATE", default=True):
+                    _save_checkpoint(
+                        trainer,
+                        os.path.join(model_root, "checkpoint"),
+                        episode + 1,
+                        episode_rewards,
+                        episode_force_ratios,
+                        best_reward,
+                        best_episode,
+                        best_team_success_rate,
+                        best_team_sr_episode,
+                        best_team_sr_force_ratio,
+                        best_team_sr_reward,
+                        success_flags,
+                        agent_success_flags,
+                        team_success_flags,
+                        actor_losses_history,
+                        critic_losses_history,
+                    )
 
             episode_time = time.time() - episode_start_time
             postfix_str = (
@@ -1332,24 +1350,25 @@ def train(args):
     final_dir = os.path.join(model_root, "final")
     if args.save_model:
         trainer.save_models(final_dir)
-        _save_checkpoint(
-            trainer,
-            os.path.join(model_root, "checkpoint"),
-            int(args.train_episodes),
-            episode_rewards,
-            episode_force_ratios,
-            best_reward,
-            best_episode,
-            best_team_success_rate,
-            best_team_sr_episode,
-            best_team_sr_force_ratio,
-            best_team_sr_reward,
-            success_flags,
-            agent_success_flags,
-            team_success_flags,
-            actor_losses_history,
-            critic_losses_history,
-        )
+        if _env_flag_enabled("SAVE_TRAINING_RESUME_STATE", default=True):
+            _save_checkpoint(
+                trainer,
+                os.path.join(model_root, "checkpoint"),
+                int(args.train_episodes),
+                episode_rewards,
+                episode_force_ratios,
+                best_reward,
+                best_episode,
+                best_team_success_rate,
+                best_team_sr_episode,
+                best_team_sr_force_ratio,
+                best_team_sr_reward,
+                success_flags,
+                agent_success_flags,
+                team_success_flags,
+                actor_losses_history,
+                critic_losses_history,
+            )
 
     num_episodes = len(agent_success_flags) if agent_success_flags else len(success_flags)
     agent_success_rates: List[float] = []

@@ -64,36 +64,22 @@ model_dirs_newest_first() {
 
 model_completed() {
   local model_dir="$1"
-  python3 - "$model_dir" "$TRAIN_EPISODES" <<'PY'
-import json
+  local seed="$2"
+  "$PYTHON_BIN" - "$model_dir" "$TRAIN_EPISODES" "$seed" <<'PY'
 import sys
 from pathlib import Path
 
-model_dir = Path(sys.argv[1])
-target = int(sys.argv[2])
-episodes = []
+from experiment_runtime_config import training_unit_completion_errors
 
-results_path = model_dir / "results.json"
-if results_path.exists():
-    try:
-        data = json.loads(results_path.read_text(encoding="utf-8"))
-        episodes.append(int(data.get("episodes", 0) or 0))
-    except Exception:
-        pass
-
-for state_path in model_dir.glob("*/checkpoint_state.json"):
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        continue
-    candidates = [int(state.get("episode", 0) or 0)]
-    for key in ("episode_rewards", "episode_force_ratios", "team_success_flags", "success_flags"):
-        value = state.get(key)
-        if isinstance(value, list):
-            candidates.append(len(value))
-    episodes.append(max(candidates))
-
-raise SystemExit(0 if episodes and max(episodes) >= target else 1)
+model_dir = Path(sys.argv[1]).resolve()
+errors = training_unit_completion_errors(
+    model_dir,
+    int(sys.argv[2]),
+    repo_root=model_dir.parent.parent,
+    expected_agents=3,
+    expected_seed=int(sys.argv[3]),
+)
+raise SystemExit(1 if errors else 0)
 PY
 }
 
@@ -102,7 +88,7 @@ latest_completed_model_dir() {
   local seed="$2"
   local candidate
   while IFS= read -r candidate; do
-    if [ -n "$candidate" ] && model_completed "$candidate"; then
+    if [ -n "$candidate" ] && model_completed "$candidate" "$seed"; then
       printf '%s\n' "$candidate"
       return 0
     fi
