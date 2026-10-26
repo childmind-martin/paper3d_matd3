@@ -427,6 +427,17 @@ class Scenario(BaseWeightedScenario):
                     ag.start_to_goal_dir = start_to_goal / _d
 
     def _compute_batch_rewards(self, agents_batch, world_batch, cache_key=None):
+        if getattr(self, 'paper_reward_profile', 'legacy') == 'paper_v1':
+            rewards = np.asarray(
+                [
+                    [BaseWeightedScenario.reward(self, agent, world) for agent in agents]
+                    for agents, world in zip(agents_batch, world_batch)
+                ],
+                dtype=np.float32,
+            )
+            if cache_key is not None:
+                self._reward_cache[cache_key] = rewards
+            return rewards
         scenario_batch, positions_batch, prev_positions_batch, actions_batch, start_positions_batch = (
             self._build_reward_inputs(agents_batch, world_batch)
         )

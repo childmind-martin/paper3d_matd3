@@ -90,6 +90,23 @@ from experiment_runtime_config import (
     runtime_environment_from_manifest,
 )
 from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
+from paper_experiment_schema import (
+    aggregate_episode_records,
+    atomic_write_json as atomic_write_paper_json,
+    build_episode_collection,
+    build_paper_run_manifest,
+    content_sha256 as paper_content_sha256,
+    episode_record_from_evaluation,
+    fingerprint_artifact,
+    write_episode_csv,
+)
+from paper_checkpoint_selection import validate_selection_result
+from paper_experiment_protocol import load_protocol
+from paper_task_bank import (
+    load_task_bank,
+    summarize_task_deadlines,
+    validate_dynamic_feasibility_audit,
+)
 
 _EVAL_NOISE_TYPE = "gaussian"
 _EVAL_NOISE_STREAM_MODE = "per_episode_seedsequence_pcg64_v1"
@@ -193,6 +210,9 @@ def _new_eval_diagnostics_accumulator():
         'pf_force_norm_sum': 0.0,
         'force_ratio_sum': 0.0,
         'action_diag_step_count': 0,
+        'action_diag_missing_steps': 0,
+        'pf_force_diag_missing_steps': 0,
+        'action_intervention_step_count': 0,
         'speed_sum': 0.0,
         'speed_step_count': 0,
         'semantic_gap_sum': 0.0,
@@ -815,22 +835,42 @@ def _accumulate_eval_step_diagnostics(acc, env, actions=None, raw_actions=None, 
     corr_norm = _mean_head_norm(actions)
     pf_norm = _mean_head_norm(pf_forces)
     delta_norm = None
+    intervention_active = False
     try:
         if actions is not None and raw_actions is not None:
             arr_corr = np.asarray(actions, dtype=np.float32)
             arr_raw = np.asarray(raw_actions, dtype=np.float32)
             if arr_corr.shape == arr_raw.shape and arr_corr.size > 0:
                 delta_norm = _mean_head_norm(arr_corr - arr_raw)
+                head_dim = min(3, int(arr_corr.shape[-1]))
+                if head_dim > 0:
+                    per_agent_delta = np.linalg.norm(
+                        arr_corr[..., :head_dim] - arr_raw[..., :head_dim],
+                        axis=-1,
+                    )
+                    finite_delta = per_agent_delta[np.isfinite(per_agent_delta)]
+                    intervention_active = bool(
+                        finite_delta.size > 0 and np.max(finite_delta) > 1e-6
+                    )
     except Exception:
         delta_norm = None
 
-    if any(v is not None for v in (raw_norm, corr_norm, delta_norm, pf_norm)) or action_force_ratio is not None:
-        _add_optional_mean(acc, 'raw_action_norm_sum', raw_norm)
-        _add_optional_mean(acc, 'corr_action_norm_sum', corr_norm)
-        _add_optional_mean(acc, 'action_delta_norm_sum', delta_norm)
-        _add_optional_mean(acc, 'pf_force_norm_sum', pf_norm)
-        _add_optional_mean(acc, 'force_ratio_sum', action_force_ratio)
-        acc['action_diag_step_count'] += 1
+    acc['action_diag_step_count'] += 1
+    if raw_norm is None or corr_norm is None or delta_norm is None:
+        acc['action_diag_missing_steps'] += 1
+    try:
+        positive_force_ratio = float(action_force_ratio) > 0.0
+    except (TypeError, ValueError):
+        positive_force_ratio = False
+    if positive_force_ratio and pf_norm is None:
+        acc['pf_force_diag_missing_steps'] += 1
+    _add_optional_mean(acc, 'raw_action_norm_sum', raw_norm)
+    _add_optional_mean(acc, 'corr_action_norm_sum', corr_norm)
+    _add_optional_mean(acc, 'action_delta_norm_sum', delta_norm)
+    _add_optional_mean(acc, 'pf_force_norm_sum', pf_norm)
+    _add_optional_mean(acc, 'force_ratio_sum', action_force_ratio)
+    if intervention_active:
+        acc['action_intervention_step_count'] += 1
 
     try:
         speeds = []
@@ -864,6 +904,16 @@ def _finalize_eval_diagnostics(acc):
             'avg_corr_action_norm': float(acc.get('corr_action_norm_sum', 0.0) / action_count),
             'avg_action_delta_norm': float(acc.get('action_delta_norm_sum', 0.0) / action_count),
             'mean_pf_force_norm': float(acc.get('pf_force_norm_sum', 0.0) / action_count),
+            'action_diag_step_count': int(acc.get('action_diag_step_count', 0)),
+            'action_diag_missing_steps': int(
+                acc.get('action_diag_missing_steps', 0)
+            ),
+            'pf_force_diag_missing_steps': int(
+                acc.get('pf_force_diag_missing_steps', 0)
+            ),
+            'action_intervention_step_fraction': float(
+                acc.get('action_intervention_step_count', 0) / action_count
+            ),
             'reward_diag_step_count': int(acc.get('reward_diag_step_count', 0)),
             'reward_diag_missing_steps': int(acc.get('reward_diag_missing_steps', 0)),
             'reward_total_before_clip_sum': float(acc.get('reward_total_before_clip_sum', 0.0)),
@@ -923,6 +973,50 @@ def _infer_episode_done_reason(success_flag, first_reach_step, step_count, episo
     except Exception:
         pass
     return 'early_done'
+
+
+def _resolve_episode_deadline(
+    world,
+    task_layout,
+    *,
+    fallback_steps,
+    require_task_contract=False,
+):
+    """Resolve and cross-check the authoritative horizon after environment reset."""
+    deadline = {}
+    if isinstance(task_layout, dict):
+        deadline = dict((task_layout.get('contract') or {}).get('deadline') or {})
+    if not deadline:
+        if require_task_contract:
+            raise RuntimeError("paper episode reset without immutable task deadline")
+        steps = max(1, int(fallback_steps))
+        dt = float(getattr(world, 'dt', os.getenv('SIMULATION_DT', '0.08')))
+        return {
+            'deadline_steps': steps,
+            'deadline_seconds': float(steps * dt),
+            'simulation_dt_seconds': dt,
+            'policy_id': 'legacy_global_episode_length',
+        }
+    try:
+        steps = int(deadline['deadline_steps'])
+        seconds = float(deadline['deadline_seconds'])
+        dt = float(deadline['simulation_dt_seconds'])
+        policy_id = str(deadline['policy_id']).strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("task deadline contract is incomplete") from exc
+    if steps <= 0 or seconds <= 0.0 or dt <= 0.0 or not policy_id:
+        raise RuntimeError("task deadline contract contains invalid values")
+    if not math.isclose(seconds, steps * dt, rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError("task deadline seconds/steps/dt are inconsistent")
+    world_steps = int(getattr(world, 'episode_length', 0) or 0)
+    world_dt = float(getattr(world, 'dt', 0.0) or 0.0)
+    if world_steps != steps:
+        raise RuntimeError(
+            f"world/task deadline mismatch: world={world_steps}, task={steps}"
+        )
+    if not math.isclose(world_dt, dt, rel_tol=0.0, abs_tol=1e-12):
+        raise RuntimeError(f"world/task simulation dt mismatch: world={world_dt}, task={dt}")
+    return deadline
 
 
 def _write_reward_decomposition_eval_csv(output_dir, episodes, args):
@@ -3093,10 +3187,60 @@ class ModelEvaluator:
         self.scenario = load_scenario_module(scenario_name, self.args)
         if self.scenario is None:
             raise RuntimeError(f"无法加载场景: {scenario_name}")
+        task_bank_info = getattr(self.scenario, 'paper_task_bank_info', None)
+        self._paper_task_bank_info = (
+            dict(task_bank_info) if isinstance(task_bank_info, dict) else None
+        )
+        if isinstance(task_bank_info, dict):
+            bank_runtime = dict(task_bank_info.get('runtime_config') or {})
+            for key, value in bank_runtime.items():
+                if hasattr(self.args, key):
+                    setattr(self.args, key, value)
+            self.args.paper_task_contract_enabled = True
+            configured_split = str(getattr(self.args, 'paper_split', '') or '').strip()
+            bank_split = str(task_bank_info.get('split_name', '') or '').strip()
+            if configured_split and configured_split != bank_split:
+                raise RuntimeError(
+                    f"--paper-split={configured_split!r} does not match task-bank "
+                    f"split={bank_split!r}"
+                )
+            self.args.paper_split = bank_split
         _apply_runtime_env_overrides_from_args(self.args)
         _apply_terrain_runtime_params_to_scenario(self.scenario, None, self.args)
         self.world = self.scenario.make_world()
         _apply_terrain_runtime_params_to_scenario(self.scenario, self.world, self.args)
+        if bool(getattr(self.scenario, 'paper_task_contract_enabled', False)):
+            if not isinstance(self._paper_task_bank_info, dict):
+                raise RuntimeError(
+                    "formal paper evaluation requires --paper-task-bank-manifest "
+                    "and --paper-task-bank-split; a procedural or single-layout "
+                    "evaluation is not a paper result"
+                )
+            split_role = str(
+                self._paper_task_bank_info.get('role', '') or ''
+            ).strip()
+            if split_role not in {
+                'validation', 'test_in_distribution', 'test_generalization'
+            }:
+                raise RuntimeError(
+                    f"paper evaluator cannot run task-bank role={split_role!r}"
+                )
+            if not bool(getattr(self.args, 'paper_eval_all_bank_tasks', True)):
+                raise RuntimeError(
+                    "formal paper evaluation requires --paper-eval-all-bank-tasks=true"
+                )
+            if int(getattr(self.args, 'eval_process_shards', 1) or 1) != 1:
+                raise RuntimeError(
+                    "formal paper evaluation currently forbids process shards; "
+                    "use in-process --eval-episode-parallelism so one atomic run "
+                    "manifest covers the complete split"
+                )
+            if str(getattr(self.scenario, 'paper_reward_profile', '')).strip() != 'paper_v1':
+                raise RuntimeError("paper evaluation requires paper_reward_profile='paper_v1'")
+            if not bool(getattr(self.world, 'hard_deadline_terminal', False)):
+                raise RuntimeError("paper evaluation requires hard deadline terminal semantics")
+            if not bool(getattr(self.world, 'paper_terminal_on_collision', False)):
+                raise RuntimeError("paper evaluation requires terminal-on-collision semantics")
         # 应用重力、控制增益与奖励缩放（仅在显式提供时覆盖）
         try:
             if hasattr(self.world, 'gravity') and getattr(self.args, 'gravity', None) is not None:
@@ -4394,13 +4538,78 @@ class ModelEvaluator:
         # 例如：models/调试分离梯度、无重力、无早停、预热、随机地图、高变FR低高低_exp_20251201_112141/final
         # 提取：调试分离梯度、无重力、无早停、预热、随机地图、高变FR低高低_exp_20251201_112141
         model_path = self.args.load_model_path
-        model_leaf_dir = os.path.basename(os.path.normpath(model_path))
-        # 移除 final/best/epXXX 等子目录
-        if _is_model_variant_dir_name(model_leaf_dir):
-            model_base_dir = os.path.dirname(model_path)
+        paper_training_metadata_path = os.path.join(
+            model_path, 'paper_training_checkpoint.json'
+        )
+        paper_checkpoint_force_ratio = None
+        paper_checkpoint_force_ratio_episode = None
+        if os.path.isfile(paper_training_metadata_path):
+            with open(paper_training_metadata_path, 'r', encoding='utf-8') as stream:
+                paper_training_metadata = json.load(stream)
+            if paper_training_metadata.get('schema_version') != (
+                'paper_training_checkpoint_v5'
+            ):
+                raise RuntimeError("paper training checkpoint metadata schema mismatch")
+            expected_paper_metadata_hash = paper_content_sha256(
+                {
+                    key: value
+                    for key, value in paper_training_metadata.items()
+                    if key != 'content_sha256'
+                }
+            )
+            if paper_training_metadata.get('content_sha256') != (
+                expected_paper_metadata_hash
+            ):
+                raise RuntimeError("paper training checkpoint metadata hash mismatch")
+            try:
+                paper_checkpoint_force_ratio = float(
+                    paper_training_metadata['checkpoint_action_force_ratio']
+                )
+                paper_checkpoint_force_ratio_episode = int(
+                    paper_training_metadata[
+                        'checkpoint_action_force_ratio_episode'
+                    ]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "paper training checkpoint lacks its exact force ratio"
+                ) from exc
+            if (
+                not np.isfinite(paper_checkpoint_force_ratio)
+                or not 0.0 <= paper_checkpoint_force_ratio <= 1.0
+                or paper_checkpoint_force_ratio_episode
+                != int(paper_training_metadata.get('completed_training_iterations', -1))
+            ):
+                raise RuntimeError(
+                    "paper training checkpoint force-ratio provenance is invalid"
+                )
+            paper_training_run_id = str(
+                paper_training_metadata.get('training_run_id', '') or ''
+            ).strip()
+            if not paper_training_run_id:
+                raise RuntimeError(
+                    "paper training checkpoint metadata lacks training_run_id"
+                )
+            ancestor = os.path.realpath(os.path.abspath(model_path))
+            model_base_dir = None
+            while ancestor != os.path.dirname(ancestor):
+                if os.path.basename(ancestor) == paper_training_run_id:
+                    model_base_dir = ancestor
+                    break
+                ancestor = os.path.dirname(ancestor)
+            if model_base_dir is None:
+                raise RuntimeError(
+                    "paper checkpoint path does not contain its training_run_id"
+                )
+            exp_name = paper_training_run_id
         else:
-            model_base_dir = model_path
-        exp_name = os.path.basename(model_base_dir)
+            model_leaf_dir = os.path.basename(os.path.normpath(model_path))
+            # 移除 final/best/epXXX 等子目录
+            if _is_model_variant_dir_name(model_leaf_dir):
+                model_base_dir = os.path.dirname(model_path)
+            else:
+                model_base_dir = model_path
+            exp_name = os.path.basename(model_base_dir)
         potential_log_dirs = [
             os.path.join("logs", exp_name),
             model_base_dir,
@@ -4415,6 +4624,12 @@ class ModelEvaluator:
         selected_force_ratio = None
         selected_force_ratio_label = None
         selected_force_ratio_episode = None
+        if paper_checkpoint_force_ratio is not None:
+            selected_force_ratio = float(paper_checkpoint_force_ratio)
+            selected_force_ratio_episode = int(
+                paper_checkpoint_force_ratio_episode
+            )
+            selected_force_ratio_label = '论文候选检查点'
         episode_force_ratios = None
         training_action_range_x = None
         training_action_range_y = None
@@ -4426,6 +4641,7 @@ class ModelEvaluator:
         training_matd3_use_separated_gradient = None
         training_maddpg_use_dual_q = None
         training_maddpg_use_separated_gradient = None
+        training_maddpg_action_semantics_mode = None
         training_gravity = None  # 🔧 新增：读取训练时的gravity
         training_damping = None  # 🔧 新增：读取训练时的damping
         training_reward_pos_scale = None
@@ -4606,6 +4822,10 @@ class ModelEvaluator:
                             training_maddpg_use_dual_q = bool(results['args']['maddpg_use_dual_q'])
                         if 'maddpg_use_separated_gradient' in results['args']:
                             training_maddpg_use_separated_gradient = bool(results['args']['maddpg_use_separated_gradient'])
+                        if 'maddpg_action_semantics_mode' in results['args']:
+                            training_maddpg_action_semantics_mode = str(
+                                results['args']['maddpg_action_semantics_mode']
+                            ).strip().lower()
                         # 🔧 新增：读取训练时的物理参数（如果值为None，保持None以便后续报错）
                         if 'gravity' in results['args']:
                             val = results['args']['gravity']
@@ -4670,6 +4890,10 @@ class ModelEvaluator:
                             training_maddpg_use_dual_q = bool(results['maddpg_use_dual_q'])
                         if 'maddpg_use_separated_gradient' in results:
                             training_maddpg_use_separated_gradient = bool(results['maddpg_use_separated_gradient'])
+                        if 'maddpg_action_semantics_mode' in results:
+                            training_maddpg_action_semantics_mode = str(
+                                results['maddpg_action_semantics_mode']
+                            ).strip().lower()
                         # 🔧 新增：从顶层读取物理参数（向后兼容，如果值为None，保持None以便后续报错）
                         if 'gravity' in results:
                             val = results['gravity']
@@ -4972,6 +5196,15 @@ class ModelEvaluator:
             matd3_use_separated_gradient=training_matd3_use_separated_gradient if training_matd3_use_separated_gradient is not None else getattr(self.args, 'matd3_use_separated_gradient', True),
             maddpg_use_dual_q=training_maddpg_use_dual_q if training_maddpg_use_dual_q is not None else getattr(self.args, 'maddpg_use_dual_q', False),
             maddpg_use_separated_gradient=training_maddpg_use_separated_gradient if training_maddpg_use_separated_gradient is not None else getattr(self.args, 'maddpg_use_separated_gradient', True),
+            maddpg_action_semantics_mode=(
+                training_maddpg_action_semantics_mode
+                if training_maddpg_action_semantics_mode is not None
+                else getattr(
+                    self.args,
+                    'maddpg_action_semantics_mode',
+                    'legacy',
+                )
+            ),
             # 🚨 关键修复：使用从训练配置读取的网络结构
             actor_hidden=actor_hidden,
             critic_hidden=critic_hidden,
@@ -5137,6 +5370,8 @@ class ModelEvaluator:
                 model_dir = fb
             else:
                 raise FileNotFoundError(f"找不到可用的权重文件，请检查目录: {self.args.load_model_path}")
+        self._loaded_model_dir = str(Path(model_dir).expanduser().resolve())
+        model_dir = self._loaded_model_dir
 
         # 先以虚拟输入构建网络，确保变量已创建。评估轻量模式只构建 Actor。
         try:
@@ -5358,6 +5593,441 @@ class ModelEvaluator:
 
         print("✅ 模型加载完成!")
 
+    def _prepare_paper_protocol_after_model_load(self):
+        """Validate data roles and bind the exact checkpoint before rollout."""
+        if not bool(getattr(self.scenario, 'paper_task_contract_enabled', False)):
+            return
+        task_bank_info = self._paper_task_bank_info
+        if not isinstance(task_bank_info, dict):
+            raise RuntimeError("paper protocol is missing task-bank provenance")
+
+        run_id = str(getattr(self.args, 'paper_run_id', '') or '').strip()
+        method_id = str(getattr(self.args, 'paper_method_id', '') or '').strip()
+        train_seed = getattr(self.args, 'paper_train_seed', None)
+        eval_seed = getattr(self.args, 'paper_eval_seed', None)
+        if not run_id or not method_id or train_seed is None or eval_seed is None:
+            raise RuntimeError(
+                "paper evaluation requires --paper-run-id, --paper-method-id, "
+                "--paper-train-seed, and --paper-eval-seed before rollout"
+            )
+        protocol_path_raw = str(
+            getattr(self.args, 'paper_experiment_protocol', '') or ''
+        ).strip()
+        if not protocol_path_raw:
+            raise RuntimeError(
+                "paper evaluation requires --paper-experiment-protocol"
+            )
+        protocol_path = Path(protocol_path_raw).expanduser().resolve()
+        experiment_protocol = load_protocol(protocol_path)
+        evaluation_device_requirement = dict(
+            (experiment_protocol.get('execution_environment') or {}).get(
+                'evaluation_device_requirement'
+            )
+            or {}
+        )
+        evaluation_device_environment = {
+            'CUDA_VISIBLE_DEVICES': evaluation_device_requirement.get(
+                'cuda_visible_devices'
+            ),
+            'TF_DETERMINISTIC_OPS': evaluation_device_requirement.get(
+                'tf_deterministic_ops'
+            ),
+            'TF_ENABLE_ONEDNN_OPTS': evaluation_device_requirement.get(
+                'tf_enable_onednn_opts'
+            ),
+            'TF_NUM_INTRAOP_THREADS': evaluation_device_requirement.get(
+                'tf_num_intraop_threads'
+            ),
+            'TF_NUM_INTEROP_THREADS': evaluation_device_requirement.get(
+                'tf_num_interop_threads'
+            ),
+            'OMP_NUM_THREADS': evaluation_device_requirement.get(
+                'omp_num_threads'
+            ),
+        }
+        evaluation_device_mismatches = {
+            key: {'expected': value, 'actual': os.environ.get(key)}
+            for key, value in evaluation_device_environment.items()
+            if value is None or os.environ.get(key) != str(value)
+        }
+        physical_eval_gpus = tf.config.list_physical_devices('GPU')
+        logical_eval_gpus = tf.config.list_logical_devices('GPU')
+        if (
+            evaluation_device_requirement.get('policy')
+            != 'tensorflow_cpu_deterministic_v1'
+            or evaluation_device_mismatches
+            or len(physical_eval_gpus)
+            > int(evaluation_device_requirement.get('maximum_physical_gpus', -1))
+            or len(logical_eval_gpus)
+            > int(evaluation_device_requirement.get('maximum_logical_gpus', -1))
+        ):
+            raise RuntimeError(
+                "paper evaluation device contract mismatch: "
+                + json.dumps(
+                    {
+                        'environment': evaluation_device_mismatches,
+                        'physical_gpus': [device.name for device in physical_eval_gpus],
+                        'logical_gpus': [device.name for device in logical_eval_gpus],
+                    },
+                    sort_keys=True,
+                )
+            )
+        self._paper_evaluation_device_provenance = {
+            'requirement': evaluation_device_requirement,
+            'environment': evaluation_device_environment,
+            'physical_gpus': [device.name for device in physical_eval_gpus],
+            'logical_gpus': [device.name for device in logical_eval_gpus],
+        }
+        evaluation_role = (
+            'validation'
+            if str(task_bank_info.get('role', '') or '').strip()
+            == 'validation'
+            else 'official_test'
+        )
+        if dict(experiment_protocol.get(evaluation_role) or {}).get(
+            'action_force_ratio_policy'
+        ) != 'checkpoint_specific_no_override':
+            raise RuntimeError(
+                "paper evaluation action force ratio policy mismatch"
+            )
+        if getattr(self.args, 'force_action_force_ratio', None) is not None:
+            raise RuntimeError(
+                "formal paper evaluation forbids force-action-force-ratio override"
+            )
+        method_spec = dict(
+            (experiment_protocol.get('methods') or {}).get(method_id) or {}
+        )
+        if not method_spec:
+            raise RuntimeError(
+                f"paper method={method_id!r} is absent from experiment protocol"
+            )
+        if str(method_spec.get('algorithm', '')).strip().lower() != str(
+            getattr(self.args, 'algorithm', '') or ''
+        ).strip().lower():
+            raise RuntimeError(
+                "paper protocol algorithm does not match evaluator arguments"
+            )
+        if int(train_seed) not in [
+            int(value) for value in experiment_protocol.get('train_seeds') or []
+        ]:
+            raise RuntimeError(
+                "paper train seed is absent from experiment protocol"
+            )
+        expected_method_environment = dict(method_spec.get('environment') or {})
+        method_environment_mismatches = {
+            key: {
+                'expected': str(expected),
+                'actual': os.environ.get(str(key)),
+            }
+            for key, expected in expected_method_environment.items()
+            if key != 'ACTION_FORCE_RATIO'
+            and os.environ.get(str(key)) != str(expected)
+        }
+        if method_environment_mismatches:
+            raise RuntimeError(
+                "paper evaluation method environment does not match protocol: "
+                + json.dumps(method_environment_mismatches, sort_keys=True)
+            )
+        if str(task_bank_info.get('bank_content_sha256', '')).strip() != str(
+            experiment_protocol['task_bank']['bank_content_sha256']
+        ):
+            raise RuntimeError(
+                "paper evaluation task bank does not match experiment protocol"
+            )
+        split_role = str(task_bank_info.get('role', '') or '').strip()
+        expected_eval_seed = int(
+            experiment_protocol[
+                'validation' if split_role == 'validation' else 'official_test'
+            ]['eval_seed']
+        )
+        if int(eval_seed) != expected_eval_seed:
+            raise RuntimeError(
+                "paper evaluation seed does not match experiment protocol"
+            )
+        experiment_protocol_fingerprint = fingerprint_artifact(protocol_path)
+        experiment_protocol_fingerprint['protocol_content_sha256'] = str(
+            experiment_protocol['content_sha256']
+        )
+        self._paper_experiment_protocol_fingerprint = (
+            experiment_protocol_fingerprint
+        )
+
+        checkpoint_dir = Path(self._loaded_model_dir).resolve()
+        training_metadata_path = checkpoint_dir / 'paper_training_checkpoint.json'
+        if not training_metadata_path.is_file():
+            raise RuntimeError(
+                "formal paper evaluation requires a periodic paper checkpoint "
+                f"with metadata: {training_metadata_path}"
+            )
+        with training_metadata_path.open('r', encoding='utf-8') as stream:
+            training_metadata = json.load(stream)
+        if training_metadata.get('schema_version') != 'paper_training_checkpoint_v5':
+            raise RuntimeError("paper training checkpoint metadata schema mismatch")
+        expected_metadata_hash = paper_content_sha256(
+            {
+                key: value
+                for key, value in training_metadata.items()
+                if key != 'content_sha256'
+            }
+        )
+        if training_metadata.get('content_sha256') != expected_metadata_hash:
+            raise RuntimeError("paper training checkpoint metadata hash mismatch")
+        checkpoint_force_ratio = float(
+            training_metadata.get('checkpoint_action_force_ratio', -1.0)
+        )
+        if (
+            not np.isfinite(checkpoint_force_ratio)
+            or not 0.0 <= checkpoint_force_ratio <= 1.0
+            or self._selected_checkpoint_force_ratio is None
+            or not math.isclose(
+                checkpoint_force_ratio,
+                float(self._selected_checkpoint_force_ratio),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                checkpoint_force_ratio,
+                float(self.args.action_force_ratio),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise RuntimeError("paper checkpoint/evaluation force ratio mismatch")
+        training_source_artifacts = training_metadata.get(
+            'training_source_artifacts'
+        )
+        if not isinstance(training_source_artifacts, list) or not training_source_artifacts:
+            raise RuntimeError("paper checkpoint lacks training source provenance")
+        source_logical_names = []
+        source_identity = []
+        for artifact in training_source_artifacts:
+            if not isinstance(artifact, dict):
+                raise RuntimeError("paper checkpoint has invalid source provenance")
+            logical_name = str(artifact.get('logical_name', '') or '').strip()
+            if not logical_name:
+                raise RuntimeError("paper checkpoint source logical_name is empty")
+            actual_source = fingerprint_artifact(artifact.get('path'))
+            if actual_source.get('sha256') != artifact.get('sha256'):
+                raise RuntimeError(
+                    f"paper training source changed after training: {logical_name}"
+                )
+            source_logical_names.append(logical_name)
+            source_identity.append(
+                {
+                    'logical_name': logical_name,
+                    'sha256': str(artifact.get('sha256', '')),
+                }
+            )
+        if len(source_logical_names) != len(set(source_logical_names)):
+            raise RuntimeError("paper checkpoint source logical names are duplicated")
+        if paper_content_sha256(source_identity) != str(
+            training_metadata.get('training_source_bundle_sha256', '') or ''
+        ):
+            raise RuntimeError("paper checkpoint training source bundle mismatch")
+        if int(training_metadata.get('train_seed')) != int(train_seed):
+            raise RuntimeError(
+                "paper checkpoint train seed does not match --paper-train-seed"
+            )
+        algorithm = str(getattr(self.args, 'algorithm', '') or '').strip().lower()
+        if str(training_metadata.get('algorithm', '')).strip().lower() != algorithm:
+            raise RuntimeError("paper checkpoint algorithm metadata mismatch")
+        scenario_name = str(getattr(self.args, 'scenario_name', '') or '').strip()
+        if str(training_metadata.get('scenario', '')).strip() != scenario_name:
+            raise RuntimeError("paper checkpoint scenario metadata mismatch")
+        if str(training_metadata.get('paper_method_id', '')).strip() != method_id:
+            raise RuntimeError("paper checkpoint method ID metadata mismatch")
+        if str(
+            training_metadata.get('experiment_protocol_content_sha256', '')
+        ) != str(experiment_protocol['content_sha256']):
+            raise RuntimeError("paper checkpoint experiment protocol mismatch")
+        expected_physics = dict(
+            (experiment_protocol.get('training') or {}).get('physics_contract') or {}
+        )
+        if dict(training_metadata.get('physics_contract') or {}) != expected_physics:
+            raise RuntimeError("paper checkpoint physics contract mismatch")
+        expected_task_semantics = dict(
+            (experiment_protocol.get('training') or {}).get(
+                'task_semantics_contract'
+            )
+            or {}
+        )
+        if dict(training_metadata.get('task_semantics_contract') or {}) != (
+            expected_task_semantics
+        ):
+            raise RuntimeError("paper checkpoint task semantics contract mismatch")
+        actual_task_semantics = {
+            'contract_id': expected_task_semantics.get('contract_id'),
+            'success_distance_threshold': float(
+                getattr(self.scenario, 'success_distance_threshold', float('nan'))
+            ),
+            'collision_distance_threshold': float(
+                getattr(self.scenario, 'collision_distance_threshold', float('nan'))
+            ),
+            'reference_surface_clearance': float(
+                getattr(
+                    self.scenario,
+                    'paper_task_reference_surface_clearance',
+                    float('nan'),
+                )
+            ),
+        }
+        if actual_task_semantics != expected_task_semantics:
+            raise RuntimeError(
+                "paper evaluation task semantics mismatch: "
+                f"actual={actual_task_semantics}, "
+                f"expected={expected_task_semantics}"
+            )
+        if (
+            float(getattr(self.args, 'success_distance_threshold', float('nan')))
+            != float(expected_task_semantics['success_distance_threshold'])
+            or float(
+                getattr(self.args, 'collision_distance_threshold', float('nan'))
+            ) != float(expected_task_semantics['collision_distance_threshold'])
+        ):
+            raise RuntimeError(
+                "paper evaluator arguments do not match task semantics contract"
+            )
+        self._paper_task_semantics_contract = expected_task_semantics
+        recorded_protocol_artifact = dict(
+            training_metadata.get('experiment_protocol') or {}
+        )
+        if recorded_protocol_artifact.get('sha256') != (
+            experiment_protocol_fingerprint.get('sha256')
+        ):
+            raise RuntimeError("paper checkpoint protocol artifact mismatch")
+        if not str(
+            training_metadata.get('checkpoint_resume_contract_sha256', '') or ''
+        ).strip():
+            raise RuntimeError("paper checkpoint lacks resume-contract fingerprint")
+
+        layouts = list(task_bank_info.get('layouts') or [])
+        evaluation_deadline_summary = summarize_task_deadlines(layouts)
+        self.args.paper_evaluation_deadline_summary = evaluation_deadline_summary
+        task_difficulties = {
+            str(layout.get('difficulty_bin', '') or '').strip() for layout in layouts
+        }
+        if len(task_difficulties) != 1:
+            raise RuntimeError(
+                f"paper evaluation split has mixed difficulties={sorted(task_difficulties)}"
+            )
+        evaluation_difficulty = next(iter(task_difficulties))
+        trained_difficulty = str(
+            training_metadata.get('trained_on_difficulty_bin', '') or ''
+        ).strip()
+        if str(training_metadata.get('task_bank_content_sha256', '')).strip() != str(
+            task_bank_info.get('bank_content_sha256', '') or ''
+        ).strip():
+            raise RuntimeError(
+                "paper checkpoint and evaluation split do not come from the same "
+                "immutable task-bank manifest"
+            )
+        if str(training_metadata.get('train_task_bank_split', '')).strip() != (
+            f"train_{trained_difficulty}"
+        ):
+            raise RuntimeError("paper checkpoint train split metadata mismatch")
+        if not str(training_metadata.get('training_run_id', '') or '').strip():
+            raise RuntimeError("paper checkpoint lacks training_run_id")
+        if not str(
+            training_metadata.get('checkpoint_resume_contract_sha256', '') or ''
+        ).strip():
+            raise RuntimeError(
+                "paper checkpoint lacks checkpoint resume-contract fingerprint"
+            )
+        training_deadline_summaries = training_metadata.get(
+            'training_task_deadline_summaries'
+        )
+        if not isinstance(training_deadline_summaries, dict):
+            raise RuntimeError(
+                "paper checkpoint lacks training task deadline summaries"
+            )
+        manifest = load_task_bank(task_bank_info['manifest_path'])
+        feasibility_errors = validate_dynamic_feasibility_audit(manifest)
+        if feasibility_errors:
+            raise RuntimeError(
+                "formal paper evaluation requires a complete dynamic feasibility "
+                "audit: " + "; ".join(feasibility_errors)
+            )
+        train_split_name = str(
+            training_metadata.get('train_task_bank_split', '') or ''
+        ).strip()
+        persisted_train_split = dict(
+            (manifest.get('splits') or {}).get(train_split_name) or {}
+        )
+        if not persisted_train_split:
+            raise RuntimeError(
+                f"paper checkpoint train split={train_split_name!r} is absent "
+                "from the immutable task bank"
+            )
+        if training_deadline_summaries.get(train_split_name) != (
+            persisted_train_split.get('deadline_summary')
+        ):
+            raise RuntimeError(
+                "paper checkpoint training deadline summary does not match task bank"
+            )
+        safety_cap_steps = int(
+            training_metadata.get('episode_safety_cap_steps', 0) or 0
+        )
+        if safety_cap_steps <= 0:
+            raise RuntimeError("paper checkpoint lacks a positive episode safety cap")
+        if split_role == 'test_generalization':
+            if trained_difficulty != 'C3':
+                raise RuntimeError(
+                    "generalization tests require a checkpoint trained on C3"
+                )
+        elif trained_difficulty != evaluation_difficulty:
+            raise RuntimeError(
+                "paper checkpoint/evaluation difficulty mismatch: "
+                f"trained={trained_difficulty!r}, eval={evaluation_difficulty!r}"
+            )
+
+        checkpoint_fingerprint = fingerprint_artifact(checkpoint_dir)
+        checkpoint_fingerprint['training_checkpoint_metadata'] = training_metadata
+        self._paper_checkpoint_fingerprint = checkpoint_fingerprint
+        self._paper_checkpoint_selection_fingerprint = None
+
+        selection_path_raw = str(
+            getattr(self.args, 'paper_selection_result', '') or ''
+        ).strip()
+        if split_role == 'validation':
+            if selection_path_raw:
+                raise RuntimeError(
+                    "validation evaluation must not consume a checkpoint selection result"
+                )
+            return
+        if not selection_path_raw:
+            raise RuntimeError(
+                "paper test evaluation requires --paper-selection-result produced "
+                "only from validation runs"
+            )
+        selection_path = Path(selection_path_raw).expanduser().resolve()
+        with selection_path.open('r', encoding='utf-8') as stream:
+            selection = validate_selection_result(json.load(stream))
+        if selection['selected_checkpoint']['sha256'] != checkpoint_fingerprint['sha256']:
+            raise RuntimeError(
+                "loaded checkpoint is not the exact validation-selected checkpoint"
+            )
+        if int(selection.get('train_seed')) != int(train_seed):
+            raise RuntimeError("checkpoint selection train seed mismatch")
+        selected_candidates = [
+            candidate
+            for candidate in selection.get('candidates_ranked', [])
+            if candidate.get('label') == selection.get('selected_label')
+        ]
+        if len(selected_candidates) != 1:
+            raise RuntimeError("checkpoint selection selected candidate is ambiguous")
+        if str(selected_candidates[0].get('algorithm', '')).strip() != method_id:
+            raise RuntimeError("checkpoint selection paper method ID mismatch")
+        if str(selection.get('validation_split', '')).strip() == str(
+            task_bank_info.get('split_name', '') or ''
+        ).strip():
+            raise RuntimeError("test split cannot be the validation selection split")
+        self._paper_checkpoint_selection_fingerprint = fingerprint_artifact(
+            selection_path
+        )
+        self._paper_checkpoint_selection_fingerprint[
+            'selection_content_sha256'
+        ] = selection['content_sha256']
+
     def _init_batched_episode_state(self, eval_ctx):
         """初始化一个 batch 子回合的统计状态。"""
         episode_idx = int(eval_ctx.episode_idx)
@@ -5370,6 +6040,22 @@ class ModelEvaluator:
             obs_n, _ = reset_result
         else:
             obs_n = reset_result
+        task_layout = copy.deepcopy(
+            getattr(getattr(env, 'world', None), 'current_task_layout', None)
+        )
+        if bool(getattr(self.args, 'paper_task_contract_enabled', False)) and not isinstance(task_layout, dict):
+            raise RuntimeError(
+                f"paper evaluation episode={episode_idx} reset without current_task_layout"
+            )
+        paper_contract_enabled = bool(
+            getattr(self.args, 'paper_task_contract_enabled', False)
+        )
+        episode_deadline = _resolve_episode_deadline(
+            world,
+            task_layout,
+            fallback_steps=getattr(self.args, 'episode_length', 2200),
+            require_task_contract=paper_contract_enabled,
+        )
 
         # reset_world 才会根据本回合上下文最终生成动态障碍。这里必须在
         # reset 之后回填实际种子，否则 batch 路径会把已使用的障碍种子
@@ -5402,10 +6088,7 @@ class ModelEvaluator:
             success_threshold = float(getattr(self.args, 'success_distance_threshold', 4.0))
         except Exception:
             success_threshold = 4.0
-        try:
-            simulation_dt = float(getattr(world, 'dt', os.getenv('SIMULATION_DT', '0.08')))
-        except Exception:
-            simulation_dt = 0.08
+        simulation_dt = float(episode_deadline['simulation_dt_seconds'])
 
         agent_first_reach_steps = []
         for pos, goal in zip(initial_positions, agent_goal_positions):
@@ -5460,6 +6143,10 @@ class ModelEvaluator:
             'step_count': 0,
             'prev_positions': [pos.copy() if pos is not None else None for pos in initial_positions],
             'agent_path_lengths': [0.0 for _ in initial_positions],
+            'agent_min_clearances': [float('inf') for _ in initial_positions],
+            'agent_control_effort': [0.0 for _ in initial_positions],
+            'task_layout': task_layout,
+            'task_deadline': copy.deepcopy(episode_deadline),
             'direct_goal_distances': direct_goal_distances,
             'agent_goal_positions': agent_goal_positions,
             'agent_min_goal_distances': agent_min_goal_distances,
@@ -5488,7 +6175,8 @@ class ModelEvaluator:
             'episode_inter_agent_collision_counts': [0] * len(getattr(env, 'agents', []) or []),
             'episode_inter_agent_collision_pair_count': 0,
             'episode_min_inter_agent_clearance': None,
-            'episode_length': int(getattr(self.args, 'episode_length', 2200) or 2200),
+            'episode_length': int(episode_deadline['deadline_steps']),
+            'paper_contract_enabled': paper_contract_enabled,
             'eval_diagnostics': _new_eval_diagnostics_accumulator(),
             'eval_noise_streams': self._make_eval_noise_streams(episode_idx),
         }
@@ -5565,6 +6253,26 @@ class ModelEvaluator:
             pf_forces=pf_forces,
             action_force_ratio=getattr(self.args, 'action_force_ratio', 0.0),
         )
+        try:
+            executed = np.asarray(actions, dtype=np.float64)
+            for agent_index in range(min(len(state['agent_control_effort']), executed.shape[0])):
+                head = executed[agent_index, :3]
+                state['agent_control_effort'][agent_index] += float(
+                    np.dot(head, head) * state.get('simulation_dt', 0.08)
+                )
+        except Exception:
+            pass
+        for agent_index, agent in enumerate(getattr(env, 'agents', []) or []):
+            if agent_index >= len(state['agent_min_clearances']):
+                break
+            try:
+                clearance = float((getattr(agent, 'debug_info', {}) or {}).get('d_min_current'))
+            except Exception:
+                continue
+            if np.isfinite(clearance):
+                state['agent_min_clearances'][agent_index] = min(
+                    state['agent_min_clearances'][agent_index], clearance
+                )
         if state.get('save_gazebo_dynamic_replay'):
             state['episode_dynamic_state_history'].append(_capture_agent_dynamic_states(env.agents))
             state['episode_dynamic_time_history'].append(float(state['step_count'] * state.get('simulation_dt', 0.08)))
@@ -5645,7 +6353,17 @@ class ModelEvaluator:
                 state['team_first_reach_step'] = state['step_count']
 
         state['processed_obs'] = self._process_observations_for_eval(next_obs_n)
-        if all(done_n) and (not getattr(self.args, 'disable_early_termination', False)):
+        all_done = bool(all(done_n))
+        if (
+            state.get('paper_contract_enabled')
+            and state['step_count'] >= int(state['episode_length'])
+            and not all_done
+        ):
+            raise RuntimeError(
+                "paper environment reached the immutable task deadline without "
+                "emitting terminal done flags"
+            )
+        if all_done and (not getattr(self.args, 'disable_early_termination', False)):
             state['done'] = True
         return info_n
 
@@ -5715,6 +6433,7 @@ class ModelEvaluator:
         except Exception:
             pass
 
+        agent_reached_flags = []
         agent_success_flags = []
         agent_safe_flags = []
         team_success_flag = 1
@@ -5730,6 +6449,7 @@ class ModelEvaluator:
             for agent_idx, agent in enumerate(getattr(getattr(env, 'world', None), 'agents', [])):
                 pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
                 if pos is None or len(pos) < 3:
+                    agent_reached_flags.append(0)
                     agent_success_flags.append(0)
                     team_success_flag = 0
                     continue
@@ -5739,6 +6459,7 @@ class ModelEvaluator:
                 if ag_goal is None:
                     ag_goal = goal_pos
                 if ag_goal is None:
+                    agent_reached_flags.append(0)
                     agent_success_flags.append(0)
                     team_success_flag = 0
                     continue
@@ -5746,6 +6467,7 @@ class ModelEvaluator:
                 dy = pos[1] - ag_goal[1]
                 dz = pos[2] - ag_goal[2]
                 reach_i = ((dx * dx + dy * dy + dz * dz) ** 0.5) <= thr_success
+                agent_reached_flags.append(1 if reach_i else 0)
                 safe_i = True
                 for attr in ('_episode_has_collision', '_had_obstacle_collision', '_had_terrain_contact_or_penetration'):
                     try:
@@ -5768,12 +6490,14 @@ class ModelEvaluator:
                 if succ_i == 0:
                     team_success_flag = 0
         except Exception:
+            agent_reached_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             agent_success_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             agent_safe_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             team_success_flag = 0
 
         world_snapshot = _get_world_success_snapshot(env, expected_count=len(episode_collision_counts))
         if world_snapshot is not None:
+            agent_reached_flags = world_snapshot['reach_flags']
             agent_safe_flags = world_snapshot['safe_flags']
             agent_success_flags = world_snapshot['success_flags']
             team_success_flag = world_snapshot['team_success']
@@ -5865,10 +6589,20 @@ class ModelEvaluator:
         if world_snapshot is not None and world_snapshot.get('done_reason'):
             episode_done_reason = world_snapshot['done_reason']
 
+        agent_energy_consumed = []
+        for agent in getattr(env, 'agents', []) or []:
+            try:
+                value = float(getattr(agent, 'energy_consumed'))
+            except Exception:
+                value = float('nan')
+            agent_energy_consumed.append(value)
+
         return {
             'episode': episode_idx,
             'reward': state['episode_reward'],
             'steps': state['step_count'],
+            'episode_length': int(state['episode_length']),
+            'task_deadline': copy.deepcopy(state.get('task_deadline')),
             'trajectory': state['episode_trajectory'] if state.get('record_trajectory') else [],
             'actions_history': state['episode_actions_history'] if state.get('record_actions') else [],
             'executed_actions_history': state['episode_executed_actions_history'] if state.get('save_control_diagnostics') else [],
@@ -5894,6 +6628,7 @@ class ModelEvaluator:
             'min_distance': min_distance_stat,
             'success': success_flag,
             'agent_success_flags': agent_success_flags,
+            'agent_reached_flags': agent_reached_flags,
             'agent_safe_flags': agent_safe_flags,
             'team_success': team_success_flag,
             'arrival_step': arrival_step,
@@ -5911,6 +6646,10 @@ class ModelEvaluator:
             'agent_first_reach_steps': [int(v) if v is not None else None for v in state['agent_first_reach_steps']],
             'path_efficiency': path_efficiency,
             'agent_path_efficiencies': agent_path_efficiencies,
+            'agent_min_clearances': [float(value) for value in state['agent_min_clearances']],
+            'agent_energy_consumed': agent_energy_consumed,
+            'agent_control_effort': [float(value) for value in state['agent_control_effort']],
+            'task_layout': state.get('task_layout'),
             'penetration_stat': penetration_stat,
             'reward_decomposition': reward_decomposition,
             'diagnostic_metrics': diagnostic_metrics,
@@ -5926,11 +6665,7 @@ class ModelEvaluator:
     def _evaluate_episode_batch(self, episode_contexts):
         """方案A：单进程内多 episode 上下文，batch actor/PF 推理，可选并行 env.step。"""
         states = [self._init_batched_episode_state(eval_ctx) for eval_ctx in episode_contexts]
-        try:
-            episode_length = int(getattr(self.args, 'episode_length', 2200) or 2200)
-        except Exception:
-            episode_length = 2200
-        episode_length = max(1, episode_length)
+        episode_length = max(int(state['episode_length']) for state in states)
 
         use_tf_potential_field = getattr(self.args, 'use_tf_potential_field', True)
         action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
@@ -6082,8 +6817,17 @@ class ModelEvaluator:
         episode_data = []
         for state in states:
             if state.get('failed'):
+                if state.get('paper_contract_enabled'):
+                    raise RuntimeError(
+                        f"paper batch episode={state['episode']} failed"
+                    ) from state.get('error')
                 print(f"❌ 回合 {state['episode'] + 1} batch评估失败: {state.get('error')}")
                 continue
+            if state.get('paper_contract_enabled') and not state.get('done'):
+                raise RuntimeError(
+                    f"paper batch episode={state['episode']} ended outside an "
+                    "authoritative terminal transition"
+                )
             episode_data.append(self._finalize_batched_episode_state(state))
         return sorted(episode_data, key=lambda item: int(item.get('episode', 0)))
         
@@ -6127,6 +6871,21 @@ class ModelEvaluator:
             obs_n, _ = reset_result
         else:
             obs_n = reset_result
+        task_layout = copy.deepcopy(
+            getattr(getattr(self.env, 'world', None), 'current_task_layout', None)
+        )
+        if bool(getattr(self.args, 'paper_task_contract_enabled', False)) and not isinstance(task_layout, dict):
+            raise RuntimeError(
+                f"paper evaluation episode={episode_idx} reset without current_task_layout"
+            )
+        episode_deadline = _resolve_episode_deadline(
+            self.world,
+            task_layout,
+            fallback_steps=getattr(self.args, 'episode_length', 2200),
+            require_task_contract=bool(
+                getattr(self.args, 'paper_task_contract_enabled', False)
+            ),
+        )
 
         gazebo_live_launch = None
         gazebo_live_launch_error = None
@@ -6200,6 +6959,8 @@ class ModelEvaluator:
         agent_goal_positions = _extract_agent_goal_positions(self.world, self.scenario)
         prev_positions = [pos.copy() if pos is not None else None for pos in initial_positions]
         agent_path_lengths = [0.0 for _ in initial_positions]
+        agent_min_clearances = [float('inf') for _ in initial_positions]
+        agent_control_effort = [0.0 for _ in initial_positions]
         direct_goal_distances = [
             _distance_3d(pos, goal) for pos, goal in zip(initial_positions, agent_goal_positions)
         ]
@@ -6210,12 +6971,7 @@ class ModelEvaluator:
             success_threshold = float(getattr(self.args, 'success_distance_threshold', 4.0))
         except Exception:
             success_threshold = 4.0
-        try:
-            simulation_dt = float(
-                getattr(getattr(self.env, 'world', None), 'dt', os.getenv('SIMULATION_DT', '0.08'))
-            )
-        except Exception:
-            simulation_dt = 0.08
+        simulation_dt = float(episode_deadline['simulation_dt_seconds'])
         agent_first_reach_steps = []
         for pos, goal in zip(initial_positions, agent_goal_positions):
             dist_to_goal = _distance_3d(pos, goal)
@@ -6276,6 +7032,7 @@ class ModelEvaluator:
         episode_dynamic_executed_action_history = []
         episode_dynamic_pf_force_history = []
         step_count = 0
+        authoritative_done_observed = False
         episode_inter_agent_collision_counts = [0] * len(getattr(self.env, 'agents', []) or [])
         episode_inter_agent_collision_pair_count = 0
         episode_min_inter_agent_clearance = None
@@ -6518,12 +7275,8 @@ class ModelEvaluator:
         # 记录开始时间
         start_time = time.time()
         
-        # 🚨 关键修复：确保episode_length正确设置
-        episode_length = getattr(self.args, 'episode_length', 2200)
-        if episode_length <= 0:
-            episode_length = 2200
-            if not quiet_output:
-                print(f"⚠️  警告: episode_length无效，使用默认值: {episode_length}")
+        # The reset task, not a historical global CLI value, owns the horizon.
+        episode_length = int(episode_deadline['deadline_steps'])
         
         # 🔧 新增：打印关键评估参数，便于调试
         action_force_ratio = getattr(self.args, 'action_force_ratio', 0.0)
@@ -7138,6 +7891,26 @@ class ModelEvaluator:
                 pf_forces=pf_forces,
                 action_force_ratio=action_force_ratio,
             )
+            try:
+                executed = np.asarray(actions, dtype=np.float64)
+                for agent_index in range(min(len(agent_control_effort), executed.shape[0])):
+                    head = executed[agent_index, :3]
+                    agent_control_effort[agent_index] += float(
+                        np.dot(head, head) * simulation_dt
+                    )
+            except Exception:
+                pass
+            for agent_index, agent in enumerate(getattr(self.env, 'agents', []) or []):
+                if agent_index >= len(agent_min_clearances):
+                    break
+                try:
+                    clearance = float((getattr(agent, 'debug_info', {}) or {}).get('d_min_current'))
+                except Exception:
+                    continue
+                if np.isfinite(clearance):
+                    agent_min_clearances[agent_index] = min(
+                        agent_min_clearances[agent_index], clearance
+                    )
             if save_gazebo_dynamic_replay:
                 episode_dynamic_state_history.append(_capture_agent_dynamic_states(self.env.agents))
                 episode_dynamic_time_history.append(float(step_count * simulation_dt))
@@ -7310,6 +8083,7 @@ class ModelEvaluator:
             
             # 检查结束条件（支持禁用提前终止）
             if all(done_n) and (not getattr(self.args, 'disable_early_termination', False)):
+                authoritative_done_observed = True
                 # 🔧 性能优化：只在进度条启用时更新
                 if not tqdm_disable:
                     pbar.set_postfix({
@@ -7321,6 +8095,15 @@ class ModelEvaluator:
                 if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
                     tqdm.write(f"📍 回合在第 {step + 1}/{episode_length} 步自然结束（所有智能体done）", file=tqdm_file)
                 break
+
+        if (
+            bool(getattr(self.args, 'paper_task_contract_enabled', False))
+            and not authoritative_done_observed
+        ):
+            raise RuntimeError(
+                f"paper episode={episode_idx} ended without an authoritative "
+                "terminal transition"
+            )
                 
         # 🔧 修复：在循环结束后更新最终状态
         # 🔧 性能优化：只在进度条启用时更新
@@ -7477,6 +8260,7 @@ class ModelEvaluator:
         #       Safe_i := 整个回合期间无真实碰撞/真实穿透
         #       Succ_i := Reach_i ∧ Safe_i
         #       Succ_team := Λ_{i=1}^{M} Succ_i
+        agent_reached_flags = []
         agent_success_flags = []
         agent_safe_flags = []
         team_success_flag = 1
@@ -7497,6 +8281,7 @@ class ModelEvaluator:
                     # 检查是否到达目标（Reach_i）
                     pos = getattr(getattr(agent, 'state', None), 'p_pos', None)
                     if pos is None or len(pos) < 3:
+                        agent_reached_flags.append(0)
                         agent_success_flags.append(0)
                         team_success_flag = 0
                         continue
@@ -7509,6 +8294,7 @@ class ModelEvaluator:
                         ag_goal = goal_pos
                     
                     if ag_goal is None:
+                        agent_reached_flags.append(0)
                         agent_success_flags.append(0)
                         team_success_flag = 0
                         continue
@@ -7520,6 +8306,7 @@ class ModelEvaluator:
                     dist_goal_3d = (dx*dx + dy*dy + dz*dz) ** 0.5
                     # 统一阈值：评估侧不再乘 1.2
                     reach_i = (dist_goal_3d <= thr_success)
+                    agent_reached_flags.append(1 if reach_i else 0)
                     
                     # 检查是否无碰撞（Safe_i）
                     safe_i = True
@@ -7561,12 +8348,14 @@ class ModelEvaluator:
         except Exception as e:
             if not os.getenv("QUIET_OUTPUT", "1").lower() in ("1", "true", "yes", "on"):
                 print(f"⚠️  计算成功标志时出错: {e}")
+            agent_reached_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             agent_success_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             agent_safe_flags = [0] * len(episode_collision_counts) if episode_collision_counts else []
             team_success_flag = 0
 
         world_snapshot = _get_world_success_snapshot(self.env, expected_count=len(episode_collision_counts))
         if world_snapshot is not None:
+            agent_reached_flags = world_snapshot['reach_flags']
             agent_safe_flags = world_snapshot['safe_flags']
             agent_success_flags = world_snapshot['success_flags']
             team_success_flag = world_snapshot['team_success']
@@ -7676,6 +8465,13 @@ class ModelEvaluator:
             episode_done_reason = world_snapshot['done_reason']
         if gazebo_first_contact_step is not None and gazebo_live_contact_terminates:
             episode_done_reason = "gazebo_hard_contact"
+        agent_energy_consumed = []
+        for agent in getattr(self.env, 'agents', []) or []:
+            try:
+                value = float(getattr(agent, 'energy_consumed'))
+            except Exception:
+                value = float('nan')
+            agent_energy_consumed.append(value)
         
         if not quiet_output:
             print(f"✅ 回合 {episode_idx + 1} 完成:")
@@ -7811,6 +8607,7 @@ class ModelEvaluator:
             'reward': episode_reward,
             'steps': step_count,
             'episode_length': int(episode_length),
+            'task_deadline': copy.deepcopy(episode_deadline),
             'trajectory': episode_trajectory if record_trajectory else [],
             'actions_history': episode_actions_history if record_actions else [],
             'executed_actions_history': episode_executed_actions_history if save_control_diagnostics else [],
@@ -7984,6 +8781,7 @@ class ModelEvaluator:
             'min_distance': min_distance_stat,
             'success': success_flag,
             'agent_success_flags': agent_success_flags,
+            'agent_reached_flags': agent_reached_flags,
             'agent_safe_flags': agent_safe_flags,
             'team_success': team_success_flag,
             # 🔧 新增：到达时间/步数
@@ -8002,6 +8800,10 @@ class ModelEvaluator:
             'agent_first_reach_steps': [int(v) if v is not None else None for v in agent_first_reach_steps],
             'path_efficiency': path_efficiency,
             'agent_path_efficiencies': agent_path_efficiencies,
+            'agent_min_clearances': [float(value) for value in agent_min_clearances],
+            'agent_energy_consumed': agent_energy_consumed,
+            'agent_control_effort': [float(value) for value in agent_control_effort],
+            'task_layout': task_layout,
             # 🔧 新增：穿透深度统计
             'penetration_stat': penetration_stat,
             'reward_decomposition': reward_decomposition,
@@ -8619,6 +9421,7 @@ class ModelEvaluator:
         
         # 加载模型
         self.load_model()
+        self._prepare_paper_protocol_after_model_load()
         
         # 评估统计
         all_rewards = []
@@ -9096,9 +9899,29 @@ class ModelEvaluator:
                 or 1
             ),
         )
-        eval_episode_count = max(1, int(self.args.eval_episodes))
         eval_episode_start_index = max(0, _env_int("EVAL_EPISODE_START_INDEX", 0))
+        task_bank_layouts = list(
+            getattr(self.scenario, 'paper_task_bank_layouts', []) or []
+        )
+        if (
+            task_bank_layouts
+            and bool(getattr(self.args, 'paper_eval_all_bank_tasks', True))
+            and 'EVAL_EPISODE_START_INDEX' not in os.environ
+        ):
+            eval_episode_count = len(task_bank_layouts) - eval_episode_start_index
+        else:
+            eval_episode_count = max(1, int(self.args.eval_episodes))
+        if eval_episode_count <= 0:
+            raise RuntimeError(
+                f"no task-bank tasks remain at start index={eval_episode_start_index}"
+            )
         eval_episode_stop_index = eval_episode_start_index + eval_episode_count
+        if task_bank_layouts and eval_episode_stop_index > len(task_bank_layouts):
+            raise RuntimeError(
+                f"task-bank split={getattr(self.scenario, 'paper_task_bank_split', '')} "
+                f"contains {len(task_bank_layouts)} tasks, but requested episode range "
+                f"[{eval_episode_start_index}, {eval_episode_stop_index})"
+            )
         eval_episode_parallelism = min(eval_episode_parallelism, eval_episode_count)
         use_batched_episode_eval = eval_episode_parallelism > 1
         if use_batched_episode_eval and str(getattr(self.args, 'apf_backend', 'python_original')).strip().lower() == 'gazebo_apf':
@@ -9670,6 +10493,217 @@ class ModelEvaluator:
             print(f"⚠️  Success/reward一致性报告生成失败: {success_diag_e}")
             traceback.print_exc()
 
+        # 论文任务契约启用时，严格导出独立于历史 evaluation_results.json 的
+        # 版本化记录；任何缺失 task/seed/终止/逐智能体指标都会中止写出。
+        paper_artifacts = {}
+        if bool(getattr(self.args, 'paper_task_contract_enabled', False)):
+            run_id = str(getattr(self.args, 'paper_run_id', '') or '').strip()
+            split_name = str(getattr(self.args, 'paper_split', '') or '').strip()
+            train_seed = getattr(self.args, 'paper_train_seed', None)
+            eval_seed = getattr(self.args, 'paper_eval_seed', None)
+            missing_identity = []
+            if not run_id:
+                missing_identity.append('--paper-run-id')
+            if not split_name:
+                missing_identity.append('--paper-split')
+            if train_seed is None:
+                missing_identity.append('--paper-train-seed')
+            if eval_seed is None:
+                missing_identity.append('--paper-eval-seed')
+            if missing_identity:
+                raise RuntimeError(
+                    "paper evaluation identity is incomplete: "
+                    + ', '.join(missing_identity)
+                )
+            if bool(getattr(self.args, 'disable_early_termination', False)):
+                raise RuntimeError(
+                    "paper evaluation forbids --disable-early-termination because it "
+                    "would step beyond the authoritative terminal transition"
+                )
+            if float(getattr(self.args, 'eval_noise_scale', 0.0) or 0.0) != 0.0:
+                raise RuntimeError("paper evaluation requires --eval-noise-scale=0")
+            if float(getattr(self.args, 'eval_random_action_prob', 0.0) or 0.0) != 0.0:
+                raise RuntimeError("paper evaluation requires --eval-random-action-prob=0")
+
+            paper_records = [
+                episode_record_from_evaluation(
+                    episode,
+                    run_id=run_id,
+                    algorithm=str(self.args.paper_method_id),
+                    split=split_name,
+                    train_seed=int(train_seed),
+                    eval_seed=int(eval_seed),
+                )
+                for episode in all_episodes_data
+            ]
+            task_bank_info = self._paper_task_bank_info
+            split_role = str(task_bank_info.get('role', '') or '').strip()
+            expected_task_ids = [
+                str(layout.get('task_id', ''))
+                for layout in list(task_bank_info.get('layouts') or [])
+            ]
+            actual_task_ids = [record['task_id'] for record in paper_records]
+            if actual_task_ids != expected_task_ids:
+                raise RuntimeError(
+                    "paper evaluation did not produce exactly one ordered record "
+                    "for every immutable split task"
+                )
+            paper_aggregate = aggregate_episode_records(paper_records)
+            records_path = os.path.join(
+                self.args.save_viz_path, 'paper_episode_records.json'
+            )
+            csv_path = os.path.join(
+                self.args.save_viz_path, 'paper_episode_records.csv'
+            )
+            aggregate_path = os.path.join(
+                self.args.save_viz_path, 'paper_aggregate.json'
+            )
+            paper_collection = build_episode_collection(
+                paper_records,
+                run_id=run_id,
+                split=split_name,
+            )
+            atomic_write_paper_json(records_path, paper_collection)
+            write_episode_csv(csv_path, paper_records)
+            atomic_write_paper_json(aggregate_path, paper_aggregate)
+
+            output_fingerprints = {
+                'episode_records_json': fingerprint_artifact(records_path),
+                'episode_records_csv': fingerprint_artifact(csv_path),
+                'aggregate_json': fingerprint_artifact(aggregate_path),
+            }
+            manifest_path = Path(task_bank_info['manifest_path']).resolve()
+            task_bank_fingerprint = fingerprint_artifact(manifest_path.parent)
+            task_bank_fingerprint.update(
+                {
+                    'manifest_path': str(manifest_path),
+                    'bank_id': str(task_bank_info['bank_id']),
+                    'bank_content_sha256': str(
+                        task_bank_info['bank_content_sha256']
+                    ),
+                    'split': split_name,
+                    'split_role': split_role,
+                    'split_task_count': len(expected_task_ids),
+                    'split_task_ids_sha256': paper_content_sha256(
+                        expected_task_ids
+                    ),
+                }
+            )
+
+            repo_root = Path(__file__).resolve().parent
+            source_paths = [
+                Path(__file__).resolve(),
+                repo_root / 'run_evaluation.sh',
+                repo_root / 'paper3d_train_optimized.py',
+                repo_root / 'experiment_runtime_config.py',
+                repo_root / 'paper_curriculum.py',
+                repo_root / 'paper_experiment_protocol.py',
+                repo_root / 'paper_experiment_pipeline.py',
+                repo_root / 'paper_task_bank.py',
+                repo_root / 'paper_task_layout.py',
+                repo_root / 'paper_experiment_schema.py',
+                repo_root / 'paper_checkpoint_selection.py',
+                repo_root / 'cross_agent_reference_state.py',
+                repo_root / 'potential_field_corrector.py',
+                repo_root / 'multiagent' / 'core.py',
+                repo_root / 'multiagent' / 'environment.py',
+                repo_root / 'multiagent' / 'scenarios'
+                / f"{self.args.scenario_name}.py",
+                repo_root / 'multiagent' / 'scenarios'
+                / 'obstacle_observation.py',
+            ]
+            source_artifacts = []
+            for source_path in source_paths:
+                source_fingerprint = fingerprint_artifact(source_path)
+                source_fingerprint['logical_name'] = str(
+                    source_path.relative_to(repo_root)
+                )
+                source_artifacts.append(source_fingerprint)
+
+            runtime_environment = {
+                field.attr: getattr(self.args, field.attr, field.default)
+                for field in SCIENTIFIC_RUNTIME_ENV_FIELDS
+            }
+            runtime_environment.update(
+                {
+                    'episode_length': int(self.args.episode_length),
+                    'episode_length_semantics': 'outer_safety_cap_only',
+                    'task_deadline_summary': summarize_task_deadlines(
+                        list(task_bank_info.get('layouts') or [])
+                    ),
+                    'paper_task_deadline_policy': copy.deepcopy(
+                        dict(task_bank_info.get('runtime_config') or {}).get(
+                            'paper_task_deadline_policy'
+                        )
+                    ),
+                    'task_semantics_contract': copy.deepcopy(
+                        self._paper_task_semantics_contract
+                    ),
+                    'evaluated_episode_count': len(paper_records),
+                    'action_force_ratio': float(self.args.action_force_ratio),
+                    'force_action_force_ratio': getattr(
+                        self.args, 'force_action_force_ratio', None
+                    ),
+                    'eval_noise_scale': float(self.args.eval_noise_scale),
+                    'eval_random_action_prob': float(
+                        self.args.eval_random_action_prob
+                    ),
+                    'disable_early_termination': bool(
+                        self.args.disable_early_termination
+                    ),
+                    'terrain_sensing_mode': str(
+                        self.args.terrain_sensing_mode
+                    ),
+                    'apf_backend': str(self.args.apf_backend),
+                    'eval_backend': str(
+                        getattr(self.args, 'eval_backend', 'python_only')
+                    ),
+                    'evaluation_device_provenance': copy.deepcopy(
+                        self._paper_evaluation_device_provenance
+                    ),
+                }
+            )
+            paper_run_manifest = build_paper_run_manifest(
+                run_id=run_id,
+                phase=split_role,
+                algorithm=str(self.args.paper_method_id),
+                scenario=self.args.scenario_name,
+                split=split_name,
+                split_role=split_role,
+                train_seed=int(train_seed),
+                eval_seed=int(eval_seed),
+                experiment_protocol=(
+                    self._paper_experiment_protocol_fingerprint
+                ),
+                task_bank=task_bank_fingerprint,
+                checkpoint=self._paper_checkpoint_fingerprint,
+                runtime_environment=runtime_environment,
+                source_artifacts=source_artifacts,
+                outputs=output_fingerprints,
+                checkpoint_selection=(
+                    self._paper_checkpoint_selection_fingerprint
+                    if split_role != 'validation'
+                    else None
+                ),
+            )
+            run_manifest_path = os.path.join(
+                self.args.save_viz_path, 'paper_run_manifest.json'
+            )
+            atomic_write_paper_json(run_manifest_path, paper_run_manifest)
+            paper_artifacts = {
+                'episode_records_json': records_path,
+                'episode_records_csv': csv_path,
+                'aggregate_json': aggregate_path,
+                'run_manifest_json': run_manifest_path,
+                'episode_collection_content_sha256': paper_collection[
+                    'content_sha256'
+                ],
+                'aggregate_content_sha256': paper_aggregate['content_sha256'],
+                'run_manifest_content_sha256': paper_run_manifest[
+                    'content_sha256'
+                ],
+            }
+
         # 保存评估结果
         results = {
             'model_path': self.args.load_model_path,
@@ -9683,6 +10717,7 @@ class ModelEvaluator:
             'summary': summary,
             'evaluation_setup': evaluation_setup,
             'visualization_artifacts': visualization_artifacts,
+            'paper_artifacts': paper_artifacts,
             # 结果文件记录“实际执行”的逐回合环境，而不是只记录调用方是否
             # 显式传入过序列。否则自动生成的地形/障碍在结果中会显示为空，
             # 无法用于跨模型配对审计。
@@ -9718,6 +10753,8 @@ class ModelEvaluator:
                     'min_distance': ep.get('min_distance', None),
                     'success': ep.get('success', 0),
                     'agent_success_flags': ep.get('agent_success_flags', []),
+                    'agent_reached_flags': ep.get('agent_reached_flags', []),
+                    'agent_safe_flags': ep.get('agent_safe_flags', []),
                     'team_success': ep.get('team_success', 0),
                     # 🔧 新增：到达时间/步数
                     'arrival_step': ep.get('arrival_step', None),
@@ -9735,9 +10772,12 @@ class ModelEvaluator:
                     'agent_first_reach_steps': ep.get('agent_first_reach_steps', []),
                     'path_efficiency': ep.get('path_efficiency', None),
                     'agent_path_efficiencies': ep.get('agent_path_efficiencies', []),
+                    'agent_min_clearances': ep.get('agent_min_clearances', []),
+                    'agent_energy_consumed': ep.get('agent_energy_consumed', []),
+                    'agent_control_effort': ep.get('agent_control_effort', []),
+                    'task_layout': ep.get('task_layout', None),
                     # 🔧 新增：穿透深度统计
                     'penetration_stat': ep.get('penetration_stat', None),
-                    'agent_safe_flags': ep.get('agent_safe_flags', []),
                     'reward_decomposition': ep.get('reward_decomposition', {}),
                     'diagnostic_metrics': ep.get('diagnostic_metrics', {}),
                     'terminal_success_bonus_applied': ep.get('terminal_success_bonus_applied', False),
@@ -10363,6 +11403,41 @@ HTML交互式轨迹图功能:
                        help="要加载的模型权重文件夹路径（默认从环境变量MODEL_PATH或models/optimized_exp/best）")
     parser.add_argument("--save-viz-path", type=str, default="evaluation_results", 
                        help="可视化结果保存路径")
+    parser.add_argument("--paper-run-id", type=str, default=os.getenv("PAPER_RUN_ID", ""),
+                       help="论文结果唯一运行ID；启用paper task contract时必填")
+    parser.add_argument(
+        "--paper-method-id",
+        type=str,
+        default=os.getenv("PAPER_METHOD_ID", ""),
+        help="稳定的论文方法标识，例如 MATD3-APF；论文模式必填，禁止从目录名推断",
+    )
+    parser.add_argument(
+        "--paper-experiment-protocol",
+        type=str,
+        default=os.getenv("PAPER_EXPERIMENT_PROTOCOL_PATH", ""),
+        help="不可变论文实验协议文件；论文模式必填并写入运行manifest",
+    )
+    parser.add_argument("--paper-split", type=str, default=os.getenv("PAPER_SPLIT", ""),
+                       help="任务库split名称；启用paper task contract时必填")
+    parser.add_argument("--paper-train-seed", type=int, default=None,
+                       help="模型训练seed；启用paper task contract时必填")
+    parser.add_argument("--paper-eval-seed", type=int, default=None,
+                       help="评估seed；启用paper task contract时必填")
+    parser.add_argument(
+        "--paper-selection-result",
+        type=str,
+        default=os.getenv("PAPER_SELECTION_RESULT", ""),
+        help=(
+            "测试split必填：仅由validation运行生成的 checkpoint selection JSON；"
+            "validation split禁止传入"
+        ),
+    )
+    parser.add_argument(
+        "--paper-eval-all-bank-tasks",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('PAPER_EVAL_ALL_BANK_TASKS', '1')).lower() in ('true', '1', 'yes', 'on'),
+        help="提供task-bank split时自动评估该split剩余全部任务",
+    )
     
     # 可视化控制
     parser.add_argument("--disable-visualization", action="store_true", 
@@ -10893,6 +11968,11 @@ def _run_process_sharded_evaluation(args):
     shard_count = int(getattr(args, "eval_process_shards", 1) or 1)
     if shard_count <= 1:
         return None
+    if str(getattr(args, 'paper_task_bank_manifest', '') or '').strip():
+        raise RuntimeError(
+            "formal paper task-bank evaluation forbids --eval-process-shards > 1; "
+            "use --eval-episode-parallelism instead"
+        )
     requested_backend = getattr(args, "eval_backend", None)
     if requested_backend in ("both", "gazebo_live"):
         raise RuntimeError("--eval-process-shards 暂不支持 gazebo_live/both 后端")

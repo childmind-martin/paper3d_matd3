@@ -33,6 +33,11 @@ from selector_experiment_protocol import (
 from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
 
 
+class TrainingEntrypointImportTests(unittest.TestCase):
+    def test_paper_artifact_paths_use_imported_pathlib_path(self):
+        self.assertIs(training.Path, Path)
+
+
 class SelectorFormalBatchSpecTests(unittest.TestCase):
     @staticmethod
     def _payload():

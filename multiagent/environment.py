@@ -208,6 +208,8 @@ class MultiAgentEnv(gym.Env):
     def _sync_world_team_success_snapshot(self):
         """每步末更新 world 上团队成功权威快照（仅 policy_agents，与回合层判定同源），供训练侧日志读取。"""
         w = self.world
+        prior_terminal = bool(getattr(w, '_episode_terminal', False))
+        prior_done_reason = getattr(w, '_episode_done_reason', None)
         agents = list(self.agents) if self.agents is not None else []
         scn = getattr(self, 'scenario', None)
         thr_raw = getattr(scn, 'success_distance_threshold', 2.0) if scn is not None else 2.0
@@ -243,11 +245,15 @@ class MultiAgentEnv(gym.Env):
         w._episode_all_reached = bool(reach and all(v == 1 for v in reach))
         w._episode_success = bool(team == 1)
         w._episode_success_thr_snapshot = thr
-        w._episode_terminal = bool(w._episode_all_reached or w._episode_success)
+        w._episode_terminal = bool(
+            w._episode_all_reached or w._episode_success or prior_terminal
+        )
         if w._episode_success:
             w._episode_done_reason = 'team_success'
         elif w._episode_all_reached:
             w._episode_done_reason = 'all_reached_without_safe_team_success'
+        elif prior_terminal:
+            w._episode_done_reason = prior_done_reason or 'terminal_semantics_error'
         else:
             w._episode_done_reason = None
 
@@ -389,6 +395,9 @@ class MultiAgentEnv(gym.Env):
         # authoritative success snapshot here. The reward calculator reads this
         # snapshot to settle terminal success/failure rewards on the same step.
         if self._reward_terminal_order_fix_enabled:
+            prepare_reward = getattr(getattr(self, 'scenario', None), 'prepare_step_reward', None)
+            if callable(prepare_reward):
+                prepare_reward(self.world)
             self._sync_world_team_success_snapshot()
         
         # 记录最新的观察、奖励、是否完成和信息
@@ -598,6 +607,10 @@ class MultiAgentEnv(gym.Env):
             reward_n = reward_list
             done_n = done_list
             info_n['n'] = info_list
+            # Some legacy reward implementations discover contact while computing
+            # reward. Re-publish the authoritative snapshot before team terminal
+            # semantics so the same transition cannot bootstrap past that failure.
+            self._sync_world_team_success_snapshot()
             if timing_detail_enabled:
                 _t_env_post_seg = _perf_counter()
             
@@ -769,6 +782,101 @@ class MultiAgentEnv(gym.Env):
                 if not self._quiet_output_enabled:
                     traceback.print_exc()
                 pass
+
+            # 统一有限时域语义：当前任务把超时作为带终局失败结算的硬截止，
+            # 因此最后一个 transition 必须 terminated=True 且禁止 Bellman bootstrap。
+            try:
+                episode_length = int(getattr(self.world, 'episode_length', 0) or 0)
+                current_step = int(getattr(self.world, 'current_step', 0) or 0)
+                hard_deadline_enabled = bool(
+                    getattr(self.world, 'hard_deadline_terminal', True)
+                )
+                deadline_hit = bool(
+                    hard_deadline_enabled
+                    and episode_length > 0
+                    and current_step >= episode_length
+                )
+                team_success = bool(getattr(self.world, '_episode_success', False))
+                all_reached = bool(getattr(self.world, '_episode_all_reached', False))
+                paper_collision_terminal = bool(
+                    getattr(self.world, 'paper_task_contract_enabled', False)
+                    and getattr(self.world, 'paper_terminal_on_collision', False)
+                )
+                collision_failure = bool(
+                    paper_collision_terminal
+                    and getattr(self.world, '_paper_any_collision', False)
+                )
+                out_of_bounds_failure = bool(
+                    paper_collision_terminal
+                    and getattr(self.world, '_paper_any_out_of_bounds', False)
+                )
+                episode_terminal = bool(
+                    team_success
+                    or all_reached
+                    or collision_failure
+                    or out_of_bounds_failure
+                    or deadline_hit
+                )
+                if episode_terminal:
+                    if team_success:
+                        done_reason = 'team_success'
+                    elif out_of_bounds_failure:
+                        done_reason = 'out_of_bounds'
+                    elif collision_failure:
+                        done_reason = 'collision'
+                    elif all_reached:
+                        done_reason = 'all_reached_unsafe'
+                    else:
+                        done_reason = 'time_limit'
+                    done_n = [True] * agent_count
+                    self.world._episode_terminal = True
+                    self.world._episode_done_reason = done_reason
+                    for index, agent in enumerate(self.agents):
+                        agent_key = getattr(agent, 'name', f'agent_{index}')
+                        self._agent_done_flags[agent_key] = True
+                        self._agent_done_steps[agent_key] = current_step
+                    for index in range(agent_count):
+                        row = info_n['n'][index] if index < len(info_n['n']) else {}
+                        if not isinstance(row, dict):
+                            row = {}
+                            info_n['n'][index] = row
+                        row['terminated'] = True
+                        row['truncated'] = False
+                        row['episode_terminal'] = True
+                        row['done_reason'] = done_reason
+                        row['time_limit'] = bool(
+                            deadline_hit
+                            and not (
+                                team_success
+                                or all_reached
+                                or collision_failure
+                                or out_of_bounds_failure
+                            )
+                        )
+                    info_n['episode_terminal'] = True
+                    info_n['terminated_n'] = [True] * agent_count
+                    info_n['truncated_n'] = [False] * agent_count
+                    info_n['done_reason'] = done_reason
+                else:
+                    info_n['episode_terminal'] = False
+                    info_n['terminated_n'] = [bool(value) for value in done_n]
+                    info_n['truncated_n'] = [False] * agent_count
+                info_n['task_id'] = getattr(self.world, 'task_id', None)
+                info_n['task_difficulty_bin'] = getattr(
+                    self.world, 'task_difficulty_bin', None
+                )
+                info_n['curriculum_stage_id'] = int(
+                    getattr(self.world, 'curriculum_stage_id', 0) or 0
+                )
+            except Exception as exc:
+                done_n = [True] * agent_count
+                self.world._episode_terminal = True
+                self.world._episode_done_reason = 'terminal_semantics_error'
+                info_n['episode_terminal'] = True
+                info_n['terminated_n'] = [True] * agent_count
+                info_n['truncated_n'] = [False] * agent_count
+                info_n['done_reason'] = 'terminal_semantics_error'
+                info_n['terminal_semantics_error'] = str(exc)
                 
         except Exception as e:
             print(f"步骤执行期间发生严重错误: {e}")
@@ -872,6 +980,8 @@ class MultiAgentEnv(gym.Env):
             self.world._episode_team_success_flag = 0
             self.world._episode_terminal = False
             self.world._episode_done_reason = None
+            self.world._paper_any_collision = False
+            self.world._paper_any_out_of_bounds = False
             if hasattr(self.world, '_episode_success_thr_snapshot'):
                 delattr(self.world, '_episode_success_thr_snapshot')
         except Exception:

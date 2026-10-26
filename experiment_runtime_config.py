@@ -65,6 +65,37 @@ SCIENTIFIC_RUNTIME_ENV_FIELDS = (
     RuntimeEnvironmentField("max_start_goal_dist", "MAX_START_GOAL_DIST", "float", 100.0),
     RuntimeEnvironmentField("start_pos_margin", "START_POS_MARGIN", "float", 5.0),
     RuntimeEnvironmentField("start_pos_max_trials", "START_POS_MAX_TRIALS", "int", 2000),
+    # Paper-grade task/terminal contract.  Historical artifacts reconstruct
+    # these defaults as disabled, while new formal runs explicitly enable and
+    # freeze them in the resolved manifest.
+    RuntimeEnvironmentField("paper_task_contract_enabled", "PAPER_TASK_CONTRACT_ENABLED", "bool", False),
+    RuntimeEnvironmentField("paper_task_contract_strict", "PAPER_TASK_CONTRACT_STRICT", "bool", True),
+    RuntimeEnvironmentField("paper_task_require_reference_feasible", "PAPER_TASK_REQUIRE_REFERENCE_FEASIBLE", "bool", True),
+    RuntimeEnvironmentField("paper_task_reference_grid_resolution", "PAPER_TASK_REFERENCE_GRID_RESOLUTION", "float", 4.0),
+    RuntimeEnvironmentField("paper_task_obstacle_inflation", "PAPER_TASK_OBSTACLE_INFLATION", "float", 1.5),
+    RuntimeEnvironmentField("paper_task_reference_surface_clearance", "PAPER_TASK_REFERENCE_SURFACE_CLEARANCE", "float", 4.5),
+    RuntimeEnvironmentField("paper_goal_formation_radius", "PAPER_GOAL_FORMATION_RADIUS", "float", 10.0),
+    RuntimeEnvironmentField("paper_goal_boundary_clearance", "PAPER_GOAL_BOUNDARY_CLEARANCE", "float", 5.0),
+    RuntimeEnvironmentField("min_agent_start_separation", "MIN_AGENT_START_SEPARATION", "float", 8.0),
+    RuntimeEnvironmentField("hard_deadline_terminal", "HARD_DEADLINE_TERMINAL", "bool", True),
+    RuntimeEnvironmentField("paper_terminal_on_collision", "PAPER_TERMINAL_ON_COLLISION", "bool", False),
+    RuntimeEnvironmentField("paper_reward_profile", "PAPER_REWARD_PROFILE", "str", "legacy"),
+    RuntimeEnvironmentField("paper_progress_reward_scale", "PAPER_PROGRESS_REWARD_SCALE", "float", 20.0),
+    RuntimeEnvironmentField("paper_individual_reach_bonus", "PAPER_INDIVIDUAL_REACH_BONUS", "float", 10.0),
+    RuntimeEnvironmentField("paper_team_success_bonus", "PAPER_TEAM_SUCCESS_BONUS", "float", 100.0),
+    RuntimeEnvironmentField("paper_collision_penalty", "PAPER_COLLISION_PENALTY", "float", 100.0),
+    RuntimeEnvironmentField("paper_out_of_bounds_penalty", "PAPER_OUT_OF_BOUNDS_PENALTY", "float", 100.0),
+    RuntimeEnvironmentField("paper_deadline_penalty", "PAPER_DEADLINE_PENALTY", "float", 50.0),
+    RuntimeEnvironmentField("paper_step_penalty", "PAPER_STEP_PENALTY", "float", 0.01),
+    RuntimeEnvironmentField("paper_control_effort_penalty", "PAPER_CONTROL_EFFORT_PENALTY", "float", 0.005),
+    RuntimeEnvironmentField("paper_clearance_margin", "PAPER_CLEARANCE_MARGIN", "float", 2.0),
+    RuntimeEnvironmentField("paper_clearance_penalty", "PAPER_CLEARANCE_PENALTY", "float", 0.2),
+    RuntimeEnvironmentField("include_time_to_go_observation", "INCLUDE_TIME_TO_GO_OBSERVATION", "bool", False),
+    RuntimeEnvironmentField("task_difficulty_bin", "TASK_DIFFICULTY_BIN", "str", "unassigned"),
+    RuntimeEnvironmentField("paper_task_num_obstacles", "PAPER_TASK_NUM_OBSTACLES", "int", -1),
+    RuntimeEnvironmentField("paper_task_layout_file", "PAPER_TASK_LAYOUT_FILE", "str", ""),
+    RuntimeEnvironmentField("paper_task_bank_manifest", "PAPER_TASK_BANK_MANIFEST", "str", ""),
+    RuntimeEnvironmentField("paper_task_bank_split", "PAPER_TASK_BANK_SPLIT", "str", ""),
 )
 
 _RESOLVED_MANIFEST_HASH_KEY = "content_sha256"

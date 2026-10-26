@@ -1,6 +1,7 @@
 # 创建multiagent/scenarios/paper3d_terrain.py文件
 import hashlib
 import json
+import math
 import numpy as np
 import random
 from multiagent.core import World, Agent, Landmark
@@ -11,6 +12,15 @@ import matplotlib.pyplot as plt
 import os
 import traceback  # 添加traceback模块用于错误跟踪
 from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
+from paper_task_layout import (
+    TaskLayoutError,
+    atomic_write_json,
+    build_task_layout,
+    validate_distance_bounds,
+    validate_task_layout_payload,
+)
+from paper_task_bank import load_task_bank_split
+from paper_curriculum import paper_physics_contract, paper_task_semantics_contract
 
 
 def _scenario_quiet_output():
@@ -38,6 +48,35 @@ def _float_from_kwargs_or_env(kwargs, key, env_names, default):
         return float(default if value is None else value)
     except Exception:
         return float(default)
+
+
+def _int_from_kwargs_or_env(kwargs, key, env_names, default):
+    value = kwargs.get(key, None)
+    if value is None:
+        for env_name in env_names:
+            raw = os.getenv(env_name, '').strip()
+            if raw:
+                value = raw
+                break
+    try:
+        return int(default if value is None else value)
+    except Exception:
+        return int(default)
+
+
+def _bool_from_kwargs_or_env(kwargs, key, env_names, default):
+    value = kwargs.get(key, None)
+    if value is None:
+        for env_name in env_names:
+            raw = os.getenv(env_name, '').strip()
+            if raw:
+                value = raw
+                break
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 class Scenario(BaseScenario):
@@ -91,6 +130,443 @@ class Scenario(BaseScenario):
             map_size_kw = 200.0
         self.map_size = float(map_size_kw)  # 地图大小（从100扩大到200，可配置）
         self.terrain = None  # 地形高度图，生成后填充
+
+        # 论文级任务契约。启用时，清单中的起终点距离不再只是记录项，
+        # 而是在每次 reset 的最终 agent goal 上逐智能体验证。
+        self.min_start_goal_dist = _float_from_kwargs_or_env(
+            kwargs, 'min_start_goal_dist', ('MIN_START_GOAL_DIST',), 40.0
+        )
+        self.max_start_goal_dist = _float_from_kwargs_or_env(
+            kwargs, 'max_start_goal_dist', ('MAX_START_GOAL_DIST',), 100.0
+        )
+        self.start_pos_margin = _float_from_kwargs_or_env(
+            kwargs, 'start_pos_margin', ('START_POS_MARGIN',), 5.0
+        )
+        self.start_pos_max_trials = _int_from_kwargs_or_env(
+            kwargs, 'start_pos_max_trials', ('START_POS_MAX_TRIALS',), 2000
+        )
+        self.min_agent_start_separation = _float_from_kwargs_or_env(
+            kwargs,
+            'min_agent_start_separation',
+            ('MIN_AGENT_START_SEPARATION',),
+            8.0,
+        )
+        self.paper_task_contract_enabled = _bool_from_kwargs_or_env(
+            kwargs,
+            'paper_task_contract_enabled',
+            ('PAPER_TASK_CONTRACT_ENABLED',),
+            False,
+        )
+        self.paper_task_contract_strict = _bool_from_kwargs_or_env(
+            kwargs,
+            'paper_task_contract_strict',
+            ('PAPER_TASK_CONTRACT_STRICT',),
+            True,
+        )
+        self.paper_task_require_reference_feasible = _bool_from_kwargs_or_env(
+            kwargs,
+            'paper_task_require_reference_feasible',
+            ('PAPER_TASK_REQUIRE_REFERENCE_FEASIBLE',),
+            True,
+        )
+        self.paper_task_reference_grid_resolution = _float_from_kwargs_or_env(
+            kwargs,
+            'paper_task_reference_grid_resolution',
+            ('PAPER_TASK_REFERENCE_GRID_RESOLUTION',),
+            4.0,
+        )
+        self.paper_task_obstacle_inflation = _float_from_kwargs_or_env(
+            kwargs,
+            'paper_task_obstacle_inflation',
+            ('PAPER_TASK_OBSTACLE_INFLATION',),
+            1.5,
+        )
+        self.paper_task_reference_surface_clearance = _float_from_kwargs_or_env(
+            kwargs,
+            'paper_task_reference_surface_clearance',
+            ('PAPER_TASK_REFERENCE_SURFACE_CLEARANCE',),
+            4.5,
+        )
+        self.paper_goal_formation_radius = _float_from_kwargs_or_env(
+            kwargs,
+            'paper_goal_formation_radius',
+            ('PAPER_GOAL_FORMATION_RADIUS', 'AGENT_GOAL_FORMATION_RADIUS'),
+            10.0,
+        )
+        self.paper_goal_boundary_clearance = _float_from_kwargs_or_env(
+            kwargs,
+            'paper_goal_boundary_clearance',
+            ('PAPER_GOAL_BOUNDARY_CLEARANCE',),
+            5.0,
+        )
+        raw_deadline_policy = kwargs.get('paper_task_deadline_policy')
+        if raw_deadline_policy is None:
+            self.paper_task_deadline_policy = None
+        elif isinstance(raw_deadline_policy, dict):
+            self.paper_task_deadline_policy = dict(raw_deadline_policy)
+        else:
+            raise ValueError("paper_task_deadline_policy must be an object")
+        self.hard_deadline_terminal = _bool_from_kwargs_or_env(
+            kwargs,
+            'hard_deadline_terminal',
+            ('HARD_DEADLINE_TERMINAL',),
+            True,
+        )
+        self.paper_terminal_on_collision = _bool_from_kwargs_or_env(
+            kwargs,
+            'paper_terminal_on_collision',
+            ('PAPER_TERMINAL_ON_COLLISION',),
+            False,
+        )
+        self.paper_reward_profile = str(
+            kwargs.get(
+                'paper_reward_profile',
+                os.getenv('PAPER_REWARD_PROFILE', 'legacy'),
+            )
+            or 'legacy'
+        ).strip().lower()
+        self.paper_progress_reward_scale = _float_from_kwargs_or_env(
+            kwargs, 'paper_progress_reward_scale', ('PAPER_PROGRESS_REWARD_SCALE',), 20.0
+        )
+        self.paper_individual_reach_bonus = _float_from_kwargs_or_env(
+            kwargs, 'paper_individual_reach_bonus', ('PAPER_INDIVIDUAL_REACH_BONUS',), 10.0
+        )
+        self.paper_team_success_bonus = _float_from_kwargs_or_env(
+            kwargs, 'paper_team_success_bonus', ('PAPER_TEAM_SUCCESS_BONUS',), 100.0
+        )
+        self.paper_collision_penalty = _float_from_kwargs_or_env(
+            kwargs, 'paper_collision_penalty', ('PAPER_COLLISION_PENALTY',), 100.0
+        )
+        self.paper_out_of_bounds_penalty = _float_from_kwargs_or_env(
+            kwargs, 'paper_out_of_bounds_penalty', ('PAPER_OUT_OF_BOUNDS_PENALTY',), 100.0
+        )
+        self.paper_deadline_penalty = _float_from_kwargs_or_env(
+            kwargs, 'paper_deadline_penalty', ('PAPER_DEADLINE_PENALTY',), 50.0
+        )
+        self.paper_step_penalty = _float_from_kwargs_or_env(
+            kwargs, 'paper_step_penalty', ('PAPER_STEP_PENALTY',), 0.01
+        )
+        self.paper_control_effort_penalty = _float_from_kwargs_or_env(
+            kwargs, 'paper_control_effort_penalty', ('PAPER_CONTROL_EFFORT_PENALTY',), 0.005
+        )
+        self.paper_clearance_margin = _float_from_kwargs_or_env(
+            kwargs, 'paper_clearance_margin', ('PAPER_CLEARANCE_MARGIN',), 2.0
+        )
+        self.paper_clearance_penalty = _float_from_kwargs_or_env(
+            kwargs, 'paper_clearance_penalty', ('PAPER_CLEARANCE_PENALTY',), 0.2
+        )
+        self.success_distance_threshold = _float_from_kwargs_or_env(
+            kwargs, 'success_distance_threshold', ('SUCCESS_DISTANCE_THRESHOLD',), 2.0
+        )
+        self.collision_distance_threshold = _float_from_kwargs_or_env(
+            kwargs, 'collision_distance_threshold', ('COLLISION_DISTANCE_THRESHOLD',), 0.5
+        )
+        if self.paper_reward_profile not in ('legacy', 'paper_v1'):
+            raise ValueError(
+                f"unsupported paper_reward_profile={self.paper_reward_profile!r}; "
+                "expected 'legacy' or 'paper_v1'"
+            )
+        for name in (
+            'paper_progress_reward_scale',
+            'paper_individual_reach_bonus',
+            'paper_team_success_bonus',
+            'paper_collision_penalty',
+            'paper_out_of_bounds_penalty',
+            'paper_deadline_penalty',
+            'paper_step_penalty',
+            'paper_control_effort_penalty',
+            'paper_clearance_margin',
+            'paper_clearance_penalty',
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.success_distance_threshold <= 0.0:
+            raise ValueError("success_distance_threshold must be positive")
+        if self.collision_distance_threshold < 0.0:
+            raise ValueError("collision_distance_threshold must be non-negative")
+        if self.paper_goal_formation_radius <= 0.0:
+            raise ValueError("paper_goal_formation_radius must be positive")
+        if self.paper_goal_boundary_clearance <= 0.0:
+            raise ValueError("paper_goal_boundary_clearance must be positive")
+        self.include_time_to_go_observation = _bool_from_kwargs_or_env(
+            kwargs,
+            'include_time_to_go_observation',
+            ('INCLUDE_TIME_TO_GO_OBSERVATION',),
+            False,
+        )
+        self.task_difficulty_bin = str(
+            kwargs.get('task_difficulty_bin', os.getenv('TASK_DIFFICULTY_BIN', 'unassigned'))
+        ).strip() or 'unassigned'
+        self.curriculum_stage_id = _int_from_kwargs_or_env(
+            kwargs,
+            'curriculum_stage_id',
+            ('CURRICULUM_STAGE_ID',),
+            0,
+        )
+        self.paper_task_metadata_dir = str(
+            kwargs.get('paper_task_metadata_dir', os.getenv('PAPER_TASK_METADATA_DIR', ''))
+            or ''
+        ).strip()
+        self.paper_task_num_obstacles = _int_from_kwargs_or_env(
+            kwargs,
+            'paper_task_num_obstacles',
+            ('PAPER_TASK_NUM_OBSTACLES',),
+            -1,
+        )
+        if self.paper_task_num_obstacles < -1:
+            raise ValueError("paper_task_num_obstacles must be -1 or non-negative")
+        self.paper_task_layout_file = str(
+            kwargs.get(
+                'paper_task_layout_file',
+                os.getenv('PAPER_TASK_LAYOUT_FILE', ''),
+            )
+            or ''
+        ).strip()
+        self.paper_task_bank_manifest = str(
+            kwargs.get(
+                'paper_task_bank_manifest',
+                os.getenv('PAPER_TASK_BANK_MANIFEST', ''),
+            )
+            or ''
+        ).strip()
+        self.paper_task_bank_split = str(
+            kwargs.get(
+                'paper_task_bank_split',
+                os.getenv('PAPER_TASK_BANK_SPLIT', ''),
+            )
+            or ''
+        ).strip()
+        self.paper_task_bank_parallel_envs = max(
+            1,
+            int(
+                kwargs.get(
+                    'num_envs',
+                    os.getenv('PAPER_TASK_BANK_PARALLEL_ENVS', '1'),
+                )
+                or 1
+            ),
+        )
+        if self.paper_task_layout_file and self.paper_task_bank_manifest:
+            raise TaskLayoutError(
+                "PAPER_TASK_LAYOUT_FILE and PAPER_TASK_BANK_MANIFEST are mutually exclusive"
+            )
+        self.paper_task_layout = None
+        self.paper_task_bank_layouts = []
+        self.paper_task_bank_info = None
+        self.paper_physics_contract = None
+        if self.paper_task_bank_manifest:
+            if not self.paper_task_bank_split:
+                raise TaskLayoutError(
+                    "PAPER_TASK_BANK_SPLIT is required with PAPER_TASK_BANK_MANIFEST"
+                )
+            self.paper_task_bank_info = load_task_bank_split(
+                self.paper_task_bank_manifest,
+                self.paper_task_bank_split,
+            )
+            self.paper_task_bank_layouts = list(
+                self.paper_task_bank_info.get('layouts') or []
+            )
+            if not self.paper_task_bank_layouts:
+                raise TaskLayoutError(
+                    f"paper task-bank split={self.paper_task_bank_split} is empty"
+                )
+            bank_runtime = dict(
+                self.paper_task_bank_info.get('runtime_config') or {}
+            )
+            bank_physics = dict(
+                bank_runtime.get('paper_physics_contract') or {}
+            )
+            if bank_physics != paper_physics_contract():
+                raise TaskLayoutError(
+                    "task-bank paper_physics_contract mismatch"
+                )
+            self.paper_physics_contract = bank_physics
+            bank_semantics = dict(
+                bank_runtime.get('paper_task_semantics_contract') or {}
+            )
+            if bank_semantics != paper_task_semantics_contract():
+                raise TaskLayoutError(
+                    "task-bank paper_task_semantics_contract mismatch"
+                )
+            kwargs.update(bank_runtime)
+            self.paper_terminal_on_collision = bool(
+                bank_runtime.get(
+                    'paper_terminal_on_collision', self.paper_terminal_on_collision
+                )
+            )
+            self.paper_reward_profile = str(
+                bank_runtime.get('paper_reward_profile', self.paper_reward_profile)
+                or self.paper_reward_profile
+            ).strip().lower()
+            for paper_float_name in (
+                'paper_progress_reward_scale',
+                'paper_individual_reach_bonus',
+                'paper_team_success_bonus',
+                'paper_collision_penalty',
+                'paper_out_of_bounds_penalty',
+                'paper_deadline_penalty',
+                'paper_step_penalty',
+                'paper_control_effort_penalty',
+                'paper_clearance_margin',
+                'paper_clearance_penalty',
+                'paper_task_reference_grid_resolution',
+                'paper_task_obstacle_inflation',
+                'paper_task_reference_surface_clearance',
+                'success_distance_threshold',
+                'collision_distance_threshold',
+                'paper_goal_formation_radius',
+                'paper_goal_boundary_clearance',
+            ):
+                if paper_float_name in bank_runtime:
+                    setattr(self, paper_float_name, float(bank_runtime[paper_float_name]))
+            if 'paper_task_deadline_policy' in bank_runtime:
+                raw_policy = bank_runtime['paper_task_deadline_policy']
+                if not isinstance(raw_policy, dict):
+                    raise TaskLayoutError(
+                        "task-bank paper_task_deadline_policy must be an object"
+                    )
+                self.paper_task_deadline_policy = dict(raw_policy)
+            seed = int(bank_runtime.get('terrain_seed', seed if seed is not None else 67))
+            terrain_complexity_level = int(
+                bank_runtime.get('terrain_complexity_level', terrain_complexity_level)
+            )
+            use_fixed_positions = bool(bank_runtime.get('use_fixed_positions', False))
+            dynamic_first_time = bool(bank_runtime.get('dynamic_first_time', False))
+            random_terrain = bool(bank_runtime.get('random_terrain', False))
+            self.paper_task_layout = self.paper_task_bank_layouts[0]
+        if self.paper_task_layout_file:
+            with open(self.paper_task_layout_file, 'r', encoding='utf-8') as handle:
+                self.paper_task_layout = json.load(handle)
+            layout_errors = validate_task_layout_payload(self.paper_task_layout)
+            if layout_errors:
+                raise TaskLayoutError(
+                    f"invalid PAPER_TASK_LAYOUT_FILE={self.paper_task_layout_file}: "
+                    + '; '.join(layout_errors)
+                )
+        if self.paper_task_layout is not None:
+            self.paper_task_contract_enabled = True
+            layout_contract = dict(self.paper_task_layout.get('contract') or {})
+            self.min_start_goal_dist = float(
+                layout_contract.get('min_start_goal_dist', self.min_start_goal_dist)
+            )
+            self.max_start_goal_dist = float(
+                layout_contract.get('max_start_goal_dist', self.max_start_goal_dist)
+            )
+            self.paper_task_require_reference_feasible = bool(
+                layout_contract.get(
+                    'require_reference_feasible',
+                    self.paper_task_require_reference_feasible,
+                )
+            )
+            self.paper_task_reference_grid_resolution = float(
+                layout_contract.get(
+                    'reference_grid_resolution',
+                    self.paper_task_reference_grid_resolution,
+                )
+            )
+            self.paper_task_obstacle_inflation = float(
+                layout_contract.get(
+                    'reference_obstacle_inflation',
+                    self.paper_task_obstacle_inflation,
+                )
+            )
+            self.paper_task_reference_surface_clearance = float(
+                layout_contract.get(
+                    'reference_surface_clearance',
+                    self.paper_task_reference_surface_clearance,
+                )
+            )
+            self.success_distance_threshold = float(
+                layout_contract.get(
+                    'success_distance_threshold',
+                    self.success_distance_threshold,
+                )
+            )
+            self.collision_distance_threshold = float(
+                layout_contract.get(
+                    'collision_distance_threshold',
+                    self.collision_distance_threshold,
+                )
+            )
+            if layout_contract.get('goal_formation_radius') is not None:
+                self.paper_goal_formation_radius = float(
+                    layout_contract['goal_formation_radius']
+                )
+            if layout_contract.get('goal_boundary_clearance') is not None:
+                self.paper_goal_boundary_clearance = float(
+                    layout_contract['goal_boundary_clearance']
+                )
+            layout_deadline = layout_contract.get('deadline')
+            if isinstance(layout_deadline, dict):
+                self.paper_task_deadline_policy = {
+                    key: layout_deadline[key]
+                    for key in (
+                        'policy_id',
+                        'simulation_dt_seconds',
+                        'nominal_speed_mps',
+                        'path_time_slack',
+                        'fixed_overhead_seconds',
+                        'minimum_seconds',
+                        'maximum_seconds',
+                    )
+                }
+            self.paper_task_num_obstacles = len(
+                self.paper_task_layout.get('obstacles') or []
+            )
+            layout_difficulty = str(
+                self.paper_task_layout.get('difficulty_bin', '') or ''
+            ).strip()
+            if (
+                self.task_difficulty_bin not in ('', 'unassigned')
+                and layout_difficulty
+                and self.task_difficulty_bin != layout_difficulty
+            ):
+                raise TaskLayoutError(
+                    f"task difficulty mismatch: configured={self.task_difficulty_bin}, "
+                    f"layout={layout_difficulty}"
+                )
+            if layout_difficulty:
+                self.task_difficulty_bin = layout_difficulty
+            for index, bank_layout in enumerate(self.paper_task_bank_layouts):
+                bank_difficulty = str(
+                    bank_layout.get('difficulty_bin', '') or ''
+                ).strip()
+                bank_contract = dict(bank_layout.get('contract') or {})
+                if bank_difficulty != self.task_difficulty_bin:
+                    raise TaskLayoutError(
+                        f"mixed difficulty in task-bank split at index={index}: "
+                        f"{bank_difficulty!r} != {self.task_difficulty_bin!r}"
+                    )
+                if (
+                    float(bank_contract.get('min_start_goal_dist')) != self.min_start_goal_dist
+                    or float(bank_contract.get('max_start_goal_dist')) != self.max_start_goal_dist
+                    or len(bank_layout.get('obstacles') or []) != self.paper_task_num_obstacles
+                ):
+                    raise TaskLayoutError(
+                        f"mixed task contract in task-bank split at index={index}"
+                    )
+        if self.min_start_goal_dist < 0.0 or self.max_start_goal_dist <= self.min_start_goal_dist:
+            raise ValueError(
+                f"invalid start/goal distance interval "
+                f"[{self.min_start_goal_dist}, {self.max_start_goal_dist}]"
+            )
+        if self.start_pos_margin < 0.0 or self.start_pos_max_trials <= 0:
+            raise ValueError("start position margin/trial contract must be positive")
+        if self.paper_reward_profile == 'paper_v1':
+            if not self.paper_task_contract_enabled:
+                raise ValueError(
+                    "paper_reward_profile='paper_v1' requires paper_task_contract_enabled=true"
+                )
+            if not self.hard_deadline_terminal:
+                raise ValueError(
+                    "paper_reward_profile='paper_v1' requires hard_deadline_terminal=true"
+                )
+            if not self.paper_terminal_on_collision:
+                raise ValueError(
+                    "paper_reward_profile='paper_v1' requires paper_terminal_on_collision=true"
+                )
+        self.current_task_layout = None
+        self.current_episode_position_seed = None
         
         # 储存目标信息
         self.goal_pos = None  # 目标位置，生成后填充
@@ -123,12 +599,18 @@ class Scenario(BaseScenario):
         
         # 根据复杂度等级设置参数
         self._setup_complexity_parameters()
+        if self.paper_task_num_obstacles >= 0:
+            self.num_obstacles = int(self.paper_task_num_obstacles)
         
         # 障碍物设置（由复杂度等级控制）
         self.obstacle_size_range = [5, 15]  # 障碍物尺寸范围
         self.obstacle_height_boost = 10  # 障碍物高度提升
         try:
-            agent_size_kw = kwargs.get('agent_size', None)
+            agent_size_kw = (
+                self.paper_physics_contract.get('agent_size')
+                if self.paper_physics_contract is not None
+                else kwargs.get('agent_size', None)
+            )
             if agent_size_kw is None:
                 agent_size_kw = os.getenv('AGENT_SIZE', '0.5')
             self.agent_size = float(agent_size_kw)
@@ -153,6 +635,7 @@ class Scenario(BaseScenario):
         self._obs_env_info_agent_count = None
         self._obs_step_cache_key = None
         self._obs_step_cache = {}
+        self._paper_prepared_step_key = None
         self.observation_dim = 81
         obstacle_obs_mode_kw = kwargs.get('obstacle_observation_mode', kwargs.get('obstacle_obs_mode', None))
         if obstacle_obs_mode_kw is None:
@@ -200,6 +683,18 @@ class Scenario(BaseScenario):
                 self.use_semi_random_terrain = bool(semi_random_kw)
         except Exception:
             self.use_semi_random_terrain = False
+        self.per_episode_terrain = _bool_from_kwargs_or_env(
+            kwargs,
+            'per_episode_terrain',
+            ('PER_EPISODE_TERRAIN',),
+            False,
+        )
+        self.per_env_terrain = _bool_from_kwargs_or_env(
+            kwargs,
+            'per_env_terrain',
+            ('PER_ENV_TERRAIN',),
+            True,
+        )
         try:
             default_base_seed = self.seed if self.seed is not None else 67
             terrain_base_seed_kw = kwargs.get('terrain_base_seed', None)
@@ -431,6 +926,20 @@ class Scenario(BaseScenario):
                     dtype=np.float32,
                 )
                 self._obs_env_info_agent_count = num_agents
+
+    def _resolved_observation_env_info(self, world):
+        """Return the environment segment, optionally exposing finite-horizon time."""
+        env_info = np.asarray(self._obs_env_info, dtype=np.float32).copy()
+        if bool(getattr(self, 'include_time_to_go_observation', False)) and env_info.size:
+            episode_length = int(getattr(world, 'episode_length', 0) or 0)
+            current_step = int(getattr(world, 'current_step', 0) or 0)
+            if episode_length > 0:
+                env_info[-1] = np.float32(
+                    np.clip((episode_length - current_step) / float(episode_length), 0.0, 1.0)
+                )
+            else:
+                env_info[-1] = np.float32(1.0)
+        return env_info
 
     def _sort_obstacle_indices_by_score(self, scores, top_k):
         obstacle_count = int(scores.shape[1]) if getattr(scores, 'ndim', 0) == 2 else 0
@@ -2051,10 +2560,49 @@ class Scenario(BaseScenario):
             extra = path_obstacles - base_per_seg * k
 
             def _emit_ob(center_x, center_y):
-                radius = self.rng.randint(self.obstacle_size_range[0], self.obstacle_size_range[1])
+                radius = int(
+                    self.rng.randint(
+                        self.obstacle_size_range[0], self.obstacle_size_range[1]
+                    )
+                )
+                if self.paper_task_contract_enabled:
+                    boundary_clearance = max(
+                        2.0, float(self.paper_goal_boundary_clearance)
+                    )
+                    if not (
+                        boundary_clearance + radius <= center_x
+                        <= self.map_size - boundary_clearance - radius
+                        and boundary_clearance + radius <= center_y
+                        <= self.map_size - boundary_clearance - radius
+                    ):
+                        return False
+                    endpoint_surface_clearance = float(
+                        os.getenv('PAPER_OBSTACLE_ENDPOINT_SURFACE_CLEARANCE', '5.0')
+                    )
+                    for ox, oy in keep_out_points:
+                        if np.hypot(center_x - ox, center_y - oy) < (
+                            radius + endpoint_surface_clearance
+                        ):
+                            return False
+                    obstacle_surface_clearance = float(
+                        os.getenv('PAPER_OBSTACLE_SURFACE_CLEARANCE', '3.0')
+                    )
+                    for existing in self.obstacles:
+                        prior_center = np.asarray(existing['center'], dtype=np.float64)
+                        prior_radius = float(existing['radius'])
+                        if np.hypot(
+                            center_x - prior_center[0], center_y - prior_center[1]
+                        ) < radius + prior_radius + obstacle_surface_clearance:
+                            return False
                 terrain_height = self.get_terrain_height(center_x, center_y)
                 center_z = terrain_height + radius + self.obstacle_height_boost
-                self.obstacles.append({'center': [float(center_x), float(center_y), float(center_z)], 'radius': int(radius)})
+                self.obstacles.append(
+                    {
+                        'center': [float(center_x), float(center_y), float(center_z)],
+                        'radius': radius,
+                    }
+                )
+                return True
 
             # 沿每条路径投放（仅当与所有起点/目标保持 min_clearance 以上才放置）
             for si, (s, g) in enumerate(segments):
@@ -2086,8 +2634,7 @@ class Scenario(BaseScenario):
                         cy +=  unit_x * off
                         cx = np.clip(cx, 5, self.map_size - 5)
                         cy = np.clip(cy, 5, self.map_size - 5)
-                        if _is_clear_of_start_goal(cx, cy):
-                            _emit_ob(cx, cy)
+                        if _is_clear_of_start_goal(cx, cy) and _emit_ob(cx, cy):
                             placed = True
                             break
                     if not placed:
@@ -2100,8 +2647,7 @@ class Scenario(BaseScenario):
                 for _attempt in range(50):
                     cx = self.rng.randint(low, max(low+1, high))
                     cy = self.rng.randint(low, max(low+1, high))
-                    if _is_clear_of_start_goal(cx, cy):
-                        _emit_ob(cx, cy)
+                    if _is_clear_of_start_goal(cx, cy) and _emit_ob(cx, cy):
                         placed = True
                         break
                 if not placed:
@@ -2144,12 +2690,44 @@ class Scenario(BaseScenario):
                     if len(self.obstacles) <= 3:
                         print(f"🏗️ 生成障碍物 {len(self.obstacles)}: 位置=({center_x},{center_y},{center_z:.1f}), 半径={radius}, 地形高度={terrain_height:.1f}")
         
+        if self.paper_task_contract_enabled and len(self.obstacles) < num_obstacles:
+            # 路径候选可能因为端点/边界/障碍物间净空而被拒绝。论文任务不允许
+            # 静默减少障碍数；在全图继续确定性拒绝采样，直到补足精确数量。
+            fill_trials = max(200, 200 * int(num_obstacles))
+            for _ in range(fill_trials):
+                if len(self.obstacles) >= num_obstacles:
+                    break
+                cx = float(self.rng.uniform(5.0, self.map_size - 5.0))
+                cy = float(self.rng.uniform(5.0, self.map_size - 5.0))
+                if _is_clear_of_start_goal(cx, cy):
+                    _emit_ob(cx, cy)
+            if len(self.obstacles) != int(num_obstacles):
+                raise TaskLayoutError(
+                    f"unable to generate exact paper obstacle count: "
+                    f"requested={num_obstacles}, generated={len(self.obstacles)}"
+                )
         self._refresh_observation_static_cache()
         return self.obstacles
         
     def make_world(self):
         world = World()
         world.dim_p = 3  # 3D环境
+        physics = dict(self.paper_physics_contract or {})
+        if physics:
+            world.dt = float(physics['simulation_dt'])
+            world.gravity = float(physics['gravity'])
+            world.control_accel_gain = float(physics['control_accel_gain'])
+            world.damping = float(physics['damping'])
+            world.action_range = [
+                float(physics['action_range_x']),
+                float(physics['action_range_y']),
+                float(physics['action_range_z']),
+            ]
+            world.z_action_bias = float(physics['z_action_bias'])
+            world.quadrotor_attitude_response_time = float(
+                physics['quadrotor_attitude_response_time']
+            )
+            world.quadrotor_psi_cmd = float(physics['quadrotor_psi_cmd'])
         
         # 创建智能体
         num_agents = 3
@@ -2161,16 +2739,21 @@ class Scenario(BaseScenario):
             agent.size = float(getattr(self, 'agent_size', 0.5))
             # 确保地形文件生成之后再进行属性设置
             if hasattr(agent, 'max_speed'):
-                agent.max_speed = 25  # 原始值是1.0，调整到1.2
+                agent.max_speed = float(physics.get('agent_max_speed', 25.0))
             # 设置更大的加速度值，增强智能体移动能力
-            agent.accel = 8.5  # 增大加速度系数，原先默认为5.0
+            agent.accel = float(physics.get('agent_accel', 8.5))
             if hasattr(agent, 'color'):
                 agent.color = np.array([0.35, 0.35, 0.85])
             
             # 🔧 四旋翼动力学：通过环境变量启用
             # 设置 USE_QUADROTOR_DYNAMICS=1 来启用四旋翼动力学模型
             import os
-            use_quadrotor = os.getenv('USE_QUADROTOR_DYNAMICS', '0').lower() in ('1', 'true', 'yes', 'on')
+            use_quadrotor = (
+                bool(physics['use_quadrotor_dynamics'])
+                if physics
+                else os.getenv('USE_QUADROTOR_DYNAMICS', '0').lower()
+                in ('1', 'true', 'yes', 'on')
+            )
             agent.use_quadrotor_dynamics = use_quadrotor
         
         # 创建一个中央地标（对智能体不可见，仅用于计算），并为每个智能体创建目标
@@ -2182,6 +2765,14 @@ class Scenario(BaseScenario):
         # 为可视化与外部查询提供直接引用占位
         world.goal_pos = None
         world.agent_goals = []
+        world.paper_task_contract_enabled = bool(self.paper_task_contract_enabled)
+        world.hard_deadline_terminal = bool(self.hard_deadline_terminal)
+        world.paper_terminal_on_collision = bool(self.paper_terminal_on_collision)
+        world.paper_reward_profile = str(self.paper_reward_profile)
+        world.include_time_to_go_observation = bool(self.include_time_to_go_observation)
+        world.current_task_layout = None
+        world.task_difficulty_bin = self.task_difficulty_bin
+        world.curriculum_stage_id = int(self.curriculum_stage_id)
 
         # 为每个智能体创建可见的目标地标
         for i, agent in enumerate(world.agents):
@@ -2305,6 +2896,328 @@ class Scenario(BaseScenario):
                     except Exception:
                         pass
 
+    def _paper_task_position_seed(self, world):
+        """Return the deterministic seed dedicated to start-position sampling."""
+        episode_index, env_id = self._resolve_episode_context(world)
+        try:
+            return int(self._make_deterministic_episode_seed('position', episode_index, env_id))
+        except Exception:
+            base = int(self.training_env_sequence_seed)
+            return int((base + 32452843 * int(episode_index) + 49979687 * int(env_id)) % 2147483647)
+
+    def _sample_paper_contract_starts(self, world):
+        """Sample starts against the final per-agent goals under the frozen contract."""
+        agents = list(getattr(world, 'agents', []) or [])
+        if not agents:
+            raise TaskLayoutError("paper task contract requires at least one agent")
+        goals = []
+        for index, agent in enumerate(agents):
+            goal = getattr(agent, 'goal_a', None)
+            goal_state = getattr(goal, 'state', None)
+            goal_pos = getattr(goal_state, 'p_pos', None)
+            if goal_pos is None:
+                raise TaskLayoutError(f"agent_{index} has no resolved individual goal")
+            goals.append(np.asarray(goal_pos, dtype=np.float64)[:3])
+
+        position_seed = self._paper_task_position_seed(world)
+        rng = np.random.RandomState(position_seed)
+        min_distance = float(self.min_start_goal_dist)
+        max_distance = float(self.max_start_goal_dist)
+        margin = float(self.start_pos_margin)
+        min_separation = max(0.0, float(self.min_agent_start_separation))
+        max_trials = max(1, int(self.start_pos_max_trials))
+        altitude_offset = max(1.0, float(self._get_start_altitude_offset()))
+        try:
+            flatness_limit = max(0.0, float(os.getenv('TASK_START_MAX_TERRAIN_RANGE', '3.0')))
+        except Exception:
+            flatness_limit = 3.0
+
+        chosen = []
+        total_attempts = 0
+        for index, goal_pos in enumerate(goals):
+            selected = None
+            for _ in range(max_trials):
+                total_attempts += 1
+                # Area-uniform sampling in the configured annulus.
+                radius = math.sqrt(
+                    float(rng.uniform(min_distance * min_distance, max_distance * max_distance))
+                )
+                theta = float(rng.uniform(0.0, 2.0 * np.pi))
+                x = float(goal_pos[0] + radius * np.cos(theta))
+                y = float(goal_pos[1] + radius * np.sin(theta))
+                if not (margin <= x <= self.map_size - margin):
+                    continue
+                if not (margin <= y <= self.map_size - margin):
+                    continue
+                actual_distance = float(np.linalg.norm(np.asarray([x, y]) - goal_pos[:2]))
+                if actual_distance < min_distance or actual_distance > max_distance:
+                    continue
+                if chosen and any(
+                    float(np.linalg.norm(np.asarray([x, y]) - position[:2])) < min_separation
+                    for position in chosen
+                ):
+                    continue
+                if flatness_limit > 0.0:
+                    heights = np.asarray(
+                        [
+                            self.get_terrain_height(x, y),
+                            self.get_terrain_height(x + 1.0, y),
+                            self.get_terrain_height(x - 1.0, y),
+                            self.get_terrain_height(x, y + 1.0),
+                            self.get_terrain_height(x, y - 1.0),
+                        ],
+                        dtype=np.float64,
+                    )
+                    if not np.isfinite(heights).all():
+                        continue
+                    if float(np.max(heights) - np.min(heights)) > flatness_limit:
+                        continue
+                terrain_height = float(self.get_terrain_height(x, y))
+                selected = np.asarray([x, y, terrain_height + altitude_offset], dtype=np.float64)
+                break
+            if selected is None:
+                raise TaskLayoutError(
+                    f"unable to sample start for agent_{index} after {max_trials} trials "
+                    f"under distance=[{min_distance}, {max_distance}]m, margin={margin}m, "
+                    f"separation={min_separation}m"
+                )
+            chosen.append(selected)
+
+        validate_distance_bounds(
+            chosen,
+            goals,
+            min_distance=min_distance,
+            max_distance=max_distance,
+        )
+        self.current_episode_position_seed = int(position_seed)
+        for agent, position in zip(agents, chosen):
+            agent.state.p_pos = np.asarray(position, dtype=float)
+            agent.state.p_vel = np.zeros(world.dim_p, dtype=float)
+            agent.state.c = np.zeros(world.dim_c, dtype=float)
+            agent.start_position = agent.state.p_pos.copy()
+            agent._trajectory = [agent.state.p_pos.copy()]
+            agent.last_goal_dist = float(
+                np.linalg.norm(agent.state.p_pos - agent.goal_a.state.p_pos)
+            )
+        return chosen
+
+    def _enforce_paper_task_distance_contract(self, world, *, allow_resample):
+        if not bool(getattr(self, 'paper_task_contract_enabled', False)):
+            return
+        starts = [np.asarray(agent.state.p_pos, dtype=np.float64) for agent in world.agents]
+        goals = [np.asarray(agent.goal_a.state.p_pos, dtype=np.float64) for agent in world.agents]
+        try:
+            validate_distance_bounds(
+                starts,
+                goals,
+                min_distance=self.min_start_goal_dist,
+                max_distance=self.max_start_goal_dist,
+            )
+            if self.current_episode_position_seed is None:
+                self.current_episode_position_seed = self._paper_task_position_seed(world)
+            return
+        except TaskLayoutError:
+            if not allow_resample:
+                raise
+        self._sample_paper_contract_starts(world)
+
+    def _refresh_reset_observation_cache(self, world):
+        """Rebuild first observations after every final position/goal/obstacle mutation."""
+        self._obs_step_cache_key = None
+        self._obs_step_cache = {}
+        observation_cache = {}
+        for agent in world.agents:
+            observation_cache[id(agent)] = np.asarray(
+                self.observation(agent, world), dtype=np.float32
+            )
+        self.observation_cache = observation_cache
+
+    def _build_and_store_current_task_layout(self, world, *, source):
+        """Validate the resolved episode and publish its immutable task artifact."""
+        if not bool(getattr(self, 'paper_task_contract_enabled', False)):
+            self.current_task_layout = None
+            world.current_task_layout = None
+            return None
+
+        starts = [np.asarray(agent.state.p_pos, dtype=np.float64) for agent in world.agents]
+        goals = [np.asarray(agent.goal_a.state.p_pos, dtype=np.float64) for agent in world.agents]
+        central_goal = np.asarray(self.goal_pos, dtype=np.float64)
+        max_obstacle_trials = max(
+            1, int(os.getenv('PAPER_TASK_OBSTACLE_RESAMPLE_TRIALS', '20'))
+        )
+        last_error = None
+        layout = None
+        original_override = getattr(self, 'current_episode_obstacle_seed_override', None)
+        try:
+            for attempt in range(max_obstacle_trials):
+                try:
+                    layout = build_task_layout(
+                        agent_starts=starts,
+                        agent_goals=goals,
+                        central_goal=central_goal,
+                        map_size=self.map_size,
+                        min_start_goal_dist=self.min_start_goal_dist,
+                        max_start_goal_dist=self.max_start_goal_dist,
+                        terrain=self.terrain,
+                        obstacles=getattr(self, 'obstacles', []),
+                        terrain_seed=getattr(self, 'current_terrain_seed', self.seed),
+                        terrain_variant_seed=getattr(
+                            self, 'current_terrain_variant_seed', getattr(self, 'terrain_variant_seed', None)
+                        ),
+                        obstacle_seed=getattr(self, 'current_episode_obstacle_seed', None),
+                        position_seed=self.current_episode_position_seed,
+                        episode_index=getattr(self, 'current_episode_index', None),
+                        env_id=getattr(self, 'current_episode_env_id', None),
+                        source=source,
+                        difficulty_bin=self.task_difficulty_bin,
+                        grid_resolution=self.paper_task_reference_grid_resolution,
+                        obstacle_inflation=self.paper_task_obstacle_inflation,
+                        reference_surface_clearance=(
+                            self.paper_task_reference_surface_clearance
+                        ),
+                        success_distance_threshold=(
+                            self.success_distance_threshold
+                        ),
+                        collision_distance_threshold=(
+                            self.collision_distance_threshold
+                        ),
+                        goal_formation_radius=self.paper_goal_formation_radius,
+                        goal_boundary_clearance=self.paper_goal_boundary_clearance,
+                        deadline_policy=self.paper_task_deadline_policy,
+                        simulation_dt_seconds=float(getattr(world, 'dt', 0.08)),
+                        require_reference_feasible=self.paper_task_require_reference_feasible,
+                    )
+                    break
+                except TaskLayoutError as exc:
+                    last_error = exc
+                    can_resample_obstacles = bool(getattr(self, 'use_dynamic_obstacles', False))
+                    disconnected = 'disconnected' in str(exc)
+                    if not (can_resample_obstacles and disconnected and attempt + 1 < max_obstacle_trials):
+                        raise
+                    base_seed = int(getattr(self, 'current_episode_obstacle_seed', self.seed or 42))
+                    retry_seed = int((base_seed + (attempt + 1) * 104729) % 2147483647)
+                    self.current_episode_obstacle_seed_override = retry_seed
+                    self._refresh_obstacles_for_current_layout(
+                        world,
+                        start_positions=starts,
+                        goal_position=central_goal,
+                        agent_goal_positions=goals,
+                        force_regenerate=True,
+                    )
+        finally:
+            self.current_episode_obstacle_seed_override = original_override
+
+        if layout is None:
+            raise TaskLayoutError(f"failed to resolve task layout: {last_error}")
+        self.current_task_layout = layout
+        world.current_task_layout = layout
+        world.task_id = layout['task_id']
+        world.task_difficulty_bin = self.task_difficulty_bin
+        world.curriculum_stage_id = int(self.curriculum_stage_id)
+
+        if self.paper_task_metadata_dir:
+            episode_index = int(getattr(self, 'current_episode_index', 0))
+            env_id = int(getattr(self, 'current_episode_env_id', 0))
+            output_path = os.path.join(
+                self.paper_task_metadata_dir,
+                f"episode_{episode_index:06d}_env_{env_id:03d}.json",
+            )
+            atomic_write_json(output_path, layout)
+        return layout
+
+    def _apply_paper_task_layout(self, world):
+        """Apply one immutable task-bank entry and verify exact physical replay."""
+        layout = self.paper_task_layout
+        if not isinstance(layout, dict):
+            return False
+        starts = np.asarray(layout.get('agent_starts'), dtype=np.float64)
+        goals = np.asarray(layout.get('agent_goals'), dtype=np.float64)
+        central_goal = np.asarray(layout.get('central_goal'), dtype=np.float64).reshape(-1)
+        obstacles = list(layout.get('obstacles') or [])
+        if starts.shape != (len(world.agents), 3) or goals.shape != (len(world.agents), 3):
+            raise TaskLayoutError(
+                f"task-bank agent geometry mismatch: starts={starts.shape}, "
+                f"goals={goals.shape}, world_agents={len(world.agents)}"
+            )
+        if central_goal.shape != (3,):
+            raise TaskLayoutError(
+                f"task-bank central_goal must have shape (3,), got={central_goal.shape}"
+            )
+        if len(obstacles) != len(getattr(world, 'obstacles', [])):
+            raise TaskLayoutError(
+                f"task-bank obstacle count mismatch: layout={len(obstacles)}, "
+                f"world={len(getattr(world, 'obstacles', []))}; "
+                "set PAPER_TASK_NUM_OBSTACLES to the bank entry count"
+            )
+
+        for index, agent in enumerate(world.agents):
+            agent.state.p_pos = starts[index].astype(np.float64, copy=True)
+            agent.state.p_vel = np.zeros(3, dtype=np.float64)
+            agent.action.u = np.zeros(world.dim_p, dtype=np.float64)
+            agent.goal_a.state.p_pos = goals[index].astype(np.float64, copy=True)
+            agent.last_position = agent.state.p_pos.copy()
+            agent.start_position = agent.state.p_pos.copy()
+            agent.last_goal_dist = float(
+                np.linalg.norm(agent.state.p_pos - agent.goal_a.state.p_pos)
+            )
+        self.goal_pos = central_goal.astype(np.float64, copy=True)
+        world.goal_pos = self.goal_pos.copy()
+        world.agent_goals = [agent.goal_a.state.p_pos.copy() for agent in world.agents]
+        if getattr(world, 'landmarks', None):
+            world.landmarks[0].state.p_pos = self.goal_pos.copy()
+
+        normalized_obstacles = []
+        for index, raw in enumerate(obstacles):
+            center = np.asarray(raw.get('center'), dtype=np.float64).reshape(-1)
+            radius = float(raw.get('radius'))
+            if center.shape != (3,) or not np.isfinite(center).all():
+                raise TaskLayoutError(f"task-bank obstacle[{index}] has invalid center")
+            if not np.isfinite(radius) or radius < 0.0:
+                raise TaskLayoutError(f"task-bank obstacle[{index}] has invalid radius")
+            normalized_obstacles.append({'center': center.tolist(), 'radius': radius})
+        self.obstacles = normalized_obstacles
+        self._place_obstacles(world)
+        seeds = dict(layout.get('seeds') or {})
+        self.current_episode_position_seed = seeds.get('position')
+        self.current_episode_obstacle_seed = seeds.get('obstacle')
+        self._obstacle_layout_signature = None
+        self._refresh_observation_static_cache(num_agents=len(world.agents))
+
+        replayed = self._build_and_store_current_task_layout(
+            world, source='paper_task_bank_replay'
+        )
+        expected_task_id = str(layout.get('task_id', ''))
+        if replayed.get('task_id') != expected_task_id:
+            raise TaskLayoutError(
+                f"task-bank physical replay mismatch: expected task_id={expected_task_id}, "
+                f"actual={replayed.get('task_id')}; terrain/config does not match bank"
+            )
+        self._refresh_reset_observation_cache(world)
+        world._reset_completed = True
+        return True
+
+    def _prepare_terrain_for_paper_task_layout(self):
+        layout = self.paper_task_layout
+        if not isinstance(layout, dict):
+            return
+        seeds = dict(layout.get('seeds') or {})
+        terrain_seed = seeds.get('terrain')
+        terrain_variant_seed = seeds.get('terrain_variant')
+        if terrain_seed is None:
+            raise TaskLayoutError("task-bank layout is missing terrain seed")
+        if bool(getattr(self, 'use_semi_random_terrain', False)):
+            if terrain_variant_seed is None:
+                raise TaskLayoutError(
+                    "semi-random task-bank layout is missing terrain_variant seed"
+                )
+            self.terrain_base_seed = int(terrain_seed)
+            self.regenerate_terrain(
+                new_seed=int(terrain_seed),
+                variant_seed=int(terrain_variant_seed),
+            )
+        else:
+            self.regenerate_terrain(new_seed=int(terrain_seed))
+
     def reset_world(self, world):
         """
         重置世界状态
@@ -2318,6 +3231,8 @@ class Scenario(BaseScenario):
             world.enable_collision_autoreset = _os.getenv('ENABLE_COLLISION_AUTORESET', '1').lower() in ('1','true','yes','on')
         except Exception:
             world.enable_collision_autoreset = True
+        if self.paper_reward_profile == 'paper_v1':
+            world.enable_collision_autoreset = False
         # 通知子类/组件：回合开始（用于ARW等自适应模块）
         try:
             if hasattr(self, 'on_episode_start') and callable(getattr(self, 'on_episode_start')):
@@ -2325,7 +3240,56 @@ class Scenario(BaseScenario):
         except Exception:
             pass
         self.current_episode_index, self.current_episode_env_id = self._resolve_episode_context(world)
+        if self.paper_task_bank_layouts:
+            bank_role = str(
+                (self.paper_task_bank_info or {}).get('role', '') or ''
+            ).strip()
+            if bank_role == 'train':
+                # Every synchronous worker receives a distinct task.  Once the
+                # finite immutable bank is exhausted, training starts another
+                # deterministic cycle; validation/test never cycle.
+                sequence_position = (
+                    int(self.current_episode_index)
+                    * int(self.paper_task_bank_parallel_envs)
+                    + int(self.current_episode_env_id)
+                )
+                task_index = sequence_position % len(self.paper_task_bank_layouts)
+                world.paper_task_bank_cycle = (
+                    sequence_position // len(self.paper_task_bank_layouts)
+                )
+            else:
+                task_index = int(self.current_episode_index)
+                if task_index < 0 or task_index >= len(self.paper_task_bank_layouts):
+                    raise TaskLayoutError(
+                        f"task-bank split={self.paper_task_bank_split} index={task_index} "
+                        f"outside [0, {len(self.paper_task_bank_layouts) - 1}]"
+                    )
+                world.paper_task_bank_cycle = 0
+            world.paper_task_bank_index = int(task_index)
+            self.paper_task_layout = self.paper_task_bank_layouts[task_index]
+        if self.paper_task_layout is not None:
+            deadline = dict(
+                (self.paper_task_layout.get('contract') or {}).get('deadline') or {}
+            )
+            if self.paper_task_bank_layouts and not deadline:
+                raise TaskLayoutError("task-bank layout is missing deadline contract")
+            if deadline:
+                expected_dt = float(deadline.get('simulation_dt_seconds'))
+                actual_dt = float(getattr(world, 'dt', 0.08))
+                if not math.isclose(actual_dt, expected_dt, rel_tol=0.0, abs_tol=1e-12):
+                    raise TaskLayoutError(
+                        f"task deadline dt mismatch: layout={expected_dt}, world={actual_dt}"
+                    )
+                deadline_steps = int(deadline.get('deadline_steps', 0))
+                if deadline_steps <= 0:
+                    raise TaskLayoutError("task deadline_steps must be positive")
+                world.episode_length = deadline_steps
+                world.paper_task_deadline_steps = deadline_steps
+                world.paper_task_deadline_seconds = float(deadline['deadline_seconds'])
         self.current_episode_obstacle_seed = None
+        self.current_episode_position_seed = None
+        self.current_task_layout = None
+        world.current_task_layout = None
         if self._use_deterministic_train_env_sequence():
             self.current_episode_rng_seed = self._make_deterministic_episode_seed(
                 'episode_rng',
@@ -2351,6 +3315,7 @@ class Scenario(BaseScenario):
         for agent in world.agents:
             agent.total_energy = 3000.0  # 初始总能量
             agent.energy_consumed = 0.0  # 已消耗能量
+            agent.energy_consumed_unit = 'normalized_energy_seconds'
             agent.last_velocity = np.zeros(3)  # 上一步速度，用于计算加速度
             
             # 确保加速度值被显式重置为零
@@ -2379,6 +3344,13 @@ class Scenario(BaseScenario):
             agent.last_position = agent.state.p_pos.copy()
             agent.stationary_count = 0
             agent.initialized_for_reward = False
+            agent._paper_reward_last_goal_dist = None
+            agent._paper_reward_initial_goal_dist = None
+            agent._paper_reached_once = False
+            agent._paper_step_collision = False
+            agent._paper_step_out_of_bounds = False
+            agent._paper_step_min_clearance = float('inf')
+            agent._paper_step_control_effort = 0.0
             
             # 🔧 关键修复：每回合重置成功状态标志
             # 问题：如果不重置，智能体在首次到达目标后，后续回合将无法再获得一次性成功奖励
@@ -2398,8 +3370,17 @@ class Scenario(BaseScenario):
             if hasattr(agent, 'collision_reduction_reward_given'):
                 agent.collision_reduction_reward_given = False
 
-        # 重新生成地形（如果设置了随机地形）
-        if hasattr(self, 'random_terrain') and self.random_terrain:
+        # 重新生成地形：全随机地形，或配置为逐回合变化的半随机地形。
+        regenerate_episode_terrain = bool(
+            getattr(self, 'random_terrain', False)
+            or (
+                getattr(self, 'use_semi_random_terrain', False)
+                and getattr(self, 'per_episode_terrain', False)
+            )
+        )
+        if self.paper_task_layout is not None:
+            self._prepare_terrain_for_paper_task_layout()
+        elif regenerate_episode_terrain:
             try:
                 if getattr(world, 'is_main_env', True) and not _scenario_quiet_output():
                     print("启用随机地形，重新生成")
@@ -2425,6 +3406,13 @@ class Scenario(BaseScenario):
                 new_seed=terrain_seed_override,
                 variant_seed=terrain_variant_seed_override,
             )
+
+        # Task-bank replay has priority over every procedural/fixed-position branch.
+        # It restores per-agent goals and obstacle geometry exactly and then
+        # rebuilds the physical task ID to detect any terrain/config drift.
+        if self.paper_task_layout is not None:
+            self._apply_paper_task_layout(world)
+            return
         
         # 🚨 关键修复：只有在use_fixed_positions=True时才加载固定位置文件
         # 原因：即使USE_FIXED_POSITIONS=0，如果fixed_positions_file存在，代码也会加载固定位置
@@ -2568,6 +3556,21 @@ class Scenario(BaseScenario):
                 
                 # 🚀 插入角色随机化 (动态首次生成时)
                 self._apply_role_randomization(world)
+
+                # 动态首次分支此前会在障碍物按新布局刷新前直接 return。
+                # 论文任务契约要求起点、目标、障碍物和首帧观察来自同一最终状态。
+                agent_positions_now = [agent.state.p_pos for agent in world.agents]
+                agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
+                self._refresh_obstacles_for_current_layout(
+                    world,
+                    start_positions=agent_positions_now,
+                    goal_position=self.goal_pos,
+                    agent_goal_positions=agent_goals_now,
+                )
+                self._build_and_store_current_task_layout(
+                    world, source='dynamic_first_time'
+                )
+                self._refresh_reset_observation_cache(world)
                 
                 # 标记reset已完成，允许调试信息打印
                 world._reset_completed = True
@@ -2638,6 +3641,10 @@ class Scenario(BaseScenario):
                 pass
                 
             self._apply_fixed_positions(world)
+            self._enforce_paper_task_distance_contract(
+                world,
+                allow_resample=not bool(self.paper_task_contract_strict),
+            )
             # 同地形/同起点/同目标基础上，为每个并行环境引入独立的初始朝向/速度微扰
             self._apply_per_env_randomization(world)
             
@@ -2657,6 +3664,10 @@ class Scenario(BaseScenario):
             
             # 🚀 插入角色随机化 (固定位置重置时)
             self._apply_role_randomization(world)
+            self._build_and_store_current_task_layout(
+                world, source='fixed_positions'
+            )
+            self._refresh_reset_observation_cache(world)
             
             # print("=== 重置完成 ===\n")
             return
@@ -2689,6 +3700,18 @@ class Scenario(BaseScenario):
                 
         # 🚀 插入角色随机化 (完全动态位置生成时)
         self._apply_role_randomization(world)
+        agent_positions_now = [agent.state.p_pos for agent in world.agents]
+        agent_goals_now = [agent.goal_a.state.p_pos for agent in world.agents]
+        self._refresh_obstacles_for_current_layout(
+            world,
+            start_positions=agent_positions_now,
+            goal_position=self.goal_pos,
+            agent_goal_positions=agent_goals_now,
+        )
+        self._build_and_store_current_task_layout(
+            world, source='generated_positions'
+        )
+        self._refresh_reset_observation_cache(world)
         
         # 根据DEBUG_ENV_OUTPUT环境变量控制完成信息输出
         debug_mode = int(os.getenv('DEBUG_ENV_OUTPUT', '0'))
@@ -3070,6 +4093,11 @@ class Scenario(BaseScenario):
         """
         # 直接使用 world.obstacles 列表
         obstacles_to_place = world.obstacles if hasattr(world, 'obstacles') else []
+        if self.paper_task_contract_enabled and len(self.obstacles) != len(obstacles_to_place):
+            raise TaskLayoutError(
+                f"paper obstacle geometry/entity count mismatch: "
+                f"generated={len(self.obstacles)}, world={len(obstacles_to_place)}"
+            )
         
         for i, obstacle in enumerate(obstacles_to_place):
             if hasattr(self, 'obstacles') and i < len(self.obstacles):
@@ -3235,6 +4263,7 @@ class Scenario(BaseScenario):
         
         # 新增：根据中央目标点设置每个智能体的包围目标
         self._set_agent_goals(world)
+        self._enforce_paper_task_distance_contract(world, allow_resample=True)
 
         # 标记reset已完成，允许调试信息打印
         world._reset_completed = True
@@ -4033,11 +5062,226 @@ class Scenario(BaseScenario):
         return heights_out[:num_coords]
     
         
+    def _paper_agent_minimum_clearance(self, agent, world):
+        """Return exact body-surface clearance used by paper safety metrics."""
+        pos = np.asarray(agent.state.p_pos, dtype=np.float64)[:3]
+        agent_radius = float(max(0.0, getattr(agent, 'size', self.agent_size)))
+        candidates = []
+
+        terrain_height = float(self.get_terrain_height(pos[0], pos[1]))
+        candidates.append((float(pos[2] - agent_radius - terrain_height), 'terrain'))
+
+        centers = np.asarray(getattr(self, '_obs_centers', np.zeros((0, 3))), dtype=np.float64)
+        radii = np.asarray(getattr(self, '_obs_radii', np.zeros((0,))), dtype=np.float64)
+        if centers.ndim == 2 and centers.shape[0] and centers.shape[1] >= 3:
+            obstacle_clearances = np.linalg.norm(centers[:, :3] - pos[None, :], axis=1)
+            obstacle_clearances -= radii[:centers.shape[0]] + agent_radius
+            obstacle_index = int(np.argmin(obstacle_clearances))
+            candidates.append((float(obstacle_clearances[obstacle_index]), 'obstacle'))
+
+        for other in list(getattr(world, 'policy_agents', []) or []):
+            if other is agent:
+                continue
+            other_pos = getattr(getattr(other, 'state', None), 'p_pos', None)
+            if other_pos is None:
+                continue
+            clearance = float(
+                np.linalg.norm(pos - np.asarray(other_pos, dtype=np.float64)[:3])
+                - agent_radius
+                - float(max(0.0, getattr(other, 'size', self.agent_size)))
+            )
+            candidates.append((clearance, 'agent'))
+
+        return min(candidates, key=lambda item: item[0])
+
+    @staticmethod
+    def _paper_control_effort(agent, world):
+        action = np.asarray(
+            getattr(getattr(agent, 'action', None), 'u', np.zeros(3)),
+            dtype=np.float64,
+        ).reshape(-1)
+        head = np.zeros(3, dtype=np.float64)
+        head[:min(3, action.size)] = action[:3]
+        # agent.action.u is the executed normalized head after APF correction;
+        # physical action_range/control gains are applied later in World.step.
+        return float(np.dot(head, head))
+
+    def prepare_step_reward(self, world):
+        """Prepare once-per-step paper safety state and the energy audit channel."""
+        key = (
+            id(world),
+            int(getattr(world, 'episode_index', -1)),
+            int(getattr(world, 'current_step', -1)),
+        )
+        if self._paper_prepared_step_key == key:
+            return
+        self._paper_prepared_step_key = key
+        dt = float(max(0.0, getattr(world, 'dt', 0.08)))
+        paper_enabled = self.paper_reward_profile == 'paper_v1'
+        any_collision = False
+        any_out_of_bounds = False
+
+        for agent in list(getattr(world, 'policy_agents', []) or []):
+            control_effort = self._paper_control_effort(agent, world)
+            agent._paper_step_control_effort = control_effort
+            # The simulator has no motor/battery model, so this is explicitly a
+            # normalized proxy: unit hover power plus squared executed command.
+            agent.energy_consumed = float(getattr(agent, 'energy_consumed', 0.0)) + (1.0 + control_effort) * dt
+            agent.energy_consumed_unit = 'normalized_energy_seconds'
+            if not paper_enabled:
+                continue
+
+            minimum_clearance, clearance_source = self._paper_agent_minimum_clearance(agent, world)
+            out_of_bounds = not bool(world.is_within_bounds(agent.state.p_pos))
+            collision = bool(minimum_clearance <= self.collision_distance_threshold)
+            agent._paper_step_min_clearance = float(minimum_clearance)
+            agent._paper_step_clearance_source = str(clearance_source)
+            agent._paper_step_collision = collision
+            agent._paper_step_out_of_bounds = out_of_bounds
+            if not isinstance(getattr(agent, 'debug_info', None), dict):
+                agent.debug_info = {}
+            agent.debug_info['d_min_current'] = float(minimum_clearance)
+            agent.debug_info['paper_clearance_source'] = str(clearance_source)
+            agent.debug_info['paper_control_effort'] = float(control_effort)
+            world._episode_dmin_min = min(
+                float(getattr(world, '_episode_dmin_min', float('inf'))),
+                float(minimum_clearance),
+            )
+
+            if collision:
+                any_collision = True
+                agent._episode_has_collision = True
+                agent._had_penetration_or_collision = True
+                if clearance_source == 'terrain':
+                    agent._had_terrain_contact_or_penetration = True
+                else:
+                    agent._had_obstacle_collision = True
+                step_index = int(getattr(world, 'current_step', -1))
+                if int(getattr(agent, '_last_collision_counted_step', -2)) != step_index:
+                    agent._last_collision_counted_step = step_index
+                    agent.current_episode_collision_count = int(
+                        getattr(agent, 'current_episode_collision_count', 0)
+                    ) + 1
+                    old_count = int(agent.debug_info.get('total_penetration_count', 0) or 0)
+                    agent.debug_info['total_penetration_count'] = old_count + 1
+                    count_key = (
+                        'terrain_penetration_count'
+                        if clearance_source == 'terrain'
+                        else 'obstacle_collision_count'
+                    )
+                    agent.debug_info[count_key] = int(agent.debug_info.get(count_key, 0) or 0) + 1
+            if out_of_bounds:
+                any_out_of_bounds = True
+
+        world._paper_any_collision = bool(any_collision)
+        world._paper_any_out_of_bounds = bool(any_out_of_bounds)
+
+    def _paper_reward(self, agent, world):
+        """Bounded transition reward aligned with the paper success definition."""
+        self.prepare_step_reward(world)
+        goal = getattr(getattr(agent, 'goal_a', None), 'state', None)
+        goal_pos = getattr(goal, 'p_pos', None)
+        if goal_pos is None:
+            raise RuntimeError('paper_v1 reward requires one resolved goal per agent')
+        current_distance = float(
+            np.linalg.norm(
+                np.asarray(agent.state.p_pos, dtype=np.float64)[:3]
+                - np.asarray(goal_pos, dtype=np.float64)[:3]
+            )
+        )
+        initial_distance = getattr(agent, '_paper_reward_initial_goal_dist', None)
+        if initial_distance is None or not np.isfinite(initial_distance) or initial_distance <= 1e-9:
+            start_position = np.asarray(
+                getattr(agent, 'start_position', agent.state.p_pos), dtype=np.float64
+            )[:3]
+            initial_distance = float(
+                np.linalg.norm(start_position - np.asarray(goal_pos, dtype=np.float64)[:3])
+            )
+            if initial_distance <= 1e-9:
+                initial_distance = max(current_distance, 1.0)
+            agent._paper_reward_initial_goal_dist = initial_distance
+
+        previous_distance = getattr(agent, '_paper_reward_last_goal_dist', None)
+        if previous_distance is None or not np.isfinite(previous_distance):
+            previous_distance = float(initial_distance)
+        progress = float(previous_distance) - current_distance
+        agent._paper_reward_last_goal_dist = current_distance
+        agent.last_goal_dist = current_distance
+
+        progress_term = self.paper_progress_reward_scale * progress / max(initial_distance, 1e-6)
+        progress_term = float(np.clip(progress_term, -2.0, 2.0))
+        step_term = -float(self.paper_step_penalty)
+        control_term = -float(
+            self.paper_control_effort_penalty
+            * max(0.0, getattr(agent, '_paper_step_control_effort', 0.0))
+        )
+        minimum_clearance = float(
+            getattr(agent, '_paper_step_min_clearance', float('inf'))
+        )
+        if self.paper_clearance_margin > 0.0 and minimum_clearance < self.paper_clearance_margin:
+            violation = max(
+                0.0,
+                (self.paper_clearance_margin - minimum_clearance)
+                / self.paper_clearance_margin,
+            )
+            clearance_term = -float(self.paper_clearance_penalty * min(violation, 2.0) ** 2)
+        else:
+            clearance_term = 0.0
+
+        safe_so_far = not bool(getattr(agent, '_episode_has_collision', False))
+        in_goal = current_distance <= self.success_distance_threshold
+        reach_term = 0.0
+        if in_goal and safe_so_far and not bool(getattr(agent, '_paper_reached_once', False)):
+            agent._paper_reached_once = True
+            reach_term = float(self.paper_individual_reach_bonus)
+        elif not in_goal and bool(getattr(agent, '_paper_reached_once', False)):
+            agent._paper_reached_once = False
+            reach_term = -float(self.paper_individual_reach_bonus)
+
+        terminal_term = 0.0
+        terminal_kind = None
+        if bool(getattr(world, '_episode_success', False)):
+            terminal_term = float(self.paper_team_success_bonus)
+            terminal_kind = 'team_success'
+        elif bool(getattr(world, '_paper_any_out_of_bounds', False)):
+            terminal_term = -float(self.paper_out_of_bounds_penalty)
+            terminal_kind = 'out_of_bounds'
+        elif bool(getattr(world, '_paper_any_collision', False)):
+            terminal_term = -float(self.paper_collision_penalty)
+            terminal_kind = 'collision'
+        else:
+            episode_length = int(getattr(world, 'episode_length', 0) or 0)
+            current_step = int(getattr(world, 'current_step', 0) or 0)
+            if episode_length > 0 and current_step >= episode_length:
+                terminal_term = -float(self.paper_deadline_penalty)
+                terminal_kind = 'time_limit'
+
+        terms = {
+            'progress': float(progress_term),
+            'step': float(step_term),
+            'control_effort': float(control_term),
+            'clearance': float(clearance_term),
+            'individual_reach': float(reach_term),
+            'terminal': float(terminal_term),
+        }
+        reward_value = float(sum(terms.values()))
+        if not isinstance(getattr(agent, 'debug_info', None), dict):
+            agent.debug_info = {}
+        agent.debug_info['paper_reward_terms'] = terms
+        agent.debug_info['paper_terminal_kind'] = terminal_kind
+        agent.debug_info['reward'] = reward_value
+        agent.debug_info['distance'] = current_distance
+        agent.debug_info['distance_change'] = progress
+        return reward_value
+
     def reward(self, agent, world):
         import os  # 确保os模块可用
         """
         分项加权求和奖励函数
         """
+        if self.paper_reward_profile == 'paper_v1':
+            return self._paper_reward(agent, world)
+
         # 🔧 修复：健壮性检查 - 确保输入有效
         if agent.state.p_pos is None:
             return 0.0
@@ -4812,7 +6056,7 @@ class Scenario(BaseScenario):
                 print(f"其他智能体信息批量计算错误: {e}")
                 other_agents_obs.fill(0.0)
 
-            env_info = self._obs_env_info.astype(np.float32, copy=False)
+            env_info = self._resolved_observation_env_info(world)
             obs = np.concatenate(
                 [
                     state_info,
@@ -4824,6 +6068,9 @@ class Scenario(BaseScenario):
                 ],
                 axis=1,
             ).astype(np.float32, copy=False)
+            # Match the scalar observation path: out-of-domain geometry must
+            # not produce a different input range when batching is enabled.
+            obs = np.clip(obs, -10.0, 10.0)
             return {id(ag): obs[idx] for idx, ag in enumerate(agents)}
         except Exception:
             return {}
@@ -5127,7 +6374,7 @@ class Scenario(BaseScenario):
         # 6. 环境状态信息 (6维) - 新增
         if self._obs_env_info is None or self._obs_env_info_agent_count != len(world.agents):
             self._refresh_observation_static_cache(num_agents=len(world.agents))
-        env_info = self._obs_env_info  # 段落标记位（固定常量，方便解析）
+        env_info = self._resolved_observation_env_info(world)
         
         # 合并所有观察信息（目标结构：9 + 32 + 15 + 7 + 12 + 6 = 81维）
         obs_components = [
@@ -5741,12 +6988,52 @@ class Scenario(BaseScenario):
             print("警告: 中央目标点 (self.goal_pos) 未设置，无法设定智能体目标。")
             return
 
-        # 包围圈半径：各智能体目标绕中央目标分布，适当拉开可减少到终点时的组间斥力
-        formation_radius = float(os.getenv('AGENT_GOAL_FORMATION_RADIUS', '10.0'))
+        # 包围圈半径：各智能体目标绕中央目标分布，适当拉开可减少到终点时的组间斥力。
+        # 论文任务中必须平移完整编队，使每个目标都保留显式边界净空；逐目标 clip
+        # 会压扁编队，并把某个目标固定到 map_size-1，造成系统性越界风险。
+        formation_radius = (
+            float(self.paper_goal_formation_radius)
+            if self.paper_task_contract_enabled
+            else float(os.getenv('AGENT_GOAL_FORMATION_RADIUS', '10.0'))
+        )
         num_agents = len(world.agents)
+        if num_agents <= 0:
+            raise TaskLayoutError("goal formation requires at least one agent")
         # 维护world级的可视化读取容器
         if hasattr(world, 'agent_goals'):
             world.agent_goals = []
+
+        angles = np.asarray(
+            [(2 * np.pi * i / num_agents) + (np.pi / 2) for i in range(num_agents)],
+            dtype=np.float64,
+        )
+        offsets_xy = np.stack(
+            [formation_radius * np.cos(angles), formation_radius * np.sin(angles)],
+            axis=1,
+        )
+
+        # 保持编队几何不变，并把中央目标整体平移到所有分配目标都安全的区域。
+        if self.paper_task_contract_enabled:
+            clearance = float(self.paper_goal_boundary_clearance)
+            lower = clearance - np.min(offsets_xy, axis=0)
+            upper = (float(self.map_size) - clearance) - np.max(offsets_xy, axis=0)
+            if np.any(lower > upper):
+                raise TaskLayoutError(
+                    f"goal formation cannot fit map: map_size={self.map_size}, "
+                    f"radius={formation_radius}, clearance={clearance}"
+                )
+            old_goal = np.asarray(self.goal_pos, dtype=np.float64).copy()
+            old_terrain = float(self.get_terrain_height(old_goal[0], old_goal[1]))
+            preserved_altitude = max(float(old_goal[2] - old_terrain), 5.0)
+            self.goal_pos[:2] = np.clip(self.goal_pos[:2], lower, upper)
+            self.goal_pos[2] = (
+                float(self.get_terrain_height(self.goal_pos[0], self.goal_pos[1]))
+                + preserved_altitude
+            )
+            if getattr(world, 'landmarks', None):
+                world.landmarks[0].state.p_pos = self.goal_pos.copy()
+            if hasattr(world, 'goal_pos'):
+                world.goal_pos = self.goal_pos.copy()
         
         # 🔧 获取目标高度偏移量（中央目标相对于其地形的高度）
         central_terrain_h = self.get_terrain_height(self.goal_pos[0], self.goal_pos[1])
@@ -5755,19 +7042,23 @@ class Scenario(BaseScenario):
         
         for i, agent in enumerate(world.agents):
             # 为3个智能体创建一个等边三角形
-            angle = (2 * np.pi * i / num_agents) + (np.pi / 2) # 旋转90度，让一个点朝上
-            offset_x = formation_radius * np.cos(angle)
-            offset_y = formation_radius * np.sin(angle)
+            offset_x, offset_y = offsets_xy[i]
             
             goal_pos = self.goal_pos.copy()
             goal_pos[0] += offset_x
             goal_pos[1] += offset_y
-            # 保证目标XY仍在地图范围内（避免靠边时越界）
-            try:
+            if self.paper_task_contract_enabled:
+                clearance = float(self.paper_goal_boundary_clearance)
+                if not bool(
+                    clearance <= goal_pos[0] <= self.map_size - clearance
+                    and clearance <= goal_pos[1] <= self.map_size - clearance
+                ):
+                    raise TaskLayoutError(
+                        f"resolved agent_{i} goal violates boundary clearance: {goal_pos[:2]}"
+                    )
+            else:
                 goal_pos[0] = float(np.clip(goal_pos[0], 0, self.map_size - 1))
                 goal_pos[1] = float(np.clip(goal_pos[1], 0, self.map_size - 1))
-            except Exception:
-                pass
             
             # 🔧 关键修复：根据该目标XY位置的地形高度动态设置Z坐标
             # 原设计：goal_pos[2] = self.goal_pos[2]  ❌ 错误！会导致目标在地形内部

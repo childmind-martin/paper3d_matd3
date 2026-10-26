@@ -463,9 +463,47 @@ CMD_ARGS="$CMD_ARGS --reward-neg-scale $REWARD_NEG_SCALE"
 TRAINING_FR=""
 RESULTS_JSON_PATH=""
 
-# 从模型路径推断并严格绑定 results.json（按 exp_name 精确匹配）
+# 从模型路径推断并严格绑定 results.json（按 exp_name 精确匹配）。论文候选
+# 位于 models/<run>/paper_candidates/<candidate>，不能把 paper_candidates
+# 错当成训练 exp_name；此时以候选内不可变元数据为准向上定位训练根目录。
 MODEL_PARENT_DIR=$(dirname "$MODEL_PATH")
 EXPECTED_EXP_NAME=$(basename "$MODEL_PARENT_DIR")
+PAPER_TRAINING_METADATA="$MODEL_PATH/paper_training_checkpoint.json"
+PAPER_CHECKPOINT_FR=""
+if [ -f "$PAPER_TRAINING_METADATA" ]; then
+    PAPER_TRAINING_RUN_ID=$(
+        "$EVAL_PYTHON_BIN" -c \
+            'import json,sys; print(str(json.load(open(sys.argv[1], encoding="utf-8")).get("training_run_id", "")).strip())' \
+            "$PAPER_TRAINING_METADATA"
+    )
+    if [ -z "$PAPER_TRAINING_RUN_ID" ]; then
+        echo "❌ 论文候选缺少 training_run_id: $PAPER_TRAINING_METADATA" >&2
+        exit 1
+    fi
+    PAPER_CHECKPOINT_FR=$(
+        "$EVAL_PYTHON_BIN" -c \
+            'import json,math,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); v=float(d["checkpoint_action_force_ratio"]); assert d.get("schema_version")=="paper_training_checkpoint_v5" and math.isfinite(v) and 0.0 <= v <= 1.0; print(v)' \
+            "$PAPER_TRAINING_METADATA"
+    ) || {
+        echo "❌ 论文候选缺少有效的 checkpoint-specific FR: $PAPER_TRAINING_METADATA" >&2
+        exit 1
+    }
+    PAPER_MODEL_ANCESTOR=$(cd "$MODEL_PATH" && pwd)
+    PAPER_MODEL_ROOT=""
+    while [ "$PAPER_MODEL_ANCESTOR" != "/" ]; do
+        if [ "$(basename "$PAPER_MODEL_ANCESTOR")" = "$PAPER_TRAINING_RUN_ID" ]; then
+            PAPER_MODEL_ROOT="$PAPER_MODEL_ANCESTOR"
+            break
+        fi
+        PAPER_MODEL_ANCESTOR=$(dirname "$PAPER_MODEL_ANCESTOR")
+    done
+    if [ -z "$PAPER_MODEL_ROOT" ]; then
+        echo "❌ 无法从论文候选路径定位 training_run_id=$PAPER_TRAINING_RUN_ID" >&2
+        exit 1
+    fi
+    MODEL_PARENT_DIR="$PAPER_MODEL_ROOT"
+    EXPECTED_EXP_NAME="$PAPER_TRAINING_RUN_ID"
+fi
 
 # 先收集候选，再做精确匹配，避免 head -1 误选到其他实验
 declare -a RESULTS_JSON_CANDIDATES
@@ -1267,6 +1305,10 @@ CMD_ARGS="$CMD_ARGS --reward-neg-scale $REWARD_NEG_SCALE"
 # 确保评估时使用的势场参数与训练时完全一致
 
 # ACTION_FORCE_RATIO
+if [ -n "$PAPER_CHECKPOINT_FR" ]; then
+    TRAINING_FR="$PAPER_CHECKPOINT_FR"
+    echo "✅ 使用论文候选元数据中的 checkpoint-specific ACTION_FORCE_RATIO: $TRAINING_FR"
+fi
 if [ -n "${FORCE_EVAL_ACTION_FORCE_RATIO}" ]; then
     export ACTION_FORCE_RATIO=$FORCE_EVAL_ACTION_FORCE_RATIO
     echo "⚠️  控制实验：强制使用ACTION_FORCE_RATIO: $ACTION_FORCE_RATIO"
@@ -1419,7 +1461,7 @@ apply_training_or_default MAX_REWARD TRAINING_MAX_REWARD 800.0
 apply_training_or_default MIN_REWARD TRAINING_MIN_REWARD -800.0
 apply_training_or_default SUCCESS_REWARD_VALUE TRAINING_SUCCESS_REWARD_VALUE 8000.0
 apply_training_or_default NO_COLLISION_REWARD_VALUE TRAINING_NO_COLLISION_REWARD_VALUE 0.0
-apply_training_or_default SUCCESS_DISTANCE_THRESHOLD TRAINING_SUCCESS_DISTANCE_THRESHOLD 5.0
+apply_training_or_default SUCCESS_DISTANCE_THRESHOLD TRAINING_SUCCESS_DISTANCE_THRESHOLD 2.0
 apply_training_or_default TERRAIN_CONTACT_EPS TRAINING_TERRAIN_CONTACT_EPS 0.2
 apply_training_or_default COLLISION_DISTANCE_THRESHOLD TRAINING_COLLISION_DISTANCE_THRESHOLD 0.5
 apply_training_or_default COLLISION_PENALTY_VALUE TRAINING_COLLISION_PENALTY_VALUE 60.0
@@ -1723,6 +1765,48 @@ if [ "${DISABLE_GIF:-0}" = "1" ] || [ "${DISABLE_GIF,,}" = "true" ] || [ "${DISA
 fi
 if [ "${EVAL_CONFIG_RESOLVE_ONLY:-0}" = "1" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "true" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "yes" ] || [ "${EVAL_CONFIG_RESOLVE_ONLY,,}" = "on" ]; then
     EVAL_CMD+=(--config-resolve-only)
+fi
+
+# 论文模式必须显式提供完整数据角色与任务库身份。只设置其中一部分时
+# 直接失败，避免评估脚本退回普通随机场景而生成不可用于论文的结果。
+if [ -n "${PAPER_RUN_ID:-}${PAPER_METHOD_ID:-}${PAPER_SPLIT:-}${PAPER_TRAIN_SEED:-}${PAPER_EVAL_SEED:-}${PAPER_TASK_BANK_MANIFEST:-}${PAPER_TASK_BANK_SPLIT:-}${PAPER_EXPERIMENT_PROTOCOL_PATH:-}" ]; then
+    PAPER_REQUIRED_VARS=(
+        PAPER_RUN_ID
+        PAPER_METHOD_ID
+        PAPER_SPLIT
+        PAPER_TRAIN_SEED
+        PAPER_EVAL_SEED
+        PAPER_TASK_BANK_MANIFEST
+        PAPER_TASK_BANK_SPLIT
+        PAPER_EXPERIMENT_PROTOCOL_PATH
+    )
+    PAPER_MISSING_VARS=()
+    for PAPER_VAR_NAME in "${PAPER_REQUIRED_VARS[@]}"; do
+        if [ -z "${!PAPER_VAR_NAME:-}" ]; then
+            PAPER_MISSING_VARS+=("$PAPER_VAR_NAME")
+        fi
+    done
+    if [ ${#PAPER_MISSING_VARS[@]} -gt 0 ]; then
+        echo "❌ 论文评估身份不完整: ${PAPER_MISSING_VARS[*]}" >&2
+        exit 2
+    fi
+    EVAL_CMD+=(
+        --paper-run-id "$PAPER_RUN_ID"
+        --paper-method-id "$PAPER_METHOD_ID"
+        --paper-split "$PAPER_SPLIT"
+        --paper-train-seed "$PAPER_TRAIN_SEED"
+        --paper-eval-seed "$PAPER_EVAL_SEED"
+        --paper-task-bank-manifest "$PAPER_TASK_BANK_MANIFEST"
+        --paper-task-bank-split "$PAPER_TASK_BANK_SPLIT"
+        --paper-experiment-protocol "$PAPER_EXPERIMENT_PROTOCOL_PATH"
+        --paper-eval-all-bank-tasks true
+    )
+    if [ -n "${PAPER_SELECTION_RESULT:-}" ]; then
+        EVAL_CMD+=(--paper-selection-result "$PAPER_SELECTION_RESULT")
+    fi
+fi
+if [ "${PAPER_EVAL_DISABLE_VISUALIZATION:-0}" = "1" ] || [ "${PAPER_EVAL_DISABLE_VISUALIZATION,,}" = "true" ] || [ "${PAPER_EVAL_DISABLE_VISUALIZATION,,}" = "yes" ] || [ "${PAPER_EVAL_DISABLE_VISUALIZATION,,}" = "on" ]; then
+    EVAL_CMD+=(--disable-visualization)
 fi
 
 printf '正在执行:'

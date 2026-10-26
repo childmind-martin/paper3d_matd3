@@ -1,8 +1,32 @@
-# Execution-Consistent Dual-Semantic APF Reviewer Artifact
+# Learning with APF-Corrected Actions for Multi-UAV Navigation
 
-This repository is the reviewer-facing artifact for the paper:
+## Revision status — 7 September 2026
 
-**Execution-Consistent Dual-Semantic Actor–Critic Learning for Artificial-Potential-Field-Corrected Multi-UAV Navigation**
+The current WSL source has been revised against the ROBOT-D-26-01216 review.
+Read `docs/REVIEW_REVISION_20260907.md` for the implemented changes and remaining
+experimental requirements, and `docs/REVIEW_STATISTICS_20260907.md` for inference.
+The current manuscript is `/home/tang/paper/execution_consistent_dual_semantic_apf_uav_navigation.tex`.
+
+Current formal methods are `EC-MATD3-APF`, `EC-MATD3`, `DualQ-MATD3-APF`,
+`MADDPG-APF`, and `RawOnly-MATD3-APF`. The proposed executed-control method uses
+two scalar critics; the historical additive critic is an ablation. `raw_only`
+uses the complete seven-dimensional proposed action for replay, targets, and
+actor queries while retaining APF for execution. Common formal exploration
+uses OU noise before APF and disables epsilon actions that bypass correction.
+
+Historical tables below are archival evidence from the submitted version.
+They do not evaluate the revised algorithms, rewards, or task contracts.
+New source hashes require a new task-bank audit and frozen protocol; do not
+edit hashes to reuse incompatible old runs. No new superiority claim or
+convergence result is established by the regression/smoke checks.
+
+Quick WSL correctness check:
+
+```bash
+python tools/smoke_review_raw_only.py --output paper_artifacts/raw_only_smoke.json
+```
+
+## Historical submitted artifact
 
 ## Main scientific claim
 
@@ -23,7 +47,7 @@ The benchmark studies cooperative terrain-aware navigation with:
 
 - three UAVs,
 - complex 3-D terrain,
-- stochastic obstacles in the main Level-2 deployment setting,
+- static obstacles whose positions are resampled between episodes in the main Level-2 setting,
 - local per-agent observations with centralized critics during training,
 - strict all-agent coordinated arrival as the team-success criterion.
 

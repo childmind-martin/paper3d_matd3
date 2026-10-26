@@ -174,7 +174,15 @@ fi
 
 # 生成时间戳，确保每次训练都有唯一的目录
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXP_NAME_WITH_TIMESTAMP="${EXP_NAME}_${TIMESTAMP}"
+if [ -n "${EXP_NAME_WITH_TIMESTAMP_OVERRIDE:-}" ]; then
+    if [[ "$EXP_NAME_WITH_TIMESTAMP_OVERRIDE" == */* ]] || [[ "$EXP_NAME_WITH_TIMESTAMP_OVERRIDE" != "${EXP_NAME}_"* ]]; then
+        echo "❌ 错误: EXP_NAME_WITH_TIMESTAMP_OVERRIDE 必须是不含路径且以 ${EXP_NAME}_ 开头的既有运行名" >&2
+        exit 2
+    fi
+    EXP_NAME_WITH_TIMESTAMP="$EXP_NAME_WITH_TIMESTAMP_OVERRIDE"
+else
+    EXP_NAME_WITH_TIMESTAMP="${EXP_NAME}_${TIMESTAMP}"
+fi
 LOG_ROOT="logs/$EXP_NAME_WITH_TIMESTAMP"
 MODEL_ROOT="models/$EXP_NAME_WITH_TIMESTAMP"
 
@@ -677,8 +685,7 @@ export NO_COLLISION_REWARD_VALUE=${NO_COLLISION_REWARD_VALUE:-8000.0}  # 🚨�
                                                                          #   结论：无碰撞回合奖励远高于有碰撞回合，确保团队成功（无碰撞）成为最佳回合
                                                                          # 建议范围：15000-25000（确保无碰撞回合奖励足够高，强烈鼓励无碰撞策略）
 
-export SUCCESS_DISTANCE_THRESHOLD=${SUCCESS_DISTANCE_THRESHOLD:-2.0} # 🔧 修复1/3：收紧成功判定阈值（5.0→2.0），鼓励精确到达
-                                                                     # 实际判断阈值 = 1.2 * SUCCESS_DISTANCE_THRESHOLD = 2.4米
+export SUCCESS_DISTANCE_THRESHOLD=${SUCCESS_DISTANCE_THRESHOLD:-2.0} # 论文任务契约：3-D目标距离不超过2.0米
                                                                      # 问题诊断：5.0米太宽松，APF方法只需将智能体推到目标附近就触发高额成功奖励
                                                                      # 导致虚假的高奖励（+100,000），但Team Success Rate = 0%（实际未全部到达）
                                                                      # 新值2.4米：只有真正进入目标核心才算成功，确保奖励与实际完成任务对齐
@@ -693,7 +700,7 @@ export COLLISION_PENALTY_VALUE=${COLLISION_PENALTY_VALUE:-120.0}   # 保守调�
                                                                      #   3. 配合降低的引导奖励，让"少碰撞"成为高奖励的关键因素
                                                                      # 建议范围：70-100
 
-export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.4}  # 🚨🚨🚨 紧急修复：大幅降低碰撞阈值（1.5→0.5）
+export COLLISION_DISTANCE_THRESHOLD=${COLLISION_DISTANCE_THRESHOLD:-0.5}  # 论文任务契约：最小净空不超过0.5米判为碰撞
                                                                          # 问题诊断：1.5m阈值导致智能体在复杂地形中"无处不碰撞"
                                                                          #          Episode 6有2444次碰撞，意味着几乎每步都在"碰撞"
                                                                          # 根本原因：1.5m太大了！智能体半径通常<0.5m，1.5m等于"3倍体积"
@@ -1291,7 +1298,7 @@ ARGS=(
     --lr-min-actor "$LR_MIN_ACTOR"                   # Actor最小学习率
     --lr-min-critic "$LR_MIN_CRITIC"                 # Critic最小学习率
     
-    --gamma 0.95                          # 好效果：0.95
+    --gamma "${PAPER_GAMMA:-0.95}"        # 正式协议显式注入；非正式运行保持历史默认0.95
     --tau 0.015                           # 好效果：0.015（目标网络软更新）
     --huber-delta "$HUBER_DELTA"         # 好效果：1.0
     --grad-clip-norm 10.0                 # 好效果：10.0
@@ -1387,6 +1394,7 @@ ARGS=(
     --reward-scale "$REWARD_SCALE"                                         # TD目标奖励缩放
     
     # 势场修正版本选择
+    --enable-action-correction "${ENABLE_ACTION_CORRECTION:-true}"              # 是否执行APF动作修正
     --use-tf-potential-field "$USE_TF_POTENTIAL_FIELD"                      # 是否使用TensorFlow版本的势场修正
     # 🔧 注意：--terrain-sensing-mode 参数已移除，训练时强制使用local模式
     # Oracle模式仅在评估时通过 evaluate_optimized.py 传递
@@ -1491,7 +1499,11 @@ if [ "$ALGORITHM" = "matd3" ]; then
     )
 fi
 if [ "$ALGORITHM" = "maddpg" ]; then
-    ARGS+=(--maddpg-use-dual-q "${MADDPG_USE_DUAL_Q:-false}" --maddpg-use-separated-gradient "${MADDPG_USE_SEPARATED_GRADIENT:-true}")
+    ARGS+=(
+        --maddpg-use-dual-q "${MADDPG_USE_DUAL_Q:-false}"
+        --maddpg-use-separated-gradient "${MADDPG_USE_SEPARATED_GRADIENT:-true}"
+        --maddpg-action-semantics-mode "${MADDPG_ACTION_SEMANTICS_MODE:-legacy}"
+    )
 fi
 if [ "$ALGORITHM" != "mappo" ]; then
     ARGS+=(
@@ -1598,9 +1610,7 @@ if [ "$USE_WEIGHTED_REWARD" = "1" ] || [ "${USE_WEIGHTED_REWARD,,}" = "true" ]; 
         --min-reward "$MIN_REWARD"
         --success-reward-value "$SUCCESS_REWARD_VALUE"
         --no-collision-reward-value "$NO_COLLISION_REWARD_VALUE"
-        --success-distance-threshold "$SUCCESS_DISTANCE_THRESHOLD"
         --collision-penalty-value "$COLLISION_PENALTY_VALUE"
-        --collision-distance-threshold "$COLLISION_DISTANCE_THRESHOLD"
         --global-reward-mode "$GLOBAL_REWARD_MODE"
         --shaping-gamma "$SHAPING_GAMMA"
         --goal-ring-individual-scale "$GOAL_RING_INDIVIDUAL_SCALE"
@@ -1634,6 +1644,12 @@ else
     echo "[奖励模式] 原始（original）"
     # 原始奖励模式：全局缩放参数已在第449-450行传递，无需重复
 fi
+
+# 成功与碰撞是任务终止语义，不属于某一种奖励分支；所有方法显式传递。
+ARGS+=(
+    --success-distance-threshold "$SUCCESS_DISTANCE_THRESHOLD"
+    --collision-distance-threshold "$COLLISION_DISTANCE_THRESHOLD"
+)
 
 # 🔧 追加网络架构配置到ARGS（已在环境变量区定义）
 if [ -n "$ACTOR_HIDDEN" ]; then

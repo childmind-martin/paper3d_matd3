@@ -40,6 +40,8 @@ if 'XLA_FLAGS' in os.environ:
 import time
 import argparse
 import numpy as np
+from action_semantics import (MATD3_ACTION_SEMANTICS, validate_matd3_action_semantics,
+                              select_replay_action_channels, actor_critic_apf_enabled, raw_only_critic_actions)
 import tensorflow as tf
 from tqdm import tqdm
 import json
@@ -54,6 +56,7 @@ import itertools
 import random
 import csv
 import hashlib
+from pathlib import Path
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from experiment_runtime_config import (
@@ -82,12 +85,25 @@ from cross_agent_reference_selector import (
     twin_consensus_target,
 )
 from multiagent.scenarios.obstacle_observation import normalize_obstacle_observation_mode
+from paper_curriculum import build_paper_curriculum, promotion_decision
+from paper_experiment_protocol import load_protocol, runtime_method_environment
+from paper_experiment_schema import (
+    atomic_write_json as atomic_write_paper_json,
+    content_sha256 as paper_content_sha256,
+    fingerprint_artifact as fingerprint_paper_artifact,
+)
+from paper_task_bank import (
+    load_task_bank,
+    summarize_task_deadlines,
+    validate_dynamic_feasibility_audit,
+)
 
 
 TRAINING_ENVIRONMENT_SCHEMA_VERSION = 2
-CHECKPOINT_STATE_SCHEMA_VERSION = 2
+CHECKPOINT_STATE_SCHEMA_VERSION = 3
 CHECKPOINT_RESUME_CONFIG_SCHEMA_VERSION = 1
 DEFAULT_NOISE_RESTART_INTERVAL = 25
+TD3_TARGET_ACTION_CONTRACT = "smoothed_target_policy_then_apf_v1"
 
 
 # These options control where/how often artifacts are written, but do not alter
@@ -659,6 +675,41 @@ def _adaptive_behavior_noise_update(controller, default_cap):
     updated = min(hard_cap, max(minimum, current + beta * (target - current)))
     updated = _assign_behavior_noise_scale(controller, updated, reanchor_schedule=True)
     return current, updated, target, hard_cap, beta
+
+
+def _update_adaptive_reward_state(controller, episode_reward):
+    """Update the stage-local reward tracker used by adaptive LR/noise control."""
+    state = controller.adaptive_learning
+    try:
+        reward_value = float(episode_reward)
+    except Exception:
+        reward_value = 0.0
+    if not np.isfinite(reward_value):
+        reward_value = 0.0
+
+    reward_history = state.setdefault("reward_history", [])
+    reward_history.append(reward_value)
+    if len(reward_history) > 1000:
+        del reward_history[:-1000]
+
+    stage_best_reward = float(state.get("stage_best_reward", -np.inf))
+    if reward_value > stage_best_reward:
+        state["stage_best_reward"] = reward_value
+        state["consecutive_no_improve"] = 0
+        return True
+    state["consecutive_no_improve"] = int(
+        state.get("consecutive_no_improve", 0)
+    ) + 1
+    return False
+
+
+def _reset_adaptive_learning_stage_state(controller):
+    """Start a fresh plateau comparison window after a curriculum shift."""
+    state = controller.adaptive_learning
+    state["stage_best_reward"] = -np.inf
+    state["consecutive_no_improve"] = 0
+    state["reward_history"] = []
+    state["last_plateau_stats"] = {}
 
 
 def _base_optimizer(optimizer):
@@ -1766,101 +1817,8 @@ def _worker(remote, parent_remote, env_fn):
                     obs_n, _ = reset_result
                 else:
                     obs_n = reset_result
-                # 在固定地图但不固定起点的配置下，为每回合重新采样起点（与目标保持安全距离）
-                try:
-                    import os, time
-                    # 仅在以下条件全部满足时启用：
-                    # - RANDOM_TERRAIN=false  -> 固定地形
-                    # - USE_FIXED_POSITIONS in {0,false}  -> 不使用固定位置文件
-                    # - DYNAMIC_FIRST_TIME in {0,false}   -> 不锁定首次位置
-                    _flag_rt = os.getenv('RANDOM_TERRAIN', 'false').lower() in ('1','true','yes','on')
-                    _flag_fp = os.getenv('USE_FIXED_POSITIONS', '0').lower() in ('1','true','yes','on')
-                    _flag_df = os.getenv('DYNAMIC_FIRST_TIME', '0').lower() in ('1','true','yes','on')
-                    if (not _flag_rt) and (not _flag_fp) and (not _flag_df):
-                        world = getattr(env, 'world', None)
-                        agents = list(getattr(world, 'agents', [])) if world is not None else []
-                        # 读取地形与地图尺寸（不修改地形，保持固定地图）
-                        terrain = None
-                        map_size = None
-                        if hasattr(getattr(env, 'scenario', None), 'terrain') and env.scenario.terrain is not None:
-                            terrain = env.scenario.terrain
-                            map_size = int(getattr(env.scenario, 'map_size', terrain.shape[1]))
-                        elif hasattr(world, 'terrain') and world.terrain is not None:
-                            terrain = world.terrain
-                            map_size = int(getattr(world, 'map_size', terrain.shape[1]))
-                        # 读取目标点（存在于 scenario 或 world）
-                        goal_pos = None
-                        if hasattr(world, 'goal_pos') and world.goal_pos is not None:
-                            goal_pos = np.asarray(world.goal_pos, dtype=np.float32)
-                        elif hasattr(getattr(env, 'scenario', None), 'goal_pos') and env.scenario.goal_pos is not None:
-                            goal_pos = np.asarray(env.scenario.goal_pos, dtype=np.float32)
-                        # 无地形或目标时跳过
-                        if terrain is not None and map_size is not None and len(agents) > 0:
-                            rng = np.random.default_rng(int(time.time_ns() % (2**32 - 1)))  # 独立随机源，避免随场景seed固定
-                            # 采样参数（可通过环境变量微调）
-                            min_goal_dist = float(os.getenv('MIN_START_GOAL_DIST', '40.0'))
-                            max_goal_dist = float(os.getenv('MAX_START_GOAL_DIST', str(min_goal_dist + 60.0)))
-                            if max_goal_dist <= min_goal_dist + 1.0:
-                                max_goal_dist = min_goal_dist + 5.0
-                            altitude_offset = float(os.getenv('START_ALTITUDE_OFFSET', '1.0'))
-                            max_trials = int(os.getenv('START_POS_MAX_TRIALS', '2000'))
-                            safe_margin = float(os.getenv('START_POS_MARGIN', '5.0'))
-                            # 简单的可行高度查询
-                            def _height_at_xy(xx: float, yy: float) -> float:
-                                try:
-                                    i = int(np.clip(round(xx), 0, terrain.shape[1]-1))
-                                    j = int(np.clip(round(yy), 0, terrain.shape[0]-1))
-                                    return float(terrain[j, i])
-                                except Exception:
-                                    return 0.0
-                            # 候选点采样：远离目标且尽量选择较平坦区域（用局部高度差近似）
-                            chosen = []
-                            attempts = 0
-                            need_n = len(agents)
-                            while len(chosen) < need_n and attempts < max_trials:
-                                attempts += 1
-                                if goal_pos is not None:
-                                    radius = float(rng.uniform(min_goal_dist, max_goal_dist))
-                                    theta = float(rng.uniform(0.0, 2.0 * np.pi))
-                                    x = float(goal_pos[0] + radius * np.cos(theta))
-                                    y = float(goal_pos[1] + radius * np.sin(theta))
-                                    x = float(np.clip(x, safe_margin, max(safe_margin, map_size - safe_margin)))
-                                    y = float(np.clip(y, safe_margin, max(safe_margin, map_size - safe_margin)))
-                                    dist_to_goal = np.linalg.norm(np.array([x, y], dtype=np.float32) - goal_pos[:2])
-                                    if dist_to_goal < min_goal_dist or dist_to_goal > max_goal_dist + 1e-3:
-                                        continue
-                                else:
-                                    x = float(rng.uniform(safe_margin, max(safe_margin + 1.0, map_size - safe_margin)))
-                                    y = float(rng.uniform(safe_margin, max(safe_margin + 1.0, map_size - safe_margin)))
-                                # 平坦性近似：检查3x3邻域高度范围
-                                try:
-                                    i = int(np.clip(round(x), 1, terrain.shape[1]-2))
-                                    j = int(np.clip(round(y), 1, terrain.shape[0]-2))
-                                    patch = terrain[j-1:j+2, i-1:i+2]
-                                    if float(patch.max() - patch.min()) > 0.2:  # >20cm 认为不够平坦
-                                        continue
-                                except Exception:
-                                    pass
-                                z = _height_at_xy(x, y) + altitude_offset
-                                pos = np.array([x, y, z], dtype=np.float32)
-                                # 与已选起点保持间距，避免重叠
-                                if chosen and any(np.linalg.norm(pos[:2]-c[:2]) < 8.0 for c in chosen):
-                                    continue
-                                chosen.append(pos)
-                            # 写回到智能体状态
-                            if len(chosen) >= 1:
-                                for idx, ag in enumerate(agents):
-                                    p = chosen[min(idx, len(chosen)-1)].copy()
-                                    if hasattr(getattr(ag, 'state', None), 'p_pos'):
-                                        ag.state.p_pos = p
-                                    # 清空并写入初始轨迹点，保持可视化一致
-                                    try:
-                                        ag._trajectory = [p.copy()]
-                                    except Exception:
-                                        pass
-                except Exception:
-                    # 任意异常都不影响主流程
-                    pass
+                # 起点、目标、障碍物和首帧观察现在全部由 Scenario.reset_world
+                # 在一个确定性事务中解析。禁止在 reset 返回观察后再修改物理状态。
                 remote.send(obs_n)
             elif cmd == 'prime_resume_env_sequence':
                 completed_episodes = int(data or 0)
@@ -2938,6 +2896,11 @@ class ReplayBatch:
     rewards: np.ndarray
     next_obs: np.ndarray
     dones: np.ndarray
+    terminated: np.ndarray
+    truncated: np.ndarray
+    task_hash_u64: np.ndarray
+    task_difficulty_hash_u32: np.ndarray
+    curriculum_stage_id: np.ndarray
     fr: np.ndarray
     pf_forces: np.ndarray
     pf_features: object
@@ -3026,7 +2989,19 @@ class LiteReplayBuffer:
         # 当前默认训练路径延迟计算 next_act_corrected，仅在显式写入后启用该快路径
         self.stores_next_act_corrected = False
         self.rew = np.zeros((self.capacity, self.n_agents), dtype=self.storage_dtype)
+        # Bellman bootstrap mask.  In the paper task a hard deadline is an MDP
+        # terminal (not a Gym time-limit truncation), so ``done`` and
+        # ``terminated`` are intentionally identical for new transitions.
         self.done = np.zeros((self.capacity, self.n_agents), dtype=self.storage_dtype)
+        self.terminated = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        self.truncated = np.zeros((self.capacity, self.n_agents), dtype=np.float32)
+        # Store content identifiers compactly; exact labels remain available
+        # through the collision-checked dictionaries below.
+        self.task_hash_u64 = np.zeros((self.capacity,), dtype=np.uint64)
+        self.task_difficulty_hash_u32 = np.zeros((self.capacity,), dtype=np.uint32)
+        self.curriculum_stage_id = np.zeros((self.capacity,), dtype=np.int16)
+        self.task_id_by_hash = {}
+        self.task_difficulty_by_hash = {}
         # 新增：记录每条样本的FR（action_force_ratio），使用FP32保证数值精度
         self.fr = np.zeros((self.capacity,), dtype=np.float32)
         # 🚨 新增：存储势场力（pf_forces），用于恢复修正后的动作
@@ -3103,6 +3078,42 @@ class LiteReplayBuffer:
             self._per_debug_print_interval = max(0, int(_os.getenv('PER_DEBUG_PRINT_INTERVAL', '2000')))
         except Exception:
             self._per_debug_print_interval = 2000
+
+    @staticmethod
+    def _stable_label_hash(value, bits):
+        label = str(value or '').strip()
+        if not label:
+            return 0, ''
+        digest = hashlib.sha256(label.encode('utf-8')).digest()
+        byte_count = int(bits) // 8
+        return int.from_bytes(digest[:byte_count], byteorder='big', signed=False), label
+
+    def _encode_transition_metadata(self, task_id, task_difficulty_bin, curriculum_stage_id):
+        task_hash, task_label = self._stable_label_hash(task_id, 64)
+        difficulty_hash, difficulty_label = self._stable_label_hash(task_difficulty_bin, 32)
+        if task_label:
+            previous = self.task_id_by_hash.get(task_hash)
+            if previous is not None and previous != task_label:
+                raise RuntimeError(
+                    f"replay task hash collision: hash={task_hash}, "
+                    f"existing={previous}, incoming={task_label}"
+                )
+            self.task_id_by_hash[task_hash] = task_label
+        if difficulty_label:
+            previous = self.task_difficulty_by_hash.get(difficulty_hash)
+            if previous is not None and previous != difficulty_label:
+                raise RuntimeError(
+                    f"replay difficulty hash collision: hash={difficulty_hash}, "
+                    f"existing={previous}, incoming={difficulty_label}"
+                )
+            self.task_difficulty_by_hash[difficulty_hash] = difficulty_label
+        try:
+            stage_id = int(curriculum_stage_id)
+        except (TypeError, ValueError):
+            stage_id = 0
+        if stage_id < np.iinfo(np.int16).min or stage_id > np.iinfo(np.int16).max:
+            raise ValueError(f"curriculum_stage_id out of int16 range: {stage_id}")
+        return np.uint64(task_hash), np.uint32(difficulty_hash), np.int16(stage_id)
 
     def _reset_episode_quality_labels_at(self, positions):
         try:
@@ -3410,6 +3421,8 @@ class LiteReplayBuffer:
         random_action_mask_batch = self.random_action_mask[indices].astype(np.float32, copy=False)
         rew_batch = self.rew[indices]
         done_batch = self.done[indices]
+        terminated_batch = self.terminated[indices].astype(np.float32, copy=False)
+        truncated_batch = self.truncated[indices].astype(np.float32, copy=False)
         fr_batch = self.fr[indices].astype(np.float32, copy=False)
         pf_forces_batch = self.pf_forces[indices].astype(np.float32, copy=False)
         pf_features_batch = self.pf_features[indices].astype(np.float32, copy=False)
@@ -3425,6 +3438,11 @@ class LiteReplayBuffer:
             rewards=rew_batch,
             next_obs=next_obs_batch,
             dones=done_batch,
+            terminated=terminated_batch,
+            truncated=truncated_batch,
+            task_hash_u64=self.task_hash_u64[indices].astype(np.uint64, copy=False),
+            task_difficulty_hash_u32=self.task_difficulty_hash_u32[indices].astype(np.uint32, copy=False),
+            curriculum_stage_id=self.curriculum_stage_id[indices].astype(np.int16, copy=False),
             fr=fr_batch,
             pf_forces=pf_forces_batch,
             pf_features=pf_features_batch,
@@ -3449,7 +3467,9 @@ class LiteReplayBuffer:
     def add(self, obs_n, next_obs_n, act_n, rew_n, done_n, fr_value=None, pf_forces=None,
             act_corrected=None, next_pf_forces=None, next_act_corrected=None,
             pf_features=None, next_pf_features=None, next_pf_geometry_cache=None,
-            act_policy_clean=None, random_action_mask=None):
+            act_policy_clean=None, random_action_mask=None, terminated_n=None,
+            truncated_n=None, task_id=None, task_difficulty_bin=None,
+            curriculum_stage_id=0):
         # `next_pf_forces` 仅为兼容旧调用保留；next_pf_features 表示下一状态的 base PF 特征。
         # 数据验证
         if len(obs_n) != self.n_agents:
@@ -3573,6 +3593,20 @@ class LiteReplayBuffer:
 
         self.rew[self.position] = rew_vec
         self.done[self.position] = done_vec
+        terminated_vec = done_vec if terminated_n is None else self._fit_vec(
+            terminated_n, self.n_agents
+        ).astype(np.float32, copy=False)
+        truncated_vec = np.zeros((self.n_agents,), dtype=np.float32) if truncated_n is None else self._fit_vec(
+            truncated_n, self.n_agents
+        ).astype(np.float32, copy=False)
+        self.terminated[self.position] = np.clip(terminated_vec, 0.0, 1.0)
+        self.truncated[self.position] = np.clip(truncated_vec, 0.0, 1.0)
+        task_hash, difficulty_hash, stage_id = self._encode_transition_metadata(
+            task_id, task_difficulty_bin, curriculum_stage_id
+        )
+        self.task_hash_u64[self.position] = task_hash
+        self.task_difficulty_hash_u32[self.position] = difficulty_hash
+        self.curriculum_stage_id[self.position] = stage_id
         # 记录当前样本对应的FR（若未提供则记为0.0，保证对齐）
         try:
             self.fr[self.position] = float(fr_value) if fr_value is not None else 0.0
@@ -3677,7 +3711,9 @@ class LiteReplayBuffer:
                            fr_value=None, pf_forces=None, act_corrected=None,
                            next_act_corrected=None, pf_features=None,
                            next_pf_features=None, next_pf_geometry_cache=None,
-                           act_policy_clean=None, random_action_mask=None):
+                           act_policy_clean=None, random_action_mask=None,
+                           terminated_n=None, truncated_n=None, task_id=None,
+                           task_difficulty_bin=None, curriculum_stage_id=0):
         """
         当前默认单环境训练主线专用的快速写入路径。
 
@@ -3800,6 +3836,20 @@ class LiteReplayBuffer:
         self.random_action_mask[pos] = random_action_mask_arr
         self.rew[pos] = rew_vec
         self.done[pos] = done_vec
+        terminated_vec = done_vec.astype(np.float32, copy=False) if terminated_n is None else self._fit_vec(
+            terminated_n, self.n_agents
+        ).astype(np.float32, copy=False)
+        truncated_vec = np.zeros((self.n_agents,), dtype=np.float32) if truncated_n is None else self._fit_vec(
+            truncated_n, self.n_agents
+        ).astype(np.float32, copy=False)
+        self.terminated[pos] = np.clip(terminated_vec, 0.0, 1.0)
+        self.truncated[pos] = np.clip(truncated_vec, 0.0, 1.0)
+        task_hash, difficulty_hash, stage_id = self._encode_transition_metadata(
+            task_id, task_difficulty_bin, curriculum_stage_id
+        )
+        self.task_hash_u64[pos] = task_hash
+        self.task_difficulty_hash_u32[pos] = difficulty_hash
+        self.curriculum_stage_id[pos] = stage_id
         if act_policy_clean is not None:
             self.stores_policy_clean_actions = True
         if random_action_mask is not None:
@@ -3868,7 +3918,9 @@ class LiteReplayBuffer:
                   next_pf_forces_batch=None, next_act_corrected_batch=None,
                   pf_features_batch=None, next_pf_features_batch=None,
                   next_pf_geometry_cache_batch=None, act_policy_clean_batch=None,
-                  random_action_mask_batch=None):
+                  random_action_mask_batch=None, terminated_batch=None,
+                  truncated_batch=None, task_ids=None,
+                  task_difficulty_bins=None, curriculum_stage_ids=None):
         """
         🚀 真正的批量存储优化：使用numpy切片操作，避免Python循环
         参数:
@@ -3890,6 +3942,17 @@ class LiteReplayBuffer:
         batch_size = len(obs_batch) if isinstance(obs_batch, (list, tuple)) else obs_batch.shape[0]
         if batch_size == 0:
             return
+
+        def _batch_item(values, index, default=None):
+            if values is None:
+                return default
+            if isinstance(values, str):
+                return values
+            try:
+                return values[index]
+            except (TypeError, IndexError, KeyError):
+                return values if np.isscalar(values) else default
+
         if batch_size > self.capacity:
             # 极端情况下避免高级索引写入重复位置语义不清晰，退化为逐条写入。
             written_positions = []
@@ -3911,7 +3974,12 @@ class LiteReplayBuffer:
                 write_ref = self.add(
                     obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i,
                     act_corrected_i, None, next_act_corrected_i, pf_feat_i,
-                    next_pf_feat_i, None, act_policy_clean_i, random_action_mask_i
+                    next_pf_feat_i, None, act_policy_clean_i, random_action_mask_i,
+                    terminated_n=_batch_item(terminated_batch, i, done_i),
+                    truncated_n=_batch_item(truncated_batch, i, None),
+                    task_id=_batch_item(task_ids, i, None),
+                    task_difficulty_bin=_batch_item(task_difficulty_bins, i, None),
+                    curriculum_stage_id=_batch_item(curriculum_stage_ids, i, 0),
                 )
                 if write_ref is not None:
                     written_positions.append(int(write_ref[0]))
@@ -3948,7 +4016,12 @@ class LiteReplayBuffer:
                 write_ref = self.add(
                     obs_i, next_obs_i, act_i, rew_i, done_i, fr_i, pf_i,
                     act_corrected_i, None, next_act_corrected_i, pf_feat_i,
-                    next_pf_feat_i, None, act_policy_clean_i, random_action_mask_i
+                    next_pf_feat_i, None, act_policy_clean_i, random_action_mask_i,
+                    terminated_n=_batch_item(terminated_batch, i, done_i),
+                    truncated_n=_batch_item(truncated_batch, i, None),
+                    task_id=_batch_item(task_ids, i, None),
+                    task_difficulty_bin=_batch_item(task_difficulty_bins, i, None),
+                    curriculum_stage_id=_batch_item(curriculum_stage_ids, i, 0),
                 )
                 if write_ref is not None:
                     written_positions.append(int(write_ref[0]))
@@ -3959,6 +4032,28 @@ class LiteReplayBuffer:
             )
 
         fr_arr = self._coerce_batch_scalar(fr_values, batch_size, dtype=np.float32)
+        terminated_arr = self._coerce_batch_vector(
+            done_batch if terminated_batch is None else terminated_batch,
+            batch_size,
+            self.n_agents,
+            np.float32,
+        )
+        truncated_arr = self._coerce_batch_vector(
+            np.zeros((batch_size, self.n_agents), dtype=np.float32)
+            if truncated_batch is None else truncated_batch,
+            batch_size,
+            self.n_agents,
+            np.float32,
+        )
+        task_hash_arr = np.zeros((batch_size,), dtype=np.uint64)
+        difficulty_hash_arr = np.zeros((batch_size,), dtype=np.uint32)
+        stage_id_arr = np.zeros((batch_size,), dtype=np.int16)
+        for i in range(batch_size):
+            task_hash_arr[i], difficulty_hash_arr[i], stage_id_arr[i] = self._encode_transition_metadata(
+                _batch_item(task_ids, i, None),
+                _batch_item(task_difficulty_bins, i, None),
+                _batch_item(curriculum_stage_ids, i, 0),
+            )
         pf_arr = self._coerce_batch_matrix(pf_forces_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
         pf_feat_arr = self._coerce_batch_matrix(pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
         next_pf_feat_arr = self._coerce_batch_matrix(next_pf_features_batch, batch_size, self.n_agents, 3, np.float32, allow_none=True)
@@ -4020,6 +4115,11 @@ class LiteReplayBuffer:
         self.random_action_mask[positions] = random_action_mask_arr
         self.rew[positions] = rew_arr
         self.done[positions] = done_arr
+        self.terminated[positions] = np.clip(terminated_arr, 0.0, 1.0)
+        self.truncated[positions] = np.clip(truncated_arr, 0.0, 1.0)
+        self.task_hash_u64[positions] = task_hash_arr
+        self.task_difficulty_hash_u32[positions] = difficulty_hash_arr
+        self.curriculum_stage_id[positions] = stage_id_arr
         self.fr[positions] = fr_arr
         self.pf_forces[positions] = pf_arr
         self.pf_features[positions] = pf_feat_arr
@@ -4979,6 +5079,11 @@ def _unpack_replay_sample(sample_result):
         rewards=rew_n,
         next_obs=next_obs_n,
         dones=done_n,
+        terminated=np.asarray(done_n, dtype=np.float32),
+        truncated=np.zeros_like(np.asarray(done_n, dtype=np.float32)),
+        task_hash_u64=np.zeros((batch_size,), dtype=np.uint64),
+        task_difficulty_hash_u32=np.zeros((batch_size,), dtype=np.uint32),
+        curriculum_stage_id=np.zeros((batch_size,), dtype=np.int16),
         fr=fr_batch,
         pf_forces=pf_forces_batch,
         pf_features=pf_features_batch,
@@ -6048,6 +6153,7 @@ def load_scenario_module(scenario_name, args=None):
             }
             if args is not None:
                 for key in (
+                    'num_envs',
                     'use_dynamic_obstacles',
                     'semi_random_terrain',
                     'terrain_base_seed',
@@ -6069,6 +6175,40 @@ def load_scenario_module(scenario_name, args=None):
                     'obstacle_observation_mode',
                     'obstacle_risk_velocity_forward_weight',
                     'obstacle_risk_goal_along_weight',
+                    'min_start_goal_dist',
+                    'max_start_goal_dist',
+                    'start_pos_margin',
+                    'start_pos_max_trials',
+                    'min_agent_start_separation',
+                    'paper_task_contract_enabled',
+                    'paper_task_contract_strict',
+                    'paper_task_require_reference_feasible',
+                    'paper_task_reference_grid_resolution',
+                    'paper_task_obstacle_inflation',
+                    'paper_task_reference_surface_clearance',
+                    'paper_goal_formation_radius',
+                    'paper_goal_boundary_clearance',
+                    'paper_task_deadline_policy',
+                    'hard_deadline_terminal',
+                    'paper_terminal_on_collision',
+                    'include_time_to_go_observation',
+                    'paper_reward_profile',
+                    'paper_progress_reward_scale',
+                    'paper_individual_reach_bonus',
+                    'paper_team_success_bonus',
+                    'paper_collision_penalty',
+                    'paper_out_of_bounds_penalty',
+                    'paper_deadline_penalty',
+                    'paper_step_penalty',
+                    'paper_control_effort_penalty',
+                    'paper_clearance_margin',
+                    'paper_clearance_penalty',
+                    'task_difficulty_bin',
+                    'paper_task_num_obstacles',
+                    'paper_task_layout_file',
+                    'paper_task_bank_manifest',
+                    'paper_task_bank_split',
+                    'paper_task_metadata_dir',
                 ):
                     value = getattr(args, key, None)
                     if value is not None:
@@ -6154,9 +6294,13 @@ def load_scenario_module(scenario_name, args=None):
 
             # 尝试带参数创建
             scenario = scenario_module.Scenario(**scenario_kwargs)
-        except TypeError:
-            # 如果参数不匹配，尝试无参数创建
-            scenario = scenario_module.Scenario()
+        except TypeError as exc:
+            # 科学实验参数不允许静默回退到 Scenario() 默认值；否则 manifest
+            # 看似记录了参数，真实环境却可能完全没有采用它们。
+            raise TypeError(
+                f"场景 {scenario_name!r} 无法接受已解析参数；拒绝无参回退。"
+                f" kwargs={sorted(scenario_kwargs.keys())}; error={exc}"
+            ) from exc
 
         # 调用make_world确保地形被正确初始化
         try:
@@ -6697,6 +6841,32 @@ class OptimizedMADDPG:
         # 双Q头/分离梯度开关（MADDPG）
         self.use_dual_q = bool(getattr(self.args, 'maddpg_use_dual_q', False))
         self.use_separated_gradient = bool(getattr(self.args, 'maddpg_use_separated_gradient', True))
+        self.action_semantics_mode = str(
+            getattr(self.args, 'maddpg_action_semantics_mode', 'legacy')
+            or 'legacy'
+        ).strip().lower()
+        if self.action_semantics_mode not in ('legacy', 'executed_control'):
+            raise ValueError(
+                "Unsupported MADDPG action semantics mode: "
+                f"{self.action_semantics_mode}. Expected one of: legacy, "
+                "executed_control"
+            )
+        self.execution_consistent_critic = (
+            self.action_semantics_mode == 'executed_control'
+        )
+        if self.execution_consistent_critic and self.use_dual_q:
+            raise ValueError(
+                "MADDPG executed_control requires --no-maddpg-use-dual-q: "
+                "the fair algorithm baseline uses one scalar critic over the "
+                "true executed control"
+            )
+        if self.execution_consistent_critic and any(
+            int(dim) < 3 for dim in self.action_dims
+        ):
+            raise ValueError(
+                "MADDPG executed_control requires every action_dim >= 3, "
+                f"got={self.action_dims}"
+            )
         # MATD3 的 hybrid actor objective 不属于当前 MADDPG 消融线；这里显式置为关闭，
         # 避免 separated MADDPG 复用共享 train_step 分支时访问未初始化属性。
         self.use_hybrid_actor_objective = False
@@ -6705,6 +6875,7 @@ class OptimizedMADDPG:
             self.use_separated_gradient = False
         if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
             print(f"[MADDPG] Dual Q: {self.use_dual_q}, Separated Gradient: {self.use_separated_gradient}")
+            print(f"[MADDPG] Action Semantics: {self.action_semantics_mode}")
         if not hasattr(self, '_episode_count'):
             self._episode_count = 0
 
@@ -6839,6 +7010,7 @@ class OptimizedMADDPG:
         # 自适应学习机制（借鉴旧版本paper3d_train）
         self.adaptive_learning = {
             'enabled': True,
+            'stage_best_reward': -np.inf,
             'consecutive_no_improve': 0,
             'patience': int(os.getenv('ADAPTIVE_PATIENCE', '25')),  # 🔧 修复：增加patience（10 → 25），降低触发频率
             'lr_decay_factor': float(os.getenv('ADAPTIVE_LR_DECAY', '0.95')),  # 🔧 修复：降低衰减因子（0.8 → 0.95），减缓学习率下降
@@ -7482,21 +7654,7 @@ class OptimizedMADDPG:
         """检查是否需要自适应调整（借鉴旧版本paper3d_train）"""
         if not self.adaptive_learning['enabled']:
             return
-        try:
-            reward_value = float(episode_reward)
-        except Exception:
-            reward_value = 0.0
-        reward_history = self.adaptive_learning.setdefault('reward_history', [])
-        reward_history.append(reward_value)
-        if len(reward_history) > 1000:
-            del reward_history[:-1000]
-
-        # 更新最佳奖励
-        if reward_value > self.training_stats['best_reward']:
-            self.training_stats['best_reward'] = reward_value
-            self.adaptive_learning['consecutive_no_improve'] = 0
-        else:
-            self.adaptive_learning['consecutive_no_improve'] += 1
+        _update_adaptive_reward_state(self, episode_reward)
 
         # 触发自适应调整
         if self.adaptive_learning['consecutive_no_improve'] >= self.adaptive_learning['patience']:
@@ -9680,6 +9838,37 @@ class OptimizedMADDPG:
         total_repulsion = tf.reduce_sum(repulsion_dir * repulsion_strength, axis=1)  # (batch, 3)
         return total_repulsion
 
+    def _project_joint_action_to_executed_control(self, joint_actions):
+        """Keep only the true 3D control consumed by the environment.
+
+        The actor tail parameterizes the differentiable APF transform.  It is
+        not an independent environment action, so the MADDPG algorithm
+        baseline must not expose it directly to the critic.
+        """
+        joint_actions = tf.cast(joint_actions, tf.float32)
+        if not bool(getattr(self, 'execution_consistent_critic', False)):
+            return joint_actions
+        pieces = []
+        start = 0
+        for dim in self.action_dims:
+            dim = int(dim)
+            agent_action = joint_actions[:, start:start + dim]
+            executed_head = agent_action[:, :min(3, dim)]
+            if dim > 3:
+                executed_head = tf.pad(
+                    executed_head,
+                    [[0, 0], [0, dim - 3]],
+                )
+            pieces.append(executed_head)
+            start += dim
+        projected = tf.concat(pieces, axis=1)
+        if self.total_action_dim is not None:
+            projected = tf.ensure_shape(
+                projected,
+                [None, self.total_action_dim],
+            )
+        return projected
+
     def _forward_dual_q_pair(self, critic, inputs_a, inputs_b, training):
         """单次前向同时评估 raw / corrected 两组输入，避免 dual-Q 路径重复 kernel launch。"""
         merged_inputs = [tf.concat([tf.cast(a, tf.float32), tf.cast(b, tf.float32)], axis=0)
@@ -9980,6 +10169,12 @@ class OptimizedMADDPG:
 
             global_actions_actor_raw = tf.concat(act_input_raw, axis=1)
             global_actions_actor_corrected = tf.concat(act_input_corrected, axis=1)
+            if self.execution_consistent_critic:
+                global_actions_actor_corrected = (
+                    self._project_joint_action_to_executed_control(
+                        global_actions_actor_corrected
+                    )
+                )
             # 保留 corrected 视图给后续调试/敏感度分析代码复用
             global_actions_actor = global_actions_actor_corrected
 
@@ -10545,6 +10740,12 @@ class OptimizedMADDPG:
             corrected_actions_list.append(act_n[:, i, :act_dim])
         global_actions_raw_all = tf.concat(raw_actions_list, axis=1)
         global_actions_corrected_all = tf.concat(corrected_actions_list, axis=1)
+        if self.execution_consistent_critic:
+            global_actions_corrected_all = (
+                self._project_joint_action_to_executed_control(
+                    global_actions_corrected_all
+                )
+            )
         if detail_enabled:
             update_timing['upd_prepare'] += _upd_perf_counter() - _t_upd_phase
             _t_upd_phase = _upd_perf_counter()
@@ -10604,6 +10805,13 @@ class OptimizedMADDPG:
             global_next_actions_corrected = tf.concat(corrected_target_actions, axis=1)
         else:
             global_next_actions_corrected = global_next_actions_raw
+
+        if self.execution_consistent_critic:
+            global_next_actions_corrected = (
+                self._project_joint_action_to_executed_control(
+                    global_next_actions_corrected
+                )
+            )
 
         # 目标动作保持归一化尺度，Critic与Target Critic一致使用归一化动作
         if detail_enabled:
@@ -11168,19 +11376,36 @@ class OptimizedMATD3:
         self.action_semantics_mode = str(
             getattr(args, 'matd3_action_semantics_mode', 'dual') or 'dual'
         ).strip().lower()
-        if self.action_semantics_mode not in ('dual', 'collapsed_replay'):
+        if self.action_semantics_mode not in MATD3_ACTION_SEMANTICS:
             raise ValueError(
                 f"Unsupported MATD3 action semantics mode: {self.action_semantics_mode}. "
-                "Expected one of: dual, collapsed_replay"
+                "Expected one of: dual, collapsed_replay, executed_control, raw_only"
             )
+        self.execution_consistent_critic = self.action_semantics_mode == 'executed_control'
         self.reconstruct_corrected_target = bool(
             getattr(args, 'matd3_reconstruct_corrected_target', True)
+        )
+        validate_matd3_action_semantics(
+            self.action_semantics_mode, use_dual_q=self.use_dual_q,
+            separated=self.use_separated_gradient, hybrid=self.use_hybrid_actor_objective,
+            reconstruct_corrected_target=self.reconstruct_corrected_target,
+            random_action_prob=getattr(args, "random_action_prob", 0.03),
         )
         self.critic_q_reg_cached = float(getattr(args, 'critic_q_reg', 0.0) or 0.0)
         if not self.use_dual_q and self.use_separated_gradient:
             self.use_separated_gradient = False
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
                 print("[MATD3] 已禁用分离梯度：双Q头关闭时不支持分离梯度")
+        if self.execution_consistent_critic:
+            if self.use_dual_q:
+                raise ValueError(
+                    "executed_control requires --no-matd3-use-dual-q: the paper mainline "
+                    "uses two independent scalar critics, not additive head/tail Q outputs"
+                )
+            if any(int(dim) < 3 for dim in self.action_dims):
+                raise ValueError(
+                    f"executed_control requires every actor action_dim >= 3, got={self.action_dims}"
+                )
         if (not self.use_dual_q or not self.use_separated_gradient) and self.use_hybrid_actor_objective:
             self.use_hybrid_actor_objective = False
             if not (os.getenv('QUIET_OUTPUT', '1').lower() in ('1', 'true', 'yes', 'on')):
@@ -11192,6 +11417,11 @@ class OptimizedMATD3:
                 f"[MATD3] Action Semantics: {self.action_semantics_mode}, "
                 f"Target Reconstruction: {self.reconstruct_corrected_target}"
             )
+            if self.execution_consistent_critic:
+                print(
+                    "[MATD3] Critic action contract: executed control head only "
+                    "(3D per agent; non-executed actor tail is zero-padded at critic input)"
+                )
             if self.use_hybrid_actor_objective:
                 print(f"[MATD3] Actor Objective: hybrid (separated_weight={self.hybrid_actor_alpha:.2f}, unified_weight={1.0 - self.hybrid_actor_alpha:.2f})")
             elif self.use_dual_q and self.use_separated_gradient:
@@ -11408,6 +11638,7 @@ class OptimizedMATD3:
         # 自适应学习机制（与MADDPG保持一致）
         self.adaptive_learning = {
             'enabled': True,
+            'stage_best_reward': -np.inf,
             'consecutive_no_improve': 0,
             'patience': int(os.getenv('ADAPTIVE_PATIENCE', '25')),  # 🔧 修复：增加patience（10 → 25），降低触发频率
             'lr_decay_factor': float(os.getenv('ADAPTIVE_LR_DECAY', '0.95')),  # 🔧 修复：降低衰减因子（0.8 → 0.95），减缓学习率下降
@@ -13011,6 +13242,10 @@ class OptimizedMATD3:
                     all_actions = [action_batch[:, j] for j in range(self.n_agents)]
                     global_state = tf.concat(all_obs, axis=1)
                     global_actions = tf.concat(all_actions, axis=1)
+                    if self.execution_consistent_critic:
+                        global_actions = self._project_joint_action_to_executed_control(
+                            global_actions
+                        )
                     # 🔧 关键修复：根据实际网络配置准备输入，确保与网络定义一致
                     critic_inputs = [global_state, global_actions]
                     if self.use_fr_feature_flag:
@@ -13754,7 +13989,9 @@ class OptimizedMATD3:
 
         # 🔧 修复：优先使用存储的修正动作，如果没有则从原始动作+势场力+FR计算
         # 🔧 XLA友好：这部分在Python代码中执行，不在@tf.function中，对XLA无影响
-        if act_corrected_batch is not None:
+        if self.action_semantics_mode == 'raw_only':
+            act_n_corrected = raw_only_critic_actions(act_n_raw, act_corrected_batch)
+        elif act_corrected_batch is not None:
             # 使用存储的修正动作（混合动作）
             act_n_corrected = np.asarray(act_corrected_batch, dtype=np.float32)
         else:
@@ -13857,11 +14094,12 @@ class OptimizedMATD3:
         # 性能优化：确保所有tensor转换在循环外完成，减少重复转换
         fr_next = fr_batch_column
         reconstruct_corrected_target = bool(getattr(self, 'reconstruct_corrected_target', True))
-        next_act_corrected_valid = bool(
-            reconstruct_corrected_target
-            and next_act_corrected_batch is not None
-            and getattr(replay_buffer, 'stores_next_act_corrected', False)
-        )
+        # A TD3 Bellman target must evaluate the target policy at ``next_obs``.
+        # ``next_act_corrected_batch`` is a historical replay compatibility
+        # field and, when populated, contains a behavior-policy action.  Using
+        # it here silently changes the off-policy target into a SARSA-like
+        # target.  Always reconstruct the corrected target from the smoothed
+        # target-actor action and the next-state APF context instead.
         next_pf_geometry_cache_np = None
         if getattr(replay_buffer, 'stores_next_pf_geometry_cache', False) and next_pf_geometry_cache_batch is not None:
             next_pf_geometry_cache_np = _coerce_pf_geometry_cache_batch_numpy(
@@ -13886,7 +14124,6 @@ class OptimizedMATD3:
                     reconstruct_corrected_target
                     and use_tf_potential_field
                     and fr_positive
-                    and (not next_act_corrected_valid)
                     and shared_next_correction_supported
                 )
             )
@@ -13997,25 +14234,9 @@ class OptimizedMATD3:
                 start_idx += action_dim
 
         smoothed_target_actions_corrected = []
-        if next_act_corrected_valid:
-            # ✅ 使用存储的 next_act_corrected（交互时用当时的地形计算）
-            # 这确保了 Target Q 评估的动作与交互时的一致
-            next_act_corr_tensor = tf.convert_to_tensor(next_act_corrected_batch, dtype=tf.float32)
-            if uniform_action_dims and self.total_action_dim is not None:
-                act_dim = self.action_dims[0]
-                smoothed_target_actions_corrected = tf.reshape(
-                    next_act_corr_tensor[:, :, :act_dim],
-                    [batch_size_dyn, self.total_action_dim],
-                )
-            else:
-                start_idx = 0
-                for i in range(self.n_agents):
-                    action_dim = self.action_dims[i]
-                    corrected_action = next_act_corr_tensor[:, i, :action_dim]
-                    smoothed_target_actions_corrected.append(corrected_action)
-                    start_idx += action_dim
-        elif reconstruct_corrected_target and use_tf_potential_field and fr_positive:
-            # 🔧 向后兼容：如果 Buffer 没有 next_act_corrected，重新计算
+        if reconstruct_corrected_target and use_tf_potential_field and fr_positive:
+            # Reconstruct T_APF(s', pi_target(s')) from the target policy.  Do
+            # not substitute the next behavior action stored in replay.
             if next_obs_valid_inputs is not None and next_obs_geometry_context is not None and uniform_action_dims and self.action_dims[0] >= 3:
                 act_dim = self.action_dims[0]
                 flat_force_ratio = tf.repeat(fr_batch_column, repeats=self.n_agents, axis=0)
@@ -14087,6 +14308,10 @@ class OptimizedMATD3:
         # 训练与回放统一使用归一化动作[-1,1]，不在训练侧做物理映射
         global_a_next_smooth = global_smoothed_actions_raw
         global_a_next_corr = global_smoothed_actions_corrected
+        if self.execution_consistent_critic:
+            global_a_next_corr = self._project_joint_action_to_executed_control(
+                global_a_next_corr
+            )
         if getattr(self, 'total_action_dim', None) is not None:
             try:
                 global_a_next_smooth = tf.ensure_shape(global_a_next_smooth, [None, self.total_action_dim])
@@ -14122,6 +14347,10 @@ class OptimizedMATD3:
             # ✅ Critic学习使用修正后动作（与环境执行一致）
             global_actions = tf.concat(global_actions_corrected, axis=1)  # [修正前3维, 原始后4维]
             global_actions_raw_all = tf.concat(global_actions_raw_all, axis=1)
+        if self.execution_consistent_critic:
+            global_actions = self._project_joint_action_to_executed_control(
+                global_actions
+            )
         if getattr(self, 'total_action_dim', None) is not None:
             try:
                 global_actions = tf.ensure_shape(global_actions, [None, self.total_action_dim])
@@ -14915,21 +15144,7 @@ class OptimizedMATD3:
         """检查是否需要自适应调整（与MADDPG保持一致）"""
         if not self.adaptive_learning['enabled']:
             return
-        try:
-            reward_value = float(episode_reward)
-        except Exception:
-            reward_value = 0.0
-        reward_history = self.adaptive_learning.setdefault('reward_history', [])
-        reward_history.append(reward_value)
-        if len(reward_history) > 1000:
-            del reward_history[:-1000]
-
-        # 更新最佳奖励
-        if reward_value > self.training_stats['best_reward']:
-            self.training_stats['best_reward'] = reward_value
-            self.adaptive_learning['consecutive_no_improve'] = 0
-        else:
-            self.adaptive_learning['consecutive_no_improve'] += 1
+        _update_adaptive_reward_state(self, episode_reward)
 
         # 触发自适应调整
         if self.adaptive_learning['consecutive_no_improve'] >= self.adaptive_learning['patience']:
@@ -15590,6 +15805,42 @@ class OptimizedMATD3:
         except Exception:
             pass
         return merged
+
+    def _project_joint_action_to_executed_control(self, joint_actions):
+        """Embed the true 3D environment control in the legacy packed action shape.
+
+        The environment consumes only each agent's corrected first three
+        components.  Tail components parameterize the differentiable APF
+        transform but are not independent environment controls, so a critic
+        must never observe them as separate action coordinates.
+        """
+        joint_actions = tf.cast(joint_actions, tf.float32)
+        if not bool(getattr(self, 'execution_consistent_critic', False)):
+            return joint_actions
+        pieces = []
+        start = 0
+        for dim in self.action_dims:
+            dim = int(dim)
+            agent_action = joint_actions[:, start:start + dim]
+            executed_head = agent_action[:, :min(3, dim)]
+            if dim > 3:
+                executed_head = tf.pad(executed_head, [[0, 0], [0, dim - 3]])
+            pieces.append(executed_head)
+            start += dim
+        projected = tf.concat(pieces, axis=1)
+        if self.total_action_dim is not None:
+            projected = tf.ensure_shape(projected, [None, self.total_action_dim])
+        return projected
+
+    def _merge_executed_head_for_critic(self, corrected_head, action_dim):
+        action_dim = int(action_dim)
+        if not bool(getattr(self, 'execution_consistent_critic', False)):
+            raise RuntimeError(
+                "_merge_executed_head_for_critic is valid only in executed_control mode"
+            )
+        if action_dim <= 3:
+            return corrected_head[:, :action_dim]
+        return tf.pad(corrected_head[:, :3], [[0, 0], [0, action_dim - 3]])
 
     @tf.function(reduce_retracing=True, autograph=False)
     def _multi_agent_update_step(self,
@@ -16317,7 +16568,9 @@ class OptimizedMATD3:
                 # tensors must never control Python branches.  The PF feature
                 # switch is static; when a sampled FR is zero the correction
                 # formula itself exactly reduces to the raw action.
-                actor_use_pf = bool(self.use_tf_potential_field_cached)
+                actor_use_pf = actor_critic_apf_enabled(
+                    self.action_semantics_mode, self.use_tf_potential_field_cached
+                )
                 actor_agent_fairness_weights = []
                 actor_agents_list = []
                 actor_action_dims = []
@@ -16519,11 +16772,17 @@ class OptimizedMATD3:
                         else:
                             corrected_head_joint = new_action_safe[:, :3]
 
-                        corrected_action_mapped_joint = self._merge_action_head_tail_static(
-                            corrected_head_joint,
-                            pf_params_for_tail,
-                            agent_action_dim,
-                        )
+                        if self.execution_consistent_critic:
+                            corrected_action_mapped_joint = self._merge_executed_head_for_critic(
+                                corrected_head_joint,
+                                agent_action_dim,
+                            )
+                        else:
+                            corrected_action_mapped_joint = self._merge_action_head_tail_static(
+                                corrected_head_joint,
+                                pf_params_for_tail,
+                                agent_action_dim,
+                            )
                         global_actions_corrected_joint = self._replace_agent_action_slice_static(
                             base_actions_corrected_f32,
                             corrected_action_mapped_joint,
@@ -16875,11 +17134,17 @@ class OptimizedMATD3:
                                         )
                                     else:
                                         corrected_candidate_head = candidate_head
-                                    candidate_corrected_mapped = self._merge_action_head_tail_static(
-                                        corrected_candidate_head,
-                                        candidate_tail,
-                                        agent_action_dim,
-                                    )
+                                    if self.execution_consistent_critic:
+                                        candidate_corrected_mapped = self._merge_executed_head_for_critic(
+                                            corrected_candidate_head,
+                                            agent_action_dim,
+                                        )
+                                    else:
+                                        candidate_corrected_mapped = self._merge_action_head_tail_static(
+                                            corrected_candidate_head,
+                                            candidate_tail,
+                                            agent_action_dim,
+                                        )
                                     candidate_raw_global = self._replace_agent_action_slice_static(
                                         base_actions_raw_f32,
                                         candidate_raw_mapped,
@@ -20150,6 +20415,89 @@ def train(args):
         setattr(args, 'semi_random_hold_episodes', int(hold_episodes))
         setattr(args, 'semi_random_hold_min_episodes', int(hold_min_episodes))
         setattr(args, 'semi_random_hold_max_episodes', int(hold_max_episodes))
+        physics_contract = dict(stage_cfg.get('paper_physics_contract') or {})
+        if bool(getattr(args, 'paper_curriculum_enabled', False)):
+            if not physics_contract:
+                raise ValueError(
+                    "paper curriculum stage is missing paper_physics_contract"
+                )
+            deadline_dt = float(
+                dict(stage_cfg.get('paper_task_deadline_policy') or {}).get(
+                    'simulation_dt_seconds', -1.0
+                )
+            )
+            if not math.isclose(
+                float(physics_contract.get('simulation_dt', -2.0)),
+                deadline_dt,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    "paper physics simulation_dt does not match deadline policy"
+                )
+        for physics_name in (
+            'simulation_dt',
+            'use_quadrotor_dynamics',
+            'agent_size',
+            'agent_max_speed',
+            'agent_accel',
+            'gravity',
+            'control_accel_gain',
+            'damping',
+            'action_range_x',
+            'action_range_y',
+            'action_range_z',
+            'z_action_bias',
+            'quadrotor_attitude_response_time',
+            'quadrotor_psi_cmd',
+        ):
+            if physics_name in physics_contract:
+                setattr(args, physics_name, physics_contract[physics_name])
+        for key in (
+            'min_start_goal_dist',
+            'max_start_goal_dist',
+            'terrain_complexity_level',
+            'paper_task_num_obstacles',
+            'task_difficulty_bin',
+            'min_agent_start_separation',
+            'paper_task_contract_enabled',
+            'paper_task_contract_strict',
+            'paper_task_require_reference_feasible',
+            'paper_task_reference_grid_resolution',
+            'paper_task_obstacle_inflation',
+            'paper_task_reference_surface_clearance',
+            'success_distance_threshold',
+            'collision_distance_threshold',
+            'hard_deadline_terminal',
+            'paper_terminal_on_collision',
+            'include_time_to_go_observation',
+            'paper_reward_profile',
+            'paper_progress_reward_scale',
+            'paper_individual_reach_bonus',
+            'paper_team_success_bonus',
+            'paper_collision_penalty',
+            'paper_out_of_bounds_penalty',
+            'paper_deadline_penalty',
+            'paper_step_penalty',
+            'paper_control_effort_penalty',
+            'paper_clearance_margin',
+            'paper_clearance_penalty',
+            'paper_goal_formation_radius',
+            'paper_goal_boundary_clearance',
+            'paper_task_deadline_policy',
+        ):
+            if key in stage_cfg:
+                setattr(args, key, stage_cfg[key])
+        if bool(getattr(args, 'paper_curriculum_enabled', False)):
+            difficulty = str(stage_cfg.get('difficulty_bin', '') or '').strip()
+            if not difficulty:
+                raise ValueError("paper curriculum stage is missing difficulty_bin")
+            paper_train_split = f"train_{difficulty}"
+            setattr(args, 'paper_task_bank_split', paper_train_split)
+            os.environ['PAPER_TASK_BANK_SPLIT'] = paper_train_split
+            os.environ['PAPER_TASK_BANK_PARALLEL_ENVS'] = str(
+                max(1, int(getattr(args, 'num_envs', 1) or 1))
+            )
 
         _set_bool_env('USE_DYNAMIC_OBSTACLES', stage_cfg['use_dynamic_obstacles'])
         _set_bool_env('USE_FIXED_POSITIONS', stage_cfg['use_fixed_positions'])
@@ -20174,10 +20522,93 @@ def train(args):
         os.environ['CURRICULUM_MULTI_TERRAIN_SEEDS'] = ','.join(str(int(seed)) for seed in stage_cfg.get('multi_terrain_seeds', []))
         os.environ['CURRICULUM_STAGE_ID'] = str(int(stage_cfg.get('stage_id', 0)))
         os.environ['CURRICULUM_REWARD_PROFILE'] = str(stage_cfg.get('reward_profile', 'fixed_route'))
+        physics_environment_names = {
+            'simulation_dt': 'SIMULATION_DT',
+            'agent_size': 'AGENT_SIZE',
+            'agent_max_speed': 'AGENT_MAX_SPEED',
+            'agent_accel': 'AGENT_ACCEL',
+            'gravity': 'GRAVITY',
+            'control_accel_gain': 'CONTROL_ACCEL_GAIN',
+            'damping': 'DAMPING',
+            'action_range_x': 'ACTION_RANGE_X',
+            'action_range_y': 'ACTION_RANGE_Y',
+            'action_range_z': 'ACTION_RANGE_Z',
+            'z_action_bias': 'Z_ACTION_BIAS',
+            'quadrotor_attitude_response_time': 'QUADROTOR_ATTITUDE_RESPONSE_TIME',
+            'quadrotor_psi_cmd': 'QUADROTOR_PSI_CMD',
+        }
+        for physics_name, environment_name in physics_environment_names.items():
+            if physics_name in physics_contract:
+                os.environ[environment_name] = str(physics_contract[physics_name])
+        if 'use_quadrotor_dynamics' in physics_contract:
+            _set_bool_env(
+                'USE_QUADROTOR_DYNAMICS',
+                physics_contract['use_quadrotor_dynamics'],
+            )
+        runtime_stage_env = {
+            'MIN_START_GOAL_DIST': stage_cfg.get('min_start_goal_dist'),
+            'MAX_START_GOAL_DIST': stage_cfg.get('max_start_goal_dist'),
+            'TERRAIN_COMPLEXITY_LEVEL': stage_cfg.get('terrain_complexity_level'),
+            'PAPER_TASK_NUM_OBSTACLES': stage_cfg.get('paper_task_num_obstacles'),
+            'TASK_DIFFICULTY_BIN': stage_cfg.get('difficulty_bin'),
+            'MIN_AGENT_START_SEPARATION': stage_cfg.get('min_agent_start_separation'),
+            'PAPER_REWARD_PROFILE': stage_cfg.get('paper_reward_profile'),
+            'PAPER_PROGRESS_REWARD_SCALE': stage_cfg.get('paper_progress_reward_scale'),
+            'PAPER_INDIVIDUAL_REACH_BONUS': stage_cfg.get('paper_individual_reach_bonus'),
+            'PAPER_TEAM_SUCCESS_BONUS': stage_cfg.get('paper_team_success_bonus'),
+            'PAPER_COLLISION_PENALTY': stage_cfg.get('paper_collision_penalty'),
+            'PAPER_OUT_OF_BOUNDS_PENALTY': stage_cfg.get('paper_out_of_bounds_penalty'),
+            'PAPER_DEADLINE_PENALTY': stage_cfg.get('paper_deadline_penalty'),
+            'PAPER_STEP_PENALTY': stage_cfg.get('paper_step_penalty'),
+            'PAPER_CONTROL_EFFORT_PENALTY': stage_cfg.get('paper_control_effort_penalty'),
+            'PAPER_CLEARANCE_MARGIN': stage_cfg.get('paper_clearance_margin'),
+            'PAPER_CLEARANCE_PENALTY': stage_cfg.get('paper_clearance_penalty'),
+            'PAPER_GOAL_FORMATION_RADIUS': stage_cfg.get('paper_goal_formation_radius'),
+            'PAPER_GOAL_BOUNDARY_CLEARANCE': stage_cfg.get('paper_goal_boundary_clearance'),
+            'PAPER_TASK_REFERENCE_GRID_RESOLUTION': stage_cfg.get(
+                'paper_task_reference_grid_resolution'
+            ),
+            'PAPER_TASK_OBSTACLE_INFLATION': stage_cfg.get(
+                'paper_task_obstacle_inflation'
+            ),
+            'PAPER_TASK_REFERENCE_SURFACE_CLEARANCE': stage_cfg.get(
+                'paper_task_reference_surface_clearance'
+            ),
+            'SUCCESS_DISTANCE_THRESHOLD': stage_cfg.get(
+                'success_distance_threshold'
+            ),
+            'COLLISION_DISTANCE_THRESHOLD': stage_cfg.get(
+                'collision_distance_threshold'
+            ),
+        }
+        for env_name, value in runtime_stage_env.items():
+            if value is not None:
+                os.environ[env_name] = str(value)
+        for env_name, config_key in (
+            ('PAPER_TASK_CONTRACT_ENABLED', 'paper_task_contract_enabled'),
+            ('PAPER_TASK_CONTRACT_STRICT', 'paper_task_contract_strict'),
+            ('PAPER_TASK_REQUIRE_REFERENCE_FEASIBLE', 'paper_task_require_reference_feasible'),
+            ('HARD_DEADLINE_TERMINAL', 'hard_deadline_terminal'),
+            ('PAPER_TERMINAL_ON_COLLISION', 'paper_terminal_on_collision'),
+            ('INCLUDE_TIME_TO_GO_OBSERVATION', 'include_time_to_go_observation'),
+        ):
+            if config_key in stage_cfg:
+                _set_bool_env(env_name, stage_cfg[config_key])
 
     # 初始化课程学习状态：实现 5 阶段训练路径
     user_explicit_random = bool(getattr(args, 'random_terrain', False))
-    curriculum_enabled = bool(args.unlock_env_on_success > 0 and args.unlock_env_on_plateau > 0)
+    paper_curriculum_mode = bool(getattr(args, 'paper_curriculum_enabled', False))
+    if paper_curriculum_mode and str(
+        getattr(args, 'paper_task_layout_file', '') or ''
+    ).strip():
+        raise ValueError(
+            "--paper-curriculum-enabled forbids --paper-task-layout-file; "
+            "use one immutable task-bank manifest"
+        )
+    curriculum_enabled = bool(
+        paper_curriculum_mode
+        or (args.unlock_env_on_success > 0 and args.unlock_env_on_plateau > 0)
+    )
     if curriculum_enabled and user_explicit_random:
         if not quiet_output:
             print("🧭 已启用五阶段课程学习，训练将按课程阶段控制地图随机化，覆盖显式 --random-terrain 设置。")
@@ -20191,6 +20622,9 @@ def train(args):
     curriculum_stage_success_count = 0     # 当前阶段累计团队成功次数
     curriculum_stage_start_episode = 0
     curriculum_stage_best_reward = -np.inf
+    paper_curriculum_success_flags = []
+    curriculum_transition_occurred_this_iteration = False
+    paper_stage_transition_event = None
 
     try:
         base_terrain_seed = int(getattr(args, 'terrain_seed', None) if getattr(args, 'terrain_seed', None) is not None else os.getenv('SCENARIO_SEED', os.getenv('TERRAIN_BASE_SEED', '67')))
@@ -20399,6 +20833,229 @@ def train(args):
             'multi_terrain_seeds': multi_terrain_seeds,
         },
     ]
+    if paper_curriculum_mode:
+        curriculum_stages = build_paper_curriculum(base_terrain_seed)
+        if getattr(args, 'seed', None) is None:
+            raise ValueError("paper curriculum requires an explicit --seed")
+        if not str(getattr(args, 'paper_method_id', '') or '').strip():
+            raise ValueError("paper curriculum requires --paper-method-id")
+        experiment_protocol_raw = str(
+            getattr(args, 'paper_experiment_protocol', '') or ''
+        ).strip()
+        if not experiment_protocol_raw:
+            raise ValueError(
+                "paper curriculum requires --paper-experiment-protocol"
+            )
+        experiment_protocol_path = Path(
+            experiment_protocol_raw
+        ).expanduser().resolve()
+        paper_experiment_protocol = load_protocol(experiment_protocol_path)
+        method_id = str(args.paper_method_id).strip()
+        method_spec = dict(
+            (paper_experiment_protocol.get('methods') or {}).get(method_id) or {}
+        )
+        if not method_spec:
+            raise ValueError(
+                f"paper method={method_id!r} is absent from experiment protocol"
+            )
+        if int(args.seed) not in [
+            int(value)
+            for value in paper_experiment_protocol.get('train_seeds') or []
+        ]:
+            raise ValueError(
+                f"paper train seed={args.seed} is absent from experiment protocol"
+            )
+        if str(method_spec.get('algorithm', '')).strip().lower() != str(
+            getattr(args, 'algo', '') or ''
+        ).strip().lower():
+            raise ValueError("paper protocol algorithm does not match training args")
+        expected_method_environment = runtime_method_environment(method_spec)
+        method_environment_mismatches = {
+            key: {
+                'expected': str(expected),
+                'actual': os.environ.get(str(key)),
+            }
+            for key, expected in expected_method_environment.items()
+            if os.environ.get(str(key)) != str(expected)
+        }
+        if method_environment_mismatches:
+            raise ValueError(
+                "paper method environment does not match immutable protocol: "
+                + json.dumps(method_environment_mismatches, sort_keys=True)
+            )
+        protocol_training = dict(paper_experiment_protocol.get('training') or {})
+        training_contract_actual = {
+            'synchronous_iterations': int(args.train_episodes),
+            'parallel_environments': int(args.num_envs),
+            'batch_size': int(args.batch_size),
+        }
+        training_contract_mismatches = {
+            field: {
+                'expected': int(protocol_training.get(field, -1)),
+                'actual': actual,
+            }
+            for field, actual in training_contract_actual.items()
+            if int(protocol_training.get(field, -1)) != actual
+        }
+        if training_contract_mismatches:
+            raise ValueError(
+                "paper training dimensions do not match immutable protocol: "
+                + json.dumps(training_contract_mismatches, sort_keys=True)
+            )
+        if protocol_training.get('stage_transition_policy') != (
+            'fixed_iteration_budget_v1'
+        ):
+            raise ValueError("paper protocol stage transition policy mismatch")
+        if protocol_training.get('task_sampling_policy') != (
+            'deterministic_bank_order_complete_cycles_v1'
+        ):
+            raise ValueError("paper protocol task sampling policy mismatch")
+        stage_transition_runtime = dict(
+            protocol_training.get('stage_transition_runtime') or {}
+        )
+        transition_runtime_actual = {
+            'replay_keep_recent_transitions': int(
+                os.getenv('CURRICULUM_RB_KEEP_RECENT', '1000')
+            ),
+            'learning_rate_factor': float(
+                os.getenv('CURRICULUM_LR_FACTOR', '0.5')
+            ),
+            'optimizer_slot_policy': (
+                'reset_adam_moments'
+                if os.getenv('CURRICULUM_RESET_OPTIMIZER', '1').lower()
+                in ('1', 'true', 'yes', 'on')
+                else 'preserve_adam_moments'
+            ),
+        }
+        transition_runtime_mismatches = {
+            field: {
+                'expected': stage_transition_runtime.get(field),
+                'actual': actual,
+            }
+            for field, actual in transition_runtime_actual.items()
+            if stage_transition_runtime.get(field) != actual
+        }
+        if transition_runtime_mismatches:
+            raise ValueError(
+                "paper stage transition runtime does not match protocol: "
+                + json.dumps(transition_runtime_mismatches, sort_keys=True)
+            )
+        paper_stage_iteration_budgets = {
+            str(key): int(value)
+            for key, value in dict(
+                protocol_training.get('stage_synchronous_iterations') or {}
+            ).items()
+        }
+        if set(paper_stage_iteration_budgets) != {'C0', 'C1', 'C2', 'C3'}:
+            raise ValueError("paper protocol stage iteration budget is incomplete")
+        if sum(paper_stage_iteration_budgets.values()) != int(
+            args.train_episodes
+        ):
+            raise ValueError("paper protocol stage budgets do not sum to training total")
+        paper_experiment_protocol_artifact = fingerprint_paper_artifact(
+            experiment_protocol_path
+        )
+        paper_experiment_protocol_artifact['protocol_content_sha256'] = str(
+            paper_experiment_protocol['content_sha256']
+        )
+        if not bool(getattr(args, 'save_model', False)):
+            raise ValueError("paper curriculum requires --save-model")
+        task_bank_manifest_raw = str(
+            getattr(args, 'paper_task_bank_manifest', '') or ''
+        ).strip()
+        if not task_bank_manifest_raw:
+            raise ValueError(
+                "--paper-curriculum-enabled requires --paper-task-bank-manifest"
+            )
+        task_bank_path = Path(task_bank_manifest_raw).expanduser().resolve()
+        if task_bank_path.is_dir():
+            task_bank_path = task_bank_path / 'task_bank_manifest.json'
+        paper_training_task_bank = load_task_bank(task_bank_path)
+        if str(paper_training_task_bank['content_sha256']) != str(
+            paper_experiment_protocol['task_bank']['bank_content_sha256']
+        ):
+            raise ValueError(
+                "paper training task bank does not match experiment protocol"
+            )
+        feasibility_errors = validate_dynamic_feasibility_audit(
+            paper_training_task_bank
+        )
+        if feasibility_errors:
+            raise ValueError(
+                "formal paper training requires a complete dynamic feasibility "
+                "audit: " + "; ".join(feasibility_errors)
+            )
+        for stage_cfg in curriculum_stages:
+            expected_split = f"train_{stage_cfg['difficulty_bin']}"
+            split_cfg = dict(
+                (paper_training_task_bank.get('splits') or {}).get(expected_split) or {}
+            )
+            if not split_cfg:
+                raise ValueError(
+                    f"paper task bank lacks required split={expected_split!r}"
+                )
+            if str(split_cfg.get('role', '')).strip() != 'train':
+                raise ValueError(
+                    f"paper task-bank split={expected_split!r} must have role='train'"
+                )
+            runtime_cfg = dict(split_cfg.get('runtime_config') or {})
+            for field in (
+                'difficulty_bin',
+                'min_start_goal_dist',
+                'max_start_goal_dist',
+                'terrain_complexity_level',
+                'paper_task_num_obstacles',
+                'paper_task_require_reference_feasible',
+                'paper_task_reference_grid_resolution',
+                'paper_task_obstacle_inflation',
+                'paper_task_reference_surface_clearance',
+                'success_distance_threshold',
+                'collision_distance_threshold',
+                'paper_task_semantics_contract',
+                'paper_goal_formation_radius',
+                'paper_goal_boundary_clearance',
+                'paper_task_deadline_policy',
+                'paper_physics_contract',
+                'paper_reward_profile',
+                'hard_deadline_terminal',
+                'paper_terminal_on_collision',
+            ):
+                if runtime_cfg.get(field) != stage_cfg.get(field):
+                    raise ValueError(
+                        f"paper task-bank split={expected_split!r} runtime {field} "
+                        f"mismatch: bank={runtime_cfg.get(field)!r}, "
+                        f"curriculum={stage_cfg.get(field)!r}"
+                    )
+        deadline_summaries = {}
+        for stage_cfg in curriculum_stages:
+            split_name = f"train_{stage_cfg['difficulty_bin']}"
+            split_cfg = dict(paper_training_task_bank['splits'][split_name])
+            layout_paths = [
+                task_entry['task_layout_file']
+                for task_entry in list(split_cfg.get('tasks') or [])
+            ]
+            layouts = []
+            for relative_path in layout_paths:
+                with (task_bank_path.parent / relative_path).open(
+                    'r', encoding='utf-8'
+                ) as stream:
+                    layouts.append(json.load(stream))
+            summary = summarize_task_deadlines(layouts)
+            if split_cfg.get('deadline_summary') != summary:
+                raise ValueError(
+                    f"paper task-bank split={split_name!r} deadline summary mismatch"
+                )
+            deadline_summaries[split_name] = summary
+        safety_cap_steps = max(
+            int(summary['maximum_deadline_steps'])
+            for summary in deadline_summaries.values()
+        )
+        args.paper_task_deadline_summary_by_split = deadline_summaries
+        args.paper_episode_safety_cap_steps = safety_cap_steps
+        args.episode_length = safety_cap_steps
+        os.environ['EPISODE_LENGTH'] = str(safety_cap_steps)
+        args.paper_task_bank_manifest = str(task_bank_path)
+        os.environ['PAPER_TASK_BANK_MANIFEST'] = str(task_bank_path)
 
     def _format_curriculum_stage_desc(stage_cfg, stage_index=None):
         if not isinstance(stage_cfg, dict):
@@ -20437,14 +21094,22 @@ def train(args):
         _apply_curriculum_stage_env(curriculum_stages[curriculum_stage_index])
         obstacle_change_unlocked = curriculum_stages[curriculum_stage_index]['use_dynamic_obstacles']
         if not quiet_output:
-            print("🚀 五阶段课程学习已启用:")
+            print(f"🚀 {'论文任务' if paper_curriculum_mode else '五阶段'}课程学习已启用:")
             for idx, stage_cfg in enumerate(curriculum_stages, start=1):
                 print(f"   {idx}. {stage_cfg['label']}")
             print(f"   当前阶段: {curriculum_stages[curriculum_stage_index]['label']}")
-            print(f"   阶段解锁目标(连续成功): {stage_success_targets}")
-            print(f"   阶段解锁目标(奖励停滞): {stage_plateau_targets}")
-            print(f"   阶段最短训练回合: {stage_min_episodes}")
-            print(f"   多 terrain seed 池: {multi_terrain_seeds}")
+            if paper_curriculum_mode:
+                for stage_cfg in curriculum_stages[:-1]:
+                    print(
+                        f"   {stage_cfg['difficulty_bin']} 解锁契约: "
+                        f"{stage_cfg['promotion']}"
+                    )
+                print("   held-out terrain seeds 不进入训练课程；仅用于独立泛化评估。")
+            else:
+                print(f"   阶段解锁目标(连续成功): {stage_success_targets}")
+                print(f"   阶段解锁目标(奖励停滞): {stage_plateau_targets}")
+                print(f"   阶段最短训练回合: {stage_min_episodes}")
+                print(f"   多 terrain seed 池: {multi_terrain_seeds}")
     elif user_explicit_random and not quiet_output:
         print("🗺️ 用户显式启用随机地形模式，将在每个回合使用不同的随机地形（绕过课程学习）。")
     if not curriculum_enabled:
@@ -20590,7 +21255,10 @@ def train(args):
             use_separated_gradient = bool(getattr(args, "maddpg_use_separated_gradient", True))
             use_hybrid_actor_objective = False
             hybrid_actor_alpha = 0.0
-            action_semantics_mode = "dual"
+            action_semantics_mode = str(
+                getattr(args, "maddpg_action_semantics_mode", "legacy")
+                or "legacy"
+            ).strip().lower()
             reconstruct_corrected_target = True
         else:
             use_dual_q = False
@@ -20651,8 +21319,16 @@ def train(args):
             "adaptive_plateau_window": _env_int("ADAPTIVE_PLATEAU_WINDOW", 50),
             "adaptive_plateau_rel_delta": _env_float("ADAPTIVE_PLATEAU_REL_DELTA", 0.03),
             "adaptive_plateau_slope_eps": _env_float("ADAPTIVE_PLATEAU_SLOPE_EPS", 0.002),
+            "adaptive_reward_comparison_scope": "curriculum_stage",
             "adaptive_noise_max": _env_float("ADAPTIVE_NOISE_MAX", 0.12),
             "adaptive_noise_smooth": _env_float("ADAPTIVE_NOISE_SMOOTH", 0.4),
+            "curriculum_replay_keep_recent": _env_int(
+                "CURRICULUM_RB_KEEP_RECENT", 1000
+            ),
+            "curriculum_lr_factor": _env_float("CURRICULUM_LR_FACTOR", 0.5),
+            "curriculum_reset_optimizer": _env_bool(
+                "CURRICULUM_RESET_OPTIMIZER", True
+            ),
             "noise_restart_interval": _env_int(
                 "NOISE_RESTART_INTERVAL",
                 DEFAULT_NOISE_RESTART_INTERVAL,
@@ -20699,6 +21375,13 @@ def train(args):
             "action_semantics_mode": str(action_semantics_mode),
             "replay_action_semantics_mode": str(action_semantics_mode),
             "reconstruct_corrected_target": bool(reconstruct_corrected_target),
+            "target_action_contract": (
+                TD3_TARGET_ACTION_CONTRACT
+                if algo_name == "matd3" and reconstruct_corrected_target
+                else "target_policy_then_apf_v1"
+                if algo_name == "maddpg" and reconstruct_corrected_target
+                else "target_policy_without_apf_reconstruction_v1"
+            ),
             "cross_agent_reference_enabled": bool(getattr(args, "cross_agent_reference_enabled", False)),
             "cross_agent_reference_coef": float(getattr(args, "cross_agent_reference_coef", 0.0) or 0.0),
             "cross_agent_reference_start_episode": int(getattr(args, "cross_agent_reference_start_episode", 0) or 0),
@@ -21279,13 +21962,47 @@ def train(args):
             if not quiet_output:
                 tqdm.write(f"⚠️ 重置优化器状态失败: {e}", file=tqdm_file)
 
-    def _transition_curriculum_stage(next_stage_index, unlock_reason, episode_idx):
+    def _transition_curriculum_stage(
+        next_stage_index,
+        unlock_reason,
+        episode_idx,
+        paper_promotion_evidence=None,
+    ):
         nonlocal curriculum_stage_index
         nonlocal consecutive_success_count, episodes_since_best_for_unlock
         nonlocal curriculum_stage_success_count, curriculum_stage_start_episode, curriculum_stage_best_reward
+        nonlocal paper_curriculum_success_flags
         nonlocal obstacle_change_unlocked
-        current_stage_label = curriculum_stages[curriculum_stage_index]['label']
+        nonlocal curriculum_transition_occurred_this_iteration
+        nonlocal paper_stage_transition_event
+        completed_stage_index = int(curriculum_stage_index)
+        completed_stage = curriculum_stages[completed_stage_index]
+        current_stage_label = completed_stage['label']
         next_stage = curriculum_stages[next_stage_index]
+        if paper_curriculum_mode:
+            if not isinstance(paper_promotion_evidence, dict):
+                raise RuntimeError(
+                    "paper curriculum transition requires frozen promotion evidence"
+                )
+            paper_stage_transition_event = {
+                'completed_stage_index': completed_stage_index,
+                'completed_difficulty_bin': str(
+                    completed_stage['difficulty_bin']
+                ),
+                'next_stage_index': int(next_stage_index),
+                'next_difficulty_bin': str(next_stage['difficulty_bin']),
+                'completed_training_iterations': int(episode_idx + 1),
+                'stage_start_completed_iterations': int(
+                    curriculum_stage_start_episode
+                ),
+                'completed_stage_iterations': int(
+                    episode_idx + 1 - curriculum_stage_start_episode
+                ),
+                'promotion_evidence': _make_json_safe(
+                    paper_promotion_evidence
+                ),
+                'unlock_reason': str(unlock_reason),
+            }
         curriculum_stage_index = next_stage_index
         obstacle_change_unlocked = bool(next_stage['use_dynamic_obstacles'])
         _apply_curriculum_stage_env(next_stage)
@@ -21295,14 +22012,18 @@ def train(args):
                 file=tqdm_file
             )
         _rebuild_env_after_curriculum_change()
+        _clear_replay_buffer_for_curriculum()
         _reset_target_networks_for_curriculum()
         _reduce_learning_rate_once_for_curriculum()
         _reset_optimizer_state_for_curriculum()
+        _reset_adaptive_learning_stage_state(maddpg)
         consecutive_success_count = 0
         episodes_since_best_for_unlock = 0
         curriculum_stage_success_count = 0
         curriculum_stage_start_episode = episode_idx + 1
         curriculum_stage_best_reward = -np.inf
+        paper_curriculum_success_flags = []
+        curriculum_transition_occurred_this_iteration = True
 
 
     # 已移除训练阶段轨迹可视化
@@ -21482,7 +22203,29 @@ def train(args):
                             raise RuntimeError("检查点运行期步数/噪声状态恢复失败") from runtime_state_exc
 
                     adaptive_runtime_state = checkpoint_state.get('adaptive_learning_runtime_state')
+                    if (
+                        int(checkpoint_state.get('checkpoint_state_schema_version', 0)) >= 3
+                        and not isinstance(adaptive_runtime_state, dict)
+                    ):
+                        raise ValueError(
+                            "checkpoint schema >=3 lacks adaptive_learning_runtime_state"
+                        )
                     if isinstance(adaptive_runtime_state, dict):
+                        if (
+                            int(checkpoint_state.get('checkpoint_state_schema_version', 0)) >= 3
+                            and 'stage_best_reward' not in adaptive_runtime_state
+                        ):
+                            raise ValueError(
+                                "checkpoint adaptive state lacks stage_best_reward"
+                            )
+                        saved_adaptive_stage_best = adaptive_runtime_state.get(
+                            'stage_best_reward', None
+                        )
+                        maddpg.adaptive_learning['stage_best_reward'] = (
+                            float(saved_adaptive_stage_best)
+                            if saved_adaptive_stage_best is not None
+                            else -np.inf
+                        )
                         maddpg.adaptive_learning['consecutive_no_improve'] = int(
                             adaptive_runtime_state.get('consecutive_no_improve', 0)
                         )
@@ -21510,6 +22253,69 @@ def train(args):
                             if saved_train_steps < 0:
                                 raise ValueError("checkpoint training_train_steps must be non-negative")
                             maddpg.training_stats['train_steps'] = saved_train_steps
+
+                    if paper_curriculum_mode:
+                        saved_curriculum = checkpoint_state.get(
+                            'paper_curriculum_runtime_state'
+                        )
+                        if not isinstance(saved_curriculum, dict):
+                            raise ValueError(
+                                "paper curriculum checkpoint lacks "
+                                "paper_curriculum_runtime_state"
+                            )
+                        saved_stage_index = int(
+                            saved_curriculum.get('stage_index', -1)
+                        )
+                        if not 0 <= saved_stage_index < len(curriculum_stages):
+                            raise ValueError(
+                                "paper curriculum checkpoint stage_index is invalid: "
+                                f"{saved_stage_index}"
+                            )
+                        saved_difficulty = str(
+                            saved_curriculum.get('difficulty_bin', '') or ''
+                        ).strip()
+                        expected_difficulty = str(
+                            curriculum_stages[saved_stage_index]['difficulty_bin']
+                        )
+                        if saved_difficulty != expected_difficulty:
+                            raise ValueError(
+                                "paper curriculum checkpoint difficulty mismatch: "
+                                f"saved={saved_difficulty!r}, "
+                                f"expected={expected_difficulty!r}"
+                            )
+                        curriculum_stage_index = saved_stage_index
+                        curriculum_stage_start_episode = int(
+                            saved_curriculum.get('stage_start_episode', 0)
+                        )
+                        curriculum_stage_success_count = int(
+                            saved_curriculum.get('stage_success_count', 0)
+                        )
+                        saved_stage_best = saved_curriculum.get(
+                            'stage_best_reward', None
+                        )
+                        curriculum_stage_best_reward = (
+                            float(saved_stage_best)
+                            if saved_stage_best is not None
+                            else -np.inf
+                        )
+                        consecutive_success_count = int(
+                            saved_curriculum.get('consecutive_success_count', 0)
+                        )
+                        episodes_since_best_for_unlock = int(
+                            saved_curriculum.get(
+                                'episodes_since_best_for_unlock', 0
+                            )
+                        )
+                        paper_curriculum_success_flags = [
+                            bool(flag)
+                            for flag in list(
+                                saved_curriculum.get('success_flags', []) or []
+                            )
+                        ]
+                        _apply_curriculum_stage_env(
+                            curriculum_stages[curriculum_stage_index]
+                        )
+                        _rebuild_env_after_curriculum_change()
 
                     print(f"✅ 成功加载检查点状态:")
                     print(f"   - 起始回合: {start_episode}")
@@ -21604,6 +22410,13 @@ def train(args):
             'total_steps': int(getattr(maddpg, 'training_stats', {}).get('total_steps', 0)),
             'behavior_noise_runtime_state': _capture_behavior_noise_runtime_state(maddpg),
             'adaptive_learning_runtime_state': {
+                'stage_best_reward': (
+                    float(maddpg.adaptive_learning.get('stage_best_reward'))
+                    if np.isfinite(
+                        float(maddpg.adaptive_learning.get('stage_best_reward', -np.inf))
+                    )
+                    else None
+                ),
                 'consecutive_no_improve': int(maddpg.adaptive_learning.get('consecutive_no_improve', 0)),
                 'reward_history': [
                     float(value) for value in maddpg.adaptive_learning.get('reward_history', [])[-1000:]
@@ -21633,6 +22446,33 @@ def train(args):
             ),
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
+        if paper_curriculum_mode:
+            stage_cfg = curriculum_stages[curriculum_stage_index]
+            checkpoint_state['paper_curriculum_runtime_state'] = {
+                'stage_index': int(curriculum_stage_index),
+                'stage_id': int(stage_cfg['stage_id']),
+                'difficulty_bin': str(stage_cfg['difficulty_bin']),
+                'task_bank_manifest': str(
+                    getattr(args, 'paper_task_bank_manifest', '') or ''
+                ),
+                'task_bank_split': str(
+                    getattr(args, 'paper_task_bank_split', '') or ''
+                ),
+                'stage_start_episode': int(curriculum_stage_start_episode),
+                'stage_success_count': int(curriculum_stage_success_count),
+                'stage_best_reward': (
+                    float(curriculum_stage_best_reward)
+                    if np.isfinite(curriculum_stage_best_reward)
+                    else None
+                ),
+                'consecutive_success_count': int(consecutive_success_count),
+                'episodes_since_best_for_unlock': int(
+                    episodes_since_best_for_unlock
+                ),
+                'success_flags': [
+                    bool(flag) for flag in paper_curriculum_success_flags
+                ],
+            }
 
         # 在覆盖任何已有权重前验证状态内部一致性。这样调用方若错误地传入
         # 零基 episode 或漏写某条历史，不会留下“新权重 + 旧状态”的目录。
@@ -21663,6 +22503,291 @@ def train(args):
                 print(f"💾 检查点已保存: {checkpoint_dir} (已完成 {episode} 回合)")
         except Exception as e:
             raise RuntimeError(f"保存检查点状态失败: {checkpoint_state_file}") from e
+
+    paper_candidate_index_path = (
+        Path('models') / args.exp_name / 'paper_candidate_index.json'
+        if paper_curriculum_mode
+        else None
+    )
+    paper_training_source_artifacts = []
+    paper_training_source_bundle_sha256 = None
+    if paper_curriculum_mode:
+        paper_repo_root = Path(__file__).resolve().parent
+        paper_source_paths = [
+            Path(__file__).resolve(),
+            paper_repo_root / 'run_optimized.sh',
+            paper_repo_root / 'experiment_runtime_config.py',
+            paper_repo_root / 'paper_curriculum.py',
+            paper_repo_root / 'paper_experiment_protocol.py',
+            paper_repo_root / 'paper_experiment_pipeline.py',
+            paper_repo_root / 'paper_task_bank.py',
+            paper_repo_root / 'paper_task_layout.py',
+            paper_repo_root / 'paper_experiment_schema.py',
+            paper_repo_root / 'cross_agent_reference_state.py',
+            paper_repo_root / 'potential_field_corrector.py',
+            paper_repo_root / 'multiagent' / 'core.py',
+            paper_repo_root / 'multiagent' / 'environment.py',
+            paper_repo_root / 'multiagent' / 'scenarios'
+            / f"{args.scenario}.py",
+            paper_repo_root / 'multiagent' / 'scenarios'
+            / 'obstacle_observation.py',
+        ]
+        for source_path in paper_source_paths:
+            artifact = fingerprint_paper_artifact(source_path)
+            artifact['logical_name'] = str(
+                source_path.relative_to(paper_repo_root)
+            )
+            paper_training_source_artifacts.append(artifact)
+        paper_training_source_bundle_sha256 = paper_content_sha256(
+            [
+                {
+                    'logical_name': artifact['logical_name'],
+                    'sha256': artifact['sha256'],
+                }
+                for artifact in paper_training_source_artifacts
+            ]
+        )
+    paper_candidate_records = []
+    if paper_candidate_index_path is not None and paper_candidate_index_path.is_file():
+        if int(resume_completed_episodes) <= 0:
+            raise RuntimeError(
+                "refusing to append a fresh paper run to an existing candidate index"
+            )
+        with paper_candidate_index_path.open('r', encoding='utf-8') as stream:
+            persisted_candidate_index = json.load(stream)
+        expected_index_hash = paper_content_sha256(
+            {
+                key: value
+                for key, value in persisted_candidate_index.items()
+                if key != 'content_sha256'
+            }
+        )
+        if persisted_candidate_index.get('content_sha256') != expected_index_hash:
+            raise RuntimeError("paper candidate index content hash mismatch")
+        if persisted_candidate_index.get('schema_version') != (
+            'paper_training_candidate_index_v2'
+        ):
+            raise RuntimeError("paper candidate index schema mismatch")
+        if str(persisted_candidate_index.get('training_run_id', '')) != str(
+            args.exp_name
+        ):
+            raise RuntimeError("paper candidate index training_run_id mismatch")
+        if str(persisted_candidate_index.get('task_bank_content_sha256', '')) != str(
+            paper_training_task_bank['content_sha256']
+        ):
+            raise RuntimeError("paper candidate index task-bank hash mismatch")
+        if str(
+            persisted_candidate_index.get(
+                'experiment_protocol_content_sha256', ''
+            )
+        ) != str(paper_experiment_protocol['content_sha256']):
+            raise RuntimeError("paper candidate index experiment protocol mismatch")
+        persisted_protocol_artifact = dict(
+            persisted_candidate_index.get('experiment_protocol') or {}
+        )
+        actual_protocol_artifact = fingerprint_paper_artifact(
+            persisted_protocol_artifact.get('path')
+        )
+        if actual_protocol_artifact.get('sha256') != (
+            persisted_protocol_artifact.get('sha256')
+        ):
+            raise RuntimeError("paper experiment protocol artifact changed")
+        if str(
+            persisted_candidate_index.get('training_source_bundle_sha256', '')
+        ) != str(paper_training_source_bundle_sha256):
+            raise RuntimeError("paper candidate index training source hash mismatch")
+        paper_candidate_records = list(
+            persisted_candidate_index.get('candidates') or []
+        )
+        for candidate_record in paper_candidate_records:
+            actual = fingerprint_paper_artifact(
+                candidate_record.get('checkpoint', {}).get('path')
+            )
+            if actual.get('sha256') != candidate_record.get(
+                'checkpoint', {}
+            ).get('sha256'):
+                raise RuntimeError(
+                    "persisted paper candidate artifact fingerprint mismatch"
+                )
+
+    def _save_paper_candidate(
+        *,
+        trained_stage_index,
+        completed_iterations,
+        stage_start_completed_iterations,
+        candidate_kind,
+        promotion_evidence=None,
+    ):
+        if not paper_curriculum_mode:
+            raise RuntimeError("paper candidate save called outside paper curriculum")
+        trained_stage_index = int(trained_stage_index)
+        completed_iterations = int(completed_iterations)
+        stage_start_completed_iterations = int(
+            stage_start_completed_iterations
+        )
+        if not 0 <= trained_stage_index < len(curriculum_stages):
+            raise RuntimeError("paper candidate trained stage index is invalid")
+        if not 0 <= stage_start_completed_iterations < completed_iterations:
+            raise RuntimeError("paper candidate stage iteration range is invalid")
+        stage_cfg = curriculum_stages[trained_stage_index]
+        difficulty = str(stage_cfg['difficulty_bin'])
+        duplicate = [
+            record
+            for record in paper_candidate_records
+            if int(record.get('completed_training_iterations', -1))
+            == completed_iterations
+            and str(record.get('trained_on_difficulty_bin', '')) == difficulty
+        ]
+        if duplicate:
+            return dict(duplicate[0])
+
+        safe_kind = str(candidate_kind).strip().lower().replace(' ', '_')
+        if safe_kind not in {'periodic', 'stage_boundary', 'training_final'}:
+            raise RuntimeError(f"invalid paper candidate kind={candidate_kind!r}")
+        checkpoint_name = (
+            f"paper_candidates/{difficulty}_ep{completed_iterations:06d}_"
+            f"{safe_kind}"
+        )
+        save_checkpoint(completed_iterations, checkpoint_name)
+        completed_stage_iterations = (
+            completed_iterations - stage_start_completed_iterations
+        )
+        checkpoint_action_force_ratio = float(
+            getattr(args, 'action_force_ratio', 0.0) or 0.0
+        )
+        if (
+            not np.isfinite(checkpoint_action_force_ratio)
+            or checkpoint_action_force_ratio < 0.0
+            or checkpoint_action_force_ratio > 1.0
+        ):
+            raise RuntimeError(
+                "paper checkpoint action_force_ratio must be finite in [0, 1]"
+            )
+        candidate_metadata = {
+            'schema_version': 'paper_training_checkpoint_v5',
+            'candidate_kind': safe_kind,
+            'completed_training_iterations': completed_iterations,
+            'completed_environment_trajectories': int(
+                completed_iterations * int(env.num_envs)
+            ),
+            'trained_on_stage_index': trained_stage_index,
+            'trained_on_difficulty_bin': difficulty,
+            'stage_start_completed_iterations': (
+                stage_start_completed_iterations
+            ),
+            'completed_stage_iterations': completed_stage_iterations,
+            'completed_stage_environment_trajectories': int(
+                completed_stage_iterations * int(env.num_envs)
+            ),
+            'checkpoint_action_force_ratio': checkpoint_action_force_ratio,
+            'checkpoint_action_force_ratio_episode': completed_iterations,
+            'candidate_checkpoint_interval_trajectories': int(
+                stage_cfg['candidate_checkpoint_interval_trajectories']
+            ),
+            'promotion_evidence': _make_json_safe(promotion_evidence),
+            'train_task_bank_split': f'train_{difficulty}',
+            'task_bank_manifest_path': str(
+                getattr(args, 'paper_task_bank_manifest', '') or ''
+            ),
+            'task_bank_content_sha256': str(
+                paper_training_task_bank['content_sha256']
+            ),
+            'train_seed': int(getattr(args, 'seed', 0) or 0),
+            'training_run_id': str(args.exp_name),
+            'paper_method_id': str(args.paper_method_id),
+            'experiment_protocol': _make_json_safe(
+                paper_experiment_protocol_artifact
+            ),
+            'experiment_protocol_content_sha256': str(
+                paper_experiment_protocol['content_sha256']
+            ),
+            'checkpoint_resume_contract_sha256': paper_content_sha256(
+                _make_json_safe(args._checkpoint_resume_config)
+            ),
+            'training_source_bundle_sha256': str(
+                paper_training_source_bundle_sha256
+            ),
+            'training_source_artifacts': _make_json_safe(
+                paper_training_source_artifacts
+            ),
+            'training_task_deadline_summaries': _make_json_safe(
+                getattr(args, 'paper_task_deadline_summary_by_split', {})
+            ),
+            'episode_safety_cap_steps': int(
+                getattr(args, 'paper_episode_safety_cap_steps', 0) or 0
+            ),
+            'task_deadline_policy': _make_json_safe(
+                stage_cfg['paper_task_deadline_policy']
+            ),
+            'physics_contract': _make_json_safe(
+                stage_cfg['paper_physics_contract']
+            ),
+            'task_semantics_contract': _make_json_safe(
+                stage_cfg['paper_task_semantics_contract']
+            ),
+            'algorithm': str(getattr(args, 'algo', '') or ''),
+            'scenario': str(getattr(args, 'scenario', '') or ''),
+        }
+        candidate_metadata['content_sha256'] = paper_content_sha256(
+            candidate_metadata
+        )
+        candidate_dir = Path('models') / args.exp_name / checkpoint_name
+        metadata_path = candidate_dir / 'paper_training_checkpoint.json'
+        atomic_write_paper_json(metadata_path, candidate_metadata)
+        checkpoint_fingerprint = fingerprint_paper_artifact(candidate_dir)
+        candidate_record = {
+            'candidate_kind': safe_kind,
+            'completed_training_iterations': completed_iterations,
+            'completed_environment_trajectories': int(
+                completed_iterations * int(env.num_envs)
+            ),
+            'trained_on_stage_index': trained_stage_index,
+            'trained_on_difficulty_bin': difficulty,
+            'completed_stage_iterations': completed_stage_iterations,
+            'checkpoint_action_force_ratio': checkpoint_action_force_ratio,
+            'candidate_checkpoint_interval_trajectories': int(
+                stage_cfg['candidate_checkpoint_interval_trajectories']
+            ),
+            'checkpoint': checkpoint_fingerprint,
+            'training_metadata_path': str(metadata_path.resolve()),
+            'training_metadata_content_sha256': candidate_metadata[
+                'content_sha256'
+            ],
+        }
+        paper_candidate_records.append(candidate_record)
+        candidate_index = {
+            'schema_version': 'paper_training_candidate_index_v2',
+            'training_run_id': str(args.exp_name),
+            'paper_method_id': str(args.paper_method_id),
+            'train_seed': int(getattr(args, 'seed', 0) or 0),
+            'algorithm': str(getattr(args, 'algo', '') or ''),
+            'scenario': str(getattr(args, 'scenario', '') or ''),
+            'task_bank_manifest_path': str(
+                getattr(args, 'paper_task_bank_manifest', '') or ''
+            ),
+            'task_bank_content_sha256': str(
+                paper_training_task_bank['content_sha256']
+            ),
+            'experiment_protocol': candidate_metadata[
+                'experiment_protocol'
+            ],
+            'experiment_protocol_content_sha256': candidate_metadata[
+                'experiment_protocol_content_sha256'
+            ],
+            'checkpoint_resume_contract_sha256': candidate_metadata[
+                'checkpoint_resume_contract_sha256'
+            ],
+            'training_source_bundle_sha256': candidate_metadata[
+                'training_source_bundle_sha256'
+            ],
+            'candidate_count': len(paper_candidate_records),
+            'candidates': paper_candidate_records,
+        }
+        candidate_index['content_sha256'] = paper_content_sha256(
+            candidate_index
+        )
+        atomic_write_paper_json(paper_candidate_index_path, candidate_index)
+        return dict(candidate_record)
 
     # 配置进度显示输出与行为（支持环境变量控制）
     try:
@@ -22225,9 +23350,22 @@ def train(args):
 
     # 初始化环境观察
     if resume_completed_episodes > 0:
-        _prime_resume_env_sequence_state(env, resume_completed_episodes)
+        resume_sequence_completed = int(resume_completed_episodes)
+        if paper_curriculum_mode:
+            resume_sequence_completed = max(
+                0,
+                int(resume_completed_episodes)
+                - int(curriculum_stage_start_episode),
+            )
+        _prime_resume_env_sequence_state(env, resume_sequence_completed)
     obs_n = env.reset()
+    episode_curriculum_stage_index = int(curriculum_stage_index)
+    episode_curriculum_stage_start_episode = int(
+        curriculum_stage_start_episode
+    )
     for episode in episode_range:
+        curriculum_transition_occurred_this_iteration = False
+        paper_stage_transition_event = None
         # 【调试】每100个回合检查一次权重变化（优化：进一步降低频率以提升性能）
         if episode % 100 == 0 and episode > 0 and not quiet_output:
             print(f"\n{'='*80}")
@@ -22261,7 +23399,11 @@ def train(args):
         actor_losses_history.clear()
         critic_losses_history.clear()
 
-        current_curriculum_stage = curriculum_stages[curriculum_stage_index] if curriculum_enabled else None
+        episode_curriculum_stage_index = int(curriculum_stage_index)
+        episode_curriculum_stage_start_episode = int(
+            curriculum_stage_start_episode
+        )
+        current_curriculum_stage = curriculum_stages[episode_curriculum_stage_index] if curriculum_enabled else None
         random_terrain_mode_active = bool(user_explicit_random and not curriculum_enabled)
         random_obstacle_mode_active = bool(current_curriculum_stage['use_dynamic_obstacles']) if current_curriculum_stage else obstacle_change_unlocked
         random_mode_active = random_terrain_mode_active
@@ -22548,6 +23690,11 @@ def train(args):
                 next_pf_features=next_pf_features_single,
                 act_policy_clean=pending_single_transition.get('act_policy_clean'),
                 random_action_mask=pending_single_transition.get('random_action_mask'),
+                terminated_n=pending_single_transition['terminated_n'],
+                truncated_n=pending_single_transition['truncated_n'],
+                task_id=pending_single_transition['task_id'],
+                task_difficulty_bin=pending_single_transition['task_difficulty_bin'],
+                curriculum_stage_id=pending_single_transition['curriculum_stage_id'],
             )
             _record_episode_replay_refs(0, write_ref)
             pending_single_transition = None
@@ -22560,10 +23707,9 @@ def train(args):
         cross_agent_reference_enabled = bool(getattr(args, 'cross_agent_reference_enabled', False))
 
         def _select_replay_action_channels(raw_storage_actions, corrected_execution_actions):
-            if replay_action_semantics_mode == 'collapsed_replay':
-                collapsed = np.ascontiguousarray(corrected_execution_actions, dtype=np.float32)
-                return collapsed, collapsed
-            return raw_storage_actions, corrected_execution_actions
+            return select_replay_action_channels(
+                replay_action_semantics_mode, raw_storage_actions, corrected_execution_actions
+            )
 
         for step in range(args.episode_length):
             step_start = time.time() if _profiling_enabled else None
@@ -22985,6 +24131,85 @@ def train(args):
                     next_obs_n, rew_n, done_n, info_n = env.step(actions_for_env)
             else:
                 next_obs_n, rew_n, done_n, info_n = env.step(actions_for_env)
+            done_array = np.asarray(done_n, dtype=np.float32)
+            if done_array.ndim == 1:
+                done_array = done_array[np.newaxis, :]
+            expected_transition_shape = (
+                int(getattr(env, 'num_envs', 1)),
+                int(n_agents),
+            )
+            if done_array.shape != expected_transition_shape:
+                raise RuntimeError(
+                    f"environment done shape mismatch: expected={expected_transition_shape}, "
+                    f"actual={done_array.shape}"
+                )
+            authoritative_terminal_now = np.zeros(expected_transition_shape[0], dtype=bool)
+            transition_terminated_n = np.zeros(expected_transition_shape, dtype=np.float32)
+            transition_truncated_n = np.zeros(expected_transition_shape, dtype=np.float32)
+            transition_task_ids = [None] * expected_transition_shape[0]
+            transition_difficulty_bins = [None] * expected_transition_shape[0]
+            transition_stage_ids = [0] * expected_transition_shape[0]
+            info_rows = list(info_n or [])
+            if len(info_rows) != expected_transition_shape[0]:
+                raise RuntimeError(
+                    f"environment info row count mismatch: expected={expected_transition_shape[0]}, "
+                    f"actual={len(info_rows)}"
+                )
+            paper_task_contract_active = bool(
+                getattr(args, 'paper_task_contract_enabled', False)
+            )
+            for env_index, row in enumerate(info_rows):
+                if not isinstance(row, dict):
+                    raise RuntimeError(
+                        f"environment info row {env_index} must be dict, got {type(row).__name__}"
+                    )
+                authoritative_terminal_now[env_index] = bool(
+                    row.get('episode_terminal', False)
+                )
+                terminated_row = np.asarray(
+                    row.get('terminated_n', done_array[env_index]), dtype=np.float32
+                ).reshape(-1)
+                truncated_row = np.asarray(
+                    row.get('truncated_n', np.zeros(n_agents, dtype=np.float32)),
+                    dtype=np.float32,
+                ).reshape(-1)
+                if terminated_row.shape != (n_agents,) or truncated_row.shape != (n_agents,):
+                    raise RuntimeError(
+                        f"environment terminal vector shape mismatch for env={env_index}: "
+                        f"terminated={terminated_row.shape}, truncated={truncated_row.shape}, "
+                        f"expected={(n_agents,)}"
+                    )
+                transition_terminated_n[env_index] = np.clip(terminated_row, 0.0, 1.0)
+                transition_truncated_n[env_index] = np.clip(truncated_row, 0.0, 1.0)
+                transition_task_ids[env_index] = row.get('task_id')
+                transition_difficulty_bins[env_index] = row.get('task_difficulty_bin')
+                try:
+                    transition_stage_ids[env_index] = int(
+                        row.get('curriculum_stage_id', 0) or 0
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"invalid curriculum_stage_id for env={env_index}: "
+                        f"{row.get('curriculum_stage_id')}"
+                    ) from exc
+                if authoritative_terminal_now[env_index] and not np.all(
+                    transition_terminated_n[env_index] >= 0.5
+                ):
+                    raise RuntimeError(
+                        f"episode_terminal=True but terminated_n is not all true for env={env_index}"
+                    )
+                if paper_task_contract_active:
+                    if not str(transition_task_ids[env_index] or '').strip():
+                        raise RuntimeError(
+                            f"paper task contract enabled but env={env_index} did not return task_id"
+                        )
+                    if not str(transition_difficulty_bins[env_index] or '').strip():
+                        raise RuntimeError(
+                            f"paper task contract enabled but env={env_index} did not return difficulty bin"
+                        )
+            # This is the only mask consumed by Bellman targets.  Truncation is
+            # retained for audit, but does not silently change the task MDP.
+            transition_bootstrap_terminal_n = transition_terminated_n.copy()
             # One behavior timestep has completed.  Update immediately so the
             # next action (and any early-stop checkpoint) sees the true count.
             if hasattr(maddpg, 'training_stats'):
@@ -23206,6 +24431,17 @@ def train(args):
             except Exception:
                 env_done_now = np.array([False] * int(getattr(env, 'num_envs', 1)))
 
+            # HARD_DEADLINE_TERMINAL 和团队成功是环境给出的权威 episode
+            # 终止，不能被 EARLY_STOP_MODE=never 屏蔽。该模式只控制普通的
+            # 个体 done 聚合策略。
+            try:
+                if authoritative_terminal_now.shape == env_done_now.shape:
+                    env_done_now = np.logical_or(
+                        env_done_now, authoritative_terminal_now
+                    )
+            except Exception:
+                pass
+
             # 若“之前已早停”与“本步刚早停”的并集为全 True，则本回合已整体结束
             try:
                 if hasattr(env, 'num_envs') and isinstance(env_done_now, np.ndarray):
@@ -23320,7 +24556,7 @@ def train(args):
                                 next_obs_n=next_obs_np,
                                 act_n=replay_actions_for_storage[0],
                                 rew_n=rew_n[0],
-                                done_n=done_n[0],
+                                done_n=transition_bootstrap_terminal_n[0],
                                 fr_value=current_fr_value,
                                 pf_forces=pf_forces_single,
                                 act_corrected=act_corrected_single,
@@ -23329,6 +24565,11 @@ def train(args):
                                 next_pf_features=terminal_next_pf_features,
                                 act_policy_clean=act_policy_clean_single,
                                 random_action_mask=random_action_mask_single,
+                                terminated_n=transition_terminated_n[0],
+                                truncated_n=transition_truncated_n[0],
+                                task_id=transition_task_ids[0],
+                                task_difficulty_bin=transition_difficulty_bins[0],
+                                curriculum_stage_id=transition_stage_ids[0],
                             )
                             _record_episode_replay_refs(0, write_ref)
                         else:
@@ -23339,7 +24580,12 @@ def train(args):
                                 'act_policy_clean': act_policy_clean_single,
                                 'random_action_mask': random_action_mask_single,
                                 'rew_n': rew_n[0],
-                                'done_n': done_n[0],
+                                'done_n': transition_bootstrap_terminal_n[0],
+                                'terminated_n': transition_terminated_n[0],
+                                'truncated_n': transition_truncated_n[0],
+                                'task_id': transition_task_ids[0],
+                                'task_difficulty_bin': transition_difficulty_bins[0],
+                                'curriculum_stage_id': transition_stage_ids[0],
                                 'fr_value': current_fr_value,
                                 'pf_forces': pf_forces_single,
                                 'act_corrected': act_corrected_single,
@@ -23390,7 +24636,7 @@ def train(args):
                         next_obs_list.append(next_obs_np)
                         action_list.append(replay_actions_for_storage[i])
                         reward_list.append(rew_n[i])
-                        done_list.append(done_n[i])
+                        done_list.append(transition_bootstrap_terminal_n[i])
                         fr_list.append(current_fr_value)
                         pf_forces_list.append(pf_forces_single)
                         pf_features_list.append(current_pf_features_single)
@@ -23416,6 +24662,11 @@ def train(args):
                             next_act_corrected_batch=None,
                             act_policy_clean_batch=act_policy_clean_list if cross_agent_reference_enabled else None,
                             random_action_mask_batch=random_action_mask_list if cross_agent_reference_enabled else None,
+                            terminated_batch=[transition_terminated_n[i] for i in env_index_list],
+                            truncated_batch=[transition_truncated_n[i] for i in env_index_list],
+                            task_ids=[transition_task_ids[i] for i in env_index_list],
+                            task_difficulty_bins=[transition_difficulty_bins[i] for i in env_index_list],
+                            curriculum_stage_ids=[transition_stage_ids[i] for i in env_index_list],
                         )
                         try:
                             written_positions, written_generations = write_refs
@@ -24486,6 +25737,24 @@ def train(args):
                 curriculum_stage_success_count += 1
             else:
                 consecutive_success_count = 0
+            if paper_curriculum_mode:
+                per_env_history = getattr(
+                    maddpg, '_episode_team_success_flags_per_env', []
+                )
+                if not per_env_history:
+                    raise RuntimeError(
+                        "paper curriculum promotion requires per-environment team "
+                        "success observations"
+                    )
+                current_per_env_flags = [
+                    bool(flag) for flag in list(per_env_history[-1])
+                ]
+                if len(current_per_env_flags) != int(env.num_envs):
+                    raise RuntimeError(
+                        "paper curriculum promotion observation count mismatch: "
+                        f"actual={len(current_per_env_flags)}, expected={env.num_envs}"
+                    )
+                paper_curriculum_success_flags.extend(current_per_env_flags)
 
             if avg_episode_reward > curriculum_stage_best_reward:
                 curriculum_stage_best_reward = avg_episode_reward
@@ -24494,30 +25763,77 @@ def train(args):
                 episodes_since_best_for_unlock += 1
 
             if curriculum_stage_index < len(curriculum_stages) - 1:
-                stage_elapsed = (episode - curriculum_stage_start_episode) + 1
-                success_target = stage_success_targets[curriculum_stage_index]
-                plateau_target = stage_plateau_targets[curriculum_stage_index]
-                min_episodes_target = stage_min_episodes[curriculum_stage_index]
-                total_success_target = max(
-                    success_target,
-                    int(np.ceil(success_target * curriculum_total_success_multiplier))
-                )
-                unlock_by_consecutive = (
-                    stage_elapsed >= min_episodes_target and
-                    consecutive_success_count >= success_target and
-                    episodes_since_best_for_unlock >= plateau_target
-                )
-                unlock_by_total = (
-                    stage_elapsed >= min_episodes_target and
-                    curriculum_stage_success_count >= total_success_target
-                )
-                if unlock_by_consecutive or unlock_by_total:
-                    unlock_reason = (
-                        f"连续成功 {consecutive_success_count}/{success_target} 且停滞 {episodes_since_best_for_unlock}/{plateau_target}"
-                        if unlock_by_consecutive else
-                        f"阶段累计成功 {curriculum_stage_success_count}/{total_success_target}"
+                if paper_curriculum_mode:
+                    gate = promotion_decision(
+                        paper_curriculum_success_flags,
+                        current_stage_cfg['promotion'],
                     )
-                    _transition_curriculum_stage(curriculum_stage_index + 1, unlock_reason, episode)
+                    stage_elapsed = int(
+                        episode + 1 - curriculum_stage_start_episode
+                    )
+                    stage_difficulty = str(current_stage_cfg['difficulty_bin'])
+                    scheduled_iterations = int(
+                        paper_stage_iteration_budgets[stage_difficulty]
+                    )
+                    if stage_elapsed >= scheduled_iterations:
+                        readiness_interval = gate.get('wilson_interval')
+                        readiness_lower = (
+                            float(readiness_interval['lower'])
+                            if isinstance(readiness_interval, dict)
+                            else None
+                        )
+                        transition_evidence = {
+                            'transition_policy': 'fixed_iteration_budget_v1',
+                            'difficulty_bin': stage_difficulty,
+                            'scheduled_synchronous_iterations': (
+                                scheduled_iterations
+                            ),
+                            'observed_synchronous_iterations': stage_elapsed,
+                            'scheduled_environment_trajectories': int(
+                                scheduled_iterations * int(env.num_envs)
+                            ),
+                            'mastery_gate_snapshot': gate,
+                            'mastery_gate_passed_at_boundary': bool(
+                                gate['promoted']
+                            ),
+                        }
+                        unlock_reason = (
+                            f"冻结阶段预算 {stage_elapsed}/"
+                            f"{scheduled_iterations} 次同步迭代已完成；"
+                            f"边界掌握度Wilson下界="
+                            f"{readiness_lower if readiness_lower is not None else 'NA'}"
+                        )
+                        _transition_curriculum_stage(
+                            curriculum_stage_index + 1,
+                            unlock_reason,
+                            episode,
+                            paper_promotion_evidence=transition_evidence,
+                        )
+                else:
+                    stage_elapsed = (episode - curriculum_stage_start_episode) + 1
+                    success_target = stage_success_targets[curriculum_stage_index]
+                    plateau_target = stage_plateau_targets[curriculum_stage_index]
+                    min_episodes_target = stage_min_episodes[curriculum_stage_index]
+                    total_success_target = max(
+                        success_target,
+                        int(np.ceil(success_target * curriculum_total_success_multiplier))
+                    )
+                    unlock_by_consecutive = (
+                        stage_elapsed >= min_episodes_target and
+                        consecutive_success_count >= success_target and
+                        episodes_since_best_for_unlock >= plateau_target
+                    )
+                    unlock_by_total = (
+                        stage_elapsed >= min_episodes_target and
+                        curriculum_stage_success_count >= total_success_target
+                    )
+                    if unlock_by_consecutive or unlock_by_total:
+                        unlock_reason = (
+                            f"连续成功 {consecutive_success_count}/{success_target} 且停滞 {episodes_since_best_for_unlock}/{plateau_target}"
+                            if unlock_by_consecutive else
+                            f"阶段累计成功 {curriculum_stage_success_count}/{total_success_target}"
+                        )
+                        _transition_curriculum_stage(curriculum_stage_index + 1, unlock_reason, episode)
         # 保存每个回合的轨迹图（如果启用）
         if enable_episode_traj:
             try:
@@ -24643,7 +25959,7 @@ def train(args):
                 print(f"[DEBUG] 发现新最佳奖励: {best_reward:.2f} (第{best_episode+1}回合, FR={best_episode_force_ratio:.3f})")
 
             # 保存最佳模型
-            if args.save_model:
+            if args.save_model and not paper_curriculum_mode:
                 maddpg.save_models(os.path.join("models", args.exp_name, "best"))
             # 若开启则将当前回合本地收集的轨迹保存为最佳轨迹（深拷贝避免引用问题）
             if enable_best_traj:
@@ -24845,7 +26161,7 @@ def train(args):
                     ),
                     file=tqdm_file
                 )
-            if args.save_model:
+            if args.save_model and not paper_curriculum_mode:
                 save_checkpoint(len(episode_rewards), "best_by_team_sr")
 
         # 🔧 回合结束：仅在预快照缺失时补全 last_*（避免被重建后的环境覆盖）
@@ -25106,32 +26422,55 @@ def train(args):
                 success_mark = "✅" if current_ep_success else "❌"
                 mode_desc = _format_unlock_mode_desc()
                 if curriculum_enabled:
-                    stage_success_target = (
-                        stage_success_targets[curriculum_stage_index]
-                        if curriculum_stage_index < len(stage_success_targets) else getattr(args, 'unlock_env_on_success', 0)
-                    )
-                    stage_plateau_target = (
-                        stage_plateau_targets[curriculum_stage_index]
-                        if curriculum_stage_index < len(stage_plateau_targets) else getattr(args, 'unlock_env_on_plateau', 0)
-                    )
-                    total_success_target = max(
-                        stage_success_target,
-                        int(np.ceil(stage_success_target * curriculum_total_success_multiplier))
-                    )
                     stage_elapsed = (episode - curriculum_stage_start_episode) + 1
-                    if curriculum_stage_index < len(curriculum_stages) - 1:
-                        unlock_progress_desc = (
-                            f"阶段连续成功={consecutive_success_count}/{stage_success_target} | "
-                            f"阶段停滞={episodes_since_best_for_unlock}/{stage_plateau_target} | "
-                            f"阶段累计成功={curriculum_stage_success_count}/{total_success_target}"
-                        )
+                    if paper_curriculum_mode:
+                        if curriculum_stage_index < len(curriculum_stages) - 1:
+                            gate = promotion_decision(
+                                paper_curriculum_success_flags,
+                                curriculum_stages[curriculum_stage_index]['promotion'],
+                            )
+                            lower = (
+                                gate['wilson_interval']['lower']
+                                if gate['wilson_interval'] is not None else 0.0
+                            )
+                            unlock_progress_desc = (
+                                f"冻结阶段预算={stage_elapsed}/"
+                                f"{paper_stage_iteration_budgets[str(curriculum_stages[curriculum_stage_index]['difficulty_bin'])]} | "
+                                f"训练窗口成功={gate['successes']}/{gate['trials']} | "
+                                f"Wilson下界={lower:.3f}/"
+                                f"{gate['requirements']['wilson_lower_bound']:.3f}"
+                            )
+                        else:
+                            unlock_progress_desc = (
+                                f"已在最终训练阶段 | 阶段窗口回合="
+                                f"{len(paper_curriculum_success_flags)}"
+                            )
                     else:
-                        unlock_progress_desc = (
-                            f"已在最终阶段 | "
-                            f"阶段连续成功={consecutive_success_count} | "
-                            f"阶段停滞={episodes_since_best_for_unlock} | "
-                            f"阶段累计成功={curriculum_stage_success_count}"
+                        stage_success_target = (
+                            stage_success_targets[curriculum_stage_index]
+                            if curriculum_stage_index < len(stage_success_targets) else getattr(args, 'unlock_env_on_success', 0)
                         )
+                        stage_plateau_target = (
+                            stage_plateau_targets[curriculum_stage_index]
+                            if curriculum_stage_index < len(stage_plateau_targets) else getattr(args, 'unlock_env_on_plateau', 0)
+                        )
+                        total_success_target = max(
+                            stage_success_target,
+                            int(np.ceil(stage_success_target * curriculum_total_success_multiplier))
+                        )
+                        if curriculum_stage_index < len(curriculum_stages) - 1:
+                            unlock_progress_desc = (
+                                f"阶段连续成功={consecutive_success_count}/{stage_success_target} | "
+                                f"阶段停滞={episodes_since_best_for_unlock}/{stage_plateau_target} | "
+                                f"阶段累计成功={curriculum_stage_success_count}/{total_success_target}"
+                            )
+                        else:
+                            unlock_progress_desc = (
+                                f"已在最终阶段 | "
+                                f"阶段连续成功={consecutive_success_count} | "
+                                f"阶段停滞={episodes_since_best_for_unlock} | "
+                                f"阶段累计成功={curriculum_stage_success_count}"
+                            )
                     stage_meta_desc = (
                         f"{mode_desc} | "
                         f"阶段回合数={stage_elapsed} | "
@@ -25203,15 +26542,79 @@ def train(args):
             tqdm.write(f"缓冲区大小: {replay_buffer.size()}", file=tqdm_file)
             tqdm.write("=" * 50, file=tqdm_file)
 
-        # 定期保存模型
-        if (
-            args.save_model
-            and int(args.save_interval) > 0
-            and (episode + 1) % int(args.save_interval) == 0
-        ):
-            save_checkpoint(len(episode_rewards), f"ep{episode+1}")
-            if save_training_resume_state:
-                save_checkpoint(len(episode_rewards), "checkpoint")
+        # 论文候选按“阶段内迭代”保存，避免全局 episode 对齐掩盖短阶段；
+        # 晋级边界优先，只保留一份同权重候选。普通训练保持原全局间隔。
+        if args.save_model:
+            completed_iterations = int(len(episode_rewards))
+            completed_stage_iterations = int(
+                completed_iterations
+                - episode_curriculum_stage_start_episode
+            )
+            stage_candidate_interval = int(
+                curriculum_stages[episode_curriculum_stage_index][
+                    'candidate_checkpoint_interval_trajectories'
+                ]
+            ) if paper_curriculum_mode else 0
+            completed_stage_trajectories = int(
+                completed_stage_iterations * int(env.num_envs)
+            )
+            previous_stage_trajectories = int(
+                max(0, completed_stage_iterations - 1) * int(env.num_envs)
+            )
+            crossed_paper_candidate_milestone = bool(
+                paper_curriculum_mode
+                and completed_stage_iterations > 0
+                and completed_stage_trajectories // stage_candidate_interval
+                > previous_stage_trajectories // stage_candidate_interval
+            )
+            paper_candidate_saved = False
+            if paper_curriculum_mode and paper_stage_transition_event is not None:
+                _save_paper_candidate(
+                    trained_stage_index=paper_stage_transition_event[
+                        'completed_stage_index'
+                    ],
+                    completed_iterations=completed_iterations,
+                    stage_start_completed_iterations=(
+                        paper_stage_transition_event[
+                            'stage_start_completed_iterations'
+                        ]
+                    ),
+                    candidate_kind='stage_boundary',
+                    promotion_evidence=paper_stage_transition_event[
+                        'promotion_evidence'
+                    ],
+                )
+                paper_candidate_saved = True
+            elif (
+                paper_curriculum_mode
+                and crossed_paper_candidate_milestone
+            ):
+                _save_paper_candidate(
+                    trained_stage_index=episode_curriculum_stage_index,
+                    completed_iterations=completed_iterations,
+                    stage_start_completed_iterations=(
+                        episode_curriculum_stage_start_episode
+                    ),
+                    candidate_kind='periodic',
+                )
+                paper_candidate_saved = True
+            elif (
+                not paper_curriculum_mode
+                and int(args.save_interval) > 0
+                and completed_iterations % int(args.save_interval) == 0
+            ):
+                save_checkpoint(
+                    completed_iterations,
+                    f"ep{completed_iterations}",
+                )
+            periodic_resume_due = bool(
+                int(args.save_interval) > 0
+                and completed_iterations % int(args.save_interval) == 0
+            )
+            if save_training_resume_state and (
+                periodic_resume_due or paper_candidate_saved
+            ):
+                save_checkpoint(completed_iterations, "checkpoint")
 
         # 已移除训练阶段轨迹可视化生成
 
@@ -25334,7 +26737,10 @@ def train(args):
             pass
 
         # 非最后一回合才重置环境（延迟重置机制）
-        if episode < args.train_episodes - 1:
+        if (
+            episode < args.train_episodes - 1
+            and not curriculum_transition_occurred_this_iteration
+        ):
             # 现在重置环境并处理观察
             obs_n = env.reset()
             if hasattr(maddpg.obs_processor, 'batch_process_observations_vectorized'):
@@ -25534,6 +26940,25 @@ def train(args):
 
     # 保存最终模型和检查点
     if args.save_model:
+        if (
+            paper_curriculum_mode
+            and episode_rewards
+            and int(len(episode_rewards))
+            > int(episode_curriculum_stage_start_episode)
+        ):
+            _save_paper_candidate(
+                trained_stage_index=episode_curriculum_stage_index,
+                completed_iterations=int(len(episode_rewards)),
+                stage_start_completed_iterations=(
+                    episode_curriculum_stage_start_episode
+                ),
+                candidate_kind='training_final',
+                promotion_evidence=(
+                    paper_stage_transition_event.get('promotion_evidence')
+                    if isinstance(paper_stage_transition_event, dict)
+                    else None
+                ),
+            )
         maddpg.save_models(os.path.join("models", args.exp_name, "final"))
         if save_training_resume_state:
             # 仅显式启用 episode 续训时维护滚动 checkpoint。
@@ -26664,9 +28089,13 @@ def parse_args():
     parser.add_argument(
         "--matd3-action-semantics-mode",
         type=str,
-        choices=["dual", "collapsed_replay"],
+        choices=list(MATD3_ACTION_SEMANTICS),
         default=str(os.getenv('MATD3_ACTION_SEMANTICS_MODE', 'dual')).strip().lower(),
-        help="MATD3回放动作语义：dual=保存raw/corrected双语义；collapsed_replay=回放动作通道折叠为corrected执行动作"
+        help=(
+            "MATD3动作语义：raw_only=原始7维动作回放/critic/actor，APF仍用于执行；dual=历史加性head/tail消融；"
+            "collapsed_replay=历史回放折叠消融；executed_control=论文主线，"
+            "两个标量critic只评价环境实际执行的3D控制量，actor经可微APF映射更新"
+        )
     )
     parser.add_argument(
         "--matd3-reconstruct-corrected-target",
@@ -26998,6 +28427,18 @@ def parse_args():
         default=str(os.getenv('MADDPG_USE_SEPARATED_GRADIENT', '1')).lower() in ('true', '1', 'yes', 'on'),
         help="MADDPG是否使用分离式梯度（默认来自MADDPG_USE_SEPARATED_GRADIENT）"
     )
+    parser.add_argument(
+        "--maddpg-action-semantics-mode",
+        type=str,
+        choices=("legacy", "executed_control"),
+        default=str(
+            os.getenv("MADDPG_ACTION_SEMANTICS_MODE", "legacy")
+        ).strip().lower(),
+        help=(
+            "MADDPG critic action semantics: legacy observes the packed actor "
+            "tail directly; executed_control observes only the true 3D control"
+        ),
+    )
     parser.add_argument("--fairness-reweight-enabled", type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
                        default=True, help="是否启用按agent成功率反向补偿的loss重加权")
     parser.add_argument("--fairness-window", type=int, default=200,
@@ -27211,6 +28652,27 @@ def parse_args():
                        help="连续 N 个回合成功（奖励高于阈值）后，满足解锁条件之一。设置为0则禁用此功能。")
     parser.add_argument("--unlock-env-on-plateau", type=int, default=0,
                        help="奖励连续 N 个回合未突破最佳记录后，满足解锁条件之一。设置为0则禁用此功能。")
+    parser.add_argument(
+        "--paper-curriculum-enabled",
+        type=lambda x: str(x).lower() in ('true', '1', 'yes', 'on'),
+        default=str(os.getenv('PAPER_CURRICULUM_ENABLED', '0')).lower() in ('true', '1', 'yes', 'on'),
+        help=(
+            "启用论文任务课程 C0-C3；按固定窗口团队成功率的 Wilson 下界解锁。"
+            "未见 terrain seeds 不进入训练，只用于独立泛化评估。"
+        ),
+    )
+    parser.add_argument(
+        "--paper-method-id",
+        type=str,
+        default=str(os.getenv('PAPER_METHOD_ID', '') or ''),
+        help="论文训练方法的稳定标识；写入所有候选模型并由正式评估核验",
+    )
+    parser.add_argument(
+        "--paper-experiment-protocol",
+        type=str,
+        default=str(os.getenv('PAPER_EXPERIMENT_PROTOCOL_PATH', '') or ''),
+        help="不可变论文实验协议文件；论文课程训练必填并写入候选模型",
+    )
     # 移除成功奖励阈值参数：成功仅由"到达且未碰撞"判定
 
     # 分项加权求和奖励权重参数
@@ -27367,6 +28829,13 @@ def parse_args():
     parser.add_argument("--collapse-patience", type=int, default=3, help="触发崩坏操作所需连续异常步数")
     parser.add_argument("--collapse-loss-threshold", type=float, default=1e3, help="损失爆炸阈值")
     parser.add_argument("--collapse-z-threshold", type=float, default=-50.0, help="Z轴深穿透阈值（低于则判为崩坏）")
+
+    parser.add_argument(
+        "--paper-task-metadata-dir",
+        type=str,
+        default=os.getenv('PAPER_TASK_METADATA_DIR', ''),
+        help="论文任务契约逐回合JSON输出目录；空值表示只保存在内存/结果快照中",
+    )
 
     add_runtime_environment_arguments(parser)
     return parser.parse_args()

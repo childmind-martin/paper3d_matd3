@@ -253,6 +253,8 @@ class Scenario(BaseTerrainScenario):
         将奖励分解为独立的分项，通过权重配置进行加权求和
         适合随机地形训练，提高奖励稳定性
         """
+        if getattr(self, 'paper_reward_profile', 'legacy') == 'paper_v1':
+            return super().reward(agent, world)
         try:
             # 获取智能体的独立目标位置
             if not hasattr(agent, 'goal_a') or agent.goal_a.state.p_pos is None:
