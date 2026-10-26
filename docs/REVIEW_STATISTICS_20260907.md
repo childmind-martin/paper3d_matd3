@@ -1,5 +1,7 @@
 # 拒稿修订：统计检验与复现说明（2026-09-07）
 
+> 本文说明当时实现的统计方法与组件检查，不报告新的训练性能。当前实验完成程度与发布记录见 [EC 状态与分析记录](EC_MATD3_STATUS_20261026.md)。
+
 本次修改位于本机 WSL2 Ubuntu 的 `/home/tang/matd3`。修改文件为 `paper_seed_statistics.py`、`paper_results_summary.py`；新增 `test_paper_seed_statistics.py`。没有生成或补写任何正式实验结果。
 
 ## 独立单位与检验

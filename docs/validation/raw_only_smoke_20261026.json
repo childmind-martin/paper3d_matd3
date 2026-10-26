@@ -1,0 +1,13 @@
+{
+  "status": "passed",
+  "runtime": "/home/tang/miniconda3/envs/maddpg_env/bin/python",
+  "device": "CPU",
+  "environment_steps": 16,
+  "update_calls": 6,
+  "missing_alias_update_calls": 2,
+  "checked_batches": 9,
+  "maximum_apf_intervention_norm": 1.3586704730987549,
+  "actor_weight_change_l2_sum": 0.031303128955187276,
+  "critic_weight_change_l2_sum": 0.38284183447103715,
+  "evidence_scope": "runtime correctness only; not a performance or convergence experiment"
+}
